@@ -1,0 +1,14 @@
+{
+  "name": "0dte-signal-server",
+  "version": "1.0.0",
+  "description": "Cloud signal engine for 0DTE trading alerts with web push notifications",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0",
+    "web-push": "^3.6.7",
+    "express": "^4.18.2"
+  }
+}
