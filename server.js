@@ -2,7 +2,7 @@
 // Connects to Finnhub WebSocket and sends web push notifications
 // Deploy to any Node.js host (Railway, Render, Fly.io, etc.)
 
-require('dotenv').config();
+try { require('dotenv').config(); } catch(e) { /* dotenv not needed on Railway */ }
 const express = require('express');
 const webpush = require('web-push');
 const WebSocket = require('ws');
