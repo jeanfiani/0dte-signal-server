@@ -20,6 +20,7 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
+
 // ===== CONFIG =====
 const API = process.env.FINNHUB_API_KEY;
 const PORT = process.env.PORT || 3000;
@@ -183,6 +184,16 @@ function processPrice(sym, price, hi, lo) {
   if (rocBull) cS++; if (rocBear) pS++;
   if (s.crossAssetDir === 'call' && Date.now() - s.crossAssetTs < 300000) cS++;
   if (s.crossAssetDir === 'put' && Date.now() - s.crossAssetTs < 300000) pS++;
+
+  // Store indicator state for /prices endpoint
+  const dom = Math.max(cS, pS);
+  s._ind = { e5b, e5bear, e13b, e13bear, abV, blV, mBull, mBear, rBull, rBear: rsiV < 35 || rsiV > 65, rocBull, rocBear };
+  s._rsi = rsiV;
+  s._dom = dom;
+  s._macdL = macdL;
+  s._macdS = macdS;
+  s._roc3 = roc3;
+  s._vwap = vwap;
 
   // Check exit for active trades
   checkExit(sym, price);
@@ -460,6 +471,29 @@ app.post('/trade/clear', (req, res) => {
   const { sym } = req.body;
   if (S[sym]) S[sym].trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
   res.json({ ok: true });
+});
+
+// Full prices + indicators endpoint for mobile PWA polling
+app.get('/prices', (req, res) => {
+  const data = {};
+  SYMBOLS.forEach(sym => {
+    const s = S[sym];
+    data[sym] = {
+      price: s.lastPrice,
+      ind: s._ind || null,
+      rsi: s._rsi || 0,
+      dom: s._dom || 0,
+      macdL: s._macdL || 0,
+      macdS: s._macdS || 0,
+      roc3: s._roc3 || 0,
+      vwap: s._vwap || 0,
+      chopActive: s.chopActive,
+      dailySignalCount: s.dailySignalCount,
+      signals: s.signals.slice(-20),
+      trade: s.trade.active ? { active: true, type: s.trade.type, ep: s.trade.ep, t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl } : { active: false }
+    };
+  });
+  res.json({ vix: vixV, wsConnected: ws && ws.readyState === 1, ts: Date.now(), symbols: data });
 });
 
 // Status endpoint
