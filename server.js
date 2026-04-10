@@ -12,6 +12,14 @@ const fs = require('fs');
 const app = express();
 app.use(express.json());
 
+// CORS — allow requests from any origin (Netlify PWA → Railway)
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 // ===== CONFIG =====
 const API = process.env.FINNHUB_API_KEY;
 const PORT = process.env.PORT || 3000;
