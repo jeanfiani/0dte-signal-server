@@ -117,6 +117,24 @@ function log(sym, msg) {
   console.log(`[${ts()}] ${sym}: ${msg}`);
 }
 
+// ===== PERSISTENT SIGNAL LOGGING =====
+const SIGNALS_DIR = path.join(__dirname, 'signal_logs');
+try { fs.mkdirSync(SIGNALS_DIR, { recursive: true }); } catch (e) {}
+
+function todayDateET() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' }); // YYYY-MM-DD
+}
+
+function logSignal(sym, sig) {
+  const dateStr = todayDateET();
+  const file = path.join(SIGNALS_DIR, dateStr + '.csv');
+  const exists = fs.existsSync(file);
+  const header = 'date,time,symbol,type,price,score,rsi,macd,roc,vix,chop,dailyNum\n';
+  const row = [dateStr, sig.time, sym, sig.type, sig.price, sig.score, sig.rsi, sig.macd, sig.roc, vixV.toFixed(1), S[sym].chopActive ? 1 : 0, sig.num].join(',') + '\n';
+  if (!exists) fs.writeFileSync(file, header + row);
+  else fs.appendFileSync(file, row);
+}
+
 // ===== PROCESS PRICE (same engine as mobile/desktop) =====
 function processPrice(sym, price, hi, lo) {
   const s = S[sym];
@@ -298,6 +316,7 @@ function processPrice(sym, price, hi, lo) {
     s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2;
     const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: cS + '/' + mi, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
     s.signals.push(sig);
+    logSignal(sym, sig);
     log(sym, '🚀 CALL ' + sig.score + ' RSI:' + sig.rsi + ' $' + sig.price + ' [#' + s.dailySignalCount + ']');
     sendPush('🚀 ' + sym + ' CALL ' + sig.score + ' #' + s.dailySignalCount, '$' + sig.price + ' · RSI:' + sig.rsi + ' · ROC:' + sig.roc, 'signal');
     // Cross-asset
@@ -309,6 +328,7 @@ function processPrice(sym, price, hi, lo) {
     s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2;
     const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: pS + '/' + mi, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
     s.signals.push(sig);
+    logSignal(sym, sig);
     log(sym, '📉 PUT ' + sig.score + ' RSI:' + sig.rsi + ' $' + sig.price + ' [#' + s.dailySignalCount + ']');
     sendPush('📉 ' + sym + ' PUT ' + sig.score + ' #' + s.dailySignalCount, '$' + sig.price + ' · RSI:' + sig.rsi + ' · ROC:' + sig.roc, 'signal');
     SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'put'; S[other].crossAssetTs = now2; } });
@@ -510,6 +530,32 @@ app.get('/status', (req, res) => {
     };
   });
   res.json({ running: ws && ws.readyState === 1, vix: vixV, subscribers: subscriptions.length, symbols: status });
+});
+
+// Signal log — today's signals as CSV
+app.get('/signals/today', (req, res) => {
+  const file = path.join(SIGNALS_DIR, todayDateET() + '.csv');
+  if (!fs.existsSync(file)) return res.status(200).send('date,time,symbol,type,price,score,rsi,macd,roc,vix,chop,dailyNum\n');
+  res.header('Content-Type', 'text/csv');
+  res.sendFile(file);
+});
+
+// Signal log — specific date (e.g. /signals/2026-04-11)
+app.get('/signals/:date', (req, res) => {
+  const dateStr = req.params.date;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return res.status(400).json({ error: 'Use YYYY-MM-DD format' });
+  const file = path.join(SIGNALS_DIR, dateStr + '.csv');
+  if (!fs.existsSync(file)) return res.status(404).json({ error: 'No signals for ' + dateStr });
+  res.header('Content-Type', 'text/csv');
+  res.sendFile(file);
+});
+
+// Signal log — list all available dates
+app.get('/signals', (req, res) => {
+  try {
+    const files = fs.readdirSync(SIGNALS_DIR).filter(f => f.endsWith('.csv')).map(f => f.replace('.csv', '')).sort();
+    res.json({ dates: files, count: files.length });
+  } catch (e) { res.json({ dates: [], count: 0 }); }
 });
 
 // Health check
