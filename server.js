@@ -304,7 +304,7 @@ function processPrice(sym, price, hi, lo) {
     if (s.gapDirection === 'down' && pS >= finalMinS && pS > cS && rsiV <= 50) return;
   }
 
-  const vixOk = vixV > 0 && vixV < 35;
+  const vixOk = vixV <= 0 || vixV < 35;  // treat unknown VIX as OK (don't block calls when VIX fetch fails)
   const fireCall = cS >= finalMinS && vixOk && rsiSweetCall && macdAlignCall;
   const firePut = pS >= finalMinS && rsiSweetPut && macdAlignPut;
 
@@ -415,13 +415,17 @@ setInterval(() => {
   });
 }, 3000);
 
-// Fetch VIX every 30 seconds
+// Fetch VIX every 30 seconds (try multiple symbol formats)
 async function fetchVIX() {
-  try {
-    const res = await fetch('https://finnhub.io/api/v1/quote?symbol=VIX&token=' + API + '&_=' + Date.now());
-    const data = await res.json();
-    if (data && data.c > 0) vixV = data.c;
-  } catch (e) {}
+  const symbols = ['CBOE:VIX', 'VIX', '^VIX'];
+  for (const sym of symbols) {
+    try {
+      const res = await fetch('https://finnhub.io/api/v1/quote?symbol=' + encodeURIComponent(sym) + '&token=' + API + '&_=' + Date.now());
+      const data = await res.json();
+      if (data && data.c > 0) { vixV = data.c; return; }
+    } catch (e) {}
+  }
+  console.log('[' + ts() + '] VIX fetch failed - all symbols returned 0');
 }
 setInterval(fetchVIX, 30000);
 
