@@ -69,7 +69,7 @@ SYMBOLS.forEach(sym => {
     gapDayMode: false, gapDirection: null, prevClose: null,
     lastSameDir: null, lastSameDirMacd: 0, lastSameDirTs: 0,
     // Trade monitor
-    trade: { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 }
+    trade: { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 }
   };
 });
 let vixV = 0;
@@ -361,7 +361,7 @@ function checkExit(sym, price) {
     log(sym, '💰 PT1 +' + dm.toFixed(2) + '% — PARTIAL EXIT');
     sendPush('💰 PT1 ' + sym, '+' + dm.toFixed(2) + '% — close 50%', 'exit');
   } else if (fl >= 3 && cd && !t.sl) {
-    t.lastETs = now;
+    t.rev = true; t.lastETs = now;
     log(sym, '⚠️ REVERSAL — ' + fl + '/4 flipped · ' + dm.toFixed(2) + '%');
     sendPush('⚠️ REVERSAL ' + sym, fl + '/4 indicators flipped — exit zone', 'exit');
   }
@@ -449,7 +449,7 @@ setInterval(() => {
       s.sessionHigh = -Infinity; s.sessionLow = Infinity;
       s.gapDayMode = false; s.gapDirection = null;
       s.lastSameDir = null; s.lastSameDirMacd = 0; s.lastSameDirTs = 0;
-      s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+      s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
     });
   }
 }, 60000);
@@ -493,7 +493,7 @@ app.post('/trade', (req, res) => {
 // Clear trade monitor
 app.post('/trade/clear', (req, res) => {
   const { sym } = req.body;
-  if (S[sym]) S[sym].trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+  if (S[sym]) S[sym].trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
   res.json({ ok: true });
 });
 
@@ -514,7 +514,7 @@ app.get('/prices', (req, res) => {
       chopActive: s.chopActive,
       dailySignalCount: s.dailySignalCount,
       signals: s.signals.slice(-20),
-      trade: s.trade.active ? { active: true, type: s.trade.type, ep: s.trade.ep, t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl } : { active: false }
+      trade: s.trade.active ? { active: true, type: s.trade.type, ep: s.trade.ep, t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl, rev: s.trade.rev } : { active: false }
     };
   });
   res.json({ vix: vixV, wsConnected: ws && ws.readyState === 1, ts: Date.now(), symbols: data });
