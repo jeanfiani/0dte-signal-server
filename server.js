@@ -429,11 +429,13 @@ async function fetchVIX() {
 }
 setInterval(fetchVIX, 30000);
 
-// Daily reset at 9:20 AM ET
+// Daily reset — date-based (resets as soon as ET date changes, not at a fixed minute)
+let _lastResetDate = todayDateET();
 setInterval(() => {
-  const et = gET();
-  if (et === 560) { // 9:20 AM — reset before market open
-    console.log('[' + ts() + '] Daily reset');
+  const today = todayDateET();
+  if (today !== _lastResetDate) {
+    _lastResetDate = today;
+    console.log('[' + ts() + '] Daily reset — new date: ' + today);
     SYMBOLS.forEach(sym => {
       const s = S[sym];
       s.prices = []; s.highs = []; s.lows = [];
@@ -452,7 +454,7 @@ setInterval(() => {
       s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
     });
   }
-}, 60000);
+}, 30000);
 
 // ===== API ROUTES =====
 
