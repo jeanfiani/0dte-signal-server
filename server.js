@@ -268,9 +268,16 @@ function processPrice(sym, price, hi, lo) {
   if (!macdAlignCall && cS >= finalMinS && cS >= pS) return;
   if (!macdAlignPut && pS >= finalMinS && pS > cS) return;
 
-  // MACD minimum strength (raised from 0.010 — weak MACD = noise signals)
+  // MACD minimum strength — check both histogram AND line value
+  // Histogram (macdL - macdS) measures momentum divergence
+  // MACD line (macdL) measures actual trend strength — near-zero = no trend
   const macdStr = Math.abs(macdL - macdS);
   if (macdStr < 0.020 && (cS >= finalMinS || pS >= finalMinS)) return;
+  // MACD line too weak = no real trend (fixes MACD 0.008 CALL that passed histogram filter)
+  if (Math.abs(macdL) < 0.015 && (cS >= finalMinS || pS >= finalMinS)) {
+    log(sym, 'MACD line filter: blocked — |macdL| = ' + Math.abs(macdL).toFixed(3) + ' < 0.015');
+    return;
+  }
 
   // Session High/Low Proximity
   if (s.sessionHigh > -Infinity && s.openPrice) {
@@ -321,6 +328,50 @@ function processPrice(sym, price, hi, lo) {
   // RSI exhaustion check — don't short at oversold, don't buy at overbought
   if (cS >= finalMinS && cS >= pS && rsiV > 65) { log(sym, 'RSI exhaustion: CALL blocked — RSI ' + rsiV.toFixed(1) + ' (overbought)'); return; }
   if (pS >= finalMinS && pS > cS && rsiV < 35) { log(sym, 'RSI exhaustion: PUT blocked — RSI ' + rsiV.toFixed(1) + ' (oversold)'); return; }
+
+  // Post-move exhaustion filter — after a $2+ move in one direction, require stronger MACD for same-direction signals
+  if (s.openPrice && s.openPrice > 0) {
+    const dayMove = price - s.openPrice;
+    const absDayMove = Math.abs(dayMove);
+    if (absDayMove >= 2.0) {
+      const macdStrNow = Math.abs(macdL - macdS);
+      // If price has moved $2+ UP and we're firing a CALL (same direction), need MACD > 0.040
+      if (dayMove >= 2.0 && cS >= finalMinS && cS >= pS && macdStrNow < 0.040) {
+        log(sym, 'Post-move exhaustion: CALL blocked — $' + dayMove.toFixed(2) + ' up move, MACD str ' + macdStrNow.toFixed(3) + ' < 0.040');
+        return;
+      }
+      // If price has moved $2+ DOWN and we're firing a PUT (same direction), need MACD > 0.040
+      if (dayMove <= -2.0 && pS >= finalMinS && pS > cS && macdStrNow < 0.040) {
+        log(sym, 'Post-move exhaustion: PUT blocked — $' + Math.abs(dayMove).toFixed(2) + ' down move, MACD str ' + macdStrNow.toFixed(3) + ' < 0.040');
+        return;
+      }
+    }
+  }
+
+  // Session High Reversal Detector — fire high-confidence PUT when price reverses from session high
+  // Conditions: hit session high, reversed >$1 from it, RSI > 60 (was overbought), MACD turning bearish
+  if (s.sessionHigh > -Infinity && s.openPrice && cool && s.dailySignalCount < MAX_SIG && etMin >= 570 && etMin < 955) {
+    const distFromHigh = s.sessionHigh - price;
+    const sessionRange = s.sessionHigh - s.sessionLow;
+    const highWasRecent = s.prices.length >= 10 && Math.max(...s.prices.slice(-30 > -s.prices.length ? -30 : 0)) >= s.sessionHigh - 0.05;
+    if (distFromHigh >= 1.0 && rsiV > 60 && sessionRange >= 1.5 && highWasRecent && macdL < macdS && roc3 < -ROC_THR) {
+      // Don't fire if we already fired a PUT recently (use cooldown)
+      if (s.lastSignalDir !== 'put' || (now2 - s.lastNTs > COOLDOWN_MS)) {
+        s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
+        if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
+        s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
+        s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2;
+        const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇HI', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        s.signals.push(sig);
+        logSignal(sym, sig);
+        log(sym, '🔻 SESSION HIGH REVERSAL PUT — $' + distFromHigh.toFixed(2) + ' off high $' + s.sessionHigh.toFixed(2) + ' RSI:' + rsiV.toFixed(1) + ' [#' + s.dailySignalCount + ']');
+        sendPush('🔻 ' + sym + ' HIGH REVERSAL PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromHigh.toFixed(2) + ' off high · RSI:' + rsiV.toFixed(1), 'signal');
+        s.trade = { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'put'; S[other].crossAssetTs = now2; } });
+        return; // Signal fired, don't continue to regular signal logic
+      }
+    }
+  }
 
   const vixOk = vixV <= 0 || vixV < 35;  // treat unknown VIX as OK (don't block calls when VIX fetch fails)
   const fireCall = cS >= finalMinS && vixOk && rsiSweetCall && macdAlignCall;
