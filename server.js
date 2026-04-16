@@ -98,19 +98,29 @@ function ts() { return new Date().toLocaleTimeString('en-US', { hour: '2-digit',
 
 // ===== PUSH TO ALL SUBSCRIBERS =====
 function sendPush(title, body, tag) {
+  if (subscriptions.length === 0) {
+    console.log('[' + ts() + '] Push skipped — no subscribers. Title: ' + title);
+    return;
+  }
   const payload = JSON.stringify({ title, body, tag: tag || 'signal-' + Date.now() });
+  console.log('[' + ts() + '] Pushing to ' + subscriptions.length + ' sub(s): ' + title);
   const dead = [];
   subscriptions.forEach((sub, i) => {
-    webpush.sendNotification(sub, payload).catch(err => {
-      if (err.statusCode === 410 || err.statusCode === 404) dead.push(i);
-      else console.error('Push error:', err.statusCode || err.message);
-    });
+    webpush.sendNotification(sub, payload)
+      .then(() => { console.log('[' + ts() + '] Push delivered to sub #' + i); })
+      .catch(err => {
+        console.error('[' + ts() + '] Push failed sub #' + i + ': ' + (err.statusCode || err.message));
+        if (err.statusCode === 410 || err.statusCode === 404) dead.push(i);
+      });
   });
-  // Clean up dead subscriptions
-  if (dead.length > 0) {
-    dead.reverse().forEach(i => subscriptions.splice(i, 1));
-    saveSubs();
-  }
+  // Clean up dead subscriptions (async — runs after promises settle)
+  setTimeout(() => {
+    if (dead.length > 0) {
+      console.log('[' + ts() + '] Removing ' + dead.length + ' dead subscription(s)');
+      dead.sort((a, b) => b - a).forEach(i => subscriptions.splice(i, 1));
+      saveSubs();
+    }
+  }, 5000);
 }
 
 function log(sym, msg) {
@@ -642,15 +652,21 @@ app.get('/vapid-key', (req, res) => {
   res.json({ publicKey: process.env.VAPID_PUBLIC_KEY });
 });
 
-// Subscribe endpoint
+// Subscribe endpoint — always upsert (handles Railway ephemeral filesystem)
 app.post('/subscribe', (req, res) => {
   const sub = req.body;
   if (!sub || !sub.endpoint) return res.status(400).json({ error: 'Invalid subscription' });
-  // Avoid duplicates
-  const exists = subscriptions.some(s => s.endpoint === sub.endpoint);
-  if (!exists) { subscriptions.push(sub); saveSubs(); }
-  console.log('[' + ts() + '] New push subscription (' + subscriptions.length + ' total)');
-  res.json({ ok: true });
+  // Replace existing sub with same endpoint (keys may have rotated) or add new
+  const idx = subscriptions.findIndex(s => s.endpoint === sub.endpoint);
+  if (idx >= 0) {
+    subscriptions[idx] = sub;
+    console.log('[' + ts() + '] Push subscription updated (' + subscriptions.length + ' total)');
+  } else {
+    subscriptions.push(sub);
+    console.log('[' + ts() + '] New push subscription (' + subscriptions.length + ' total)');
+  }
+  saveSubs();
+  res.json({ ok: true, count: subscriptions.length });
 });
 
 // Unsubscribe
@@ -659,6 +675,16 @@ app.post('/unsubscribe', (req, res) => {
   subscriptions = subscriptions.filter(s => s.endpoint !== endpoint);
   saveSubs();
   res.json({ ok: true });
+});
+
+// Test push — send a test notification to all subscribers
+app.get('/test-push', (req, res) => {
+  if (subscriptions.length === 0) {
+    return res.json({ ok: false, error: 'No subscribers registered. Open the PWA first to subscribe.', count: 0 });
+  }
+  sendPush('🔔 Test Notification', 'Push notifications are working! ' + subscriptions.length + ' subscriber(s).', 'test');
+  console.log('[' + ts() + '] Test push sent to ' + subscriptions.length + ' subscriber(s)');
+  res.json({ ok: true, count: subscriptions.length });
 });
 
 // Activate trade monitor via API
