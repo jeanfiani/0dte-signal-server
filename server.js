@@ -32,7 +32,7 @@ const RSI_PUT_HI  = { QQQ: 55, SPY: 55 };
 const ROC_BLOWOFF = { QQQ: 0.15, SPY: 0.15 };
 const MAX_IND = { QQQ: 6, SPY: 6 };
 const COOLDOWN_MS = 180000;
-const FLIP_COOL_MS = 480000;
+// FLIP_COOL_MS removed — was blocking legitimate reversal signals
 const MAX_SIG = 10;
 const THR = 5;
 const ROC_THR = 0.018;
@@ -224,12 +224,13 @@ function processPrice(sym, price, hi, lo) {
   if (etMin < 570 || etMin >= 955) return;
   if (etMin >= 945 && (cS >= THR || pS >= THR)) return;
 
-  // Chop with override
+  // Chop with override — strengthened: require score >= 6 + RSI + ROC (was: any score + RSI + ROC)
   const domT = cS >= pS ? 'call' : 'put';
   if (s.chopActive && (cS >= THR || pS >= THR)) {
+    const chopScore = domT === 'call' ? cS : pS;
     const chopRsiOk = (domT === 'call' && rsiV >= RSI_CALL_LO[sym] && rsiV <= RSI_CALL_HI[sym]) || (domT === 'put' && rsiV >= RSI_PUT_LO[sym] && rsiV <= RSI_PUT_HI[sym]);
     const chopRocOk = (domT === 'call' && roc3 > ROC_THR) || (domT === 'put' && roc3 < -ROC_THR);
-    if (!(chopRsiOk && chopRocOk)) return;
+    if (!(chopScore >= 6 && chopRsiOk && chopRocOk)) return;
   }
 
   // Dynamic threshold
@@ -248,9 +249,7 @@ function processPrice(sym, price, hi, lo) {
   if (now2 - s.lastReversalTs < 180000 && (cS >= minS || pS >= minS)) return;
   // Daily cap
   if (s.dailySignalCount >= MAX_SIG) return;
-  // Direction-flip cooldown
-  const isFlip = (s.lastSignalDir === 'call' && pS >= minS) || (s.lastSignalDir === 'put' && cS >= minS);
-  if (isFlip && (now2 - s.lastSignalTs < FLIP_COOL_MS)) return;
+  // Direction-flip cooldown — REMOVED (was 480s, blocked reversal catches)
 
   // RSI sweet-spot
   const rsiSweetCall = rsiV >= RSI_CALL_LO[sym] && rsiV <= RSI_CALL_HI[sym];
@@ -269,9 +268,9 @@ function processPrice(sym, price, hi, lo) {
   if (!macdAlignCall && cS >= finalMinS && cS >= pS) return;
   if (!macdAlignPut && pS >= finalMinS && pS > cS) return;
 
-  // MACD minimum strength
+  // MACD minimum strength (raised from 0.010 — weak MACD = noise signals)
   const macdStr = Math.abs(macdL - macdS);
-  if (macdStr < 0.010 && (cS >= finalMinS || pS >= finalMinS)) return;
+  if (macdStr < 0.020 && (cS >= finalMinS || pS >= finalMinS)) return;
 
   // Session High/Low Proximity
   if (s.sessionHigh > -Infinity && s.openPrice) {
@@ -303,6 +302,25 @@ function processPrice(sym, price, hi, lo) {
     if (s.gapDirection === 'up' && cS >= finalMinS && cS >= pS && rsiV >= 50) return;
     if (s.gapDirection === 'down' && pS >= finalMinS && pS > cS && rsiV <= 50) return;
   }
+
+  // Retrace filter — block dead-cat-bounce signals
+  // If price dropped >$0.50 in last 30 ticks, require 50% retrace before CALL (and vice versa for PUT)
+  if (s.prices.length >= 30) {
+    const recent = s.prices.slice(-30);
+    const recentHi = Math.max(...recent), recentLo = Math.min(...recent);
+    const moveSize = recentHi - recentLo;
+    if (moveSize >= 0.50) {
+      const retracePct = recentHi > recentLo ? (price - recentLo) / (recentHi - recentLo) : 0.5;
+      // For CALL: price should be above 50% retrace (not bouncing off the bottom)
+      if (cS >= finalMinS && cS >= pS && retracePct < 0.50) { log(sym, 'Retrace filter: CALL blocked — only ' + (retracePct * 100).toFixed(0) + '% retrace of $' + moveSize.toFixed(2) + ' drop'); return; }
+      // For PUT: price should be below 50% retrace (not selling off the top)
+      if (pS >= finalMinS && pS > cS && retracePct > 0.50) { log(sym, 'Retrace filter: PUT blocked — price at ' + (retracePct * 100).toFixed(0) + '% of $' + moveSize.toFixed(2) + ' range'); return; }
+    }
+  }
+
+  // RSI exhaustion check — don't short at oversold, don't buy at overbought
+  if (cS >= finalMinS && cS >= pS && rsiV > 65) { log(sym, 'RSI exhaustion: CALL blocked — RSI ' + rsiV.toFixed(1) + ' (overbought)'); return; }
+  if (pS >= finalMinS && pS > cS && rsiV < 35) { log(sym, 'RSI exhaustion: PUT blocked — RSI ' + rsiV.toFixed(1) + ' (oversold)'); return; }
 
   const vixOk = vixV <= 0 || vixV < 35;  // treat unknown VIX as OK (don't block calls when VIX fetch fails)
   const fireCall = cS >= finalMinS && vixOk && rsiSweetCall && macdAlignCall;
