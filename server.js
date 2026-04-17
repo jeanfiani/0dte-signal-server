@@ -65,7 +65,7 @@ SYMBOLS.forEach(sym => {
     chopShort: [], chopLong: [], chopCount: 0, trendCount: 0, chopActive: false,
     signals: [], tickBuf: [], lastPrice: 0,
     crossAssetDir: null, crossAssetTs: 0,
-    sessionHigh: -Infinity, sessionLow: Infinity,
+    sessionHigh: -Infinity, sessionLow: Infinity, rsiAtSessionHigh: 50,
     gapDayMode: false, gapDirection: null, prevClose: null,
     lastSameDir: null, lastSameDirMacd: 0, lastSameDirTs: 0,
     // Trade monitor
@@ -188,6 +188,9 @@ function processPrice(sym, price, hi, lo) {
   const macdL = +(s.pMF - s.pMS).toFixed(3), macdS = +(s.pMSig || 0).toFixed(3);
   const rsiV = calcRSI(s.prices);
   const roc3 = calcROC(s.prices, 3);
+
+  // Track RSI at session high — used by Session High Reversal Detector
+  if (price >= s.sessionHigh) s.rsiAtSessionHigh = rsiV;
 
   const e5b = s.pE5 > s.pE13, e5bear = s.pE5 < s.pE13;
   const e13b = s.pE13 > s.pE34, e13bear = s.pE13 < s.pE34;
@@ -364,7 +367,7 @@ function processPrice(sym, price, hi, lo) {
     const distFromHigh = s.sessionHigh - price;
     const sessionRange = s.sessionHigh - s.sessionLow;
     const highWasRecent = s.prices.length >= 10 && Math.max(...s.prices.slice(-30 > -s.prices.length ? -30 : 0)) >= s.sessionHigh - 0.05;
-    if (distFromHigh >= 1.0 && rsiV > 60 && sessionRange >= 1.5 && highWasRecent && macdL < macdS && roc3 < -ROC_THR) {
+    if (distFromHigh >= 1.0 && s.rsiAtSessionHigh > 60 && sessionRange >= 1.5 && highWasRecent && macdL < macdS && roc3 < -ROC_THR) {
       // Don't fire if we already fired a PUT recently (use cooldown)
       if (s.lastSignalDir !== 'put' || (now2 - s.lastNTs > COOLDOWN_MS)) {
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
@@ -374,8 +377,8 @@ function processPrice(sym, price, hi, lo) {
         const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇HI', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
         s.signals.push(sig);
         logSignal(sym, sig);
-        log(sym, '🔻 SESSION HIGH REVERSAL PUT — $' + distFromHigh.toFixed(2) + ' off high $' + s.sessionHigh.toFixed(2) + ' RSI:' + rsiV.toFixed(1) + ' [#' + s.dailySignalCount + ']');
-        sendPush('🔻 ' + sym + ' HIGH REVERSAL PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromHigh.toFixed(2) + ' off high · RSI:' + rsiV.toFixed(1), 'signal');
+        log(sym, '🔻 SESSION HIGH REVERSAL PUT — $' + distFromHigh.toFixed(2) + ' off high $' + s.sessionHigh.toFixed(2) + ' RSI@high:' + s.rsiAtSessionHigh.toFixed(1) + ' RSInow:' + rsiV.toFixed(1) + ' [#' + s.dailySignalCount + ']');
+        sendPush('🔻 ' + sym + ' HIGH REVERSAL PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromHigh.toFixed(2) + ' off high · RSI@high:' + s.rsiAtSessionHigh.toFixed(1), 'signal');
         s.trade = { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
         SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'put'; S[other].crossAssetTs = now2; } });
         return; // Signal fired, don't continue to regular signal logic
@@ -443,7 +446,7 @@ function checkExit(sym, price) {
     t.t1 = true; t.lastETs = now;
     log(sym, '💰 PT1 +' + dm.toFixed(2) + '% — PARTIAL EXIT');
     sendPush('💰 PT1 ' + sym, '+' + dm.toFixed(2) + '% — close 50%', 'exit');
-  } else if (fl >= 3 && cd && !t.sl) {
+  } else if (fl >= 3 && cd && !t.sl && !t.rev) {
     t.rev = true; t.lastETs = now;
     log(sym, '⚠️ REVERSAL — ' + fl + '/4 flipped · ' + dm.toFixed(2) + '%');
     sendPush('⚠️ REVERSAL ' + sym, fl + '/4 indicators flipped — exit zone', 'exit');
@@ -634,7 +637,7 @@ setInterval(() => {
       s.chopShort = []; s.chopLong = []; s.chopCount = 0; s.trendCount = 0; s.chopActive = false;
       s.signals = []; s.tickBuf = [];
       s.crossAssetDir = null; s.crossAssetTs = 0;
-      s.sessionHigh = -Infinity; s.sessionLow = Infinity;
+      s.sessionHigh = -Infinity; s.sessionLow = Infinity; s.rsiAtSessionHigh = 50;
       s.gapDayMode = false; s.gapDirection = null;
       s.lastSameDir = null; s.lastSameDirMacd = 0; s.lastSameDirTs = 0;
       s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
