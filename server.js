@@ -498,7 +498,11 @@ function connectFinnhub() {
   cleanupWS();
 
   try {
-    ws = new WebSocket('wss://ws.finnhub.io?token=' + API);
+    ws = new WebSocket('wss://ws.finnhub.io?token=' + API, {
+      perMessageDeflate: false,
+      headers: { 'User-Agent': '0dte-signal-server/1.0' },
+      handshakeTimeout: 10000
+    });
     wsOpenedAt = Date.now();
 
     ws.on('open', () => {
@@ -514,15 +518,15 @@ function connectFinnhub() {
       // Reset backoff on successful connect
       wsBackoff = 1000;
 
-      // Delay subscribe by 2s to let connection stabilize
-      setTimeout(() => {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          SYMBOLS.forEach(s => {
-            try { ws.send(JSON.stringify({ type: 'subscribe', symbol: s })); } catch (e) {}
-          });
-          console.log('[' + ts() + '] Subscribed to: ' + SYMBOLS.join(', '));
-        }
-      }, 2000);
+      // Subscribe immediately — Finnhub may drop idle connections
+      try {
+        SYMBOLS.forEach(s => {
+          ws.send(JSON.stringify({ type: 'subscribe', symbol: s }));
+        });
+        console.log('[' + ts() + '] Subscribed to: ' + SYMBOLS.join(', '));
+      } catch (e) {
+        console.error('[' + ts() + '] Subscribe error: ' + e.message);
+      }
 
       // Start ping/pong heartbeat every 20s + Finnhub-level keepalive
       wsPingInterval = setInterval(() => {
