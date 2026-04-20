@@ -500,8 +500,13 @@ function connectFinnhub() {
   try {
     ws = new WebSocket('wss://ws.finnhub.io?token=' + API, {
       perMessageDeflate: false,
-      headers: { 'User-Agent': '0dte-signal-server/1.0' },
-      handshakeTimeout: 10000
+      skipUTF8Validation: true,
+      headers: {
+        'User-Agent': '0dte-signal-server/1.0',
+        'Origin': 'https://finnhub.io'
+      },
+      handshakeTimeout: 10000,
+      maxPayload: 50 * 1024 * 1024 // 50MB — prevent drops on large payloads
     });
     wsOpenedAt = Date.now();
 
@@ -571,6 +576,13 @@ function connectFinnhub() {
           });
         }
       } catch (e) {}
+    });
+
+    ws.on('unexpected-response', (req, res) => {
+      console.error('[' + ts() + '] WS upgrade rejected: HTTP ' + res.statusCode);
+      let body = '';
+      res.on('data', chunk => { body += chunk; });
+      res.on('end', () => { console.error('[' + ts() + '] Rejection body: ' + body.substring(0, 200)); });
     });
 
     ws.on('error', (err) => {
