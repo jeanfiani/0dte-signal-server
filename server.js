@@ -458,6 +458,7 @@ let ws = null, wsReconnects = 0, wsBackoff = 1000;
 let wsOpenedAt = 0, wsStableAt = 0, wsPingInterval = null, wsLastPong = 0;
 let wsConnectedMs = 0, wsDisconnectedMs = 0, wsLastStateChange = Date.now();
 let wsReconnectTs = 0; // Track last reconnect time for signal warmup
+let wsLastCloseCode = 0, wsLastCloseReason = '', wsLastSessionDuration = 0; // Debug tracking
 
 function wsUptime() {
   const total = wsConnectedMs + wsDisconnectedMs;
@@ -472,7 +473,24 @@ function cleanupWS() {
   }
 }
 
+function isMarketWindow() {
+  const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const day = now.getDay(); // 0=Sun, 6=Sat
+  if (day === 0 || day === 6) return false;
+  const mins = now.getHours() * 60 + now.getMinutes();
+  // Pre-market 8:00 (480) to after-hours 18:00 (1080) — covers data availability
+  return mins >= 480 && mins <= 1080;
+}
+
 function connectFinnhub() {
+  // Don't connect outside market hours — saves Finnhub quota, avoids reconnect spam
+  if (!isMarketWindow()) {
+    const retryMs = 120000; // Check again in 2 minutes
+    console.log('[' + ts() + '] Market closed — skipping WS connect, retry in 2m');
+    setTimeout(connectFinnhub, retryMs);
+    return;
+  }
+
   // Don't reconnect if we already have a live connection
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
@@ -493,6 +511,9 @@ function connectFinnhub() {
 
       console.log('[' + ts() + '] Finnhub WS connected (attempt #' + wsReconnects + ', backoff was ' + wsBackoff + 'ms, uptime: ' + wsUptime() + ')');
 
+      // Reset backoff on successful connect
+      wsBackoff = 1000;
+
       // Delay subscribe by 2s to let connection stabilize
       setTimeout(() => {
         if (ws && ws.readyState === WebSocket.OPEN) {
@@ -503,7 +524,7 @@ function connectFinnhub() {
         }
       }, 2000);
 
-      // Start ping/pong heartbeat every 20s
+      // Start ping/pong heartbeat every 20s + Finnhub-level keepalive
       wsPingInterval = setInterval(() => {
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
         // Check if we got a pong recently (within 45s)
@@ -514,7 +535,12 @@ function connectFinnhub() {
           setTimeout(connectFinnhub, wsBackoff);
           return;
         }
-        try { ws.ping(); } catch (e) {}
+        try {
+          ws.ping();
+          // Also send Finnhub-level subscribe as application-layer keepalive
+          // This generates real WS data frames that proxies (Railway) recognize as activity
+          ws.send(JSON.stringify({ type: 'subscribe', symbol: SYMBOLS[0] }));
+        } catch (e) {}
       }, 20000);
     });
 
@@ -569,6 +595,9 @@ function connectFinnhub() {
 
       wsReconnects++;
       wsOpenedAt = 0;
+      wsLastCloseCode = code;
+      wsLastCloseReason = reasonStr;
+      wsLastSessionDuration = parseFloat(sessionDuration) || 0;
 
       // If connection lasted < 5s, it's unstable — increase backoff faster
       const lasted = parseFloat(sessionDuration);
@@ -577,8 +606,12 @@ function connectFinnhub() {
       } else if (lasted < 30) {
         wsBackoff = Math.min(wsBackoff * 1.5, 60000);
       }
-      // If we've been reconnecting a lot, slow down more
-      if (wsReconnects > 10) {
+      // If session lasted >60s it was a real connection, keep backoff reasonable
+      if (lasted >= 60) {
+        wsBackoff = Math.min(wsBackoff, 5000);
+      }
+      // Only slow down aggressively if connections are dying fast AND we've had many reconnects
+      else if (wsReconnects > 10 && lasted < 10) {
         wsBackoff = Math.max(wsBackoff, 30000);
       }
 
@@ -745,7 +778,7 @@ app.get('/status', (req, res) => {
   });
   const wsState = ws ? ['CONNECTING','OPEN','CLOSING','CLOSED'][ws.readyState] : 'NULL';
   const sinceLastPong = wsLastPong > 0 ? ((Date.now() - wsLastPong) / 1000).toFixed(0) + 's' : 'never';
-  const wsInfo = { state: wsState, reconnects: wsReconnects, backoff: wsBackoff, uptime: wsUptime(), lastPong: sinceLastPong, sessionAge: wsOpenedAt > 0 ? ((Date.now() - wsOpenedAt) / 1000).toFixed(0) + 's' : 'disconnected' };
+  const wsInfo = { state: wsState, reconnects: wsReconnects, backoff: wsBackoff, uptime: wsUptime(), lastPong: sinceLastPong, sessionAge: wsOpenedAt > 0 ? ((Date.now() - wsOpenedAt) / 1000).toFixed(0) + 's' : 'disconnected', lastClose: { code: wsLastCloseCode, reason: wsLastCloseReason, sessionSec: wsLastSessionDuration } };
   res.json({ running: ws && ws.readyState === 1, vix: vixV, subscribers: subscriptions.length, ws: wsInfo, symbols: status });
 });
 
