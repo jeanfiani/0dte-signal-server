@@ -487,6 +487,7 @@ function connectFinnhub() {
   if (!isMarketWindow()) {
     const retryMs = 120000; // Check again in 2 minutes
     console.log('[' + ts() + '] Market closed — skipping WS connect, retry in 2m');
+    wsLog('SKIP market closed');
     setTimeout(connectFinnhub, retryMs);
     return;
   }
@@ -500,13 +501,7 @@ function connectFinnhub() {
   try {
     ws = new WebSocket('wss://ws.finnhub.io?token=' + API, {
       perMessageDeflate: false,
-      skipUTF8Validation: true,
-      headers: {
-        'User-Agent': '0dte-signal-server/1.0',
-        'Origin': 'https://finnhub.io'
-      },
-      handshakeTimeout: 10000,
-      maxPayload: 50 * 1024 * 1024 // 50MB — prevent drops on large payloads
+      handshakeTimeout: 10000
     });
     wsOpenedAt = Date.now();
 
@@ -519,6 +514,7 @@ function connectFinnhub() {
       wsLastPong = now;
 
       console.log('[' + ts() + '] Finnhub WS connected (attempt #' + wsReconnects + ', backoff was ' + wsBackoff + 'ms, uptime: ' + wsUptime() + ')');
+      wsLog('OPEN attempt=#' + wsReconnects + ' backoff=' + wsBackoff + 'ms');
 
       // Reset backoff on successful connect
       wsBackoff = 1000;
@@ -580,6 +576,7 @@ function connectFinnhub() {
 
     ws.on('unexpected-response', (req, res) => {
       console.error('[' + ts() + '] WS upgrade rejected: HTTP ' + res.statusCode);
+      wsLog('REJECTED HTTP ' + res.statusCode);
       let body = '';
       res.on('data', chunk => { body += chunk; });
       res.on('end', () => { console.error('[' + ts() + '] Rejection body: ' + body.substring(0, 200)); });
@@ -587,6 +584,7 @@ function connectFinnhub() {
 
     ws.on('error', (err) => {
       console.error('[' + ts() + '] WS error: ' + (err.message || err.code || 'unknown'));
+      wsLog('ERROR: ' + (err.message || err.code || 'unknown'));
     });
 
     ws.on('close', (code, reason) => {
@@ -603,6 +601,7 @@ function connectFinnhub() {
 
       // Log close details — code tells us WHY
       console.log('[' + ts() + '] WS closed: code=' + code + ' reason="' + reasonStr + '" session=' + sessionDuration + 's reconnects=' + wsReconnects + ' uptime=' + wsUptime());
+      wsLog('CLOSED code=' + code + ' reason="' + reasonStr + '" session=' + sessionDuration + 's');
 
       // Finnhub-specific close codes:
       // 1000 = normal, 1001 = going away, 1006 = abnormal (no close frame)
@@ -824,6 +823,14 @@ app.get('/signals', (req, res) => {
   } catch (e) { res.json({ dates: [], count: 0 }); }
 });
 
+// Debug endpoint — recent WS events
+const wsEvents = [];
+function wsLog(msg) { wsEvents.push({ t: ts(), msg }); if (wsEvents.length > 50) wsEvents.shift(); }
+
+app.get('/debug', (req, res) => {
+  res.json({ events: wsEvents, apiKey: API ? API.substring(0, 4) + '***' : 'NOT SET', nodeVersion: process.version });
+});
+
 // Health check
 app.get('/', (req, res) => {
   res.send('0DTE Signal Server running. ' + subscriptions.length + ' subscribers. WS: ' + (ws && ws.readyState === 1 ? 'connected' : 'disconnected'));
@@ -832,6 +839,8 @@ app.get('/', (req, res) => {
 // ===== START =====
 app.listen(PORT, () => {
   console.log(`[${ts()}] Signal server running on port ${PORT}`);
+  console.log(`[${ts()}] FINNHUB_API_KEY: ${API ? API.substring(0, 4) + '...' + API.substring(API.length - 4) : 'NOT SET'}`);
+  console.log(`[${ts()}] VAPID keys: ${process.env.VAPID_PUBLIC_KEY ? 'set' : 'NOT SET'}`);
   connectFinnhub();
   fetchVIX();
 });
