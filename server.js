@@ -521,12 +521,16 @@ function connectFinnhub() {
       // Reset backoff on successful connect — keep 5s minimum to respect Finnhub rate limits
       wsBackoff = 5000;
 
-      // Subscribe immediately — Finnhub may drop idle connections
+      // Subscribe with stagger — large data burst on QQQ+SPY can overwhelm connection
       try {
-        SYMBOLS.forEach(s => {
-          ws.send(JSON.stringify({ type: 'subscribe', symbol: s }));
-        });
-        console.log('[' + ts() + '] Subscribed to: ' + SYMBOLS.join(', '));
+        ws.send(JSON.stringify({ type: 'subscribe', symbol: SYMBOLS[0] }));
+        console.log('[' + ts() + '] Subscribed to: ' + SYMBOLS[0]);
+        setTimeout(() => {
+          if (ws && ws.readyState === WebSocket.OPEN && SYMBOLS.length > 1) {
+            ws.send(JSON.stringify({ type: 'subscribe', symbol: SYMBOLS[1] }));
+            console.log('[' + ts() + '] Subscribed to: ' + SYMBOLS[1]);
+          }
+        }, 3000);
       } catch (e) {
         console.error('[' + ts() + '] Subscribe error: ' + e.message);
       }
