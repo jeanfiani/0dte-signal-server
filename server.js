@@ -455,6 +455,8 @@ function checkExit(sym, price) {
 
 // ===== FINNHUB WEBSOCKET =====
 let ws = null, wsReconnects = 0, wsBackoff = 5000;
+const wsEvents = [];
+function wsLog(msg) { wsEvents.push({ t: ts(), msg }); if (wsEvents.length > 50) wsEvents.shift(); }
 let wsOpenedAt = 0, wsStableAt = 0, wsPingInterval = null, wsLastPong = 0;
 let wsConnectedMs = 0, wsDisconnectedMs = 0, wsLastStateChange = Date.now();
 let wsReconnectTs = 0; // Track last reconnect time for signal warmup
@@ -826,10 +828,7 @@ app.get('/signals', (req, res) => {
   } catch (e) { res.json({ dates: [], count: 0 }); }
 });
 
-// Debug endpoint — recent WS events
-const wsEvents = [];
-function wsLog(msg) { wsEvents.push({ t: ts(), msg }); if (wsEvents.length > 50) wsEvents.shift(); }
-
+// Debug endpoint — recent WS events (wsEvents + wsLog defined near WS vars at top)
 app.get('/debug', (req, res) => {
   res.json({ events: wsEvents, apiKey: API ? API.substring(0, 4) + '***' : 'NOT SET', nodeVersion: process.version });
 });
