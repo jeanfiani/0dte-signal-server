@@ -454,7 +454,7 @@ function checkExit(sym, price) {
 }
 
 // ===== FINNHUB WEBSOCKET =====
-let ws = null, wsReconnects = 0, wsBackoff = 1000;
+let ws = null, wsReconnects = 0, wsBackoff = 5000;
 let wsOpenedAt = 0, wsStableAt = 0, wsPingInterval = null, wsLastPong = 0;
 let wsConnectedMs = 0, wsDisconnectedMs = 0, wsLastStateChange = Date.now();
 let wsReconnectTs = 0; // Track last reconnect time for signal warmup
@@ -516,8 +516,8 @@ function connectFinnhub() {
       console.log('[' + ts() + '] Finnhub WS connected (attempt #' + wsReconnects + ', backoff was ' + wsBackoff + 'ms, uptime: ' + wsUptime() + ')');
       wsLog('OPEN attempt=#' + wsReconnects + ' backoff=' + wsBackoff + 'ms');
 
-      // Reset backoff on successful connect
-      wsBackoff = 1000;
+      // Reset backoff on successful connect — keep 5s minimum to respect Finnhub rate limits
+      wsBackoff = 5000;
 
       // Subscribe immediately — Finnhub may drop idle connections
       try {
@@ -536,7 +536,7 @@ function connectFinnhub() {
         if (wsLastPong > 0 && Date.now() - wsLastPong > 45000) {
           console.log('[' + ts() + '] WS no pong in 45s — forcing reconnect');
           cleanupWS();
-          wsBackoff = 2000;
+          wsBackoff = 5000;
           setTimeout(connectFinnhub, wsBackoff);
           return;
         }
@@ -551,10 +551,10 @@ function connectFinnhub() {
 
     ws.on('pong', () => {
       wsLastPong = Date.now();
-      // Connection has been stable for 30s+ — safe to reduce backoff
-      if (wsOpenedAt > 0 && Date.now() - wsOpenedAt > 30000) {
-        if (wsBackoff > 1000) {
-          wsBackoff = 1000;
+      // Connection has been stable for 60s+ — safe to reduce backoff and reset counter
+      if (wsOpenedAt > 0 && Date.now() - wsOpenedAt > 60000) {
+        if (wsBackoff > 5000) {
+          wsBackoff = 5000;
           wsReconnects = 0;
         }
       }
@@ -579,7 +579,14 @@ function connectFinnhub() {
       wsLog('REJECTED HTTP ' + res.statusCode);
       let body = '';
       res.on('data', chunk => { body += chunk; });
-      res.on('end', () => { console.error('[' + ts() + '] Rejection body: ' + body.substring(0, 200)); });
+      res.on('end', () => {
+        console.error('[' + ts() + '] Rejection body: ' + body.substring(0, 200));
+        cleanupWS();
+        // 429 = rate limited — wait 60s before retry
+        const wait = res.statusCode === 429 ? 60000 : 10000;
+        wsLog('Waiting ' + (wait/1000) + 's after ' + res.statusCode);
+        setTimeout(connectFinnhub, wait);
+      });
     });
 
     ws.on('error', (err) => {
@@ -614,20 +621,16 @@ function connectFinnhub() {
       wsLastCloseReason = reasonStr;
       wsLastSessionDuration = parseFloat(sessionDuration) || 0;
 
-      // If connection lasted < 5s, it's unstable — increase backoff faster
+      // Backoff logic — minimum 5s to respect Finnhub rate limits
       const lasted = parseFloat(sessionDuration);
       if (lasted < 5) {
-        wsBackoff = Math.min(wsBackoff * 2, 60000);
+        // Quick death — increase backoff, but cap at 60s
+        wsBackoff = Math.min(Math.max(wsBackoff * 2, 5000), 60000);
       } else if (lasted < 30) {
-        wsBackoff = Math.min(wsBackoff * 1.5, 60000);
-      }
-      // If session lasted >60s it was a real connection, keep backoff reasonable
-      if (lasted >= 60) {
-        wsBackoff = Math.min(wsBackoff, 5000);
-      }
-      // Only slow down aggressively if connections are dying fast AND we've had many reconnects
-      else if (wsReconnects > 10 && lasted < 10) {
-        wsBackoff = Math.max(wsBackoff, 30000);
+        wsBackoff = Math.min(Math.max(wsBackoff * 1.5, 5000), 60000);
+      } else if (lasted >= 60) {
+        // Connection was stable — reset to minimum
+        wsBackoff = 5000;
       }
 
       console.log('[' + ts() + '] Reconnecting in ' + (wsBackoff / 1000).toFixed(1) + 's...');
