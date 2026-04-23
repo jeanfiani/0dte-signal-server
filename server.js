@@ -283,8 +283,8 @@ function processPrice(sym, price, hi, lo) {
   if (!rsiSweetCall && cS >= minS && cS >= pS) return;
   if (!rsiSweetPut && pS >= minS && pS > cS) return;
 
-  // PM penalty
-  const pmPenalty = etMin >= 780 ? 1 : 0;
+  // PM penalty — equities only (XAU trades 24h, no PM concept)
+  const pmPenalty = (!isXAU && etMin >= 780) ? 1 : 0;
   const finalMinS = minS + pmPenalty;
   if (pmPenalty && cS >= minS && cS < finalMinS) return;
   if (pmPenalty && pS >= minS && pS < finalMinS) return;
