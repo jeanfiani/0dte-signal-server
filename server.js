@@ -24,18 +24,21 @@ app.use((req, res, next) => {
 // ===== CONFIG =====
 const API = process.env.FINNHUB_API_KEY;
 const PORT = process.env.PORT || 3000;
-const SYMBOLS = ['QQQ', 'SPY'];
-const RSI_CALL_LO = { QQQ: 45, SPY: 45 };
-const RSI_CALL_HI = { QQQ: 65, SPY: 65 };
-const RSI_PUT_LO  = { QQQ: 30, SPY: 30 };
-const RSI_PUT_HI  = { QQQ: 55, SPY: 55 };
-const ROC_BLOWOFF = { QQQ: 0.15, SPY: 0.15 };
-const MAX_IND = { QQQ: 6, SPY: 6 };
+const SYMBOLS = ['QQQ', 'SPY', 'XAU'];
+const RSI_CALL_LO = { QQQ: 45, SPY: 45, XAU: 40 };
+const RSI_CALL_HI = { QQQ: 65, SPY: 65, XAU: 68 };
+const RSI_PUT_LO  = { QQQ: 30, SPY: 30, XAU: 28 };
+const RSI_PUT_HI  = { QQQ: 55, SPY: 55, XAU: 58 };
+const ROC_BLOWOFF = { QQQ: 0.15, SPY: 0.15, XAU: 0.20 };
+const MAX_IND = { QQQ: 6, SPY: 6, XAU: 6 };
 const COOLDOWN_MS = 180000;
 // FLIP_COOL_MS removed — was blocking legitimate reversal signals
 const MAX_SIG = 10;
 const THR = 5;
 const ROC_THR = 0.018;
+const XAU_ROC_THR = 0.025; // XAU needs wider ROC threshold — higher volatility
+const XAU_MACD_MIN = 0.10; // XAU MACD values ~5x larger than QQQ/SPY (price ~$3300 vs $650)
+const XAU_MACD_LINE_MIN = 0.08; // XAU MACD line minimum strength
 
 // VAPID setup
 webpush.setVapidDetails(
@@ -150,7 +153,9 @@ function processPrice(sym, price, hi, lo) {
   const s = S[sym];
   const mi = MAX_IND[sym];
 
-  if (s.openPrice === null && gET() >= 570) {
+  // XAU: set open on first price (MT5 feeds only when market is open)
+  // Equities: set open at 9:30 AM ET (570 min)
+  if (s.openPrice === null && (sym === 'XAU' || gET() >= 570)) {
     s.openPrice = price;
     if (s.prevClose !== null) {
       const gapPct = ((price - s.prevClose) / s.prevClose) * 100;
@@ -203,7 +208,8 @@ function processPrice(sym, price, hi, lo) {
   const mBull = macdL > macdS && macdAccel >= 0, mBear = macdL < macdS && macdAccel <= 0;
   const rBull = rsiV >= RSI_CALL_LO[sym] && rsiV <= RSI_CALL_HI[sym];
   const rBear = rsiV >= RSI_PUT_LO[sym] && rsiV <= RSI_PUT_HI[sym];
-  const rocBull = roc3 > ROC_THR, rocBear = roc3 < -ROC_THR;
+  const symRocThr = sym === 'XAU' ? XAU_ROC_THR : ROC_THR;
+  const rocBull = roc3 > symRocThr, rocBear = roc3 < -symRocThr;
 
   // Score
   let cS = 0, pS = 0;
@@ -234,15 +240,22 @@ function processPrice(sym, price, hi, lo) {
 
   // === SIGNAL GATES ===
   const etMin = gET();
-  if (etMin < 570 || etMin >= 955) return;
-  if (etMin >= 945 && (cS >= THR || pS >= THR)) return;
+  const isXAU = sym === 'XAU';
+  // XAU: full session 6PM-5PM ET (Sun-Fri) = nearly 23h, block 5PM-6PM ET (1020-1080 min)
+  // Equities: 9:30 AM - 3:55 PM ET (570-955 min)
+  if (isXAU) {
+    if (etMin >= 1020 && etMin < 1080) return; // XAU closed 5-6 PM ET
+  } else {
+    if (etMin < 570 || etMin >= 955) return;
+  }
+  if (!isXAU && etMin >= 945 && (cS >= THR || pS >= THR)) return;
 
   // Chop with override — strengthened: require score >= 6 + RSI + ROC (was: any score + RSI + ROC)
   const domT = cS >= pS ? 'call' : 'put';
   if (s.chopActive && (cS >= THR || pS >= THR)) {
     const chopScore = domT === 'call' ? cS : pS;
     const chopRsiOk = (domT === 'call' && rsiV >= RSI_CALL_LO[sym] && rsiV <= RSI_CALL_HI[sym]) || (domT === 'put' && rsiV >= RSI_PUT_LO[sym] && rsiV <= RSI_PUT_HI[sym]);
-    const chopRocOk = (domT === 'call' && roc3 > ROC_THR) || (domT === 'put' && roc3 < -ROC_THR);
+    const chopRocOk = (domT === 'call' && roc3 > symRocThr) || (domT === 'put' && roc3 < -symRocThr);
     if (!(chopScore >= 6 && chopRsiOk && chopRocOk)) return;
   }
 
@@ -284,11 +297,13 @@ function processPrice(sym, price, hi, lo) {
   // MACD minimum strength — check both histogram AND line value
   // Histogram (macdL - macdS) measures momentum divergence
   // MACD line (macdL) measures actual trend strength — near-zero = no trend
+  // XAU uses higher thresholds because price (~$3300) produces ~5x larger MACD values
   const macdStr = Math.abs(macdL - macdS);
-  if (macdStr < 0.020 && (cS >= finalMinS || pS >= finalMinS)) return;
-  // MACD line too weak = no real trend (fixes MACD 0.008 CALL that passed histogram filter)
-  if (Math.abs(macdL) < 0.015 && (cS >= finalMinS || pS >= finalMinS)) {
-    log(sym, 'MACD line filter: blocked — |macdL| = ' + Math.abs(macdL).toFixed(3) + ' < 0.015');
+  const macdMinStr = isXAU ? XAU_MACD_MIN : 0.020;
+  const macdLineMin = isXAU ? XAU_MACD_LINE_MIN : 0.015;
+  if (macdStr < macdMinStr && (cS >= finalMinS || pS >= finalMinS)) return;
+  if (Math.abs(macdL) < macdLineMin && (cS >= finalMinS || pS >= finalMinS)) {
+    log(sym, 'MACD line filter: blocked — |macdL| = ' + Math.abs(macdL).toFixed(3) + ' < ' + macdLineMin);
     return;
   }
 
@@ -329,7 +344,8 @@ function processPrice(sym, price, hi, lo) {
     const recent = s.prices.slice(-30);
     const recentHi = Math.max(...recent), recentLo = Math.min(...recent);
     const moveSize = recentHi - recentLo;
-    if (moveSize >= 0.50) {
+    const retraceMin = isXAU ? 5.0 : 0.50; // XAU ~$3300 needs $5 min move vs $0.50 for equities
+    if (moveSize >= retraceMin) {
       const retracePct = recentHi > recentLo ? (price - recentLo) / (recentHi - recentLo) : 0.5;
       // For CALL: price should be above 50% retrace (not bouncing off the bottom)
       if (cS >= finalMinS && cS >= pS && retracePct < 0.50) { log(sym, 'Retrace filter: CALL blocked — only ' + (retracePct * 100).toFixed(0) + '% retrace of $' + moveSize.toFixed(2) + ' drop'); return; }
@@ -354,20 +370,21 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // Post-move exhaustion filter — after a $2+ move in one direction, require stronger MACD for same-direction signals
+  // Post-move exhaustion filter — after a big move in one direction, require stronger MACD for same-direction signals
+  // XAU: $20+ move / MACD > 0.20, Equities: $2+ move / MACD > 0.040
   if (s.openPrice && s.openPrice > 0) {
     const dayMove = price - s.openPrice;
     const absDayMove = Math.abs(dayMove);
-    if (absDayMove >= 2.0) {
+    const postMoveThr = isXAU ? 20.0 : 2.0;
+    const postMoveMacd = isXAU ? 0.20 : 0.040;
+    if (absDayMove >= postMoveThr) {
       const macdStrNow = Math.abs(macdL - macdS);
-      // If price has moved $2+ UP and we're firing a CALL (same direction), need MACD > 0.040
-      if (dayMove >= 2.0 && cS >= finalMinS && cS >= pS && macdStrNow < 0.040) {
-        log(sym, 'Post-move exhaustion: CALL blocked — $' + dayMove.toFixed(2) + ' up move, MACD str ' + macdStrNow.toFixed(3) + ' < 0.040');
+      if (dayMove >= postMoveThr && cS >= finalMinS && cS >= pS && macdStrNow < postMoveMacd) {
+        log(sym, 'Post-move exhaustion: CALL blocked — $' + dayMove.toFixed(2) + ' up move, MACD str ' + macdStrNow.toFixed(3) + ' < ' + postMoveMacd);
         return;
       }
-      // If price has moved $2+ DOWN and we're firing a PUT (same direction), need MACD > 0.040
-      if (dayMove <= -2.0 && pS >= finalMinS && pS > cS && macdStrNow < 0.040) {
-        log(sym, 'Post-move exhaustion: PUT blocked — $' + Math.abs(dayMove).toFixed(2) + ' down move, MACD str ' + macdStrNow.toFixed(3) + ' < 0.040');
+      if (dayMove <= -postMoveThr && pS >= finalMinS && pS > cS && macdStrNow < postMoveMacd) {
+        log(sym, 'Post-move exhaustion: PUT blocked — $' + Math.abs(dayMove).toFixed(2) + ' down move, MACD str ' + macdStrNow.toFixed(3) + ' < ' + postMoveMacd);
         return;
       }
     }
@@ -379,7 +396,9 @@ function processPrice(sym, price, hi, lo) {
     const distFromHigh = s.sessionHigh - price;
     const sessionRange = s.sessionHigh - s.sessionLow;
     const highWasRecent = s.prices.length >= 10 && Math.max(...s.prices.slice(-30 > -s.prices.length ? -30 : 0)) >= s.sessionHigh - 0.05;
-    if (distFromHigh >= 1.0 && s.rsiAtSessionHigh > 60 && sessionRange >= 1.5 && highWasRecent && macdL < macdS && roc3 < -ROC_THR) {
+    // XAU session high reversal needs larger move ($10+ vs $1+) — gold price is ~5x SPY/QQQ
+    const hiRevDist = isXAU ? 10.0 : 1.0, hiRevRange = isXAU ? 15.0 : 1.5;
+    if (distFromHigh >= hiRevDist && s.rsiAtSessionHigh > 60 && sessionRange >= hiRevRange && highWasRecent && macdL < macdS && roc3 < -symRocThr) {
       // Don't fire if we already fired a PUT recently (use cooldown)
       if (s.lastSignalDir !== 'put' || (now2 - s.lastNTs > COOLDOWN_MS)) {
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
@@ -660,9 +679,9 @@ function connectFinnhub() {
   }
 }
 
-// Process ticks every 3 seconds
-setInterval(() => {
-  SYMBOLS.forEach(sym => {
+// Process ticks — QQQ/SPY every 3s, XAU every 1s (MT5 feeds at 1s)
+function processTicks(symbols) {
+  symbols.forEach(sym => {
     const s = S[sym];
     if (s.tickBuf.length === 0) return;
     const price = s.tickBuf[s.tickBuf.length - 1].p;
@@ -671,7 +690,9 @@ setInterval(() => {
     s.tickBuf = [];
     processPrice(sym, price, hi, lo);
   });
-}, 3000);
+}
+setInterval(() => processTicks(['QQQ', 'SPY']), 3000);
+setInterval(() => processTicks(['XAU']), 1000);
 
 // Fetch VIX every 30 seconds (try multiple symbol formats)
 async function fetchVIX() {
@@ -774,6 +795,20 @@ app.post('/trade/clear', (req, res) => {
   const { sym } = req.body;
   if (S[sym]) S[sym].trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
   res.json({ ok: true });
+});
+
+// ===== EXTERNAL PRICE FEED (MT5 → Railway) =====
+// POST /feed — accepts price data from MT5 EA or any external source
+// Body: { sym: "XAU", price: 3315.42, high: 3316.10, low: 3314.80 }
+app.post('/feed', (req, res) => {
+  const { sym, price, high, low } = req.body;
+  if (!sym || !price) return res.status(400).json({ error: 'Missing sym or price' });
+  if (!S[sym]) return res.status(400).json({ error: 'Unknown symbol: ' + sym });
+  const p = parseFloat(price), h = parseFloat(high) || p, l = parseFloat(low) || p;
+  if (isNaN(p) || p <= 0) return res.status(400).json({ error: 'Invalid price' });
+  S[sym].lastPrice = p;
+  S[sym].tickBuf.push({ p });
+  res.json({ ok: true, sym, price: p, samples: S[sym].prices.length });
 });
 
 // Full prices + indicators endpoint for mobile PWA polling
