@@ -67,7 +67,7 @@ SYMBOLS.forEach(sym => {
     crossAssetDir: null, crossAssetTs: 0,
     sessionHigh: -Infinity, sessionLow: Infinity, rsiAtSessionHigh: 50,
     gapDayMode: false, gapDirection: null, prevClose: null,
-    lastSameDir: null, lastSameDirMacd: 0, lastSameDirTs: 0,
+    lastSameDir: null, lastSameDirMacd: 0, lastSameDirTs: 0, lastSameDirPrice: 0,
     // Trade monitor
     trade: { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 }
   };
@@ -342,6 +342,18 @@ function processPrice(sym, price, hi, lo) {
   if (cS >= finalMinS && cS >= pS && rsiV > 65) { log(sym, 'RSI exhaustion: CALL blocked — RSI ' + rsiV.toFixed(1) + ' (overbought)'); return; }
   if (pS >= finalMinS && pS > cS && rsiV < 35) { log(sym, 'RSI exhaustion: PUT blocked — RSI ' + rsiV.toFixed(1) + ' (oversold)'); return; }
 
+  // Price-distance deduplication — suppress same-direction signal if price hasn't moved enough since last signal
+  // Prevents clustered signals at similar prices while allowing signals after real moves
+  { const cDir3 = cS >= pS ? 'call' : 'put';
+    if (s.lastSameDir === cDir3 && s.lastSameDirPrice > 0) {
+      const pctMove = Math.abs((price - s.lastSameDirPrice) / s.lastSameDirPrice) * 100;
+      if (pctMove < 0.15 && ((cDir3 === 'call' && cS >= finalMinS) || (cDir3 === 'put' && pS >= finalMinS))) {
+        log(sym, 'Price-distance filter: ' + cDir3.toUpperCase() + ' blocked — only ' + pctMove.toFixed(3) + '% from last ' + cDir3 + ' @ $' + s.lastSameDirPrice.toFixed(2) + ' (need 0.15%)');
+        return;
+      }
+    }
+  }
+
   // Post-move exhaustion filter — after a $2+ move in one direction, require stronger MACD for same-direction signals
   if (s.openPrice && s.openPrice > 0) {
     const dayMove = price - s.openPrice;
@@ -373,7 +385,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
         if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
         s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
-        s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2;
+        s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇HI', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
         s.signals.push(sig);
         logSignal(sym, sig);
@@ -395,7 +407,7 @@ function processPrice(sym, price, hi, lo) {
     s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
     if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
     s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
-    s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2;
+    s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
     const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: cS + '/' + mi, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
     s.signals.push(sig);
     logSignal(sym, sig);
@@ -409,7 +421,7 @@ function processPrice(sym, price, hi, lo) {
     s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
     if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
     s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
-    s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2;
+    s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
     const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: pS + '/' + mi, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
     s.signals.push(sig);
     logSignal(sym, sig);
@@ -696,7 +708,7 @@ setInterval(() => {
       s.crossAssetDir = null; s.crossAssetTs = 0;
       s.sessionHigh = -Infinity; s.sessionLow = Infinity; s.rsiAtSessionHigh = 50;
       s.gapDayMode = false; s.gapDirection = null;
-      s.lastSameDir = null; s.lastSameDirMacd = 0; s.lastSameDirTs = 0;
+      s.lastSameDir = null; s.lastSameDirMacd = 0; s.lastSameDirTs = 0; s.lastSameDirPrice = 0;
       s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
     });
     // Reset WS uptime counters daily
