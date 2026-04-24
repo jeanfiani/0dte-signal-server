@@ -9,6 +9,15 @@ const WebSocket = require('ws');
 const path = require('path');
 const fs = require('fs');
 
+// Global crash protection — log errors instead of killing the process
+process.on('uncaughtException', (err) => {
+  console.error('[CRASH] Uncaught exception:', err.message);
+  console.error(err.stack);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('[CRASH] Unhandled rejection:', err && err.message ? err.message : err);
+});
+
 const app = express();
 app.use(express.json());
 
@@ -41,11 +50,15 @@ const XAU_MACD_MIN = 0.10; // XAU MACD values ~5x larger than QQQ/SPY (price ~$3
 const XAU_MACD_LINE_MIN = 0.08; // XAU MACD line minimum strength
 
 // VAPID setup
-webpush.setVapidDetails(
-  process.env.VAPID_EMAIL || 'mailto:jean.fiani@ktstravel.com',
-  process.env.VAPID_PUBLIC_KEY,
-  process.env.VAPID_PRIVATE_KEY
-);
+try {
+  webpush.setVapidDetails(
+    process.env.VAPID_EMAIL || 'mailto:jean.fiani@ktstravel.com',
+    process.env.VAPID_PUBLIC_KEY,
+    process.env.VAPID_PRIVATE_KEY
+  );
+} catch (e) {
+  console.error('[STARTUP] VAPID setup failed:', e.message, '— push notifications disabled');
+}
 
 // Subscription storage (in-memory, persisted to file)
 const SUBS_FILE = path.join(__dirname, 'subscriptions.json');
@@ -167,12 +180,16 @@ function sendPush(title, body, tag) {
   console.log('[' + ts() + '] Pushing to ' + subscriptions.length + ' sub(s): ' + title);
   const dead = [];
   subscriptions.forEach((sub, i) => {
-    webpush.sendNotification(sub, payload)
-      .then(() => { console.log('[' + ts() + '] Push delivered to sub #' + i); })
-      .catch(err => {
-        console.error('[' + ts() + '] Push failed sub #' + i + ': ' + (err.statusCode || err.message));
-        if (err.statusCode === 410 || err.statusCode === 404) dead.push(i);
-      });
+    try {
+      webpush.sendNotification(sub, payload)
+        .then(() => { console.log('[' + ts() + '] Push delivered to sub #' + i); })
+        .catch(err => {
+          console.error('[' + ts() + '] Push failed sub #' + i + ': ' + (err.statusCode || err.message));
+          if (err.statusCode === 410 || err.statusCode === 404) dead.push(i);
+        });
+    } catch (e) {
+      console.error('[' + ts() + '] Push error sub #' + i + ': ' + e.message);
+    }
   });
   // Clean up dead subscriptions (async — runs after promises settle)
   setTimeout(() => {
@@ -1045,13 +1062,16 @@ function connectFinnhub() {
 // Process ticks — QQQ/SPY every 3s, XAU every 1s (MT5 feeds at 1s)
 function processTicks(symbols) {
   symbols.forEach(sym => {
+    try {
     const s = S[sym];
     if (s.tickBuf.length === 0) return;
     const price = s.tickBuf[s.tickBuf.length - 1].p;
+    if (!price || isNaN(price) || price <= 0) { s.tickBuf = []; return; } // Guard bad data
     const hi = Math.max(...s.tickBuf.map(t => t.p));
     const lo = Math.min(...s.tickBuf.map(t => t.p));
     s.tickBuf = [];
     processPrice(sym, price, hi, lo);
+    } catch (e) { console.error('[' + ts() + '] processTicks ' + sym + ' error:', e.message); }
   });
 }
 setInterval(() => processTicks(['QQQ', 'SPY']), 3000);
