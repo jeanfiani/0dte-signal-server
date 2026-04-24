@@ -388,17 +388,14 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // Chop with override — require 6/6 + RSI + ROC normally
-  // XAU exception: allow 5/6 when ROC is very strong (2x threshold = real momentum, not noise)
+  // Chop override — require 5/6 + RSI sweet zone + ROC confirmation
+  // 3 conditions is stricter than normal mode but doesn't kill real breakouts
   const domT = cS >= pS ? 'call' : 'put';
   if (s.chopActive && (cS >= THR || pS >= THR)) {
     const chopScore = domT === 'call' ? cS : pS;
     const chopRsiOk = (domT === 'call' && rsiV >= RSI_CALL_LO[sym] && rsiV <= RSI_CALL_HI[sym]) || (domT === 'put' && rsiV >= RSI_PUT_LO[sym] && rsiV <= RSI_PUT_HI[sym]);
     const chopRocOk = (domT === 'call' && roc3 > symRocThr) || (domT === 'put' && roc3 < -symRocThr);
-    const strongRoc = Math.abs(roc3) > symRocThr * 2; // 2x ROC = breakout-level momentum
-    const chopMinScore = (isXAU && strongRoc) ? 5 : 6;
-    if (!(chopScore >= chopMinScore && chopRsiOk && chopRocOk)) return;
-    if (chopMinScore === 5) log(sym, '⚡ Chop override at 5/6 — strong ROC ' + roc3.toFixed(3) + '% (2x threshold)');
+    if (!(chopScore >= THR && chopRsiOk && chopRocOk)) return;
   }
 
   // Dynamic threshold
