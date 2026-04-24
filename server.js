@@ -490,6 +490,17 @@ function processPrice(sym, price, hi, lo) {
   const sessionThr = isXAU && xauSession === 'asia' ? 6 : THR;
   let minS = (tightMode ? 6 : sessionThr) + (streakActive ? s.lossStreakBoost : 0) + roundNumPenalty;
 
+  // XAU Asia session: HARD ROC gate — no signal without actual momentum
+  // Asia is choppy and low volume, EMAs/MACD can drift into alignment without real moves
+  // ROC-3 must confirm direction (even if score is 6/6 from boosts)
+  if (isXAU && xauSession === 'asia' && (cS >= minS || pS >= minS)) {
+    const asiaRocOk = (cS >= pS && roc3 > symRocThr) || (pS > cS && roc3 < -symRocThr);
+    if (!asiaRocOk) {
+      log(sym, 'Asia ROC gate: blocked — ROC-3 ' + roc3.toFixed(3) + '% too weak for ' + (cS >= pS ? 'CALL' : 'PUT') + ' (need >' + symRocThr + '%)');
+      return;
+    }
+  }
+
   // Blowoff
   const blowoffLock = now2 - s.blowoffTs < 300000;
   if (Math.abs(roc3) > ROC_BLOWOFF[sym] && !blowoffLock) { s.blowoffTs = now2; }
