@@ -80,6 +80,10 @@ SYMBOLS.forEach(sym => {
     rsiAtRollingLow: 50,  // RSI when rolling low was touched
     athApproachTs: 0,   // when price last entered ATH zone
     atlApproachTs: 0,   // when price last entered ATL zone
+    // Order Block detection — 1-min candle aggregation + OB zones
+    obCandles: [],       // [{o, h, l, c, ts}] — completed 1-min candles (last 60)
+    obCurCandle: null,   // current building candle {o, h, l, c, startTs, ticks}
+    orderBlocks: [],     // [{type:'bull'|'bear', hi, lo, ts, mitigated:false}] — active OB zones
     // Trade monitor
     trade: { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 }
   };
@@ -245,6 +249,58 @@ function processPrice(sym, price, hi, lo) {
     const isTrending = effS > resS && effL > resL;
     if (!s.chopActive) { if (isChoppy) { s.chopCount++; s.trendCount = 0; } else s.chopCount = 0; if (s.chopCount >= 3) { s.chopActive = true; s.chopCount = 0; log(sym, '🌊 CHOP MODE'); sendPush('🌊 ' + sym + ' CHOP MODE', 'Efficiency low — signals paused'); } }
     else { if (isTrending) { s.trendCount++; s.chopCount = 0; } else s.trendCount = 0; if (s.trendCount >= 3) { s.chopActive = false; s.trendCount = 0; log(sym, '📈 TREND RESUMED'); sendPush('📈 ' + sym + ' TREND BACK', 'Signals active'); } }
+  }
+
+  // === ORDER BLOCK — 1-min candle builder + OB zone detection ===
+  if (isXAU) {
+    if (!s.obCurCandle) {
+      s.obCurCandle = { o: price, h: price, l: price, c: price, startTs: Date.now(), ticks: 1 };
+    } else {
+      s.obCurCandle.h = Math.max(s.obCurCandle.h, price);
+      s.obCurCandle.l = Math.min(s.obCurCandle.l, price);
+      s.obCurCandle.c = price;
+      s.obCurCandle.ticks++;
+      // Close candle every 60 ticks (~1 min with 1s feed)
+      if (s.obCurCandle.ticks >= 60) {
+        const cc = { o: s.obCurCandle.o, h: s.obCurCandle.h, l: s.obCurCandle.l, c: s.obCurCandle.c, ts: s.obCurCandle.startTs };
+        s.obCandles.push(cc);
+        if (s.obCandles.length > 60) s.obCandles.shift(); // keep 60 candles (~1 hour)
+        // Detect displacement + mark OB zones
+        if (s.obCandles.length >= 3) {
+          const prev = s.obCandles[s.obCandles.length - 2]; // candle before displacement
+          const disp = cc; // just-closed candle (potential displacement)
+          const candleRange = disp.h - disp.l;
+          const atrNow = calcATR(s.highs, s.lows, s.prices, 14);
+          const isDisplacement = atrNow > 0 && candleRange > atrNow * 2;
+          if (isDisplacement) {
+            const bullDisp = disp.c > disp.o; // bullish displacement (big green candle)
+            const bearDisp = disp.c < disp.o; // bearish displacement (big red candle)
+            // Bullish displacement → last bearish candle before it = demand zone (bullish OB)
+            if (bullDisp && prev.c < prev.o) {
+              s.orderBlocks.push({ type: 'bull', hi: prev.h, lo: prev.l, ts: prev.ts, mitigated: false });
+              log(sym, '🟩 BULLISH OB formed: $' + prev.lo.toFixed(2) + ' - $' + prev.hi.toFixed(2) + ' (demand zone)');
+            }
+            // Bearish displacement → last bullish candle before it = supply zone (bearish OB)
+            if (bearDisp && prev.c > prev.o) {
+              s.orderBlocks.push({ type: 'bear', hi: prev.h, lo: prev.l, ts: prev.ts, mitigated: false });
+              log(sym, '🟥 BEARISH OB formed: $' + prev.lo.toFixed(2) + ' - $' + prev.hi.toFixed(2) + ' (supply zone)');
+            }
+          }
+        }
+        // Mitigate OBs — if price passes through an OB zone completely, it's spent
+        s.orderBlocks.forEach(ob => {
+          if (!ob.mitigated) {
+            if (ob.type === 'bull' && price < ob.lo) ob.mitigated = true; // demand broken
+            if (ob.type === 'bear' && price > ob.hi) ob.mitigated = true; // supply broken
+          }
+        });
+        // Prune — remove mitigated OBs and anything older than 4 hours
+        const fourHoursAgo = Date.now() - 4 * 60 * 60 * 1000;
+        s.orderBlocks = s.orderBlocks.filter(ob => !ob.mitigated && ob.ts > fourHoursAgo);
+        // Start new candle
+        s.obCurCandle = null;
+      }
+    }
   }
 
   const n = s.prices.length;
@@ -447,6 +503,58 @@ function processPrice(sym, price, hi, lo) {
     log(sym, 'MACD line filter: blocked — |macdL| = ' + Math.abs(macdL).toFixed(3) + ' < ' + macdLineMin);
     return;
   }
+
+  // MACD Exhaustion Filter — block signals chasing an already-extended move
+  // When MACD histogram is deeply negative, the selling is spent → block PUTs, boost CALLs
+  // When MACD histogram is deeply positive, the buying is spent → block CALLs, boost PUTs
+  // XAU threshold 0.80 (price ~$3300), equities 0.15 (price ~$500-650)
+  {
+    const macdExhThr = isXAU ? 0.80 : 0.15;
+    if (macdHist < -macdExhThr) {
+      // Deeply bearish MACD → selling exhausted
+      if (pS >= finalMinS && pS > cS) {
+        log(sym, 'MACD exhaustion: PUT blocked — macdHist ' + macdHist.toFixed(3) + ' already deeply bearish (thr -' + macdExhThr + ')');
+        return;
+      }
+      cS++; // Boost CALL — reversal likely
+      log(sym, 'MACD exhaustion: CALL boosted +1 — macdHist ' + macdHist.toFixed(3) + ' deeply bearish = bounce setup');
+    }
+    if (macdHist > macdExhThr) {
+      // Deeply bullish MACD → buying exhausted
+      if (cS >= finalMinS && cS >= pS) {
+        log(sym, 'MACD exhaustion: CALL blocked — macdHist ' + macdHist.toFixed(3) + ' already deeply bullish (thr +' + macdExhThr + ')');
+        return;
+      }
+      pS++; // Boost PUT — reversal likely
+      log(sym, 'MACD exhaustion: PUT boosted +1 — macdHist ' + macdHist.toFixed(3) + ' deeply bullish = pullback setup');
+    }
+  }
+
+  // Order Block Zone Filter — soft +1/-1 based on proximity to OB zones
+  // CALL near bullish OB (demand) = +1, CALL into bearish OB (supply overhead) = -1
+  // PUT near bearish OB (supply) = +1, PUT into bullish OB (demand below) = -1
+  if (isXAU && s.orderBlocks.length > 0) {
+    let obBoost = 0;
+    const obProximity = isXAU ? 5.0 : 1.0; // within $5 of OB zone for XAU
+    for (const ob of s.orderBlocks) {
+      const inZone = price >= ob.lo - obProximity && price <= ob.hi + obProximity;
+      if (!inZone) continue;
+      if (ob.type === 'bull') {
+        // Price at bullish OB (demand zone) — good for CALL, bad for PUT
+        if (cS >= pS) { obBoost = 1; log(sym, '🟩 OB boost: CALL +1 — at bullish demand $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2)); }
+        else { obBoost = -1; log(sym, '🟩 OB penalty: PUT -1 — at bullish demand $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2)); }
+      }
+      if (ob.type === 'bear') {
+        // Price at bearish OB (supply zone) — good for PUT, bad for CALL
+        if (pS > cS) { obBoost = 1; log(sym, '🟥 OB boost: PUT +1 — at bearish supply $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2)); }
+        else { obBoost = -1; log(sym, '🟥 OB penalty: CALL -1 — at bearish supply $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2)); }
+      }
+      break; // use closest/most recent OB only
+    }
+    if (obBoost > 0) { if (cS >= pS) cS++; else pS++; }
+    if (obBoost < 0) { if (cS >= pS) cS--; else pS--; }
+  }
+  s._orderBlocks = isXAU ? s.orderBlocks.filter(ob => !ob.mitigated) : [];
 
   // Session High/Low Proximity
   if (s.sessionHigh > -Infinity && s.openPrice) {
@@ -943,6 +1051,7 @@ setInterval(() => {
       s.athApproachTs = 0; s.atlApproachTs = 0;
       s.gapDayMode = false; s.gapDirection = null;
       s.lastSameDir = null; s.lastSameDirMacd = 0; s.lastSameDirTs = 0; s.lastSameDirPrice = 0;
+      s.obCandles = []; s.obCurCandle = null; s.orderBlocks = [];
       s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
     });
     saveRollingLevels(); // Persist rolling ATH/ATL data across restarts
@@ -1048,7 +1157,8 @@ app.get('/prices', (req, res) => {
       xauSession: s._xauSession || '',
       rollingHigh: s.rollingHigh || 0,
       rollingLow: s.rollingLow === Infinity ? 0 : s.rollingLow,
-      roundNum: s._roundNum || null
+      roundNum: s._roundNum || null,
+      orderBlocks: s._orderBlocks || []
     };
   });
   res.json({ vix: vixV, dxy: { price: dxyPrice, dir: dxyDir, roc3: dxyRoc3 }, wsConnected: ws && ws.readyState === 1, ts: Date.now(), symbols: data });
