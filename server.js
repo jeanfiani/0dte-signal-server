@@ -26,7 +26,7 @@ const API = process.env.FINNHUB_API_KEY;
 const PORT = process.env.PORT || 3000;
 const SYMBOLS = ['QQQ', 'SPY', 'XAU'];
 const RSI_CALL_LO = { QQQ: 45, SPY: 45, XAU: 40 };
-const RSI_CALL_HI = { QQQ: 70, SPY: 70, XAU: 68 };
+const RSI_CALL_HI = { QQQ: 65, SPY: 65, XAU: 68 }; // Gate range (rsiSweetCall) — tighter
 const RSI_PUT_LO  = { QQQ: 30, SPY: 30, XAU: 28 };
 const RSI_PUT_HI  = { QQQ: 55, SPY: 55, XAU: 58 };
 const ROC_BLOWOFF = { QQQ: 0.15, SPY: 0.15, XAU: 0.20 };
@@ -375,10 +375,13 @@ function processPrice(sym, price, hi, lo) {
   const macdAccel = typeof s.prevMacdHist === 'number' ? macdHist - s.prevMacdHist : 0;
   s.prevMacdHist = macdHist;
   const mBull = macdL > macdS && macdAccel >= 0, mBear = macdL < macdS && macdAccel <= 0;
-  // RSI scoring: rBull = in call zone (bullish), rBear = outside call zone (bearish)
-  // These are for the 6-indicator SCORE. The RSI sweet-spot GATE uses RSI_CALL/PUT ranges separately.
-  const rBull = rsiV >= RSI_CALL_LO[sym] && rsiV <= RSI_CALL_HI[sym]; // QQQ: 45-70, SPY: 45-70, XAU: 40-68
-  const rBear = rsiV < RSI_CALL_LO[sym] || rsiV > RSI_CALL_HI[sym];  // outside call zone = bearish point
+  // RSI scoring: rBull/rBear for the 6-indicator SCORE (wider zone than the gate)
+  // Scoring zone: QQQ/SPY 45-70, XAU 40-68 — matches bot pages exactly
+  // Gate zone (rsiSweetCall/Put below): QQQ/SPY 45-65/30-55, XAU 40-68/28-58 — tighter
+  const rsiScoreHi = isXAU ? 68 : 70;
+  const rsiScoreLo = isXAU ? 40 : 45;
+  const rBull = rsiV > rsiScoreLo && rsiV < rsiScoreHi;
+  const rBear = rsiV < rsiScoreLo || rsiV > rsiScoreHi;
   // ATR-adaptive ROC threshold for XAU — scales with volatility
   // Base: 0.025%. High ATR (>$3) = raise to 0.035% (filter noise in volatile markets)
   // Low ATR (<$1) = lower to 0.018% (capture meaningful moves in quiet markets)
