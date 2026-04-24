@@ -80,6 +80,11 @@ SYMBOLS.forEach(sym => {
     rsiAtRollingLow: 50,  // RSI when rolling low was touched
     athApproachTs: 0,   // when price last entered ATH zone
     atlApproachTs: 0,   // when price last entered ATL zone
+    // Shakeout recovery — tracks SL events for re-entry detection
+    shakeoutDir: null,     // direction that got stopped ('call' or 'put')
+    shakeoutTs: 0,         // when SL was hit
+    shakeoutPrice: 0,      // price at SL
+    shakeoutEp: 0,         // original entry price
     // Order Block detection — 1-min candle aggregation + OB zones
     obCandles: [],       // [{o, h, l, c, ts}] — completed 1-min candles (last 60)
     obCurCandle: null,   // current building candle {o, h, l, c, startTs, ticks}
@@ -444,7 +449,7 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // Chop override — require 5/6 + RSI sweet zone + ROC confirmation
+  // Chop override — require 5/6 + RSI sweet zone + ROC confirmation for all symbols
   // 3 conditions is stricter than normal mode but doesn't kill real breakouts
   const domT = cS >= pS ? 'call' : 'put';
   if (s.chopActive && (cS >= THR || pS >= THR)) {
@@ -504,12 +509,11 @@ function processPrice(sym, price, hi, lo) {
     return;
   }
 
-  // MACD Exhaustion Filter — block signals chasing an already-extended move
+  // MACD Exhaustion Filter — XAU only, block signals chasing an already-extended move
   // When MACD histogram is deeply negative, the selling is spent → block PUTs, boost CALLs
   // When MACD histogram is deeply positive, the buying is spent → block CALLs, boost PUTs
-  // XAU threshold 0.80 (price ~$3300), equities 0.15 (price ~$500-650)
-  {
-    const macdExhThr = isXAU ? 0.80 : 0.15;
+  if (isXAU) {
+    const macdExhThr = 0.80;
     if (macdHist < -macdExhThr) {
       // Deeply bearish MACD → selling exhausted
       if (pS >= finalMinS && pS > cS) {
@@ -587,6 +591,23 @@ function processPrice(sym, price, hi, lo) {
     if (s.gapDirection === 'down' && pS >= finalMinS && pS > cS && rsiV <= 50) return;
   }
 
+  // Short-term trend direction filter (equities) — don't fire CALL if price is actively dropping, or PUT if rising
+  // Uses ROC-10 (medium-term momentum) to confirm the signal direction matches actual price movement
+  // XAU excluded — already has MACD exhaustion + shakeout recovery for this
+  if (!isXAU && s.prices.length >= 12) {
+    const roc10 = calcROC(s.prices, 10);
+    // CALL but price trending down over last 10 ticks → block
+    if (cS >= finalMinS && cS >= pS && roc10 < -0.02) {
+      log(sym, 'Trend direction: CALL blocked — ROC-10 ' + roc10.toFixed(3) + '% (price dropping)');
+      return;
+    }
+    // PUT but price trending up over last 10 ticks → block
+    if (pS >= finalMinS && pS > cS && roc10 > 0.02) {
+      log(sym, 'Trend direction: PUT blocked — ROC-10 +' + roc10.toFixed(3) + '% (price rising)');
+      return;
+    }
+  }
+
   // Retrace filter — block dead-cat-bounce signals
   // If price dropped >$0.50 in last 30 ticks, require 50% retrace before CALL (and vice versa for PUT)
   if (s.prices.length >= 30) {
@@ -609,11 +630,13 @@ function processPrice(sym, price, hi, lo) {
 
   // Price-distance deduplication — suppress same-direction signal if price hasn't moved enough since last signal
   // Prevents clustered signals at similar prices while allowing signals after real moves
+  // XAU: 0.15% (~$7 at $4700). Equities: 0.25% (~$1.25 at $500) — tighter to prevent clustering
   { const cDir3 = cS >= pS ? 'call' : 'put';
+    const minPctMove = isXAU ? 0.15 : 0.25;
     if (s.lastSameDir === cDir3 && s.lastSameDirPrice > 0) {
       const pctMove = Math.abs((price - s.lastSameDirPrice) / s.lastSameDirPrice) * 100;
-      if (pctMove < 0.15 && ((cDir3 === 'call' && cS >= finalMinS) || (cDir3 === 'put' && pS >= finalMinS))) {
-        log(sym, 'Price-distance filter: ' + cDir3.toUpperCase() + ' blocked — only ' + pctMove.toFixed(3) + '% from last ' + cDir3 + ' @ $' + s.lastSameDirPrice.toFixed(2) + ' (need 0.15%)');
+      if (pctMove < minPctMove && ((cDir3 === 'call' && cS >= finalMinS) || (cDir3 === 'put' && pS >= finalMinS))) {
+        log(sym, 'Price-distance filter: ' + cDir3.toUpperCase() + ' blocked — only ' + pctMove.toFixed(3) + '% from last ' + cDir3 + ' @ $' + s.lastSameDirPrice.toFixed(2) + ' (need ' + minPctMove + '%)');
         return;
       }
     }
@@ -712,6 +735,45 @@ function processPrice(sym, price, hi, lo) {
   const fireCall = cS >= finalMinS && vixOk && rsiSweetCall && macdAlignCall;
   const firePut = pS >= finalMinS && rsiSweetPut && macdAlignPut;
 
+  // === SHAKEOUT RECOVERY DETECTOR ===
+  // If a signal got stopped out and price recovers past the original entry in the same direction,
+  // fire a re-entry signal with reduced cooldown (bypasses 3-min cooldown).
+  // This catches V-reversals / stop-hunt patterns common in XAU.
+  // Window: 10 minutes after SL. Requires: score >= THR, RSI OK, MACD aligned, ROC confirming direction.
+  if (isXAU && s.shakeoutDir && now2 - s.shakeoutTs < 600000 && now2 - s.shakeoutTs > 30000) {
+    const shakeoutCool = now2 - s.lastNTs > 60000; // Reduced cooldown: 60s instead of 180s
+    if (shakeoutCool && s.dailySignalCount < MAX_SIG) {
+      const isCallRecovery = s.shakeoutDir === 'call' && price > s.shakeoutEp && fireCall && roc3 > symRocThr;
+      const isPutRecovery = s.shakeoutDir === 'put' && price < s.shakeoutEp && firePut && roc3 < -symRocThr;
+      if (isCallRecovery) {
+        s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
+        s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
+        s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+        const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆REC', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        s.signals.push(sig); logSignal(sym, sig);
+        log(sym, '🔄 SHAKEOUT RECOVERY CALL — price $' + price.toFixed(2) + ' recovered past entry $' + s.shakeoutEp.toFixed(2) + ' after SL @ $' + s.shakeoutPrice.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+        sendPush('🔄 ' + sym + ' RECOVERY CALL #' + s.dailySignalCount, '$' + sig.price + ' · Recovered from SL @ $' + s.shakeoutPrice.toFixed(2), 'signal');
+        s.trade = { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        s.shakeoutDir = null; // Clear shakeout state
+        SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'call'; S[other].crossAssetTs = now2; } });
+        return;
+      }
+      if (isPutRecovery) {
+        s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
+        s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
+        s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+        const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇REC', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        s.signals.push(sig); logSignal(sym, sig);
+        log(sym, '🔄 SHAKEOUT RECOVERY PUT — price $' + price.toFixed(2) + ' recovered past entry $' + s.shakeoutEp.toFixed(2) + ' after SL @ $' + s.shakeoutPrice.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+        sendPush('🔄 ' + sym + ' RECOVERY PUT #' + s.dailySignalCount, '$' + sig.price + ' · Recovered from SL @ $' + s.shakeoutPrice.toFixed(2), 'signal');
+        s.trade = { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        s.shakeoutDir = null;
+        SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'put'; S[other].crossAssetTs = now2; } });
+        return;
+      }
+    }
+  }
+
   // === FIRE SIGNALS ===
   if (fireCall && cool) {
     s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
@@ -758,6 +820,11 @@ function checkExit(sym, price) {
   const now = Date.now(), cd = now - t.lastETs > 120000;
   if (!t.sl && dm <= -t.sl2) {
     t.sl = true; t.lastETs = now;
+    // Track shakeout — store SL details for recovery detector
+    s.shakeoutDir = t.type;        // 'call' or 'put' — the direction that got stopped
+    s.shakeoutTs = now;            // when SL was hit
+    s.shakeoutPrice = price;       // price at SL
+    s.shakeoutEp = t.ep;           // original entry price
     log(sym, '🛑 STOP LOSS — ' + t.type.toUpperCase() + ' ' + dm.toFixed(2) + '%');
     sendPush('🛑 STOP LOSS ' + sym, t.type.toUpperCase() + ' ' + dm.toFixed(2) + '% — exit now', 'exit');
   } else if (!t.t2 && dm >= t.pt2) {
@@ -1051,6 +1118,7 @@ setInterval(() => {
       s.athApproachTs = 0; s.atlApproachTs = 0;
       s.gapDayMode = false; s.gapDirection = null;
       s.lastSameDir = null; s.lastSameDirMacd = 0; s.lastSameDirTs = 0; s.lastSameDirPrice = 0;
+      s.shakeoutDir = null; s.shakeoutTs = 0; s.shakeoutPrice = 0; s.shakeoutEp = 0;
       s.obCandles = []; s.obCurCandle = null; s.orderBlocks = [];
       s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
     });
