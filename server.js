@@ -532,10 +532,24 @@ function processPrice(sym, price, hi, lo) {
   }
 
   // MACD Exhaustion Filter — XAU only, block signals chasing an already-extended move
-  // When MACD histogram is deeply negative, the selling is spent → block PUTs, boost CALLs
-  // When MACD histogram is deeply positive, the buying is spent → block CALLs, boost PUTs
+  // Check BOTH histogram (short-term momentum) AND line (trend depth)
+  // Histogram deeply extended → immediate momentum spent
+  // Line deeply extended → trend has been running too long, reversal likely
   if (isXAU) {
-    const macdExhThr = 0.80;
+    const macdExhThr = 0.80;       // histogram exhaustion threshold
+    const macdLineDepth = 1.00;    // line depth exhaustion threshold (e.g. -1.154 on bad PUT)
+    // MACD LINE depth check — trend running too long
+    if (Math.abs(macdL) > macdLineDepth) {
+      if (macdL < -macdLineDepth && pS >= finalMinS && pS > cS) {
+        log(sym, 'MACD line depth: PUT blocked — macdL ' + macdL.toFixed(3) + ' deeply bearish (trend exhausted)');
+        return;
+      }
+      if (macdL > macdLineDepth && cS >= finalMinS && cS >= pS) {
+        log(sym, 'MACD line depth: CALL blocked — macdL ' + macdL.toFixed(3) + ' deeply bullish (trend exhausted)');
+        return;
+      }
+    }
+    // MACD HISTOGRAM exhaustion — short-term momentum spent
     if (macdHist < -macdExhThr) {
       // Deeply bearish MACD → selling exhausted
       if (pS >= finalMinS && pS > cS) {
