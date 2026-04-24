@@ -220,7 +220,7 @@ function processPrice(sym, price, hi, lo) {
   if (isXAU && price > 0) {
     const fiveDaysAgo = Date.now() - 5 * 24 * 60 * 60 * 1000;
     // Add current session extremes periodically (every ~60 ticks)
-    if (n % 60 === 0 && s.sessionHigh > -Infinity) {
+    if (s.prices.length % 60 === 0 && s.sessionHigh > -Infinity) {
       s.rollingHighs.push({ price: s.sessionHigh, ts: Date.now() });
       if (s.sessionLow < Infinity) s.rollingLows.push({ price: s.sessionLow, ts: Date.now() });
       // Prune older than 5 days
