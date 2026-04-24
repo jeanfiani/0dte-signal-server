@@ -71,11 +71,47 @@ SYMBOLS.forEach(sym => {
     sessionHigh: -Infinity, sessionLow: Infinity, rsiAtSessionHigh: 50,
     gapDayMode: false, gapDirection: null, prevClose: null,
     lastSameDir: null, lastSameDirMacd: 0, lastSameDirTs: 0, lastSameDirPrice: 0,
+    // Rolling multi-day high/low for ATH/ATL reversal detection
+    rollingHighs: [],   // [{price, ts}] — last 5 days of session highs
+    rollingLows: [],    // [{price, ts}] — last 5 days of session lows
+    rollingHigh: 0,     // current 5-day high
+    rollingLow: Infinity, // current 5-day low
+    rsiAtRollingHigh: 50, // RSI when rolling high was touched
+    rsiAtRollingLow: 50,  // RSI when rolling low was touched
+    athApproachTs: 0,   // when price last entered ATH zone
+    atlApproachTs: 0,   // when price last entered ATL zone
     // Trade monitor
     trade: { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 }
   };
 });
 let vixV = 0;
+
+// ===== ROLLING HIGH/LOW PERSISTENCE (ATH/ATL detector) =====
+const ROLLING_FILE = path.join(__dirname, 'rolling_levels.json');
+function loadRollingLevels() {
+  try {
+    const data = JSON.parse(fs.readFileSync(ROLLING_FILE, 'utf8'));
+    SYMBOLS.forEach(sym => {
+      if (data[sym]) {
+        const fiveDaysAgo = Date.now() - 5 * 24 * 60 * 60 * 1000;
+        S[sym].rollingHighs = (data[sym].rollingHighs || []).filter(h => h.ts > fiveDaysAgo);
+        S[sym].rollingLows = (data[sym].rollingLows || []).filter(l => l.ts > fiveDaysAgo);
+        if (S[sym].rollingHighs.length > 0) S[sym].rollingHigh = Math.max(...S[sym].rollingHighs.map(h => h.price));
+        if (S[sym].rollingLows.length > 0) S[sym].rollingLow = Math.min(...S[sym].rollingLows.map(l => l.price));
+      }
+    });
+    console.log('[' + ts() + '] Rolling levels loaded — XAU high:$' + (S.XAU.rollingHigh || 0).toFixed(2) + ' low:$' + (S.XAU.rollingLow === Infinity ? 0 : S.XAU.rollingLow).toFixed(2));
+  } catch (e) {}
+}
+function saveRollingLevels() {
+  const data = {};
+  SYMBOLS.forEach(sym => {
+    data[sym] = { rollingHighs: S[sym].rollingHighs, rollingLows: S[sym].rollingLows };
+  });
+  try { fs.writeFileSync(ROLLING_FILE, JSON.stringify(data, null, 2)); } catch (e) {}
+}
+// Save rolling levels every 5 minutes
+setInterval(saveRollingLevels, 300000);
 
 // ===== DXY STATE (for XAU inverse correlation) =====
 let dxyPrice = 0, dxyPrices = [], dxyPrevEma5 = null, dxyPrevEma13 = null;
@@ -180,6 +216,21 @@ function processPrice(sym, price, hi, lo) {
   if (price > s.sessionHigh) s.sessionHigh = price;
   if (price < s.sessionLow) s.sessionLow = price;
 
+  // Update rolling 5-day high/low for ATH/ATL detector
+  if (isXAU && price > 0) {
+    const fiveDaysAgo = Date.now() - 5 * 24 * 60 * 60 * 1000;
+    // Add current session extremes periodically (every ~60 ticks)
+    if (n % 60 === 0 && s.sessionHigh > -Infinity) {
+      s.rollingHighs.push({ price: s.sessionHigh, ts: Date.now() });
+      if (s.sessionLow < Infinity) s.rollingLows.push({ price: s.sessionLow, ts: Date.now() });
+      // Prune older than 5 days
+      s.rollingHighs = s.rollingHighs.filter(h => h.ts > fiveDaysAgo);
+      s.rollingLows = s.rollingLows.filter(l => l.ts > fiveDaysAgo);
+      if (s.rollingHighs.length > 0) s.rollingHigh = Math.max(...s.rollingHighs.map(h => h.price));
+      if (s.rollingLows.length > 0) s.rollingLow = Math.min(...s.rollingLows.map(l => l.price));
+    }
+  }
+
   s.prices.push(price); s.highs.push(hi || price); s.lows.push(lo || price);
   if (s.prices.length > 200) { s.prices.shift(); s.highs.shift(); s.lows.shift(); }
 
@@ -210,6 +261,11 @@ function processPrice(sym, price, hi, lo) {
 
   // Track RSI at session high — used by Session High Reversal Detector
   if (price >= s.sessionHigh) s.rsiAtSessionHigh = rsiV;
+  // Track RSI at rolling ATH/ATL — used by ATH/ATL Reversal Detector
+  if (isXAU) {
+    if (s.rollingHigh > 0 && price >= s.rollingHigh * 0.999) { s.rsiAtRollingHigh = rsiV; s.athApproachTs = Date.now(); }
+    if (s.rollingLow < Infinity && s.rollingLow > 0 && price <= s.rollingLow * 1.001) { s.rsiAtRollingLow = rsiV; s.atlApproachTs = Date.now(); }
+  }
 
   const e5b = s.pE5 > s.pE13, e5bear = s.pE5 < s.pE13;
   const e13b = s.pE13 > s.pE34, e13bear = s.pE13 < s.pE34;
@@ -234,14 +290,35 @@ function processPrice(sym, price, hi, lo) {
   const atrTooLow = isXAU && s.prices.length >= 30 && atrVal < 0.50; // $0.50 ATR = dead market
 
   // XAU session detection
+  const etMin = gET();
   const xauSession = isXAU ? (etMin >= 480 && etMin < 960 ? 'london_ny' : etMin >= 180 && etMin < 480 ? 'london' : 'asia') : '';
+  // Round-number gravity for XAU — gold stalls/reverses at $50 levels ($3300, $3350, $3400...)
+  // Detect proximity to nearest $50 round number and store for signal filtering
+  let roundNumDist = 99, nearestRound = 0, roundNumZone = false;
+  if (isXAU && price > 0) {
+    nearestRound = Math.round(price / 50) * 50;
+    roundNumDist = Math.abs(price - nearestRound);
+    roundNumZone = roundNumDist <= 3.0; // Within $3 of a $50 level
+  }
+  s._roundNum = isXAU ? { nearest: nearestRound, dist: roundNumDist, inZone: roundNumZone } : null;
+
   const macdHist = macdL - macdS;
   const macdAccel = typeof s.prevMacdHist === 'number' ? macdHist - s.prevMacdHist : 0;
   s.prevMacdHist = macdHist;
   const mBull = macdL > macdS && macdAccel >= 0, mBear = macdL < macdS && macdAccel <= 0;
   const rBull = rsiV >= RSI_CALL_LO[sym] && rsiV <= RSI_CALL_HI[sym];
   const rBear = rsiV >= RSI_PUT_LO[sym] && rsiV <= RSI_PUT_HI[sym];
-  const symRocThr = sym === 'XAU' ? XAU_ROC_THR : ROC_THR;
+  // ATR-adaptive ROC threshold for XAU — scales with volatility
+  // Base: 0.025%. High ATR (>$3) = raise to 0.035% (filter noise in volatile markets)
+  // Low ATR (<$1) = lower to 0.018% (capture meaningful moves in quiet markets)
+  let symRocThr = sym === 'XAU' ? XAU_ROC_THR : ROC_THR;
+  if (isXAU && atrVal > 0) {
+    if (atrVal >= 3.0) symRocThr = 0.035;       // High volatility — need bigger move
+    else if (atrVal >= 1.5) symRocThr = 0.025;   // Normal — keep default
+    else if (atrVal >= 0.50) symRocThr = 0.018;   // Low but active — lower bar
+    // Below 0.50 = ATR filter blocks signals anyway
+  }
+  s._symRocThr = symRocThr; // Store for /prices endpoint
   const rocBull = roc3 > symRocThr, rocBear = roc3 < -symRocThr;
 
   // Score
@@ -275,7 +352,7 @@ function processPrice(sym, price, hi, lo) {
   const cool = now2 - s.lastNTs > COOLDOWN_MS;
 
   // === SIGNAL GATES ===
-  const etMin = gET();
+  // etMin already defined above (used by xauSession)
   // isXAU already defined above
   // XAU: full session 6PM-5PM ET (Sun-Fri) = nearly 23h, block 5PM-6PM ET (1020-1080 min)
   // Equities: 9:30 AM - 3:55 PM ET (570-955 min)
@@ -292,6 +369,16 @@ function processPrice(sym, price, hi, lo) {
     return;
   }
 
+  // Round-number gravity filter (XAU) — block continuation signals pushing INTO $50 levels
+  // These levels act as support/resistance; price often stalls or reverses at them
+  if (isXAU && roundNumZone && (cS >= THR || pS >= THR)) {
+    const approaching = (price < nearestRound && cS >= pS) || (price > nearestRound && pS >= cS);
+    if (approaching) {
+      log(sym, 'Round-number filter: blocked — $' + roundNumDist.toFixed(2) + ' from $' + nearestRound + ' (approaching, likely stall)');
+      return;
+    }
+  }
+
   // Chop with override — strengthened: require score >= 6 + RSI + ROC (was: any score + RSI + ROC)
   const domT = cS >= pS ? 'call' : 'put';
   if (s.chopActive && (cS >= THR || pS >= THR)) {
@@ -306,7 +393,9 @@ function processPrice(sym, price, hi, lo) {
   const dayMv = refPrice > 0 ? Math.abs(((price - refPrice) / refPrice) * 100) : 0;
   const tightMode = dayMv >= 1;
   const streakActive = now2 < s.lossStreakUntil;
-  let minS = (tightMode ? 6 : THR) + (streakActive ? s.lossStreakBoost : 0);
+  // XAU session-specific threshold: Asia = 6/6 (choppy, low volume), London/NY = 5/6 (cleaner trends)
+  const sessionThr = isXAU && xauSession === 'asia' ? 6 : THR;
+  let minS = (tightMode ? 6 : sessionThr) + (streakActive ? s.lossStreakBoost : 0);
 
   // Blowoff
   const blowoffLock = now2 - s.blowoffTs < 300000;
@@ -455,6 +544,48 @@ function processPrice(sym, price, hi, lo) {
         s.trade = { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
         SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'put'; S[other].crossAssetTs = now2; } });
         return; // Signal fired, don't continue to regular signal logic
+      }
+    }
+  }
+
+  // ===== ATH/ATL REVERSAL DETECTOR (XAU only) =====
+  // Gold tends to reverse hard at multi-day highs/lows — institutional profit-taking, algo levels
+  // Fires high-confidence reversal signals when price touches 5-day extreme then pulls back
+  if (isXAU && s.rollingHigh > 0 && s.rollingLow < Infinity && cool && s.dailySignalCount < MAX_SIG) {
+    const distFromATH = s.rollingHigh - price;
+    const distFromATL = price - s.rollingLow;
+    const athApproachRecent = now2 - s.athApproachTs < 600000; // touched ATH zone in last 10 min
+    const atlApproachRecent = now2 - s.atlApproachTs < 600000;
+
+    // ATH REVERSAL → PUT: price was near 5-day high, now pulling back $10+, RSI was overbought, MACD turning bearish
+    if (athApproachRecent && distFromATH >= 10.0 && s.rsiAtRollingHigh > 62 && macdL < macdS && roc3 < -symRocThr) {
+      if (s.lastSignalDir !== 'put' || (now2 - s.lastNTs > COOLDOWN_MS)) {
+        s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
+        if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
+        s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
+        s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+        const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇ATH', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        s.signals.push(sig); logSignal(sym, sig);
+        log(sym, '🔻 ATH REVERSAL PUT — $' + distFromATH.toFixed(2) + ' off 5-day high $' + s.rollingHigh.toFixed(2) + ' RSI@ATH:' + s.rsiAtRollingHigh.toFixed(1) + ' [#' + s.dailySignalCount + ']');
+        sendPush('🔻 ' + sym + ' ATH REVERSAL PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromATH.toFixed(2) + ' off ATH $' + s.rollingHigh.toFixed(2), 'signal');
+        s.trade = { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        return;
+      }
+    }
+
+    // ATL REVERSAL → CALL: price was near 5-day low, now bouncing $10+, RSI was oversold, MACD turning bullish
+    if (atlApproachRecent && distFromATL >= 10.0 && s.rsiAtRollingLow < 38 && macdL > macdS && roc3 > symRocThr) {
+      if (s.lastSignalDir !== 'call' || (now2 - s.lastNTs > COOLDOWN_MS)) {
+        s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
+        if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
+        s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
+        s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+        const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆ATL', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        s.signals.push(sig); logSignal(sym, sig);
+        log(sym, '🚀 ATL REVERSAL CALL — $' + distFromATL.toFixed(2) + ' off 5-day low $' + s.rollingLow.toFixed(2) + ' RSI@ATL:' + s.rsiAtRollingLow.toFixed(1) + ' [#' + s.dailySignalCount + ']');
+        sendPush('🚀 ' + sym + ' ATL REVERSAL CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromATL.toFixed(2) + ' off ATL $' + s.rollingLow.toFixed(2), 'signal');
+        s.trade = { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        return;
       }
     }
   }
@@ -798,10 +929,13 @@ setInterval(() => {
       s.signals = []; s.tickBuf = [];
       s.crossAssetDir = null; s.crossAssetTs = 0;
       s.sessionHigh = -Infinity; s.sessionLow = Infinity; s.rsiAtSessionHigh = 50;
+      // Rolling ATH/ATL: keep data (persists across days), just reset approach timestamps
+      s.athApproachTs = 0; s.atlApproachTs = 0;
       s.gapDayMode = false; s.gapDirection = null;
       s.lastSameDir = null; s.lastSameDirMacd = 0; s.lastSameDirTs = 0; s.lastSameDirPrice = 0;
       s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
     });
+    saveRollingLevels(); // Persist rolling ATH/ATL data across restarts
     // Reset WS uptime counters daily
     wsConnectedMs = 0; wsDisconnectedMs = 0; wsLastStateChange = Date.now();
     wsReconnects = 0;
@@ -901,7 +1035,10 @@ app.get('/prices', (req, res) => {
       trade: s.trade.active ? { active: true, type: s.trade.type, ep: s.trade.ep, t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl, rev: s.trade.rev } : { active: false },
       dxy: s._dxy || null,
       atr: s._atr || 0,
-      xauSession: s._xauSession || ''
+      xauSession: s._xauSession || '',
+      rollingHigh: s.rollingHigh || 0,
+      rollingLow: s.rollingLow === Infinity ? 0 : s.rollingLow,
+      roundNum: s._roundNum || null
     };
   });
   res.json({ vix: vixV, dxy: { price: dxyPrice, dir: dxyDir, roc3: dxyRoc3 }, wsConnected: ws && ws.readyState === 1, ts: Date.now(), symbols: data });
@@ -967,6 +1104,7 @@ app.listen(PORT, () => {
   console.log(`[${ts()}] Signal server running on port ${PORT}`);
   console.log(`[${ts()}] FINNHUB_API_KEY: ${API ? API.substring(0, 4) + '...' + API.substring(API.length - 4) : 'NOT SET'}`);
   console.log(`[${ts()}] VAPID keys: ${process.env.VAPID_PUBLIC_KEY ? 'set' : 'NOT SET'}`);
+  loadRollingLevels();
   connectFinnhub();
   fetchVIX();
   fetchDXY();
