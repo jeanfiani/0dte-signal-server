@@ -278,6 +278,14 @@ function processPrice(sym, price, hi, lo) {
     // DXY up (dollar strong) = bearish gold = PUT point
     dxyBullGold = dxyDir === 'down' && dxyRoc3 < -0.01;
     dxyBearGold = dxyDir === 'up' && dxyRoc3 > 0.01;
+    // Strong momentum override: if gold ROC-3 > 3x threshold, the move speaks for itself
+    // DXY polls every 15s — too slow for fast gold spikes, auto-grant DXY point
+    const goldRoc3 = calcROC(s.prices, 3);
+    const rocStrong = Math.abs(goldRoc3) > XAU_ROC_THR * 3; // 3x base threshold = 0.075%
+    if (rocStrong && !dxyBullGold && !dxyBearGold) {
+      if (goldRoc3 > 0) dxyBullGold = true;  // Strong gold up = treat as DXY weak
+      else dxyBearGold = true;                 // Strong gold down = treat as DXY strong
+    }
     abV = dxyBullGold; blV = dxyBearGold;
   } else {
     const vwapPct = vwap > 0 ? ((price - vwap) / vwap) * 100 : 0;
@@ -369,23 +377,28 @@ function processPrice(sym, price, hi, lo) {
     return;
   }
 
-  // Round-number gravity filter (XAU) — block continuation signals pushing INTO $50 levels
-  // These levels act as support/resistance; price often stalls or reverses at them
-  if (isXAU && roundNumZone && (cS >= THR || pS >= THR)) {
+  // Round-number gravity (XAU) — tighten threshold near $50 levels instead of hard block
+  // These levels act as support/resistance; require stronger conviction to push through
+  let roundNumPenalty = 0;
+  if (isXAU && roundNumZone) {
     const approaching = (price < nearestRound && cS >= pS) || (price > nearestRound && pS >= cS);
     if (approaching) {
-      log(sym, 'Round-number filter: blocked — $' + roundNumDist.toFixed(2) + ' from $' + nearestRound + ' (approaching, likely stall)');
-      return;
+      roundNumPenalty = 1; // Require 6/6 instead of 5/6 near round numbers
+      log(sym, 'Round-number caution: $' + roundNumDist.toFixed(2) + ' from $' + nearestRound + ' — threshold +1');
     }
   }
 
-  // Chop with override — strengthened: require score >= 6 + RSI + ROC (was: any score + RSI + ROC)
+  // Chop with override — require 6/6 + RSI + ROC normally
+  // XAU exception: allow 5/6 when ROC is very strong (2x threshold = real momentum, not noise)
   const domT = cS >= pS ? 'call' : 'put';
   if (s.chopActive && (cS >= THR || pS >= THR)) {
     const chopScore = domT === 'call' ? cS : pS;
     const chopRsiOk = (domT === 'call' && rsiV >= RSI_CALL_LO[sym] && rsiV <= RSI_CALL_HI[sym]) || (domT === 'put' && rsiV >= RSI_PUT_LO[sym] && rsiV <= RSI_PUT_HI[sym]);
     const chopRocOk = (domT === 'call' && roc3 > symRocThr) || (domT === 'put' && roc3 < -symRocThr);
-    if (!(chopScore >= 6 && chopRsiOk && chopRocOk)) return;
+    const strongRoc = Math.abs(roc3) > symRocThr * 2; // 2x ROC = breakout-level momentum
+    const chopMinScore = (isXAU && strongRoc) ? 5 : 6;
+    if (!(chopScore >= chopMinScore && chopRsiOk && chopRocOk)) return;
+    if (chopMinScore === 5) log(sym, '⚡ Chop override at 5/6 — strong ROC ' + roc3.toFixed(3) + '% (2x threshold)');
   }
 
   // Dynamic threshold
@@ -395,7 +408,7 @@ function processPrice(sym, price, hi, lo) {
   const streakActive = now2 < s.lossStreakUntil;
   // XAU session-specific threshold: Asia = 6/6 (choppy, low volume), London/NY = 5/6 (cleaner trends)
   const sessionThr = isXAU && xauSession === 'asia' ? 6 : THR;
-  let minS = (tightMode ? 6 : sessionThr) + (streakActive ? s.lossStreakBoost : 0);
+  let minS = (tightMode ? 6 : sessionThr) + (streakActive ? s.lossStreakBoost : 0) + roundNumPenalty;
 
   // Blowoff
   const blowoffLock = now2 - s.blowoffTs < 300000;
