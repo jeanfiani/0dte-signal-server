@@ -43,8 +43,9 @@ const MAX_IND = { QQQ: 6, SPY: 6, XAU: 6 };
 const COOLDOWN_MS = 180000;
 // FLIP_COOL_MS removed — was blocking legitimate reversal signals
 const MAX_SIG = 10;
-const THR = 5;
+const THR = 6;
 const ROC_THR = 0.018;
+const EQ_ROC_GATE = 0.030; // Hard ROC gate for equities — ROC-3 must confirm direction
 const XAU_ROC_THR = 0.025; // XAU needs wider ROC threshold — higher volatility
 const XAU_MACD_MIN = 0.10; // XAU MACD values ~5x larger than QQQ/SPY (price ~$3300 vs $650)
 const XAU_MACD_LINE_MIN = 0.08; // XAU MACD line minimum strength
@@ -497,6 +498,15 @@ function processPrice(sym, price, hi, lo) {
     const asiaRocOk = (cS >= pS && roc3 > symRocThr) || (pS > cS && roc3 < -symRocThr);
     if (!asiaRocOk) {
       log(sym, 'Asia ROC gate: blocked — ROC-3 ' + roc3.toFixed(3) + '% too weak for ' + (cS >= pS ? 'CALL' : 'PUT') + ' (need >' + symRocThr + '%)');
+      return;
+    }
+  }
+
+  // Equities hard ROC gate — ROC-3 must confirm direction, kills flat-momentum noise
+  if (!isXAU && (cS >= minS || pS >= minS)) {
+    const eqRocOk = (cS >= pS && roc3 > EQ_ROC_GATE) || (pS > cS && roc3 < -EQ_ROC_GATE);
+    if (!eqRocOk) {
+      log(sym, 'Equity ROC gate: blocked — ROC-3 ' + roc3.toFixed(3) + '% too weak for ' + (cS >= pS ? 'CALL' : 'PUT') + ' (need >' + EQ_ROC_GATE + '%)');
       return;
     }
   }
