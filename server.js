@@ -77,6 +77,10 @@ SYMBOLS.forEach(sym => {
 });
 let vixV = 0;
 
+// ===== DXY STATE (for XAU inverse correlation) =====
+let dxyPrice = 0, dxyPrices = [], dxyPrevEma5 = null, dxyPrevEma13 = null;
+let dxyRoc3 = 0, dxyDir = 'neutral'; // 'up' = bearish gold, 'down' = bullish gold
+
 // ===== MATH HELPERS =====
 function ema(prev, val, period) { return prev === null ? val : val * (2 / (period + 1)) + prev * (1 - 2 / (period + 1)); }
 function calcRSI(arr) {
@@ -87,6 +91,15 @@ function calcRSI(arr) {
   return l === 0 ? 100 : +(100 - 100 / (1 + g / l)).toFixed(1);
 }
 function calcROC(arr, p) { if (arr.length < p + 1) return 0; return +((arr[arr.length - 1] - arr[arr.length - 1 - p]) / arr[arr.length - 1 - p] * 100).toFixed(4); }
+function calcATR(highs, lows, closes, period) {
+  if (highs.length < period + 1) return 0;
+  let atr = 0;
+  for (let i = highs.length - period; i < highs.length; i++) {
+    const tr = Math.max(highs[i] - lows[i], Math.abs(highs[i] - closes[i - 1]), Math.abs(lows[i] - closes[i - 1]));
+    atr += tr;
+  }
+  return atr / period;
+}
 function calcEfficiency(arr) {
   if (arr.length < 10) return 1;
   const hi = Math.max(...arr), lo = Math.min(...arr), net = hi - lo;
@@ -152,6 +165,7 @@ function logSignal(sym, sig) {
 function processPrice(sym, price, hi, lo) {
   const s = S[sym];
   const mi = MAX_IND[sym];
+  const isXAU = sym === 'XAU';
 
   // XAU: set open on first price (MT5 feeds only when market is open)
   // Equities: set open at 9:30 AM ET (570 min)
@@ -199,9 +213,28 @@ function processPrice(sym, price, hi, lo) {
 
   const e5b = s.pE5 > s.pE13, e5bear = s.pE5 < s.pE13;
   const e13b = s.pE13 > s.pE34, e13bear = s.pE13 < s.pE34;
-  const vwapPct = vwap > 0 ? ((price - vwap) / vwap) * 100 : 0;
-  const vwapZone = 0.1;
-  const abV = vwapPct > vwapZone, blV = vwapPct < -vwapZone;
+
+  // XAU: use DXY inverse correlation instead of VWAP | Equities: keep VWAP
+  let abV = false, blV = false;
+  let dxyBullGold = false, dxyBearGold = false;
+  if (isXAU) {
+    // DXY down (dollar weak) = bullish gold = CALL point
+    // DXY up (dollar strong) = bearish gold = PUT point
+    dxyBullGold = dxyDir === 'down' && dxyRoc3 < -0.01;
+    dxyBearGold = dxyDir === 'up' && dxyRoc3 > 0.01;
+    abV = dxyBullGold; blV = dxyBearGold;
+  } else {
+    const vwapPct = vwap > 0 ? ((price - vwap) / vwap) * 100 : 0;
+    const vwapZone = 0.1;
+    abV = vwapPct > vwapZone; blV = vwapPct < -vwapZone;
+  }
+
+  // ATR for XAU — used as volatility filter (block signals when market is dead)
+  const atrVal = isXAU ? calcATR(s.highs, s.lows, s.prices, 14) : 0;
+  const atrTooLow = isXAU && s.prices.length >= 30 && atrVal < 0.50; // $0.50 ATR = dead market
+
+  // XAU session detection
+  const xauSession = isXAU ? (etMin >= 480 && etMin < 960 ? 'london_ny' : etMin >= 180 && etMin < 480 ? 'london' : 'asia') : '';
   const macdHist = macdL - macdS;
   const macdAccel = typeof s.prevMacdHist === 'number' ? macdHist - s.prevMacdHist : 0;
   s.prevMacdHist = macdHist;
@@ -224,13 +257,16 @@ function processPrice(sym, price, hi, lo) {
 
   // Store indicator state for /prices endpoint
   const dom = Math.max(cS, pS);
-  s._ind = { e5b, e5bear, e13b, e13bear, abV, blV, mBull, mBear, rBull, rBear: rsiV < 35 || rsiV > 65, rocBull, rocBear };
+  s._ind = { e5b, e5bear, e13b, e13bear, abV, blV, mBull, mBear, rBull, rBear: rsiV < 35 || rsiV > 65, rocBull, rocBear, dxyBullGold, dxyBearGold };
   s._rsi = rsiV;
   s._dom = dom;
   s._macdL = macdL;
   s._macdS = macdS;
   s._roc3 = roc3;
-  s._vwap = vwap;
+  s._vwap = isXAU ? 0 : vwap;
+  s._dxy = isXAU ? { price: dxyPrice, dir: dxyDir, roc3: dxyRoc3 } : null;
+  s._atr = atrVal;
+  s._xauSession = xauSession;
 
   // Check exit for active trades
   checkExit(sym, price);
@@ -240,7 +276,7 @@ function processPrice(sym, price, hi, lo) {
 
   // === SIGNAL GATES ===
   const etMin = gET();
-  const isXAU = sym === 'XAU';
+  // isXAU already defined above
   // XAU: full session 6PM-5PM ET (Sun-Fri) = nearly 23h, block 5PM-6PM ET (1020-1080 min)
   // Equities: 9:30 AM - 3:55 PM ET (570-955 min)
   if (isXAU) {
@@ -249,6 +285,12 @@ function processPrice(sym, price, hi, lo) {
     if (etMin < 570 || etMin >= 955) return;
   }
   if (!isXAU && etMin >= 945 && (cS >= THR || pS >= THR)) return;
+
+  // XAU ATR filter — block signals when market is dead (low volatility)
+  if (atrTooLow && (cS >= THR || pS >= THR)) {
+    log(sym, 'ATR filter: blocked — ATR $' + atrVal.toFixed(2) + ' < $0.50 (dead market)');
+    return;
+  }
 
   // Chop with override — strengthened: require score >= 6 + RSI + ROC (was: any score + RSI + ROC)
   const domT = cS >= pS ? 'call' : 'put';
@@ -708,6 +750,34 @@ async function fetchVIX() {
 }
 setInterval(fetchVIX, 60000); // 60s instead of 30s — reduce API rate pressure
 
+// Fetch DXY (US Dollar Index) every 15s — used for XAU inverse correlation
+async function fetchDXY() {
+  const symbols = ['TVC:DXY', 'DXY', 'UUP']; // UUP is dollar bull ETF as fallback
+  for (const sym of symbols) {
+    try {
+      const res = await fetch('https://finnhub.io/api/v1/quote?symbol=' + encodeURIComponent(sym) + '&token=' + API + '&_=' + Date.now());
+      const data = await res.json();
+      if (data && data.c > 0) {
+        dxyPrice = data.c;
+        dxyPrices.push(dxyPrice);
+        if (dxyPrices.length > 100) dxyPrices.shift();
+        // Calculate DXY EMAs and ROC
+        dxyPrevEma5 = ema(dxyPrevEma5, dxyPrice, 5);
+        dxyPrevEma13 = ema(dxyPrevEma13, dxyPrice, 13);
+        if (dxyPrices.length >= 4) {
+          dxyRoc3 = ((dxyPrices[dxyPrices.length - 1] - dxyPrices[dxyPrices.length - 4]) / dxyPrices[dxyPrices.length - 4]) * 100;
+        }
+        // DXY direction: EMA5 < EMA13 = dollar weakening = bullish gold
+        if (dxyPrevEma5 !== null && dxyPrevEma13 !== null) {
+          dxyDir = dxyPrevEma5 < dxyPrevEma13 ? 'down' : dxyPrevEma5 > dxyPrevEma13 ? 'up' : 'neutral';
+        }
+        return;
+      }
+    } catch (e) {}
+  }
+}
+setInterval(fetchDXY, 15000);
+
 // Daily reset — date-based (resets as soon as ET date changes, not at a fixed minute)
 let _lastResetDate = todayDateET();
 setInterval(() => {
@@ -828,10 +898,13 @@ app.get('/prices', (req, res) => {
       chopActive: s.chopActive,
       dailySignalCount: s.dailySignalCount,
       signals: s.signals.slice(-20),
-      trade: s.trade.active ? { active: true, type: s.trade.type, ep: s.trade.ep, t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl, rev: s.trade.rev } : { active: false }
+      trade: s.trade.active ? { active: true, type: s.trade.type, ep: s.trade.ep, t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl, rev: s.trade.rev } : { active: false },
+      dxy: s._dxy || null,
+      atr: s._atr || 0,
+      xauSession: s._xauSession || ''
     };
   });
-  res.json({ vix: vixV, wsConnected: ws && ws.readyState === 1, ts: Date.now(), symbols: data });
+  res.json({ vix: vixV, dxy: { price: dxyPrice, dir: dxyDir, roc3: dxyRoc3 }, wsConnected: ws && ws.readyState === 1, ts: Date.now(), symbols: data });
 });
 
 // Status endpoint
@@ -896,4 +969,5 @@ app.listen(PORT, () => {
   console.log(`[${ts()}] VAPID keys: ${process.env.VAPID_PUBLIC_KEY ? 'set' : 'NOT SET'}`);
   connectFinnhub();
   fetchVIX();
+  fetchDXY();
 });
