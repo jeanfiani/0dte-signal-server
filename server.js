@@ -26,7 +26,7 @@ const API = process.env.FINNHUB_API_KEY;
 const PORT = process.env.PORT || 3000;
 const SYMBOLS = ['QQQ', 'SPY', 'XAU'];
 const RSI_CALL_LO = { QQQ: 45, SPY: 45, XAU: 40 };
-const RSI_CALL_HI = { QQQ: 65, SPY: 65, XAU: 68 };
+const RSI_CALL_HI = { QQQ: 70, SPY: 70, XAU: 68 };
 const RSI_PUT_LO  = { QQQ: 30, SPY: 30, XAU: 28 };
 const RSI_PUT_HI  = { QQQ: 55, SPY: 55, XAU: 58 };
 const ROC_BLOWOFF = { QQQ: 0.15, SPY: 0.15, XAU: 0.20 };
@@ -375,8 +375,10 @@ function processPrice(sym, price, hi, lo) {
   const macdAccel = typeof s.prevMacdHist === 'number' ? macdHist - s.prevMacdHist : 0;
   s.prevMacdHist = macdHist;
   const mBull = macdL > macdS && macdAccel >= 0, mBear = macdL < macdS && macdAccel <= 0;
-  const rBull = rsiV >= RSI_CALL_LO[sym] && rsiV <= RSI_CALL_HI[sym];
-  const rBear = rsiV >= RSI_PUT_LO[sym] && rsiV <= RSI_PUT_HI[sym];
+  // RSI scoring: rBull = in call zone (bullish), rBear = outside call zone (bearish)
+  // These are for the 6-indicator SCORE. The RSI sweet-spot GATE uses RSI_CALL/PUT ranges separately.
+  const rBull = rsiV >= RSI_CALL_LO[sym] && rsiV <= RSI_CALL_HI[sym]; // QQQ: 45-70, SPY: 45-70, XAU: 40-68
+  const rBear = rsiV < RSI_CALL_LO[sym] || rsiV > RSI_CALL_HI[sym];  // outside call zone = bearish point
   // ATR-adaptive ROC threshold for XAU — scales with volatility
   // Base: 0.025%. High ATR (>$3) = raise to 0.035% (filter noise in volatile markets)
   // Low ATR (<$1) = lower to 0.018% (capture meaningful moves in quiet markets)
@@ -395,7 +397,7 @@ function processPrice(sym, price, hi, lo) {
   if (e5b) cS++; if (e5bear) pS++;
   if (e13b) cS++; if (e13bear) pS++;
   if (abV) cS++; if (blV) pS++;
-  if (rBull) cS++; if (rsiV < 45 || rsiV > 70) pS++;
+  if (rBull) cS++; if (rBear) pS++;
   if (mBull) cS++; if (mBear) pS++;
   if (rocBull) cS++; if (rocBear) pS++;
   if (s.crossAssetDir === 'call' && Date.now() - s.crossAssetTs < 300000) cS++;
@@ -403,7 +405,7 @@ function processPrice(sym, price, hi, lo) {
 
   // Store indicator state for /prices endpoint
   const dom = Math.max(cS, pS);
-  s._ind = { e5b, e5bear, e13b, e13bear, abV, blV, mBull, mBear, rBull, rBear: rsiV < 35 || rsiV > 65, rocBull, rocBear, dxyBullGold, dxyBearGold };
+  s._ind = { e5b, e5bear, e13b, e13bear, abV, blV, mBull, mBear, rBull, rBear, rocBull, rocBear, dxyBullGold, dxyBearGold };
   s._rsi = rsiV;
   s._dom = dom;
   s._macdL = macdL;
