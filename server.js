@@ -103,6 +103,10 @@ SYMBOLS.forEach(sym => {
     obCandles: [],       // [{o, h, l, c, ts}] — completed 1-min candles (last 60)
     obCurCandle: null,   // current building candle {o, h, l, c, startTs, ticks}
     orderBlocks: [],     // [{type:'bull'|'bear', hi, lo, ts, mitigated:false}] — active OB zones
+    // Macro trend — 5-min snapshots for 6-hour rolling window (XAU only)
+    macroSnaps: [],        // [{ts, p}] — every 5 min, max 72 entries = 6 hours
+    macroLastSnapTs: 0,    // when last snapshot was taken
+    macroEma: null,        // slow EMA on 5-min snapshots (period 36 = ~3 hours)
     // Trade monitor
     trade: { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 }
   };
@@ -1103,6 +1107,16 @@ function processTicks(symbols) {
     const lo = Math.min(...s.tickBuf.map(t => t.p));
     s.tickBuf = [];
     processPrice(sym, price, hi, lo);
+
+    // Macro trend snapshots — XAU only, every 5 min, 6-hour rolling window
+    if (sym === 'XAU' && (Date.now() - s.macroLastSnapTs >= 300000)) {
+      s.macroLastSnapTs = Date.now();
+      s.macroSnaps.push({ ts: Date.now(), p: price });
+      if (s.macroSnaps.length > 72) s.macroSnaps.shift(); // keep 6 hours
+      // Slow EMA on snapshots (period 36 = ~3 hours of 5-min bars)
+      const emaK = 2 / (36 + 1);
+      s.macroEma = s.macroEma === null ? price : price * emaK + s.macroEma * (1 - emaK);
+    }
     } catch (e) { console.error('[' + ts() + '] processTicks ' + sym + ' error:', e.message); }
   });
 }
@@ -1283,7 +1297,22 @@ app.get('/prices', (req, res) => {
       rollingHigh: s.rollingHigh || 0,
       rollingLow: s.rollingLow === Infinity ? 0 : s.rollingLow,
       roundNum: s._roundNum || null,
-      orderBlocks: s._orderBlocks || []
+      orderBlocks: s._orderBlocks || [],
+      macro: sym === 'XAU' && s.macroSnaps.length >= 2 && s.lastPrice > 0 ? (() => {
+        const p = s.lastPrice;
+        return {
+          snaps: s.macroSnaps.length,
+          oldest: s.macroSnaps[0].p,
+          hours: +((Date.now() - s.macroSnaps[0].ts) / 3600000).toFixed(1),
+          ema: s.macroEma ? +s.macroEma.toFixed(2) : null,
+          dir: p > (s.macroEma || p) ? 'bull' : 'bear',
+          chg: +((p - s.macroSnaps[0].p)).toFixed(2),
+          chgPct: +(((p - s.macroSnaps[0].p) / s.macroSnaps[0].p) * 100).toFixed(3),
+          h1: s.macroSnaps.length >= 12 ? +((p - s.macroSnaps[Math.max(0, s.macroSnaps.length - 12)].p)).toFixed(2) : null,
+          h2: s.macroSnaps.length >= 24 ? +((p - s.macroSnaps[Math.max(0, s.macroSnaps.length - 24)].p)).toFixed(2) : null,
+          h4: s.macroSnaps.length >= 48 ? +((p - s.macroSnaps[Math.max(0, s.macroSnaps.length - 48)].p)).toFixed(2) : null
+        };
+      })() : null
     };
   });
   res.json({ vix: vixV, dxy: { price: dxyPrice, dir: dxyDir, roc3: dxyRoc3 }, wsConnected: ws && ws.readyState === 1, ts: Date.now(), symbols: data });
