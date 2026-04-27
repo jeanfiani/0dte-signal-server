@@ -108,6 +108,9 @@ SYMBOLS.forEach(sym => {
     sustainedDir: null,    // 'call' or 'put' — current sustained direction
     sustainedCount: 0,     // consecutive ticks with ROC above threshold in same direction
     sustainedTs: 0,        // when sustained streak started
+    // V-Reversal detector (XAU only) — tracks recent price extremes for momentum reversal detection
+    vrevSnaps: [],         // [{ts, p}] — price snapshots every 3s, last 20 min (max 400)
+    vrevLastTs: 0,         // when last V-Rev signal fired (cooldown)
     macroSnaps: [],        // [{ts, p}] — every 5 min, max 72 entries = 6 hours
     macroLastSnapTs: 0,    // when last snapshot was taken
     macroEma: null,        // slow EMA on 5-min snapshots (period 36 = ~3 hours)
@@ -554,6 +557,10 @@ function processPrice(sym, price, hi, lo) {
     s.sustainedTs = now2;
   }
 
+  // Sustained momentum override flag — used by blowoff, RSI, and MACD exhaustion gates
+  // If ROC has been directional for 15+ consecutive ticks, the move is real regardless of "exhaustion"
+  const sustainedOverride = s.sustainedCount >= 15 && s.sustainedDir !== null;
+
   // Blowoff — with sustained momentum override
   const blowoffLock = now2 - s.blowoffTs < 300000;
   if (Math.abs(roc3) > ROC_BLOWOFF[sym] && !blowoffLock) { s.blowoffTs = now2; }
@@ -576,11 +583,19 @@ function processPrice(sym, price, hi, lo) {
   if (s.dailySignalCount >= MAX_SIG) return;
   // Direction-flip cooldown — REMOVED (was 480s, blocked reversal catches)
 
-  // RSI sweet-spot
+  // RSI sweet-spot — sustained momentum can override (move still going despite oversold/overbought)
   const rsiSweetCall = rsiV >= RSI_CALL_LO[sym] && rsiV <= RSI_CALL_HI[sym];
   const rsiSweetPut = rsiV >= RSI_PUT_LO[sym] && rsiV <= RSI_PUT_HI[sym];
-  if (!rsiSweetCall && cS >= minS && cS >= pS) return;
-  if (!rsiSweetPut && pS >= minS && pS > cS) return;
+  if (!rsiSweetCall && cS >= minS && cS >= pS) {
+    if (sustainedOverride && s.sustainedDir === 'call') {
+      log(sym, 'RSI gate override: sustained CALL momentum (' + s.sustainedCount + ' ticks) — RSI ' + rsiV.toFixed(1) + ' outside sweet zone');
+    } else return;
+  }
+  if (!rsiSweetPut && pS >= minS && pS > cS) {
+    if (sustainedOverride && s.sustainedDir === 'put') {
+      log(sym, 'RSI gate override: sustained PUT momentum (' + s.sustainedCount + ' ticks) — RSI ' + rsiV.toFixed(1) + ' outside sweet zone');
+    } else return;
+  }
 
   // PM penalty removed — THR=6 is already strict enough (was +1 when THR=5)
   const finalMinS = minS;
@@ -610,35 +625,51 @@ function processPrice(sym, price, hi, lo) {
   if (isXAU) {
     const macdExhThr = 0.80;       // histogram exhaustion threshold
     const macdLineDepth = 1.00;    // line depth exhaustion threshold (e.g. -1.154 on bad PUT)
-    // MACD LINE depth check — trend running too long
+    // MACD LINE depth check — trend running too long (sustained momentum can override)
     if (Math.abs(macdL) > macdLineDepth) {
       if (macdL < -macdLineDepth && pS >= finalMinS && pS > cS) {
-        log(sym, 'MACD line depth: PUT blocked — macdL ' + macdL.toFixed(3) + ' deeply bearish (trend exhausted)');
-        return;
+        if (sustainedOverride && s.sustainedDir === 'put') {
+          log(sym, 'MACD depth override: sustained PUT (' + s.sustainedCount + ' ticks) — macdL ' + macdL.toFixed(3) + ' still dropping');
+        } else {
+          log(sym, 'MACD line depth: PUT blocked — macdL ' + macdL.toFixed(3) + ' deeply bearish (trend exhausted)');
+          return;
+        }
       }
       if (macdL > macdLineDepth && cS >= finalMinS && cS >= pS) {
-        log(sym, 'MACD line depth: CALL blocked — macdL ' + macdL.toFixed(3) + ' deeply bullish (trend exhausted)');
-        return;
+        if (sustainedOverride && s.sustainedDir === 'call') {
+          log(sym, 'MACD depth override: sustained CALL (' + s.sustainedCount + ' ticks) — macdL ' + macdL.toFixed(3) + ' still rising');
+        } else {
+          log(sym, 'MACD line depth: CALL blocked — macdL ' + macdL.toFixed(3) + ' deeply bullish (trend exhausted)');
+          return;
+        }
       }
     }
-    // MACD HISTOGRAM exhaustion — short-term momentum spent
+    // MACD HISTOGRAM exhaustion — short-term momentum spent (sustained momentum can override)
     if (macdHist < -macdExhThr) {
-      // Deeply bearish MACD → selling exhausted
       if (pS >= finalMinS && pS > cS) {
-        log(sym, 'MACD exhaustion: PUT blocked — macdHist ' + macdHist.toFixed(3) + ' already deeply bearish (thr -' + macdExhThr + ')');
-        return;
+        if (sustainedOverride && s.sustainedDir === 'put') {
+          log(sym, 'MACD exhaustion override: sustained PUT (' + s.sustainedCount + ' ticks) — hist ' + macdHist.toFixed(3) + ' still selling');
+        } else {
+          log(sym, 'MACD exhaustion: PUT blocked — macdHist ' + macdHist.toFixed(3) + ' already deeply bearish (thr -' + macdExhThr + ')');
+          return;
+        }
+      } else {
+        cS++; // Boost CALL — reversal likely
+        log(sym, 'MACD exhaustion: CALL boosted +1 — macdHist ' + macdHist.toFixed(3) + ' deeply bearish = bounce setup');
       }
-      cS++; // Boost CALL — reversal likely
-      log(sym, 'MACD exhaustion: CALL boosted +1 — macdHist ' + macdHist.toFixed(3) + ' deeply bearish = bounce setup');
     }
     if (macdHist > macdExhThr) {
-      // Deeply bullish MACD → buying exhausted
       if (cS >= finalMinS && cS >= pS) {
-        log(sym, 'MACD exhaustion: CALL blocked — macdHist ' + macdHist.toFixed(3) + ' already deeply bullish (thr +' + macdExhThr + ')');
-        return;
+        if (sustainedOverride && s.sustainedDir === 'call') {
+          log(sym, 'MACD exhaustion override: sustained CALL (' + s.sustainedCount + ' ticks) — hist ' + macdHist.toFixed(3) + ' still buying');
+        } else {
+          log(sym, 'MACD exhaustion: CALL blocked — macdHist ' + macdHist.toFixed(3) + ' already deeply bullish (thr +' + macdExhThr + ')');
+          return;
+        }
+      } else {
+        pS++; // Boost PUT — reversal likely
+        log(sym, 'MACD exhaustion: PUT boosted +1 — macdHist ' + macdHist.toFixed(3) + ' deeply bullish = pullback setup');
       }
-      pS++; // Boost PUT — reversal likely
-      log(sym, 'MACD exhaustion: PUT boosted +1 — macdHist ' + macdHist.toFixed(3) + ' deeply bullish = pullback setup');
     }
   }
 
@@ -797,6 +828,57 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
+  // ===== V-REVERSAL DETECTOR (XAU only) =====
+  // Catches momentum reversals: price drops/rallies $8+ in 15 min, then ROC flips sharply
+  // Different from trend-following signals — fires on the turn itself, not after EMAs catch up
+  if (isXAU && s.vrevSnaps.length >= 60 && cool && s.dailySignalCount < MAX_SIG && (now2 - s.vrevLastTs > 600000)) {
+    // Find the high and low in the last 15 min of snapshots
+    const lookback = s.vrevSnaps.filter(sn => sn.ts > now2 - 900000); // 15 min
+    if (lookback.length >= 30) {
+      const lbHigh = Math.max(...lookback.map(sn => sn.p));
+      const lbLow = Math.min(...lookback.map(sn => sn.p));
+      const lbHighTs = lookback.find(sn => sn.p === lbHigh)?.ts || 0;
+      const lbLowTs = lookback.find(sn => sn.p === lbLow)?.ts || 0;
+      const range = lbHigh - lbLow;
+
+      // V-REVERSAL CALL: price dropped to a low, then bounced back up
+      // Low happened BEFORE current time, price has recovered significantly, ROC confirms upward
+      const dropThenBounce = range >= 8.0 && lbLowTs < now2 - 60000 && (price - lbLow) >= range * 0.4 && lbLowTs > lbHighTs;
+      // V-REVERSAL PUT: price rallied to a high, then dropped back down
+      const rallyThenDrop = range >= 8.0 && lbHighTs < now2 - 60000 && (lbHigh - price) >= range * 0.4 && lbHighTs > lbLowTs;
+
+      if (dropThenBounce && roc3 > symRocThr * 2 && rsiV > 35 && rsiV < 65) {
+        // CALL reversal: was dropping, now bouncing with strong upward ROC
+        s.vrevLastTs = now2;
+        s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
+        if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
+        s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
+        s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+        const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆VREV', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        s.signals.push(sig); logSignal(sym, sig);
+        log(sym, '🔄 V-REVERSAL CALL — dropped $' + (lbHigh - lbLow).toFixed(2) + ' to $' + lbLow.toFixed(2) + ', bounced $' + (price - lbLow).toFixed(2) + ' · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
+        sendPush('🔄 ' + sym + ' V-REVERSAL CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · bounced $' + (price - lbLow).toFixed(2) + ' off $' + lbLow.toFixed(2) + ' low', 'signal');
+        s.trade = { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        return;
+      }
+
+      if (rallyThenDrop && roc3 < -symRocThr * 2 && rsiV > 35 && rsiV < 65) {
+        // PUT reversal: was rallying, now dropping with strong downward ROC
+        s.vrevLastTs = now2;
+        s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
+        if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
+        s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
+        s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+        const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇VREV', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        s.signals.push(sig); logSignal(sym, sig);
+        log(sym, '🔄 V-REVERSAL PUT — rallied $' + (lbHigh - lbLow).toFixed(2) + ' to $' + lbHigh.toFixed(2) + ', dropped $' + (lbHigh - price).toFixed(2) + ' · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
+        sendPush('🔄 ' + sym + ' V-REVERSAL PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · dropped $' + (lbHigh - price).toFixed(2) + ' off $' + lbHigh.toFixed(2) + ' high', 'signal');
+        s.trade = { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        return;
+      }
+    }
+  }
+
   // ===== ATH/ATL REVERSAL DETECTOR (XAU only) =====
   // Gold tends to reverse hard at multi-day highs/lows — institutional profit-taking, algo levels
   // Fires high-confidence reversal signals when price touches 5-day extreme then pulls back
@@ -840,8 +922,11 @@ function processPrice(sym, price, hi, lo) {
   }
 
   const vixOk = vixV <= 0 || vixV < 35;  // treat unknown VIX as OK (don't block calls when VIX fetch fails)
-  const fireCall = cS >= finalMinS && vixOk && rsiSweetCall && macdAlignCall;
-  const firePut = pS >= finalMinS && rsiSweetPut && macdAlignPut;
+  // Sustained momentum allows RSI override in fire conditions
+  const rsiOkCall = rsiSweetCall || (sustainedOverride && s.sustainedDir === 'call');
+  const rsiOkPut = rsiSweetPut || (sustainedOverride && s.sustainedDir === 'put');
+  const fireCall = cS >= finalMinS && vixOk && rsiOkCall && macdAlignCall;
+  const firePut = pS >= finalMinS && rsiOkPut && macdAlignPut;
 
   // === SHAKEOUT RECOVERY DETECTOR ===
   // If a signal got stopped out and price recovers past the original entry in the same direction,
@@ -1167,6 +1252,14 @@ function processTicks(symbols) {
       const emaK = 2 / (36 + 1);
       s.macroEma = s.macroEma === null ? price : price * emaK + s.macroEma * (1 - emaK);
     }
+
+    // V-Reversal snapshots — XAU only, every tick, keep 20 min (max 1200 at 1s interval)
+    if (sym === 'XAU') {
+      s.vrevSnaps.push({ ts: Date.now(), p: price });
+      const cutoff = Date.now() - 1200000; // 20 min
+      while (s.vrevSnaps.length > 0 && s.vrevSnaps[0].ts < cutoff) s.vrevSnaps.shift();
+    }
+
     } catch (e) { console.error('[' + ts() + '] processTicks ' + sym + ' error:', e.message); }
   });
 }
@@ -1259,6 +1352,7 @@ setInterval(() => {
       s.vwapSum = 0; s.vwapCount = 0; s.prevMacdHist = null; s.openPrice = null;
       s.blowoffTs = 0; s.lossStreak = 0; s.lossStreakBoost = 0; s.lossStreakUntil = 0;
       s.sustainedDir = null; s.sustainedCount = 0; s.sustainedTs = 0;
+      s.vrevSnaps = []; s.vrevLastTs = 0;
       s.lastAT = ''; s.lastNTs = 0; s.lastReversalTs = 0;
       s.dailySignalCount = 0; s.lastSignalDir = null; s.lastSignalTs = 0;
       s.nC = 0; s.nP = 0; s.nBl = 0;
@@ -1364,6 +1458,7 @@ app.get('/prices', (req, res) => {
       ind: s._ind || null,
       rsi: s._rsi || 0,
       dom: s._dom || 0,
+      pE5: s.pE5 || 0, pE13: s.pE13 || 0, pE34: s.pE34 || 0,
       macdL: s._macdL || 0,
       macdS: s._macdS || 0,
       roc3: s._roc3 || 0,
