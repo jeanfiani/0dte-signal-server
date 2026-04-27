@@ -117,6 +117,13 @@ SYMBOLS.forEach(sym => {
     macroPrevDir: null,    // 'bull' or 'bear' — last settled macro direction
     macroFlipTs: 0,        // when last macro flip signal fired (cooldown)
     superFlipTs: 0,        // when last super signal fired (cooldown)
+    // Consolidation Breakout detector (XAU only) — fires on range escape, not lagging indicators
+    breakRange: [],          // [{ts, hi, lo}] — 1-second snapshots for rolling 5-min window (max 300)
+    breakHi: 0,              // current consolidation high
+    breakLo: Infinity,       // current consolidation low
+    breakCoilStart: 0,       // when consolidation started (range stayed tight)
+    breakCoilActive: false,  // true when range < threshold for >= 3 min
+    breakLastTs: 0,          // when last breakout signal fired (cooldown)
     // Trade monitor
     trade: { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 }
   };
@@ -462,6 +469,12 @@ function processPrice(sym, price, hi, lo) {
   s._macdL = macdL;
   s._macdS = macdS;
   s._roc3 = roc3;
+  // Breakout state for /prices exposure
+  if (isXAU) {
+    const bRange = s.breakHi > 0 && s.breakLo < Infinity ? +(s.breakHi - s.breakLo).toFixed(2) : 0;
+    const bCoilSec = s.breakCoilActive ? Math.round((Date.now() - s.breakCoilStart) / 1000) : 0;
+    s._breakout = { range: bRange, hi: s.breakHi > 0 ? +s.breakHi.toFixed(2) : 0, lo: s.breakLo < Infinity ? +s.breakLo.toFixed(2) : 0, coiling: s.breakCoilActive, coilSec: bCoilSec };
+  }
   s._roc6 = roc6;
   s._roc12 = roc12;
   s._vwap = isXAU ? 0 : vwap;
@@ -919,6 +932,39 @@ function processPrice(sym, price, hi, lo) {
         SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'put'; S[other].crossAssetTs = now2; } });
         return; // Signal fired, don't continue to regular signal logic
       }
+    }
+  }
+
+  // ===== CONSOLIDATION BREAKOUT DETECTOR (XAU only) =====
+  // Fires INSTANTLY when price escapes a tight range — no lagging indicator delay.
+  // This is the fastest signal: catches moves 2-3 min before EMAs/RSI/MACD confirm.
+  // The coil detection + breakout pending flag is set in processTicks (runs every 1s).
+  // Here we just fire the signal if a valid breakout was detected this tick.
+  if (isXAU && s._pendingBreakout && s.dailySignalCount < MAX_SIG) {
+    const bo = s._pendingBreakout;
+    s._pendingBreakout = null; // consume it
+    const cool2 = now2 - s.lastNTs > COOLDOWN_MS;
+    const breakCool = now2 - s.breakLastTs > 300000; // 5-min cooldown
+
+    if (cool2 && breakCool) {
+      s.breakLastTs = now2;
+      const dir = bo.dir;
+      s.lastAT = dir; if (dir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
+      if (s.lastSignalDir && s.lastSignalDir !== dir) s.lastReversalTs = now2;
+      s.lastSignalDir = dir; s.lastSignalTs = now2; s.lastNTs = now2;
+      s.lastSameDir = dir; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+      const scoreTag = dir === 'call' ? '⬆BREAK' : '⬇BREAK';
+      const sig = { type: dir, time: ts(), price: price.toFixed(2), score: scoreTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+      enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+      const coilMin = (bo.coilDuration / 60000).toFixed(1);
+      const rangeStr = '$' + bo.coilLo.toFixed(2) + '-$' + bo.coilHi.toFixed(2);
+      log(sym, '💥 BREAKOUT ' + dir.toUpperCase() + ' — coiled ' + coilMin + 'min in ' + rangeStr + ' · escaped $' + bo.escape.toFixed(2) + ' · accel ' + bo.accel.toFixed(1) + 'x [#' + s.dailySignalCount + ']');
+      sendPush('💥 ' + sym + ' BREAKOUT ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · broke ' + (dir === 'call' ? 'above' : 'below') + ' ' + rangeStr + ' (' + coilMin + 'min coil)', 'signal');
+      s.trade = { active: true, type: dir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+      return;
+    } else {
+      // Cooldown blocked — clear pending
+      s._pendingBreakout = null;
     }
   }
 
@@ -1423,6 +1469,75 @@ function processTicks(symbols) {
       while (s.vrevSnaps.length > 0 && s.vrevSnaps[0].ts < cutoff) s.vrevSnaps.shift();
     }
 
+    // Consolidation Breakout tracker — XAU only, every tick
+    // Tracks rolling 5-min high/low range. When range stays < $4 for 3+ min, marks "coiling".
+    // Breakout fires the instant price escapes the range — no lagging indicator delay.
+    if (sym === 'XAU') {
+      const bNow = Date.now();
+      s.breakRange.push({ ts: bNow, p: price });
+      // Trim to 5-min window
+      const bCutoff = bNow - 300000;
+      while (s.breakRange.length > 0 && s.breakRange[0].ts < bCutoff) s.breakRange.shift();
+
+      if (s.breakRange.length >= 30) { // need at least 30s of data
+        const bHi = Math.max(...s.breakRange.map(b => b.p));
+        const bLo = Math.min(...s.breakRange.map(b => b.p));
+        const bRange = bHi - bLo;
+        s.breakHi = bHi;
+        s.breakLo = bLo;
+
+        // Coil detection: range < $4 = gold is consolidating
+        if (bRange < 4.0) {
+          if (!s.breakCoilActive) {
+            s.breakCoilStart = bNow;
+            s.breakCoilActive = true;
+          }
+        } else if (s.breakCoilActive) {
+          // Range expanded — check if this is a breakout from a valid coil
+          const coilDuration = bNow - s.breakCoilStart;
+          const coilCoolOk = bNow - s.breakLastTs > 300000; // 5-min cooldown between breakouts
+
+          // Valid coil: tight range held for at least 3 minutes
+          if (coilDuration >= 180000 && coilCoolOk && s.dailySignalCount < MAX_SIG) {
+            // Find the coil's range (the tight range before this expansion)
+            const coilSnaps = s.breakRange.filter(b => b.ts < bNow - 5000); // exclude last 5s (the breakout itself)
+            if (coilSnaps.length >= 20) {
+              const coilHi = Math.max(...coilSnaps.map(b => b.p));
+              const coilLo = Math.min(...coilSnaps.map(b => b.p));
+
+              // Breakout direction: which side of the coil did price escape?
+              const brokeUp = price > coilHi + 1.0;  // $1 above coil top = confirmed breakout
+              const brokeDown = price < coilLo - 1.0; // $1 below coil bottom = confirmed breakout
+
+              if (brokeUp || brokeDown) {
+                // Calculate velocity — how fast did price move in last 10 seconds vs average
+                const last10 = s.breakRange.filter(b => b.ts > bNow - 10000);
+                const last60 = s.breakRange.filter(b => b.ts > bNow - 60000 && b.ts <= bNow - 10000);
+                if (last10.length >= 3 && last60.length >= 10) {
+                  const vel10 = Math.abs(last10[last10.length - 1].p - last10[0].p) / (last10.length || 1);
+                  const vel60 = Math.abs(last60[last60.length - 1].p - last60[0].p) / (last60.length || 1);
+                  const accel = vel60 > 0 ? vel10 / vel60 : vel10 > 0 ? 10 : 0;
+
+                  // Acceleration > 2x = price is accelerating out of the range (not a slow drift)
+                  if (accel >= 2.0) {
+                    s._pendingBreakout = {
+                      dir: brokeUp ? 'call' : 'put',
+                      coilHi: coilHi,
+                      coilLo: coilLo,
+                      coilDuration: coilDuration,
+                      accel: accel,
+                      escape: brokeUp ? +(price - coilHi).toFixed(2) : +(coilLo - price).toFixed(2)
+                    };
+                  }
+                }
+              }
+            }
+          }
+          s.breakCoilActive = false; // Reset coil — range has expanded
+        }
+      }
+    }
+
     } catch (e) { console.error('[' + ts() + '] processTicks ' + sym + ' error:', e.message); }
   });
 }
@@ -1577,6 +1692,7 @@ setInterval(() => {
       s.blowoffTs = 0; s.lossStreak = 0; s.lossStreakBoost = 0; s.lossStreakUntil = 0;
       s.sustainedDir = null; s.sustainedCount = 0; s.sustainedTs = 0;
       s.vrevSnaps = []; s.vrevLastTs = 0;
+      s.breakRange = []; s.breakHi = 0; s.breakLo = Infinity; s.breakCoilStart = 0; s.breakCoilActive = false; s.breakLastTs = 0; s._pendingBreakout = null;
       s.macroPrevDir = null; s.macroFlipTs = 0; s.superFlipTs = 0;
       s.lastAT = ''; s.lastNTs = 0; s.lastReversalTs = 0;
       s.dailySignalCount = 0; s.lastSignalDir = null; s.lastSignalTs = 0;
@@ -1701,6 +1817,7 @@ app.get('/prices', (req, res) => {
       slv: s._slv || null,
       gdx: s._gdx || null,
       priceStructure: s._priceStructure || 'neutral',
+      breakout: s._breakout || null,
       atr: s._atr || 0,
       xauSession: s._xauSession || '',
       rollingHigh: s.rollingHigh || 0,
