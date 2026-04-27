@@ -144,6 +144,11 @@ setInterval(saveRollingLevels, 300000);
 let dxyPrice = 0, dxyPrices = [], dxyPrevEma5 = null, dxyPrevEma13 = null;
 let dxyRoc3 = 0, dxyDir = 'neutral'; // 'up' = bearish gold, 'down' = bullish gold
 
+// ===== TLT STATE (Treasury bond proxy — inverse of yields, for XAU rate gate) =====
+let tltPrice = 0, tltPrices = [], tltPrevEma5 = null, tltPrevEma13 = null;
+let tltRoc3 = 0, tltDir = 'neutral'; // 'up' = yields falling = bullish gold, 'down' = yields rising = bearish gold
+const TLT_GATE_ROC = 0.030; // Hard gate: block XAU signal if TLT ROC-3 > 0.030% against signal direction
+
 // ===== MATH HELPERS =====
 function ema(prev, val, period) { return prev === null ? val : val * (2 / (period + 1)) + prev * (1 - 2 / (period + 1)); }
 function calcRSI(arr) {
@@ -438,6 +443,7 @@ function processPrice(sym, price, hi, lo) {
   s._roc3 = roc3;
   s._vwap = isXAU ? 0 : vwap;
   s._dxy = isXAU ? { price: dxyPrice, dir: dxyDir, roc3: dxyRoc3 } : null;
+  s._tlt = isXAU ? { price: tltPrice, dir: tltDir, roc3: tltRoc3 } : null;
   s._atr = atrVal;
   s._xauSession = xauSession;
 
@@ -512,6 +518,24 @@ function processPrice(sym, price, hi, lo) {
     if (!eqRocOk) {
       log(sym, 'Equity ROC gate: blocked — ROC-3 ' + roc3.toFixed(3) + '% too weak for ' + (cS >= pS ? 'CALL' : 'PUT') + ' (need >' + EQ_ROC_GATE + '%)');
       return;
+    }
+  }
+
+  // XAU TLT rate gate — interest rates must not be moving hard against signal
+  // TLT up (yields falling) = bullish gold = supports CALL | TLT down (yields rising) = bearish gold = supports PUT
+  // Only gate when TLT data is available and ROC is strong enough to matter
+  if (isXAU && tltPrice > 0 && tltPrices.length >= 4 && (cS >= minS || pS >= minS)) {
+    const sigDir = cS >= pS ? 'call' : 'put';
+    // Block CALL if yields are spiking (TLT falling hard) | Block PUT if yields are crashing (TLT rising hard)
+    const tltAgainst = (sigDir === 'call' && tltRoc3 < -TLT_GATE_ROC) || (sigDir === 'put' && tltRoc3 > TLT_GATE_ROC);
+    if (tltAgainst) {
+      // Strong gold momentum override — if gold ROC-3 > 3x threshold, rates can't keep up
+      const goldRocStrong = Math.abs(roc3) > symRocThr * 3;
+      if (!goldRocStrong) {
+        log(sym, 'TLT rate gate: blocked ' + sigDir.toUpperCase() + ' — TLT ROC-3 ' + tltRoc3.toFixed(3) + '% (yields ' + (tltRoc3 < 0 ? 'rising' : 'falling') + ', need gold ROC >' + (symRocThr * 3).toFixed(3) + '% to override)');
+        return;
+      }
+      log(sym, 'TLT rate gate: overridden by strong gold momentum — ROC-3 ' + roc3.toFixed(3) + '% > ' + (symRocThr * 3).toFixed(3) + '%');
     }
   }
 
@@ -1165,6 +1189,36 @@ async function fetchDXY() {
 }
 setInterval(fetchDXY, 15000);
 
+// Fetch TLT (20+ Year Treasury Bond ETF) every 15s — inverse proxy for interest rates
+// TLT up = yields falling = bullish gold | TLT down = yields rising = bearish gold
+async function fetchTLT() {
+  const symbols = ['TLT', 'AMEX:TLT'];
+  for (const sym of symbols) {
+    try {
+      const res = await fetch('https://finnhub.io/api/v1/quote?symbol=' + encodeURIComponent(sym) + '&token=' + API + '&_=' + Date.now());
+      const data = await res.json();
+      if (data && data.c > 0) {
+        tltPrice = data.c;
+        tltPrices.push(tltPrice);
+        if (tltPrices.length > 100) tltPrices.shift();
+        // Calculate TLT EMAs and ROC
+        tltPrevEma5 = ema(tltPrevEma5, tltPrice, 5);
+        tltPrevEma13 = ema(tltPrevEma13, tltPrice, 13);
+        if (tltPrices.length >= 4) {
+          tltRoc3 = ((tltPrices[tltPrices.length - 1] - tltPrices[tltPrices.length - 4]) / tltPrices[tltPrices.length - 4]) * 100;
+        }
+        // TLT direction: EMA5 > EMA13 = bond prices rising = yields falling = bullish gold
+        if (tltPrevEma5 !== null && tltPrevEma13 !== null) {
+          tltDir = tltPrevEma5 > tltPrevEma13 ? 'up' : tltPrevEma5 < tltPrevEma13 ? 'down' : 'neutral';
+        }
+        return;
+      }
+    } catch (e) {}
+  }
+  console.log('[' + ts() + '] TLT fetch failed - all symbols returned 0');
+}
+setInterval(fetchTLT, 15000);
+
 // Daily reset — date-based (resets as soon as ET date changes, not at a fixed minute)
 let _lastResetDate = todayDateET();
 setInterval(() => {
@@ -1292,6 +1346,7 @@ app.get('/prices', (req, res) => {
       signals: s.signals.slice(-20),
       trade: s.trade.active ? { active: true, type: s.trade.type, ep: s.trade.ep, t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl, rev: s.trade.rev } : { active: false },
       dxy: s._dxy || null,
+      tlt: s._tlt || null,
       atr: s._atr || 0,
       xauSession: s._xauSession || '',
       rollingHigh: s.rollingHigh || 0,
@@ -1315,7 +1370,7 @@ app.get('/prices', (req, res) => {
       })() : null
     };
   });
-  res.json({ vix: vixV, dxy: { price: dxyPrice, dir: dxyDir, roc3: dxyRoc3 }, wsConnected: ws && ws.readyState === 1, ts: Date.now(), symbols: data });
+  res.json({ vix: vixV, dxy: { price: dxyPrice, dir: dxyDir, roc3: dxyRoc3 }, tlt: { price: tltPrice, dir: tltDir, roc3: tltRoc3 }, wsConnected: ws && ws.readyState === 1, ts: Date.now(), symbols: data });
 });
 
 // Status endpoint
@@ -1382,4 +1437,5 @@ app.listen(PORT, () => {
   connectFinnhub();
   fetchVIX();
   fetchDXY();
+  fetchTLT();
 });
