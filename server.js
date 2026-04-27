@@ -116,6 +116,7 @@ SYMBOLS.forEach(sym => {
     macroEma: null,        // slow EMA on 5-min snapshots (period 36 = ~3 hours)
     macroPrevDir: null,    // 'bull' or 'bear' — last settled macro direction
     macroFlipTs: 0,        // when last macro flip signal fired (cooldown)
+    superFlipTs: 0,        // when last super signal fired (cooldown)
     // Trade monitor
     trade: { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 }
   };
@@ -156,6 +157,7 @@ let dxyRoc3 = 0, dxyDir = 'neutral'; // 'up' = bearish gold, 'down' = bullish go
 // ===== TLT STATE (Treasury bond proxy — inverse of yields, for XAU rate gate) =====
 let tltPrice = 0, tltPrices = [], tltPrevEma5 = null, tltPrevEma13 = null;
 let tltRoc3 = 0, tltDir = 'neutral'; // 'up' = yields falling = bullish gold, 'down' = yields rising = bearish gold
+let tltPrevDir = 'neutral', tltFlipTs = 0; // Track TLT direction flips for super signal
 const TLT_GATE_ROC = 0.030; // Hard gate: block XAU signal if TLT ROC-3 > 0.030% against signal direction
 
 // ===== MATH HELPERS =====
@@ -883,25 +885,39 @@ function processPrice(sym, price, hi, lo) {
 
   // ===== MACRO TREND FLIP DETECTOR (XAU only) =====
   // Fires when price crosses the 3-hour EMA with momentum confirmation
-  // This catches regime changes that the indicator scoring misses due to EMA lag
+  // SUPER SIGNAL: when TLT also flipped in same direction within 30 min — highest conviction
+  // TLT up = yields falling = bullish gold | TLT down = yields rising = bearish gold
   if (isXAU && s.macroEma !== null && s.macroSnaps.length >= 12 && cool && s.dailySignalCount < MAX_SIG && (now2 - s.macroFlipTs > 900000)) {
     const curDir = price > s.macroEma ? 'bull' : 'bear';
     const spread = Math.abs(price - s.macroEma);
     const spreadPct = (spread / s.macroEma) * 100;
     // Only fire when direction actually flips AND price has meaningful separation from EMA (not just touching)
     if (s.macroPrevDir !== null && curDir !== s.macroPrevDir && spreadPct > 0.03) {
+      // Check if TLT also flipped in aligned direction within last 30 min
+      // CALL: macro bull + TLT up (yields falling) | PUT: macro bear + TLT down (yields rising)
+      const tltAligned = (curDir === 'bull' && tltDir === 'up') || (curDir === 'bear' && tltDir === 'down');
+      const tltRecentFlip = tltFlipTs > 0 && (now2 - tltFlipTs < 1800000); // TLT flipped within 30 min
+      const isSuper = tltAligned && tltRecentFlip && (now2 - s.superFlipTs > 1800000); // 30-min super cooldown
+
       // MACRO FLIP CALL: was bearish, now price crossed above 3h EMA with upward ROC
       if (curDir === 'bull' && roc3 > symRocThr && rsiV > 30 && rsiV < 70) {
         s.macroFlipTs = now2;
         s.macroPrevDir = curDir;
+        if (isSuper) s.superFlipTs = now2;
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
         if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
         s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
-        const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆MFLIP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        const scoreTag = isSuper ? '⬆SUPER' : '⬆MFLIP';
+        const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: scoreTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
         s.signals.push(sig); logSignal(sym, sig);
-        log(sym, '🔀 MACRO FLIP CALL — trend turned bullish · price $' + price.toFixed(2) + ' > EMA $' + s.macroEma.toFixed(2) + ' (+' + spreadPct.toFixed(3) + '%) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
-        sendPush('🔀 ' + sym + ' MACRO FLIP CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · trend turned bullish · above 3h EMA', 'signal');
+        if (isSuper) {
+          log(sym, '🔥 SUPER CALL — macro + TLT aligned bullish · price $' + price.toFixed(2) + ' > EMA $' + s.macroEma.toFixed(2) + ' · TLT ' + tltDir + ' (yields falling) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
+          sendPush('🔥 ' + sym + ' SUPER CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · macro + yields both turned bullish gold', 'signal');
+        } else {
+          log(sym, '🔀 MACRO FLIP CALL — trend turned bullish · price $' + price.toFixed(2) + ' > EMA $' + s.macroEma.toFixed(2) + ' (+' + spreadPct.toFixed(3) + '%) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
+          sendPush('🔀 ' + sym + ' MACRO FLIP CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · trend turned bullish · above 3h EMA', 'signal');
+        }
         s.trade = { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
         return;
       }
@@ -909,14 +925,21 @@ function processPrice(sym, price, hi, lo) {
       if (curDir === 'bear' && roc3 < -symRocThr && rsiV > 30 && rsiV < 70) {
         s.macroFlipTs = now2;
         s.macroPrevDir = curDir;
+        if (isSuper) s.superFlipTs = now2;
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
         if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
         s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
-        const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇MFLIP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        const scoreTag = isSuper ? '⬇SUPER' : '⬇MFLIP';
+        const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: scoreTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
         s.signals.push(sig); logSignal(sym, sig);
-        log(sym, '🔀 MACRO FLIP PUT — trend turned bearish · price $' + price.toFixed(2) + ' < EMA $' + s.macroEma.toFixed(2) + ' (-' + spreadPct.toFixed(3) + '%) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
-        sendPush('🔀 ' + sym + ' MACRO FLIP PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · trend turned bearish · below 3h EMA', 'signal');
+        if (isSuper) {
+          log(sym, '🔥 SUPER PUT — macro + TLT aligned bearish · price $' + price.toFixed(2) + ' < EMA $' + s.macroEma.toFixed(2) + ' · TLT ' + tltDir + ' (yields rising) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
+          sendPush('🔥 ' + sym + ' SUPER PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · macro + yields both turned bearish gold', 'signal');
+        } else {
+          log(sym, '🔀 MACRO FLIP PUT — trend turned bearish · price $' + price.toFixed(2) + ' < EMA $' + s.macroEma.toFixed(2) + ' (-' + spreadPct.toFixed(3) + '%) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
+          sendPush('🔀 ' + sym + ' MACRO FLIP PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · trend turned bearish · below 3h EMA', 'signal');
+        }
         s.trade = { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
         return;
       }
@@ -1376,7 +1399,13 @@ async function fetchTLT() {
         }
         // TLT direction: EMA5 > EMA13 = bond prices rising = yields falling = bullish gold
         if (tltPrevEma5 !== null && tltPrevEma13 !== null) {
-          tltDir = tltPrevEma5 > tltPrevEma13 ? 'up' : tltPrevEma5 < tltPrevEma13 ? 'down' : 'neutral';
+          const newDir = tltPrevEma5 > tltPrevEma13 ? 'up' : tltPrevEma5 < tltPrevEma13 ? 'down' : 'neutral';
+          if (newDir !== 'neutral' && newDir !== tltPrevDir && tltPrevDir !== 'neutral') {
+            tltFlipTs = Date.now();
+            console.log('[' + ts() + '] TLT direction flipped: ' + tltPrevDir + ' → ' + newDir + ' (yields now ' + (newDir === 'up' ? 'falling' : 'rising') + ')');
+          }
+          tltPrevDir = newDir;
+          tltDir = newDir;
         }
         return;
       }
@@ -1401,7 +1430,7 @@ setInterval(() => {
       s.blowoffTs = 0; s.lossStreak = 0; s.lossStreakBoost = 0; s.lossStreakUntil = 0;
       s.sustainedDir = null; s.sustainedCount = 0; s.sustainedTs = 0;
       s.vrevSnaps = []; s.vrevLastTs = 0;
-      s.macroPrevDir = null; s.macroFlipTs = 0;
+      s.macroPrevDir = null; s.macroFlipTs = 0; s.superFlipTs = 0;
       s.lastAT = ''; s.lastNTs = 0; s.lastReversalTs = 0;
       s.dailySignalCount = 0; s.lastSignalDir = null; s.lastSignalTs = 0;
       s.nC = 0; s.nP = 0; s.nBl = 0;
@@ -1418,6 +1447,8 @@ setInterval(() => {
       s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
     });
     saveRollingLevels(); // Persist rolling ATH/ATL data across restarts
+    // Reset global flip trackers
+    tltFlipTs = 0; tltPrevDir = tltDir || 'neutral';
     // Reset WS uptime counters daily
     wsConnectedMs = 0; wsDisconnectedMs = 0; wsLastStateChange = Date.now();
     wsReconnects = 0;
