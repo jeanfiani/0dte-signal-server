@@ -33,13 +33,13 @@ app.use((req, res, next) => {
 // ===== CONFIG =====
 const API = process.env.FINNHUB_API_KEY;
 const PORT = process.env.PORT || 3000;
-const SYMBOLS = ['QQQ', 'SPY', 'XAU'];
-const RSI_CALL_LO = { QQQ: 45, SPY: 45, XAU: 40 };
-const RSI_CALL_HI = { QQQ: 65, SPY: 65, XAU: 68 }; // Gate range (rsiSweetCall) — tighter
-const RSI_PUT_LO  = { QQQ: 30, SPY: 30, XAU: 28 };
-const RSI_PUT_HI  = { QQQ: 55, SPY: 55, XAU: 58 };
-const ROC_BLOWOFF = { QQQ: 0.15, SPY: 0.15, XAU: 0.20 };
-const MAX_IND = { QQQ: 6, SPY: 6, XAU: 6 };
+const SYMBOLS = ['QQQ', 'SPY', 'XAU', 'BTC'];
+const RSI_CALL_LO = { QQQ: 45, SPY: 45, XAU: 40, BTC: 42 };
+const RSI_CALL_HI = { QQQ: 65, SPY: 65, XAU: 68, BTC: 66 }; // Gate range (rsiSweetCall) — tighter
+const RSI_PUT_LO  = { QQQ: 30, SPY: 30, XAU: 28, BTC: 30 };
+const RSI_PUT_HI  = { QQQ: 55, SPY: 55, XAU: 58, BTC: 56 };
+const ROC_BLOWOFF = { QQQ: 0.15, SPY: 0.15, XAU: 0.20, BTC: 0.25 }; // BTC more volatile
+const MAX_IND = { QQQ: 6, SPY: 6, XAU: 6, BTC: 6 };
 const COOLDOWN_MS = 180000;
 // FLIP_COOL_MS removed — was blocking legitimate reversal signals
 const MAX_SIG = 10;
@@ -48,6 +48,8 @@ const ROC_THR = 0.018;
 const EQ_ROC_GATE = 0.030; // Hard ROC gate for equities — ROC-3 must confirm direction
 const XAU_ROC_THR = 0.025; // XAU needs wider ROC threshold — higher volatility
 const XAU_MACD_MIN = 0.10; // XAU MACD values ~5x larger than QQQ/SPY (price ~$3300 vs $650)
+const BTC_ROC_THR = 0.030; // BTC needs wider ROC threshold — most volatile asset
+const BTC_MACD_MIN = 2.00; // BTC MACD values ~100x larger than QQQ/SPY (price ~$90000 vs $650)
 const XAU_MACD_LINE_MIN = 0.08; // XAU MACD line minimum strength
 
 // VAPID setup
@@ -264,10 +266,12 @@ function processPrice(sym, price, hi, lo) {
   const s = S[sym];
   const mi = MAX_IND[sym];
   const isXAU = sym === 'XAU';
+  const isBTC = sym === 'BTC';
+  const isMT5 = isXAU || isBTC; // MT5-fed instruments (24h, no VWAP, no Finnhub WS)
 
-  // XAU: set open on first price (MT5 feeds only when market is open)
+  // XAU/BTC: set open on first price (MT5 feeds only when market is open)
   // Equities: set open at 9:30 AM ET (570 min)
-  if (s.openPrice === null && (sym === 'XAU' || gET() >= 570)) {
+  if (s.openPrice === null && (isMT5 || gET() >= 570)) {
     s.openPrice = price;
     if (s.prevClose !== null) {
       const gapPct = ((price - s.prevClose) / s.prevClose) * 100;
@@ -279,7 +283,7 @@ function processPrice(sym, price, hi, lo) {
   if (price < s.sessionLow) s.sessionLow = price;
 
   // Update rolling 5-day high/low for ATH/ATL detector
-  if (isXAU && price > 0) {
+  if (isMT5 && price > 0) {
     const fiveDaysAgo = Date.now() - 5 * 24 * 60 * 60 * 1000;
     // Add current session extremes periodically (every ~60 ticks)
     if (s.prices.length % 60 === 0 && s.sessionHigh > -Infinity) {
@@ -310,7 +314,7 @@ function processPrice(sym, price, hi, lo) {
   }
 
   // === ORDER BLOCK — 1-min candle builder + OB zone detection ===
-  if (isXAU) {
+  if (isMT5) {
     if (!s.obCurCandle) {
       s.obCurCandle = { o: price, h: price, l: price, c: price, startTs: Date.now(), ticks: 1 };
     } else {
@@ -372,13 +376,13 @@ function processPrice(sym, price, hi, lo) {
   const macdL = +(s.pMF - s.pMS).toFixed(3), macdS = +(s.pMSig || 0).toFixed(3);
   const rsiV = calcRSI(s.prices);
   const roc3 = calcROC(s.prices, 3);
-  const roc6 = isXAU ? calcROC(s.prices, 6) : 0;   // medium-term momentum (XAU only)
-  const roc12 = isXAU ? calcROC(s.prices, 12) : 0;  // longer-term momentum (XAU only)
+  const roc6 = isMT5 ? calcROC(s.prices, 6) : 0;   // medium-term momentum (MT5 instruments)
+  const roc12 = isMT5 ? calcROC(s.prices, 12) : 0;  // longer-term momentum (MT5 instruments)
 
   // Track RSI at session high — used by Session High Reversal Detector
   if (price >= s.sessionHigh) s.rsiAtSessionHigh = rsiV;
   // Track RSI at rolling ATH/ATL — used by ATH/ATL Reversal Detector
-  if (isXAU) {
+  if (isMT5) {
     if (s.rollingHigh > 0 && price >= s.rollingHigh * 0.999) { s.rsiAtRollingHigh = rsiV; s.athApproachTs = Date.now(); }
     if (s.rollingLow < Infinity && s.rollingLow > 0 && price <= s.rollingLow * 1.001) { s.rsiAtRollingLow = rsiV; s.atlApproachTs = Date.now(); }
   }
@@ -386,7 +390,7 @@ function processPrice(sym, price, hi, lo) {
   const e5b = s.pE5 > s.pE13, e5bear = s.pE5 < s.pE13;
   const e13b = s.pE13 > s.pE34, e13bear = s.pE13 < s.pE34;
 
-  // XAU: use DXY inverse correlation instead of VWAP | Equities: keep VWAP
+  // XAU: use DXY inverse correlation instead of VWAP | BTC: use EMA34 as trend anchor | Equities: keep VWAP
   let abV = false, blV = false;
   let dxyBullGold = false, dxyBearGold = false;
   if (isXAU) {
@@ -403,19 +407,27 @@ function processPrice(sym, price, hi, lo) {
       else dxyBearGold = true;                 // Strong gold down = treat as DXY strong
     }
     abV = dxyBullGold; blV = dxyBearGold;
+  } else if (isBTC) {
+    // BTC: no official VWAP, use price vs EMA34 as trend anchor (above = bullish, below = bearish)
+    if (s.pE34 && s.prices.length >= 35) {
+      const ema34Pct = ((price - s.pE34) / s.pE34) * 100;
+      abV = ema34Pct > 0.05; blV = ema34Pct < -0.05;
+    }
   } else {
     const vwapPct = vwap > 0 ? ((price - vwap) / vwap) * 100 : 0;
     const vwapZone = 0.1;
     abV = vwapPct > vwapZone; blV = vwapPct < -vwapZone;
   }
 
-  // ATR for XAU — used as volatility filter (block signals when market is dead)
-  const atrVal = isXAU ? calcATR(s.highs, s.lows, s.prices, 14) : 0;
-  const atrTooLow = isXAU && s.prices.length >= 30 && atrVal < 0.50; // $0.50 ATR = dead market
+  // ATR for MT5 instruments — used as volatility filter (block signals when market is dead)
+  const atrVal = isMT5 ? calcATR(s.highs, s.lows, s.prices, 14) : 0;
+  const atrTooLow = isXAU && s.prices.length >= 30 && atrVal < 0.50; // XAU: $0.50 ATR = dead market
+  const btcAtrTooLow = isBTC && s.prices.length >= 30 && atrVal < 10; // BTC: $10 ATR = dead market
 
-  // XAU session detection
+  // Session detection
   const etMin = gET();
   const xauSession = isXAU ? (etMin >= 480 && etMin < 960 ? 'london_ny' : etMin >= 180 && etMin < 480 ? 'london' : 'asia') : '';
+  const btcSession = isBTC ? (etMin >= 570 && etMin < 960 ? 'us' : etMin >= 480 && etMin < 570 ? 'pre_us' : etMin >= 60 && etMin < 480 ? 'europe_asia' : 'overnight') : '';
   // Round-number gravity for XAU — gold stalls/reverses at $50 levels ($3300, $3350, $3400...)
   // Detect proximity to nearest $50 round number and store for signal filtering
   let roundNumDist = 99, nearestRound = 0, roundNumZone = false;
@@ -433,19 +445,24 @@ function processPrice(sym, price, hi, lo) {
   // RSI scoring: rBull/rBear for the 6-indicator SCORE (wider zone than the gate)
   // Scoring zone: QQQ/SPY 45-70, XAU 40-68 — matches bot pages exactly
   // Gate zone (rsiSweetCall/Put below): QQQ/SPY 45-65/30-55, XAU 40-68/28-58 — tighter
-  const rsiScoreHi = isXAU ? 68 : 70;
-  const rsiScoreLo = isXAU ? 40 : 45;
+  const rsiScoreHi = isXAU ? 68 : isBTC ? 66 : 70;
+  const rsiScoreLo = isXAU ? 40 : isBTC ? 42 : 45;
   const rBull = rsiV > rsiScoreLo && rsiV < rsiScoreHi;
   const rBear = rsiV < rsiScoreLo || rsiV > rsiScoreHi;
   // ATR-adaptive ROC threshold for XAU — scales with volatility
   // Base: 0.025%. High ATR (>$3) = raise to 0.035% (filter noise in volatile markets)
   // Low ATR (<$1) = lower to 0.018% (capture meaningful moves in quiet markets)
-  let symRocThr = sym === 'XAU' ? XAU_ROC_THR : ROC_THR;
+  let symRocThr = isBTC ? BTC_ROC_THR : sym === 'XAU' ? XAU_ROC_THR : ROC_THR;
   if (isXAU && atrVal > 0) {
     if (atrVal >= 3.0) symRocThr = 0.035;       // High volatility — need bigger move
     else if (atrVal >= 1.5) symRocThr = 0.025;   // Normal — keep default
     else if (atrVal >= 0.50) symRocThr = 0.018;   // Low but active — lower bar
     // Below 0.50 = ATR filter blocks signals anyway
+  }
+  if (isBTC && atrVal > 0) {
+    if (atrVal >= 100) symRocThr = 0.045;       // BTC: high vol — need bigger move
+    else if (atrVal >= 50) symRocThr = 0.030;    // Normal BTC vol
+    else if (atrVal >= 10) symRocThr = 0.020;    // Quiet BTC market
   }
   s._symRocThr = symRocThr; // Store for /prices endpoint
   const rocBull = roc3 > symRocThr, rocBear = roc3 < -symRocThr;
@@ -477,11 +494,12 @@ function processPrice(sym, price, hi, lo) {
   }
   s._roc6 = roc6;
   s._roc12 = roc12;
-  s._vwap = isXAU ? 0 : vwap;
+  s._vwap = isMT5 ? 0 : vwap;
   s._dxy = isXAU ? { price: dxyPrice, dir: dxyDir, roc3: dxyRoc3 } : null;
   s._tlt = isXAU ? { price: tltPrice, dir: tltDir, roc3: tltRoc3 } : null;
   s._slv = isXAU ? { price: slvPrice, dir: slvDir, roc3: slvRoc3 } : null;
   s._gdx = isXAU ? { price: gdxPrice, dir: gdxDir, roc3: gdxRoc3 } : null;
+  s._btcSession = btcSession;
   s._atr = atrVal;
   s._xauSession = xauSession;
 
@@ -568,20 +586,21 @@ function processPrice(sym, price, hi, lo) {
   const cool = now2 - s.lastNTs > COOLDOWN_MS;
 
   // === SIGNAL GATES ===
-  // etMin already defined above (used by xauSession)
-  // isXAU already defined above
   // XAU: full session 6PM-5PM ET (Sun-Fri) = nearly 23h, block 5PM-6PM ET (1020-1080 min)
+  // BTC: 24/7, no block window (crypto never sleeps)
   // Equities: 9:30 AM - 3:55 PM ET (570-955 min)
   if (isXAU) {
     if (etMin >= 1020 && etMin < 1080) return; // XAU closed 5-6 PM ET
+  } else if (isBTC) {
+    // BTC trades 24/7 — no session block
   } else {
     if (etMin < 570 || etMin >= 955) return;
   }
-  if (!isXAU && etMin >= 945 && (cS >= THR || pS >= THR)) return;
+  if (!isMT5 && etMin >= 945 && (cS >= THR || pS >= THR)) return;
 
-  // XAU ATR filter — block signals when market is dead (low volatility)
-  if (atrTooLow && (cS >= THR || pS >= THR)) {
-    log(sym, 'ATR filter: blocked — ATR $' + atrVal.toFixed(2) + ' < $0.50 (dead market)');
+  // ATR filter — block signals when market is dead (low volatility)
+  if ((atrTooLow || btcAtrTooLow) && (cS >= THR || pS >= THR)) {
+    log(sym, 'ATR filter: blocked — ATR $' + atrVal.toFixed(2) + ' (dead market)');
     return;
   }
 
@@ -627,7 +646,7 @@ function processPrice(sym, price, hi, lo) {
   }
 
   // Equities hard ROC gate — ROC-3 must confirm direction, kills flat-momentum noise
-  if (!isXAU && (cS >= minS || pS >= minS)) {
+  if (!isMT5 && (cS >= minS || pS >= minS)) {
     const eqRocOk = (cS >= pS && roc3 > EQ_ROC_GATE) || (pS > cS && roc3 < -EQ_ROC_GATE);
     if (!eqRocOk) {
       log(sym, 'Equity ROC gate: blocked — ROC-3 ' + roc3.toFixed(3) + '% too weak for ' + (cS >= pS ? 'CALL' : 'PUT') + ' (need >' + EQ_ROC_GATE + '%)');
@@ -717,8 +736,8 @@ function processPrice(sym, price, hi, lo) {
   // MACD line (macdL) measures actual trend strength — near-zero = no trend
   // XAU uses higher thresholds because price (~$3300) produces ~5x larger MACD values
   const macdStr = Math.abs(macdL - macdS);
-  const macdMinStr = isXAU ? XAU_MACD_MIN : 0.020;
-  const macdLineMin = isXAU ? XAU_MACD_LINE_MIN : 0.015;
+  const macdMinStr = isXAU ? XAU_MACD_MIN : isBTC ? BTC_MACD_MIN : 0.020;
+  const macdLineMin = isXAU ? XAU_MACD_LINE_MIN : isBTC ? 1.50 : 0.015;
   if (macdStr < macdMinStr && (cS >= finalMinS || pS >= finalMinS)) return;
   if (Math.abs(macdL) < macdLineMin && (cS >= finalMinS || pS >= finalMinS)) {
     log(sym, 'MACD line filter: blocked — |macdL| = ' + Math.abs(macdL).toFixed(3) + ' < ' + macdLineMin);
@@ -1542,7 +1561,7 @@ function processTicks(symbols) {
   });
 }
 setInterval(() => processTicks(['QQQ', 'SPY']), 3000);
-setInterval(() => processTicks(['XAU']), 1000);
+setInterval(() => processTicks(['XAU', 'BTC']), 1000);
 
 // Fetch VIX every 30 seconds (try multiple symbol formats)
 async function fetchVIX() {
@@ -1820,6 +1839,7 @@ app.get('/prices', (req, res) => {
       breakout: s._breakout || null,
       atr: s._atr || 0,
       xauSession: s._xauSession || '',
+      btcSession: s._btcSession || '',
       rollingHigh: s.rollingHigh || 0,
       rollingLow: s.rollingLow === Infinity ? 0 : s.rollingLow,
       roundNum: s._roundNum || null,
