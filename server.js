@@ -114,6 +114,8 @@ SYMBOLS.forEach(sym => {
     macroSnaps: [],        // [{ts, p}] — every 5 min, max 72 entries = 6 hours
     macroLastSnapTs: 0,    // when last snapshot was taken
     macroEma: null,        // slow EMA on 5-min snapshots (period 36 = ~3 hours)
+    macroPrevDir: null,    // 'bull' or 'bear' — last settled macro direction
+    macroFlipTs: 0,        // when last macro flip signal fired (cooldown)
     // Trade monitor
     trade: { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 }
   };
@@ -879,6 +881,52 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
+  // ===== MACRO TREND FLIP DETECTOR (XAU only) =====
+  // Fires when price crosses the 3-hour EMA with momentum confirmation
+  // This catches regime changes that the indicator scoring misses due to EMA lag
+  if (isXAU && s.macroEma !== null && s.macroSnaps.length >= 12 && cool && s.dailySignalCount < MAX_SIG && (now2 - s.macroFlipTs > 900000)) {
+    const curDir = price > s.macroEma ? 'bull' : 'bear';
+    const spread = Math.abs(price - s.macroEma);
+    const spreadPct = (spread / s.macroEma) * 100;
+    // Only fire when direction actually flips AND price has meaningful separation from EMA (not just touching)
+    if (s.macroPrevDir !== null && curDir !== s.macroPrevDir && spreadPct > 0.03) {
+      // MACRO FLIP CALL: was bearish, now price crossed above 3h EMA with upward ROC
+      if (curDir === 'bull' && roc3 > symRocThr && rsiV > 30 && rsiV < 70) {
+        s.macroFlipTs = now2;
+        s.macroPrevDir = curDir;
+        s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
+        if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
+        s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
+        s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+        const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆MFLIP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        s.signals.push(sig); logSignal(sym, sig);
+        log(sym, '🔀 MACRO FLIP CALL — trend turned bullish · price $' + price.toFixed(2) + ' > EMA $' + s.macroEma.toFixed(2) + ' (+' + spreadPct.toFixed(3) + '%) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
+        sendPush('🔀 ' + sym + ' MACRO FLIP CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · trend turned bullish · above 3h EMA', 'signal');
+        s.trade = { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        return;
+      }
+      // MACRO FLIP PUT: was bullish, now price crossed below 3h EMA with downward ROC
+      if (curDir === 'bear' && roc3 < -symRocThr && rsiV > 30 && rsiV < 70) {
+        s.macroFlipTs = now2;
+        s.macroPrevDir = curDir;
+        s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
+        if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
+        s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
+        s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+        const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇MFLIP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        s.signals.push(sig); logSignal(sym, sig);
+        log(sym, '🔀 MACRO FLIP PUT — trend turned bearish · price $' + price.toFixed(2) + ' < EMA $' + s.macroEma.toFixed(2) + ' (-' + spreadPct.toFixed(3) + '%) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
+        sendPush('🔀 ' + sym + ' MACRO FLIP PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · trend turned bearish · below 3h EMA', 'signal');
+        s.trade = { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        return;
+      }
+    }
+    // Update prevDir even when no signal fires — track the current state
+    if (s.macroPrevDir === null || (spreadPct > 0.05 && curDir !== s.macroPrevDir)) {
+      s.macroPrevDir = curDir;
+    }
+  }
+
   // ===== ATH/ATL REVERSAL DETECTOR (XAU only) =====
   // Gold tends to reverse hard at multi-day highs/lows — institutional profit-taking, algo levels
   // Fires high-confidence reversal signals when price touches 5-day extreme then pulls back
@@ -1353,6 +1401,7 @@ setInterval(() => {
       s.blowoffTs = 0; s.lossStreak = 0; s.lossStreakBoost = 0; s.lossStreakUntil = 0;
       s.sustainedDir = null; s.sustainedCount = 0; s.sustainedTs = 0;
       s.vrevSnaps = []; s.vrevLastTs = 0;
+      s.macroPrevDir = null; s.macroFlipTs = 0;
       s.lastAT = ''; s.lastNTs = 0; s.lastReversalTs = 0;
       s.dailySignalCount = 0; s.lastSignalDir = null; s.lastSignalTs = 0;
       s.nC = 0; s.nP = 0; s.nBl = 0;
