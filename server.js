@@ -160,6 +160,14 @@ let tltRoc3 = 0, tltDir = 'neutral'; // 'up' = yields falling = bullish gold, 'd
 let tltPrevDir = 'neutral', tltFlipTs = 0; // Track TLT direction flips for super signal
 const TLT_GATE_ROC = 0.030; // Hard gate: block XAU signal if TLT ROC-3 > 0.030% against signal direction
 
+// ===== SLV STATE (Silver ETF — cross-metal confirmation for XAU) =====
+let slvPrice = 0, slvPrices = [], slvPrevEma5 = null, slvPrevEma13 = null;
+let slvRoc3 = 0, slvDir = 'neutral'; // 'up' = silver rising = confirms gold bull, 'down' = silver falling = confirms gold bear
+
+// ===== GDX STATE (Gold Miners ETF — miners lead gold moves) =====
+let gdxPrice = 0, gdxPrices = [], gdxPrevEma5 = null, gdxPrevEma13 = null;
+let gdxRoc3 = 0, gdxDir = 'neutral'; // 'up' = miners rising = bullish gold, 'down' = miners falling = bearish gold
+
 // ===== MATH HELPERS =====
 function ema(prev, val, period) { return prev === null ? val : val * (2 / (period + 1)) + prev * (1 - 2 / (period + 1)); }
 function calcRSI(arr) {
@@ -357,6 +365,8 @@ function processPrice(sym, price, hi, lo) {
   const macdL = +(s.pMF - s.pMS).toFixed(3), macdS = +(s.pMSig || 0).toFixed(3);
   const rsiV = calcRSI(s.prices);
   const roc3 = calcROC(s.prices, 3);
+  const roc6 = isXAU ? calcROC(s.prices, 6) : 0;   // medium-term momentum (XAU only)
+  const roc12 = isXAU ? calcROC(s.prices, 12) : 0;  // longer-term momentum (XAU only)
 
   // Track RSI at session high — used by Session High Reversal Detector
   if (price >= s.sessionHigh) s.rsiAtSessionHigh = rsiV;
@@ -452,14 +462,94 @@ function processPrice(sym, price, hi, lo) {
   s._macdL = macdL;
   s._macdS = macdS;
   s._roc3 = roc3;
+  s._roc6 = roc6;
+  s._roc12 = roc12;
   s._vwap = isXAU ? 0 : vwap;
   s._dxy = isXAU ? { price: dxyPrice, dir: dxyDir, roc3: dxyRoc3 } : null;
   s._tlt = isXAU ? { price: tltPrice, dir: tltDir, roc3: tltRoc3 } : null;
+  s._slv = isXAU ? { price: slvPrice, dir: slvDir, roc3: slvRoc3 } : null;
+  s._gdx = isXAU ? { price: gdxPrice, dir: gdxDir, roc3: gdxRoc3 } : null;
   s._atr = atrVal;
   s._xauSession = xauSession;
 
+  // ===== PRICE STRUCTURE DETECTOR (XAU only) =====
+  // Build 3-minute bars from vrevSnaps, detect higher-highs/higher-lows or lower-highs/lower-lows
+  if (isXAU && s.vrevSnaps.length >= 30) {
+    const now1 = Date.now();
+    const recentSnaps = s.vrevSnaps.filter(sn => sn.ts > now1 - 900000); // last 15 min
+    if (recentSnaps.length >= 20) {
+      // Build 3-minute bars
+      const barLen = 180000; // 3 min
+      const barStart = recentSnaps[0].ts;
+      const bars = [];
+      let bIdx = 0;
+      while (true) {
+        const bS = barStart + bIdx * barLen;
+        const bE = bS + barLen;
+        if (bS > now1) break;
+        const barSnaps = recentSnaps.filter(sn => sn.ts >= bS && sn.ts < bE);
+        if (barSnaps.length >= 2) {
+          bars.push({ h: Math.max(...barSnaps.map(sn => sn.p)), l: Math.min(...barSnaps.map(sn => sn.p)) });
+        }
+        bIdx++;
+        if (bIdx > 10) break; // max 10 bars (~30 min)
+      }
+      if (bars.length >= 3) {
+        // Check last 3-5 bars for structure
+        const lb = bars.slice(-Math.min(bars.length, 5));
+        let hh = 0, lh = 0, hl = 0, ll = 0;
+        for (let i = 1; i < lb.length; i++) {
+          if (lb[i].h > lb[i - 1].h) hh++; else if (lb[i].h < lb[i - 1].h) lh++;
+          if (lb[i].l > lb[i - 1].l) hl++; else if (lb[i].l < lb[i - 1].l) ll++;
+        }
+        const pairs = lb.length - 1;
+        // Bullish structure: majority of bars making HH + HL
+        if (hh >= pairs * 0.6 && hl >= pairs * 0.6) s._priceStructure = 'bull';
+        // Bearish structure: majority of bars making LH + LL
+        else if (lh >= pairs * 0.6 && ll >= pairs * 0.6) s._priceStructure = 'bear';
+        else s._priceStructure = 'neutral';
+      } else { s._priceStructure = 'neutral'; }
+    } else { s._priceStructure = 'neutral'; }
+  } else if (isXAU) { s._priceStructure = 'neutral'; }
+
   // Check exit for active trades
   checkExit(sym, price);
+
+  // ===== CONVICTION SCORE CALCULATOR (XAU only) =====
+  // Returns { score: 0-7, label: 'HIGH'|'MOD'|'LOW', factors: [...] } for a given direction
+  function convictionFor(dir) {
+    if (!isXAU) return { score: 0, label: '', factors: [] };
+    const isCall = dir === 'call';
+    const factors = [];
+    let sc = 0;
+    // 1. DXY aligned (down = gold bull, up = gold bear)
+    if ((isCall && dxyDir === 'down') || (!isCall && dxyDir === 'up')) { sc++; factors.push('DXY'); }
+    // 2. TLT aligned (up = gold bull, down = gold bear)
+    if ((isCall && tltDir === 'up') || (!isCall && tltDir === 'down')) { sc++; factors.push('TLT'); }
+    // 3. Macro trend aligned
+    const macroDir = s.macroEma ? (price > s.macroEma ? 'bull' : 'bear') : null;
+    if ((isCall && macroDir === 'bull') || (!isCall && macroDir === 'bear')) { sc++; factors.push('MACRO'); }
+    // 4. Silver aligned
+    if (slvPrice > 0 && ((isCall && slvDir === 'up') || (!isCall && slvDir === 'down'))) { sc++; factors.push('SLV'); }
+    // 5. Gold Miners aligned
+    if (gdxPrice > 0 && ((isCall && gdxDir === 'up') || (!isCall && gdxDir === 'down'))) { sc++; factors.push('GDX'); }
+    // 6. Multi-TF ROC aligned (all 3 pointing same way)
+    const rocAllCall = roc3 > 0 && roc6 > 0 && roc12 > 0;
+    const rocAllPut = roc3 < 0 && roc6 < 0 && roc12 < 0;
+    if ((isCall && rocAllCall) || (!isCall && rocAllPut)) { sc++; factors.push('ROC×3'); }
+    // 7. Price structure aligned
+    if ((isCall && s._priceStructure === 'bull') || (!isCall && s._priceStructure === 'bear')) { sc++; factors.push('STRUCT'); }
+
+    const label = sc >= 5 ? 'HIGH' : sc >= 3 ? 'MOD' : 'LOW';
+    return { score: sc, label, factors };
+  }
+  // Enriches a signal object with conviction data (XAU only, no-op for QQQ/SPY)
+  function enrichSig(sig) {
+    if (!isXAU) return sig;
+    const conv = convictionFor(sig.type);
+    sig.conv = conv;
+    return sig;
+  }
 
   const now2 = Date.now();
   const cool = now2 - s.lastNTs > COOLDOWN_MS;
@@ -821,7 +911,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇HI', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        s.signals.push(sig);
+        enrichSig(sig); s.signals.push(sig);
         logSignal(sym, sig);
         log(sym, '🔻 SESSION HIGH REVERSAL PUT — $' + distFromHigh.toFixed(2) + ' off high $' + s.sessionHigh.toFixed(2) + ' RSI@high:' + s.rsiAtSessionHigh.toFixed(1) + ' RSInow:' + rsiV.toFixed(1) + ' [#' + s.dailySignalCount + ']');
         sendPush('🔻 ' + sym + ' HIGH REVERSAL PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromHigh.toFixed(2) + ' off high · RSI@high:' + s.rsiAtSessionHigh.toFixed(1), 'signal');
@@ -859,7 +949,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆VREV', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        s.signals.push(sig); logSignal(sym, sig);
+        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
         log(sym, '🔄 V-REVERSAL CALL — dropped $' + (lbHigh - lbLow).toFixed(2) + ' to $' + lbLow.toFixed(2) + ', bounced $' + (price - lbLow).toFixed(2) + ' · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
         sendPush('🔄 ' + sym + ' V-REVERSAL CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · bounced $' + (price - lbLow).toFixed(2) + ' off $' + lbLow.toFixed(2) + ' low', 'signal');
         s.trade = { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
@@ -874,7 +964,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇VREV', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        s.signals.push(sig); logSignal(sym, sig);
+        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
         log(sym, '🔄 V-REVERSAL PUT — rallied $' + (lbHigh - lbLow).toFixed(2) + ' to $' + lbHigh.toFixed(2) + ', dropped $' + (lbHigh - price).toFixed(2) + ' · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
         sendPush('🔄 ' + sym + ' V-REVERSAL PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · dropped $' + (lbHigh - price).toFixed(2) + ' off $' + lbHigh.toFixed(2) + ' high', 'signal');
         s.trade = { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
@@ -910,7 +1000,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const scoreTag = isSuper ? '⬆SUPER' : '⬆MFLIP';
         const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: scoreTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        s.signals.push(sig); logSignal(sym, sig);
+        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
         if (isSuper) {
           log(sym, '🔥 SUPER CALL — macro + TLT aligned bullish · price $' + price.toFixed(2) + ' > EMA $' + s.macroEma.toFixed(2) + ' · TLT ' + tltDir + ' (yields falling) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
           sendPush('🔥 ' + sym + ' SUPER CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · macro + yields both turned bullish gold', 'signal');
@@ -932,7 +1022,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const scoreTag = isSuper ? '⬇SUPER' : '⬇MFLIP';
         const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: scoreTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        s.signals.push(sig); logSignal(sym, sig);
+        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
         if (isSuper) {
           log(sym, '🔥 SUPER PUT — macro + TLT aligned bearish · price $' + price.toFixed(2) + ' < EMA $' + s.macroEma.toFixed(2) + ' · TLT ' + tltDir + ' (yields rising) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
           sendPush('🔥 ' + sym + ' SUPER PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · macro + yields both turned bearish gold', 'signal');
@@ -967,7 +1057,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇ATH', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        s.signals.push(sig); logSignal(sym, sig);
+        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
         log(sym, '🔻 ATH REVERSAL PUT — $' + distFromATH.toFixed(2) + ' off 5-day high $' + s.rollingHigh.toFixed(2) + ' RSI@ATH:' + s.rsiAtRollingHigh.toFixed(1) + ' [#' + s.dailySignalCount + ']');
         sendPush('🔻 ' + sym + ' ATH REVERSAL PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromATH.toFixed(2) + ' off ATH $' + s.rollingHigh.toFixed(2), 'signal');
         s.trade = { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
@@ -983,7 +1073,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆ATL', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        s.signals.push(sig); logSignal(sym, sig);
+        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
         log(sym, '🚀 ATL REVERSAL CALL — $' + distFromATL.toFixed(2) + ' off 5-day low $' + s.rollingLow.toFixed(2) + ' RSI@ATL:' + s.rsiAtRollingLow.toFixed(1) + ' [#' + s.dailySignalCount + ']');
         sendPush('🚀 ' + sym + ' ATL REVERSAL CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromATL.toFixed(2) + ' off ATL $' + s.rollingLow.toFixed(2), 'signal');
         s.trade = { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
@@ -1014,7 +1104,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆REC', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        s.signals.push(sig); logSignal(sym, sig);
+        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
         log(sym, '🔄 SHAKEOUT RECOVERY CALL — price $' + price.toFixed(2) + ' recovered past entry $' + s.shakeoutEp.toFixed(2) + ' after SL @ $' + s.shakeoutPrice.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('🔄 ' + sym + ' RECOVERY CALL #' + s.dailySignalCount, '$' + sig.price + ' · Recovered from SL @ $' + s.shakeoutPrice.toFixed(2), 'signal');
         s.trade = { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
@@ -1027,7 +1117,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇REC', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        s.signals.push(sig); logSignal(sym, sig);
+        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
         log(sym, '🔄 SHAKEOUT RECOVERY PUT — price $' + price.toFixed(2) + ' recovered past entry $' + s.shakeoutEp.toFixed(2) + ' after SL @ $' + s.shakeoutPrice.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('🔄 ' + sym + ' RECOVERY PUT #' + s.dailySignalCount, '$' + sig.price + ' · Recovered from SL @ $' + s.shakeoutPrice.toFixed(2), 'signal');
         s.trade = { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
@@ -1045,10 +1135,11 @@ function processPrice(sym, price, hi, lo) {
     s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
     s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
     const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: cS + '/' + mi, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-    s.signals.push(sig);
+    enrichSig(sig); s.signals.push(sig);
     logSignal(sym, sig);
-    log(sym, '🚀 CALL ' + sig.score + ' RSI:' + sig.rsi + ' $' + sig.price + ' [#' + s.dailySignalCount + ']');
-    sendPush('🚀 ' + sym + ' CALL ' + sig.score + ' #' + s.dailySignalCount, '$' + sig.price + ' · RSI:' + sig.rsi + ' · ROC:' + sig.roc, 'signal');
+    const convLbl = sig.conv ? ' [' + sig.conv.label + ' ' + sig.conv.score + '/7]' : '';
+    log(sym, '🚀 CALL ' + sig.score + ' RSI:' + sig.rsi + ' $' + sig.price + convLbl + ' [#' + s.dailySignalCount + ']');
+    sendPush('🚀 ' + sym + ' CALL ' + sig.score + ' #' + s.dailySignalCount, '$' + sig.price + ' · RSI:' + sig.rsi + ' · ROC:' + sig.roc + (sig.conv ? ' · ' + sig.conv.label + ' ' + sig.conv.score + '/7' : ''), 'signal');
     // Activate trade monitor for this signal
     s.trade = { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
     // Cross-asset
@@ -1059,10 +1150,11 @@ function processPrice(sym, price, hi, lo) {
     s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
     s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
     const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: pS + '/' + mi, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-    s.signals.push(sig);
+    enrichSig(sig); s.signals.push(sig);
     logSignal(sym, sig);
-    log(sym, '📉 PUT ' + sig.score + ' RSI:' + sig.rsi + ' $' + sig.price + ' [#' + s.dailySignalCount + ']');
-    sendPush('📉 ' + sym + ' PUT ' + sig.score + ' #' + s.dailySignalCount, '$' + sig.price + ' · RSI:' + sig.rsi + ' · ROC:' + sig.roc, 'signal');
+    const convLbl2 = sig.conv ? ' [' + sig.conv.label + ' ' + sig.conv.score + '/7]' : '';
+    log(sym, '📉 PUT ' + sig.score + ' RSI:' + sig.rsi + ' $' + sig.price + convLbl2 + ' [#' + s.dailySignalCount + ']');
+    sendPush('📉 ' + sym + ' PUT ' + sig.score + ' #' + s.dailySignalCount, '$' + sig.price + ' · RSI:' + sig.rsi + ' · ROC:' + sig.roc + (sig.conv ? ' · ' + sig.conv.label + ' ' + sig.conv.score + '/7' : ''), 'signal');
     // Activate trade monitor for this signal
     s.trade = { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
     SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'put'; S[other].crossAssetTs = now2; } });
@@ -1415,6 +1507,61 @@ async function fetchTLT() {
 }
 setInterval(fetchTLT, 15000);
 
+// Fetch SLV (Silver ETF) every 15s — cross-metal confirmation for gold
+// Silver and gold are highly correlated; divergence = weaker signal, alignment = stronger
+async function fetchSLV() {
+  const symbols = ['SLV', 'AMEX:SLV'];
+  for (const sym of symbols) {
+    try {
+      const res = await fetch('https://finnhub.io/api/v1/quote?symbol=' + encodeURIComponent(sym) + '&token=' + API + '&_=' + Date.now());
+      const data = await res.json();
+      if (data && data.c > 0) {
+        slvPrice = data.c;
+        slvPrices.push(slvPrice);
+        if (slvPrices.length > 100) slvPrices.shift();
+        slvPrevEma5 = ema(slvPrevEma5, slvPrice, 5);
+        slvPrevEma13 = ema(slvPrevEma13, slvPrice, 13);
+        if (slvPrices.length >= 4) {
+          slvRoc3 = ((slvPrices[slvPrices.length - 1] - slvPrices[slvPrices.length - 4]) / slvPrices[slvPrices.length - 4]) * 100;
+        }
+        if (slvPrevEma5 !== null && slvPrevEma13 !== null) {
+          slvDir = slvPrevEma5 > slvPrevEma13 ? 'up' : slvPrevEma5 < slvPrevEma13 ? 'down' : 'neutral';
+        }
+        return;
+      }
+    } catch (e) {}
+  }
+}
+setInterval(fetchSLV, 15000);
+
+// Fetch GDX (Gold Miners ETF) every 15s — miners often lead gold moves
+// GDX breaking down before gold = institutional selling, high-conviction PUT
+// GDX rallying before gold = institutional accumulation, high-conviction CALL
+async function fetchGDX() {
+  const symbols = ['GDX', 'AMEX:GDX'];
+  for (const sym of symbols) {
+    try {
+      const res = await fetch('https://finnhub.io/api/v1/quote?symbol=' + encodeURIComponent(sym) + '&token=' + API + '&_=' + Date.now());
+      const data = await res.json();
+      if (data && data.c > 0) {
+        gdxPrice = data.c;
+        gdxPrices.push(gdxPrice);
+        if (gdxPrices.length > 100) gdxPrices.shift();
+        gdxPrevEma5 = ema(gdxPrevEma5, gdxPrice, 5);
+        gdxPrevEma13 = ema(gdxPrevEma13, gdxPrice, 13);
+        if (gdxPrices.length >= 4) {
+          gdxRoc3 = ((gdxPrices[gdxPrices.length - 1] - gdxPrices[gdxPrices.length - 4]) / gdxPrices[gdxPrices.length - 4]) * 100;
+        }
+        if (gdxPrevEma5 !== null && gdxPrevEma13 !== null) {
+          gdxDir = gdxPrevEma5 > gdxPrevEma13 ? 'up' : gdxPrevEma5 < gdxPrevEma13 ? 'down' : 'neutral';
+        }
+        return;
+      }
+    } catch (e) {}
+  }
+}
+setInterval(fetchGDX, 15000);
+
 // Daily reset — date-based (resets as soon as ET date changes, not at a fixed minute)
 let _lastResetDate = todayDateET();
 setInterval(() => {
@@ -1542,6 +1689,8 @@ app.get('/prices', (req, res) => {
       macdL: s._macdL || 0,
       macdS: s._macdS || 0,
       roc3: s._roc3 || 0,
+      roc6: s._roc6 || 0,
+      roc12: s._roc12 || 0,
       vwap: s._vwap || 0,
       chopActive: s.chopActive,
       dailySignalCount: s.dailySignalCount,
@@ -1549,6 +1698,9 @@ app.get('/prices', (req, res) => {
       trade: s.trade.active ? { active: true, type: s.trade.type, ep: s.trade.ep, t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl, rev: s.trade.rev } : { active: false },
       dxy: s._dxy || null,
       tlt: s._tlt || null,
+      slv: s._slv || null,
+      gdx: s._gdx || null,
+      priceStructure: s._priceStructure || 'neutral',
       atr: s._atr || 0,
       xauSession: s._xauSession || '',
       rollingHigh: s.rollingHigh || 0,
@@ -1572,7 +1724,7 @@ app.get('/prices', (req, res) => {
       })() : null
     };
   });
-  res.json({ vix: vixV, dxy: { price: dxyPrice, dir: dxyDir, roc3: dxyRoc3 }, tlt: { price: tltPrice, dir: tltDir, roc3: tltRoc3 }, wsConnected: ws && ws.readyState === 1, ts: Date.now(), symbols: data });
+  res.json({ vix: vixV, dxy: { price: dxyPrice, dir: dxyDir, roc3: dxyRoc3 }, tlt: { price: tltPrice, dir: tltDir, roc3: tltRoc3 }, slv: { price: slvPrice, dir: slvDir, roc3: slvRoc3 }, gdx: { price: gdxPrice, dir: gdxDir, roc3: gdxRoc3 }, wsConnected: ws && ws.readyState === 1, ts: Date.now(), symbols: data });
 });
 
 // Status endpoint
@@ -1640,4 +1792,6 @@ app.listen(PORT, () => {
   fetchVIX();
   fetchDXY();
   fetchTLT();
+  fetchSLV();
+  fetchGDX();
 });
