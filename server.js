@@ -104,6 +104,10 @@ SYMBOLS.forEach(sym => {
     obCurCandle: null,   // current building candle {o, h, l, c, startTs, ticks}
     orderBlocks: [],     // [{type:'bull'|'bear', hi, lo, ts, mitigated:false}] — active OB zones
     // Macro trend — 5-min snapshots for 6-hour rolling window (XAU only)
+    // Sustained momentum tracking — overrides blowoff lock when trend is real
+    sustainedDir: null,    // 'call' or 'put' — current sustained direction
+    sustainedCount: 0,     // consecutive ticks with ROC above threshold in same direction
+    sustainedTs: 0,        // when sustained streak started
     macroSnaps: [],        // [{ts, p}] — every 5 min, max 72 entries = 6 hours
     macroLastSnapTs: 0,    // when last snapshot was taken
     macroEma: null,        // slow EMA on 5-min snapshots (period 36 = ~3 hours)
@@ -539,10 +543,32 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // Blowoff
+  // Sustained momentum tracking — count consecutive ticks with ROC above threshold in same direction
+  // A real trend keeps ROC elevated; a blowoff spikes once then ROC drops
+  const curRocDir = roc3 > symRocThr ? 'call' : roc3 < -symRocThr ? 'put' : null;
+  if (curRocDir && curRocDir === s.sustainedDir) {
+    s.sustainedCount++;
+  } else {
+    s.sustainedDir = curRocDir;
+    s.sustainedCount = curRocDir ? 1 : 0;
+    s.sustainedTs = now2;
+  }
+
+  // Blowoff — with sustained momentum override
   const blowoffLock = now2 - s.blowoffTs < 300000;
   if (Math.abs(roc3) > ROC_BLOWOFF[sym] && !blowoffLock) { s.blowoffTs = now2; }
-  if (blowoffLock && (cS >= minS || pS >= minS)) return;
+  if (blowoffLock && (cS >= minS || pS >= minS)) {
+    // Sustained momentum override: if ROC has been directional for 15+ consecutive ticks
+    // AND score meets threshold AND signal matches the sustained direction, let it through
+    const sustainedOk = s.sustainedCount >= 15 && s.sustainedDir === (cS >= pS ? 'call' : 'put');
+    if (sustainedOk) {
+      log(sym, 'Blowoff override: sustained momentum — ' + s.sustainedCount + ' consecutive ' + s.sustainedDir.toUpperCase() + ' ticks, ROC ' + roc3.toFixed(3) + '%');
+      // Reset blowoff to prevent rapid re-fire
+      s.blowoffTs = now2;
+    } else {
+      return;
+    }
+  }
 
   // Flip lock
   if (now2 - s.lastReversalTs < 180000 && (cS >= minS || pS >= minS)) return;
@@ -1232,6 +1258,7 @@ setInterval(() => {
       s.pE5 = null; s.pE13 = null; s.pE34 = null; s.pMF = null; s.pMS = null; s.pMSig = null;
       s.vwapSum = 0; s.vwapCount = 0; s.prevMacdHist = null; s.openPrice = null;
       s.blowoffTs = 0; s.lossStreak = 0; s.lossStreakBoost = 0; s.lossStreakUntil = 0;
+      s.sustainedDir = null; s.sustainedCount = 0; s.sustainedTs = 0;
       s.lastAT = ''; s.lastNTs = 0; s.lastReversalTs = 0;
       s.dailySignalCount = 0; s.lastSignalDir = null; s.lastSignalTs = 0;
       s.nC = 0; s.nP = 0; s.nBl = 0;
