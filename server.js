@@ -487,7 +487,7 @@ function processPrice(sym, price, hi, lo) {
   s._macdS = macdS;
   s._roc3 = roc3;
   // Breakout state for /prices exposure
-  if (isXAU) {
+  if (isMT5) {
     const bRange = s.breakHi > 0 && s.breakLo < Infinity ? +(s.breakHi - s.breakLo).toFixed(2) : 0;
     const bCoilSec = s.breakCoilActive ? Math.round((Date.now() - s.breakCoilStart) / 1000) : 0;
     s._breakout = { range: bRange, hi: s.breakHi > 0 ? +s.breakHi.toFixed(2) : 0, lo: s.breakLo < Infinity ? +s.breakLo.toFixed(2) : 0, coiling: s.breakCoilActive, coilSec: bCoilSec };
@@ -954,12 +954,12 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // ===== CONSOLIDATION BREAKOUT DETECTOR (XAU only) =====
+  // ===== CONSOLIDATION BREAKOUT DETECTOR (MT5 instruments: XAU + BTC) =====
   // Fires INSTANTLY when price escapes a tight range — no lagging indicator delay.
   // This is the fastest signal: catches moves 2-3 min before EMAs/RSI/MACD confirm.
   // The coil detection + breakout pending flag is set in processTicks (runs every 1s).
   // Here we just fire the signal if a valid breakout was detected this tick.
-  if (isXAU && s._pendingBreakout && s.dailySignalCount < MAX_SIG) {
+  if (isMT5 && s._pendingBreakout && s.dailySignalCount < MAX_SIG) {
     const bo = s._pendingBreakout;
     s._pendingBreakout = null; // consume it
     const cool2 = now2 - s.lastNTs > COOLDOWN_MS;
@@ -1488,10 +1488,17 @@ function processTicks(symbols) {
       while (s.vrevSnaps.length > 0 && s.vrevSnaps[0].ts < cutoff) s.vrevSnaps.shift();
     }
 
-    // Consolidation Breakout tracker — XAU only, every tick
-    // Tracks rolling 5-min high/low range. When range stays < $4 for 3+ min, marks "coiling".
+    // Consolidation Breakout tracker — MT5 instruments (XAU + BTC), every tick
+    // Tracks rolling 5-min high/low range. When range stays tight for 3+ min, marks "coiling".
     // Breakout fires the instant price escapes the range — no lagging indicator delay.
-    if (sym === 'XAU') {
+    // Thresholds scale per instrument:
+    //   XAU (~$3300): coil < $4, escape $1
+    //   BTC (~$90K):  coil < $120, escape $30
+    const isBTCt = sym === 'BTC';
+    const isXAUt = sym === 'XAU';
+    if (isXAUt || isBTCt) {
+      const coilMaxRange = isBTCt ? 120.0 : 4.0;   // max range to count as consolidation
+      const escapeMin    = isBTCt ? 30.0  : 1.0;    // min distance beyond coil edge = confirmed breakout
       const bNow = Date.now();
       s.breakRange.push({ ts: bNow, p: price });
       // Trim to 5-min window
@@ -1505,8 +1512,8 @@ function processTicks(symbols) {
         s.breakHi = bHi;
         s.breakLo = bLo;
 
-        // Coil detection: range < $4 = gold is consolidating
-        if (bRange < 4.0) {
+        // Coil detection: range < threshold = instrument is consolidating
+        if (bRange < coilMaxRange) {
           if (!s.breakCoilActive) {
             s.breakCoilStart = bNow;
             s.breakCoilActive = true;
@@ -1525,8 +1532,8 @@ function processTicks(symbols) {
               const coilLo = Math.min(...coilSnaps.map(b => b.p));
 
               // Breakout direction: which side of the coil did price escape?
-              const brokeUp = price > coilHi + 1.0;  // $1 above coil top = confirmed breakout
-              const brokeDown = price < coilLo - 1.0; // $1 below coil bottom = confirmed breakout
+              const brokeUp = price > coilHi + escapeMin;
+              const brokeDown = price < coilLo - escapeMin;
 
               if (brokeUp || brokeDown) {
                 // Calculate velocity — how fast did price move in last 10 seconds vs average
