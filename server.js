@@ -684,8 +684,8 @@ function processPrice(sym, price, hi, lo) {
   }
 
   // Sustained momentum override flag — used by blowoff, RSI, and MACD exhaustion gates
-  // If ROC has been directional for 15+ consecutive ticks, the move is real regardless of "exhaustion"
-  const sustainedOverride = s.sustainedCount >= 15 && s.sustainedDir !== null;
+  // If ROC has been directional for 10+ consecutive ticks, the move is real regardless of "exhaustion"
+  const sustainedOverride = s.sustainedCount >= 10 && s.sustainedDir !== null;
 
   // Blowoff — with sustained momentum override
   const blowoffLock = now2 - s.blowoffTs < 300000;
@@ -890,8 +890,21 @@ function processPrice(sym, price, hi, lo) {
   }
 
   // RSI exhaustion check — don't short at oversold, don't buy at overbought
-  if (cS >= finalMinS && cS >= pS && rsiV > 65) { log(sym, 'RSI exhaustion: CALL blocked — RSI ' + rsiV.toFixed(1) + ' (overbought)'); return; }
-  if (pS >= finalMinS && pS > cS && rsiV < 35) { log(sym, 'RSI exhaustion: PUT blocked — RSI ' + rsiV.toFixed(1) + ' (oversold)'); return; }
+  // Sustained momentum override: if move has been directional for 10+ ticks, RSI exhaustion is bypassed
+  if (cS >= finalMinS && cS >= pS && rsiV > 65) {
+    if (sustainedOverride && s.sustainedDir === 'call') {
+      log(sym, 'RSI exhaustion override: sustained CALL (' + s.sustainedCount + ' ticks) — RSI ' + rsiV.toFixed(1) + ' overbought but move is real');
+    } else {
+      log(sym, 'RSI exhaustion: CALL blocked — RSI ' + rsiV.toFixed(1) + ' (overbought)'); return;
+    }
+  }
+  if (pS >= finalMinS && pS > cS && rsiV < 35) {
+    if (sustainedOverride && s.sustainedDir === 'put') {
+      log(sym, 'RSI exhaustion override: sustained PUT (' + s.sustainedCount + ' ticks) — RSI ' + rsiV.toFixed(1) + ' oversold but move is real');
+    } else {
+      log(sym, 'RSI exhaustion: PUT blocked — RSI ' + rsiV.toFixed(1) + ' (oversold)'); return;
+    }
+  }
 
   // Price-distance deduplication — suppress same-direction signal if price hasn't moved enough since last signal
   // Prevents clustered signals at similar prices while allowing signals after real moves
