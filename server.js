@@ -127,6 +127,7 @@ SYMBOLS.forEach(sym => {
     breakCoilActive: false,  // true when range < threshold for >= 3 min
     breakLastTs: 0,          // when last breakout signal fired (cooldown)
     breakLastDir: null,      // direction of last breakout signal ('call'/'put')
+    breakLastPrice: 0,       // entry price of last breakout signal
     // Trade monitor
     trade: { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 }
   };
@@ -491,7 +492,7 @@ function processPrice(sym, price, hi, lo) {
   if (isMT5) {
     const bRange = s.breakHi > 0 && s.breakLo < Infinity ? +(s.breakHi - s.breakLo).toFixed(2) : 0;
     const bCoilSec = s.breakCoilActive ? Math.round((Date.now() - s.breakCoilStart) / 1000) : 0;
-    s._breakout = { range: bRange, hi: s.breakHi > 0 ? +s.breakHi.toFixed(2) : 0, lo: s.breakLo < Infinity ? +s.breakLo.toFixed(2) : 0, coiling: s.breakCoilActive, coilSec: bCoilSec, firedTs: s.breakLastTs || 0, firedDir: s.breakLastDir || null };
+    s._breakout = { range: bRange, hi: s.breakHi > 0 ? +s.breakHi.toFixed(2) : 0, lo: s.breakLo < Infinity ? +s.breakLo.toFixed(2) : 0, coiling: s.breakCoilActive, coilSec: bCoilSec, firedTs: s.breakLastTs || 0, firedDir: s.breakLastDir || null, firedPrice: s.breakLastPrice || 0 };
   }
   s._roc6 = roc6;
   s._roc12 = roc12;
@@ -991,8 +992,37 @@ function processPrice(sym, price, hi, lo) {
     const breakCool = now2 - s.breakLastTs > 300000; // 5-min cooldown
 
     if (cool2 && breakCool) {
+      // === BREAKOUT QUALITY FILTERS ===
+
+      // Filter 1: No consecutive same-direction breakouts (first catches the move, second stacks into exhaustion)
+      // Same-dir breakout needs 15-min cooldown instead of 5-min
+      if (s.breakLastDir === bo.dir && now2 - s.breakLastTs < 900000) {
+        log(sym, '💥 BREAKOUT blocked: consecutive ' + bo.dir.toUpperCase() + ' — last breakout was same direction ' + ((now2 - s.breakLastTs) / 60000).toFixed(1) + 'min ago (need 15min)');
+        s._pendingBreakout = null;
+        return;
+      }
+
+      // Filter 2: Minimum ROC confirmation — breakout needs momentum in the right direction
+      const breakMinRoc = isBTC ? 0.020 : isXAU ? 0.020 : 0.030; // % threshold
+      const rocAligned = (bo.dir === 'call' && roc3 >= breakMinRoc) || (bo.dir === 'put' && roc3 <= -breakMinRoc);
+      if (!rocAligned) {
+        log(sym, '💥 BREAKOUT blocked: ROC not confirming — ' + bo.dir.toUpperCase() + ' needs ROC ' + (bo.dir === 'call' ? '>' : '<') + (bo.dir === 'call' ? '+' : '-') + breakMinRoc + '% but ROC=' + (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%');
+        s._pendingBreakout = null;
+        return;
+      }
+
+      // Filter 3: MACD not fading — histogram must be growing in breakout direction (not losing steam)
+      // macdAccel > 0 = histogram expanding, < 0 = shrinking
+      const macdFading = (bo.dir === 'call' && macdAccel < 0 && macdHist > 0) || (bo.dir === 'put' && macdAccel > 0 && macdHist < 0);
+      if (macdFading) {
+        log(sym, '💥 BREAKOUT blocked: MACD fading — histogram shrinking in ' + bo.dir.toUpperCase() + ' direction (accel=' + macdAccel.toFixed(3) + ', hist=' + macdHist.toFixed(3) + ')');
+        s._pendingBreakout = null;
+        return;
+      }
+
       s.breakLastTs = now2;
       s.breakLastDir = bo.dir;
+      s.breakLastPrice = price;
       const dir = bo.dir;
       s.lastAT = dir; if (dir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
       if (s.lastSignalDir && s.lastSignalDir !== dir) s.lastReversalTs = now2;
@@ -1756,7 +1786,7 @@ setInterval(() => {
       s.blowoffTs = 0; s.lossStreak = 0; s.lossStreakBoost = 0; s.lossStreakUntil = 0;
       s.sustainedDir = null; s.sustainedCount = 0; s.sustainedTs = 0;
       s.vrevSnaps = []; s.vrevLastTs = 0;
-      s.breakRange = []; s.breakHi = 0; s.breakLo = Infinity; s.breakCoilStart = 0; s.breakCoilActive = false; s.breakLastTs = 0; s.breakLastDir = null; s._pendingBreakout = null;
+      s.breakRange = []; s.breakHi = 0; s.breakLo = Infinity; s.breakCoilStart = 0; s.breakCoilActive = false; s.breakLastTs = 0; s.breakLastDir = null; s.breakLastPrice = 0; s._pendingBreakout = null;
       s.macroPrevDir = null; s.macroFlipTs = 0; s.superFlipTs = 0;
       s.lastAT = ''; s.lastNTs = 0; s.lastReversalTs = 0;
       s.dailySignalCount = 0; s.lastSignalDir = null; s.lastSignalTs = 0;
