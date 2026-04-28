@@ -130,6 +130,11 @@ SYMBOLS.forEach(sym => {
     breakLastTs: 0,          // when last breakout signal fired (cooldown)
     breakLastDir: null,      // direction of last breakout signal ('call'/'put')
     breakLastPrice: 0,       // entry price of last breakout signal
+    // Order Block (SMC) — institutional supply/demand zone from breakout coil
+    obZone: null,            // { dir, hi, lo, mid, coilHi, coilLo, ts, breakPrice } — active OB after breakout
+    obDeparted: false,       // price left the OB zone (must leave before retest counts)
+    obFired: false,          // retest signal already fired (one per OB)
+    obMitigated: false,      // OB was fully penetrated (breakout failed)
     // Trade monitor
     trade: { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 }
   };
@@ -1077,6 +1082,19 @@ function processPrice(sym, price, hi, lo) {
       s.breakLastTs = now2;
       s.breakLastDir = bo.dir;
       s.breakLastPrice = price;
+
+      // === ORDER BLOCK ZONE — mark institutional supply/demand zone from the coil ===
+      const coilMid = (bo.coilHi + bo.coilLo) / 2;
+      if (bo.dir === 'call') {
+        // Bullish OB = demand zone at bottom half of coil (where buyers accumulated)
+        s.obZone = { dir: 'call', hi: coilMid, lo: bo.coilLo, mid: (coilMid + bo.coilLo) / 2, coilHi: bo.coilHi, coilLo: bo.coilLo, ts: now2, breakPrice: price };
+      } else {
+        // Bearish OB = supply zone at top half of coil (where sellers accumulated)
+        s.obZone = { dir: 'put', hi: bo.coilHi, lo: coilMid, mid: (bo.coilHi + coilMid) / 2, coilHi: bo.coilHi, coilLo: bo.coilLo, ts: now2, breakPrice: price };
+      }
+      s.obDeparted = false; s.obFired = false; s.obMitigated = false;
+      log(sym, '🧱 OB zone set: ' + bo.dir.toUpperCase() + ' $' + s.obZone.lo.toFixed(2) + '-$' + s.obZone.hi.toFixed(2) + ' (coil mid $' + coilMid.toFixed(2) + ')');
+
       const dir = bo.dir;
       s.lastAT = dir; if (dir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
       if (s.lastSignalDir && s.lastSignalDir !== dir) s.lastReversalTs = now2;
@@ -1094,6 +1112,66 @@ function processPrice(sym, price, hi, lo) {
     } else {
       // Cooldown blocked — clear pending
       s._pendingBreakout = null;
+    }
+  }
+
+  // ===== ORDER BLOCK RETEST / MITIGATION SIGNALS (MT5 only) =====
+  if (isMT5 && s.obZone && cool) {
+    const ob = s.obZone;
+    const obAge = now2 - ob.ts;
+    const obTolerance = isBTC ? 15.0 : 0.50;
+    const obCool = now2 - s.lastNTs > COOLDOWN_MS;
+
+    // --- OB RETEST: price departed, then returned to OB zone → re-entry in breakout direction ---
+    if (s.obDeparted && !s.obFired && !s.obMitigated && obAge <= 1800000 && obCool) {
+      const inZone = price >= (ob.lo - obTolerance) && price <= (ob.hi + obTolerance);
+      if (inZone) {
+        // Confirmation gates: RSI not extreme, ROC turning back, MACD aligned
+        const rsiOk = rsiV >= 30 && rsiV <= 70;
+        const rocOk = (ob.dir === 'call' && roc3 > 0) || (ob.dir === 'put' && roc3 < 0);
+        const macdOk = (ob.dir === 'call' && macdHist > 0) || (ob.dir === 'put' && macdHist < 0);
+
+        if (rsiOk && (rocOk || macdOk)) {
+          s.obFired = true;
+          const dir = ob.dir;
+          s.lastAT = dir; if (dir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
+          if (s.lastSignalDir && s.lastSignalDir !== dir) s.lastReversalTs = now2;
+          s.lastSignalDir = dir; s.lastSignalTs = now2; s.lastNTs = now2;
+          s.lastSameDir = dir; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+          const scoreTag = dir === 'call' ? '⬆OB' : '⬇OB';
+          const sig = { type: dir, time: ts(), price: price.toFixed(2), score: scoreTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+          enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+          log(sym, '🧱 OB RETEST ' + dir.toUpperCase() + ' — price $' + price.toFixed(2) + ' retested OB zone $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' (age ' + (obAge / 60000).toFixed(1) + 'min) [#' + s.dailySignalCount + ']');
+          sendPush('🧱 ' + sym + ' OB RETEST ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · retested OB $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2), 'signal');
+          s.trade = { active: true, type: dir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+          return;
+        }
+      }
+    }
+
+    // --- OB MITIGATION: price broke through OB → breakout failed → reversal signal ---
+    if (s.obMitigated && !s.obFired && obAge <= 1800000 && obCool) {
+      const revDir = ob.dir === 'call' ? 'put' : 'call';
+      // Confirmation: momentum in reversal direction
+      const revRocOk = (revDir === 'call' && roc3 > 0) || (revDir === 'put' && roc3 < 0);
+      const revMacdOk = (revDir === 'call' && macdHist > 0) || (revDir === 'put' && macdHist < 0);
+
+      if (revRocOk || revMacdOk) {
+        s.obFired = true; // consume — no more signals from this OB
+        const dir = revDir;
+        s.lastAT = dir; if (dir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
+        if (s.lastSignalDir && s.lastSignalDir !== dir) s.lastReversalTs = now2;
+        s.lastSignalDir = dir; s.lastSignalTs = now2; s.lastNTs = now2;
+        s.lastSameDir = dir; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+        const scoreTag = dir === 'call' ? '⬆OBFAIL' : '⬇OBFAIL';
+        const sig = { type: dir, time: ts(), price: price.toFixed(2), score: scoreTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+        log(sym, '🧱 OB MITIGATION ' + dir.toUpperCase() + ' — breakout FAILED, price $' + price.toFixed(2) + ' broke through OB $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+        sendPush('🧱 ' + sym + ' OB FAIL ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · breakout failed through OB $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2), 'signal');
+        s.trade = { active: true, type: dir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        s.obZone = null; // Clear mitigated OB
+        return;
+      }
     }
   }
 
@@ -1730,6 +1808,39 @@ function processTicks(symbols) {
       }
     }
 
+    // === ORDER BLOCK TRACKING — detect departure and retest each tick ===
+    if ((isXAUt || isBTCt) && s.obZone && !s.obMitigated) {
+      const ob = s.obZone;
+      const obAge = Date.now() - ob.ts;
+      const obTolerance = isBTCt ? 15.0 : 0.50; // zone edge tolerance
+
+      // Expire stale OBs (30 min)
+      if (obAge > 1800000) {
+        log(sym, '🧱 OB expired after 30min — clearing');
+        s.obZone = null; s.obDeparted = false; s.obFired = false;
+      } else {
+        // Track departure: price moved away from OB in breakout direction
+        if (!s.obDeparted) {
+          if (ob.dir === 'call' && price > ob.hi + obTolerance) {
+            s.obDeparted = true;
+            log(sym, '🧱 OB departed: price $' + price.toFixed(2) + ' moved above OB zone $' + ob.hi.toFixed(2));
+          } else if (ob.dir === 'put' && price < ob.lo - obTolerance) {
+            s.obDeparted = true;
+            log(sym, '🧱 OB departed: price $' + price.toFixed(2) + ' moved below OB zone $' + ob.lo.toFixed(2));
+          }
+        }
+
+        // Detect OB mitigation: price sliced through entire OB (breakout failed)
+        if (ob.dir === 'call' && price < ob.lo - obTolerance) {
+          s.obMitigated = true;
+          log(sym, '🧱 OB MITIGATED: price $' + price.toFixed(2) + ' broke below OB low $' + ob.lo.toFixed(2) + ' — breakout failed');
+        } else if (ob.dir === 'put' && price > ob.hi + obTolerance) {
+          s.obMitigated = true;
+          log(sym, '🧱 OB MITIGATED: price $' + price.toFixed(2) + ' broke above OB high $' + ob.hi.toFixed(2) + ' — breakout failed');
+        }
+      }
+    }
+
     } catch (e) { console.error('[' + ts() + '] processTicks ' + sym + ' error:', e.message); }
   });
 }
@@ -1899,6 +2010,7 @@ setInterval(() => {
       s.lastSameDir = null; s.lastSameDirMacd = 0; s.lastSameDirTs = 0; s.lastSameDirPrice = 0;
       s.shakeoutDir = null; s.shakeoutTs = 0; s.shakeoutPrice = 0; s.shakeoutEp = 0;
       s.obCandles = []; s.obCurCandle = null; s.orderBlocks = [];
+      s.obZone = null; s.obDeparted = false; s.obFired = false; s.obMitigated = false;
       s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
     });
     saveRollingLevels(); // Persist rolling ATH/ATL data across restarts
@@ -2020,6 +2132,7 @@ app.get('/prices', (req, res) => {
       rollingLow: s.rollingLow === Infinity ? 0 : s.rollingLow,
       roundNum: s._roundNum || null,
       orderBlocks: s._orderBlocks || [],
+      obBreakout: s.obZone ? { dir: s.obZone.dir, hi: +s.obZone.hi.toFixed(2), lo: +s.obZone.lo.toFixed(2), coilHi: +s.obZone.coilHi.toFixed(2), coilLo: +s.obZone.coilLo.toFixed(2), age: Math.round((Date.now() - s.obZone.ts) / 1000), departed: s.obDeparted, fired: s.obFired, mitigated: s.obMitigated } : null,
       macro: (sym === 'XAU' || sym === 'BTC') && s.macroSnaps.length >= 2 && s.lastPrice > 0 ? (() => {
         const p = s.lastPrice;
         return {
