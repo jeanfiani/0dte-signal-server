@@ -126,6 +126,7 @@ SYMBOLS.forEach(sym => {
     breakCoilStart: 0,       // when consolidation started (range stayed tight)
     breakCoilActive: false,  // true when range < threshold for >= 3 min
     breakLastTs: 0,          // when last breakout signal fired (cooldown)
+    breakLastDir: null,      // direction of last breakout signal ('call'/'put')
     // Trade monitor
     trade: { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 }
   };
@@ -490,7 +491,7 @@ function processPrice(sym, price, hi, lo) {
   if (isMT5) {
     const bRange = s.breakHi > 0 && s.breakLo < Infinity ? +(s.breakHi - s.breakLo).toFixed(2) : 0;
     const bCoilSec = s.breakCoilActive ? Math.round((Date.now() - s.breakCoilStart) / 1000) : 0;
-    s._breakout = { range: bRange, hi: s.breakHi > 0 ? +s.breakHi.toFixed(2) : 0, lo: s.breakLo < Infinity ? +s.breakLo.toFixed(2) : 0, coiling: s.breakCoilActive, coilSec: bCoilSec };
+    s._breakout = { range: bRange, hi: s.breakHi > 0 ? +s.breakHi.toFixed(2) : 0, lo: s.breakLo < Infinity ? +s.breakLo.toFixed(2) : 0, coiling: s.breakCoilActive, coilSec: bCoilSec, firedTs: s.breakLastTs || 0, firedDir: s.breakLastDir || null };
   }
   s._roc6 = roc6;
   s._roc12 = roc12;
@@ -546,37 +547,48 @@ function processPrice(sym, price, hi, lo) {
   // Check exit for active trades
   checkExit(sym, price);
 
-  // ===== CONVICTION SCORE CALCULATOR (XAU only) =====
+  // ===== CONVICTION SCORE CALCULATOR (MT5 instruments: XAU + BTC) =====
   // Returns { score: 0-7, label: 'HIGH'|'MOD'|'LOW', factors: [...] } for a given direction
   function convictionFor(dir) {
-    if (!isXAU) return { score: 0, label: '', factors: [] };
+    if (!isMT5) return { score: 0, label: '', factors: [] };
     const isCall = dir === 'call';
     const factors = [];
     let sc = 0;
-    // 1. DXY aligned (down = gold bull, up = gold bear)
-    if ((isCall && dxyDir === 'down') || (!isCall && dxyDir === 'up')) { sc++; factors.push('DXY'); }
-    // 2. TLT aligned (up = gold bull, down = gold bear)
-    if ((isCall && tltDir === 'up') || (!isCall && tltDir === 'down')) { sc++; factors.push('TLT'); }
-    // 3. Macro trend aligned
+    // 3. Macro trend aligned (shared)
     const macroDir = s.macroEma ? (price > s.macroEma ? 'bull' : 'bear') : null;
     if ((isCall && macroDir === 'bull') || (!isCall && macroDir === 'bear')) { sc++; factors.push('MACRO'); }
-    // 4. Silver aligned
-    if (slvPrice > 0 && ((isCall && slvDir === 'up') || (!isCall && slvDir === 'down'))) { sc++; factors.push('SLV'); }
-    // 5. Gold Miners aligned
-    if (gdxPrice > 0 && ((isCall && gdxDir === 'up') || (!isCall && gdxDir === 'down'))) { sc++; factors.push('GDX'); }
-    // 6. Multi-TF ROC aligned (all 3 pointing same way)
+    // 6. Multi-TF ROC aligned (shared)
     const rocAllCall = roc3 > 0 && roc6 > 0 && roc12 > 0;
     const rocAllPut = roc3 < 0 && roc6 < 0 && roc12 < 0;
     if ((isCall && rocAllCall) || (!isCall && rocAllPut)) { sc++; factors.push('ROC×3'); }
-    // 7. Price structure aligned
+    // 7. Price structure aligned (shared)
     if ((isCall && s._priceStructure === 'bull') || (!isCall && s._priceStructure === 'bear')) { sc++; factors.push('STRUCT'); }
+
+    if (isXAU) {
+      // XAU-specific: DXY, TLT, SLV, GDX
+      if ((isCall && dxyDir === 'down') || (!isCall && dxyDir === 'up')) { sc++; factors.push('DXY'); }
+      if ((isCall && tltDir === 'up') || (!isCall && tltDir === 'down')) { sc++; factors.push('TLT'); }
+      if (slvPrice > 0 && ((isCall && slvDir === 'up') || (!isCall && slvDir === 'down'))) { sc++; factors.push('SLV'); }
+      if (gdxPrice > 0 && ((isCall && gdxDir === 'up') || (!isCall && gdxDir === 'down'))) { sc++; factors.push('GDX'); }
+    } else if (isBTC) {
+      // BTC-specific: SPY, QQQ, DXY (risk-on correlation), news sentiment
+      const spyS = S['SPY'], qqqS = S['QQQ'];
+      const spyDir2 = spyS && spyS.pE5 && spyS.pE13 ? (spyS.pE5 > spyS.pE13 ? 'up' : 'down') : null;
+      const qqqDir2 = qqqS && qqqS.pE5 && qqqS.pE13 ? (qqqS.pE5 > qqqS.pE13 ? 'up' : 'down') : null;
+      if ((isCall && spyDir2 === 'up') || (!isCall && spyDir2 === 'down')) { sc++; factors.push('SPY'); }
+      if ((isCall && qqqDir2 === 'up') || (!isCall && qqqDir2 === 'down')) { sc++; factors.push('QQQ'); }
+      // DXY inverse for BTC too (dollar up = BTC bear)
+      if ((isCall && dxyDir === 'down') || (!isCall && dxyDir === 'up')) { sc++; factors.push('DXY'); }
+      // Order blocks aligned
+      if (s._orderBlocks && s._orderBlocks.length > 0) { sc++; factors.push('OB'); }
+    }
 
     const label = sc >= 5 ? 'HIGH' : sc >= 3 ? 'MOD' : 'LOW';
     return { score: sc, label, factors };
   }
-  // Enriches a signal object with conviction data (XAU only, no-op for QQQ/SPY)
+  // Enriches a signal object with conviction data (MT5 instruments, no-op for QQQ/SPY)
   function enrichSig(sig) {
-    if (!isXAU) return sig;
+    if (!isMT5) return sig;
     const conv = convictionFor(sig.type);
     sig.conv = conv;
     return sig;
@@ -744,13 +756,13 @@ function processPrice(sym, price, hi, lo) {
     return;
   }
 
-  // MACD Exhaustion Filter — XAU only, block signals chasing an already-extended move
+  // MACD Exhaustion Filter — MT5 instruments (XAU + BTC), block signals chasing an already-extended move
   // Check BOTH histogram (short-term momentum) AND line (trend depth)
   // Histogram deeply extended → immediate momentum spent
   // Line deeply extended → trend has been running too long, reversal likely
-  if (isXAU) {
-    const macdExhThr = 0.80;       // histogram exhaustion threshold
-    const macdLineDepth = 1.00;    // line depth exhaustion threshold (e.g. -1.154 on bad PUT)
+  if (isMT5) {
+    const macdExhThr = isBTC ? 12.0 : 0.80;       // histogram exhaustion threshold (BTC ~$77k vs XAU ~$4700)
+    const macdLineDepth = isBTC ? 15.0 : 1.00;    // line depth exhaustion threshold
     // MACD LINE depth check — trend running too long (sustained momentum can override)
     if (Math.abs(macdL) > macdLineDepth) {
       if (macdL < -macdLineDepth && pS >= finalMinS && pS > cS) {
@@ -879,7 +891,7 @@ function processPrice(sym, price, hi, lo) {
     const recent = s.prices.slice(-30);
     const recentHi = Math.max(...recent), recentLo = Math.min(...recent);
     const moveSize = recentHi - recentLo;
-    const retraceMin = isXAU ? 5.0 : 0.50; // XAU ~$3300 needs $5 min move vs $0.50 for equities
+    const retraceMin = isBTC ? 80.0 : isXAU ? 5.0 : 0.50; // BTC ~$77k needs $80, XAU ~$4700 needs $5, equities $0.50
     if (moveSize >= retraceMin) {
       const retracePct = recentHi > recentLo ? (price - recentLo) / (recentHi - recentLo) : 0.5;
       // For CALL: price should be above 50% retrace (not bouncing off the bottom)
@@ -910,7 +922,7 @@ function processPrice(sym, price, hi, lo) {
   // Prevents clustered signals at similar prices while allowing signals after real moves
   // XAU: 0.15% (~$7 at $4700). Equities: 0.25% (~$1.25 at $500) — tighter to prevent clustering
   { const cDir3 = cS >= pS ? 'call' : 'put';
-    const minPctMove = isXAU ? 0.15 : 0.25;
+    const minPctMove = isBTC ? 0.12 : isXAU ? 0.15 : 0.25;
     if (s.lastSameDir === cDir3 && s.lastSameDirPrice > 0) {
       const pctMove = Math.abs((price - s.lastSameDirPrice) / s.lastSameDirPrice) * 100;
       if (pctMove < minPctMove && ((cDir3 === 'call' && cS >= finalMinS) || (cDir3 === 'put' && pS >= finalMinS))) {
@@ -925,8 +937,8 @@ function processPrice(sym, price, hi, lo) {
   if (s.openPrice && s.openPrice > 0) {
     const dayMove = price - s.openPrice;
     const absDayMove = Math.abs(dayMove);
-    const postMoveThr = isXAU ? 20.0 : 2.0;
-    const postMoveMacd = isXAU ? 0.20 : 0.040;
+    const postMoveThr = isBTC ? 300.0 : isXAU ? 20.0 : 2.0;
+    const postMoveMacd = isBTC ? 3.0 : isXAU ? 0.20 : 0.040;
     if (absDayMove >= postMoveThr) {
       const macdStrNow = Math.abs(macdL - macdS);
       if (dayMove >= postMoveThr && cS >= finalMinS && cS >= pS && macdStrNow < postMoveMacd) {
@@ -980,6 +992,7 @@ function processPrice(sym, price, hi, lo) {
 
     if (cool2 && breakCool) {
       s.breakLastTs = now2;
+      s.breakLastDir = bo.dir;
       const dir = bo.dir;
       s.lastAT = dir; if (dir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
       if (s.lastSignalDir && s.lastSignalDir !== dir) s.lastReversalTs = now2;
@@ -1051,21 +1064,31 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // ===== MACRO TREND FLIP DETECTOR (XAU only) =====
+  // ===== MACRO TREND FLIP DETECTOR (MT5 instruments: XAU + BTC) =====
   // Fires when price crosses the 3-hour EMA with momentum confirmation
-  // SUPER SIGNAL: when TLT also flipped in same direction within 30 min — highest conviction
-  // TLT up = yields falling = bullish gold | TLT down = yields rising = bearish gold
-  if (isXAU && s.macroEma !== null && s.macroSnaps.length >= 12 && cool && s.dailySignalCount < MAX_SIG && (now2 - s.macroFlipTs > 900000)) {
+  // XAU SUPER SIGNAL: when TLT also flipped in same direction within 30 min — highest conviction
+  // BTC SUPER SIGNAL: when SPY also trending in same direction — risk-on/risk-off correlation
+  if (isMT5 && s.macroEma !== null && s.macroSnaps.length >= 12 && cool && s.dailySignalCount < MAX_SIG && (now2 - s.macroFlipTs > 900000)) {
     const curDir = price > s.macroEma ? 'bull' : 'bear';
     const spread = Math.abs(price - s.macroEma);
     const spreadPct = (spread / s.macroEma) * 100;
+    const spreadMinPct = isBTC ? 0.05 : 0.03; // BTC needs wider separation (higher volatility)
     // Only fire when direction actually flips AND price has meaningful separation from EMA (not just touching)
-    if (s.macroPrevDir !== null && curDir !== s.macroPrevDir && spreadPct > 0.03) {
-      // Check if TLT also flipped in aligned direction within last 30 min
-      // CALL: macro bull + TLT up (yields falling) | PUT: macro bear + TLT down (yields rising)
-      const tltAligned = (curDir === 'bull' && tltDir === 'up') || (curDir === 'bear' && tltDir === 'down');
-      const tltRecentFlip = tltFlipTs > 0 && (now2 - tltFlipTs < 1800000); // TLT flipped within 30 min
-      const isSuper = tltAligned && tltRecentFlip && (now2 - s.superFlipTs > 1800000); // 30-min super cooldown
+    if (s.macroPrevDir !== null && curDir !== s.macroPrevDir && spreadPct > spreadMinPct) {
+      // XAU: Check if TLT flipped in same direction within 30 min
+      // BTC: Check if SPY is trending in same direction (risk-on/risk-off)
+      let isSuper = false;
+      if (isXAU) {
+        const tltAligned = (curDir === 'bull' && tltDir === 'up') || (curDir === 'bear' && tltDir === 'down');
+        const tltRecentFlip = tltFlipTs > 0 && (now2 - tltFlipTs < 1800000);
+        isSuper = tltAligned && tltRecentFlip && (now2 - s.superFlipTs > 1800000);
+      } else if (isBTC) {
+        // BTC super: SPY trending in same direction (risk-on correlation)
+        const spyState = S['SPY'];
+        const spyDir = spyState && spyState.lastPrice > 0 && spyState.pE5 && spyState.pE13
+          ? (spyState.pE5 > spyState.pE13 ? 'bull' : 'bear') : null;
+        isSuper = spyDir === curDir && (now2 - s.superFlipTs > 1800000);
+      }
 
       // MACRO FLIP CALL: was bearish, now price crossed above 3h EMA with upward ROC
       if (curDir === 'bull' && roc3 > symRocThr && rsiV > 30 && rsiV < 70) {
@@ -1079,9 +1102,10 @@ function processPrice(sym, price, hi, lo) {
         const scoreTag = isSuper ? '⬆SUPER' : '⬆MFLIP';
         const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: scoreTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
         enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+        const superCtx = isXAU ? 'TLT ' + tltDir + ' (yields)' : 'SPY aligned';
         if (isSuper) {
-          log(sym, '🔥 SUPER CALL — macro + TLT aligned bullish · price $' + price.toFixed(2) + ' > EMA $' + s.macroEma.toFixed(2) + ' · TLT ' + tltDir + ' (yields falling) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
-          sendPush('🔥 ' + sym + ' SUPER CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · macro + yields both turned bullish gold', 'signal');
+          log(sym, '🔥 SUPER CALL — macro + ' + superCtx + ' bullish · price $' + price.toFixed(2) + ' > EMA $' + s.macroEma.toFixed(2) + ' · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
+          sendPush('🔥 ' + sym + ' SUPER CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · macro + corr both turned bullish', 'signal');
         } else {
           log(sym, '🔀 MACRO FLIP CALL — trend turned bullish · price $' + price.toFixed(2) + ' > EMA $' + s.macroEma.toFixed(2) + ' (+' + spreadPct.toFixed(3) + '%) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
           sendPush('🔀 ' + sym + ' MACRO FLIP CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · trend turned bullish · above 3h EMA', 'signal');
@@ -1101,9 +1125,10 @@ function processPrice(sym, price, hi, lo) {
         const scoreTag = isSuper ? '⬇SUPER' : '⬇MFLIP';
         const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: scoreTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
         enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+        const superCtx2 = isXAU ? 'TLT ' + tltDir + ' (yields)' : 'SPY aligned';
         if (isSuper) {
-          log(sym, '🔥 SUPER PUT — macro + TLT aligned bearish · price $' + price.toFixed(2) + ' < EMA $' + s.macroEma.toFixed(2) + ' · TLT ' + tltDir + ' (yields rising) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
-          sendPush('🔥 ' + sym + ' SUPER PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · macro + yields both turned bearish gold', 'signal');
+          log(sym, '🔥 SUPER PUT — macro + ' + superCtx2 + ' bearish · price $' + price.toFixed(2) + ' < EMA $' + s.macroEma.toFixed(2) + ' · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
+          sendPush('🔥 ' + sym + ' SUPER PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · macro + corr both turned bearish', 'signal');
         } else {
           log(sym, '🔀 MACRO FLIP PUT — trend turned bearish · price $' + price.toFixed(2) + ' < EMA $' + s.macroEma.toFixed(2) + ' (-' + spreadPct.toFixed(3) + '%) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
           sendPush('🔀 ' + sym + ' MACRO FLIP PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · trend turned bearish · below 3h EMA', 'signal');
@@ -1484,8 +1509,8 @@ function processTicks(symbols) {
     s.tickBuf = [];
     processPrice(sym, price, hi, lo);
 
-    // Macro trend snapshots — XAU only, every 5 min, 6-hour rolling window
-    if (sym === 'XAU' && (Date.now() - s.macroLastSnapTs >= 300000)) {
+    // Macro trend snapshots — MT5 instruments (XAU + BTC), every 5 min, 6-hour rolling window
+    if ((sym === 'XAU' || sym === 'BTC') && (Date.now() - s.macroLastSnapTs >= 300000)) {
       s.macroLastSnapTs = Date.now();
       s.macroSnaps.push({ ts: Date.now(), p: price });
       if (s.macroSnaps.length > 72) s.macroSnaps.shift(); // keep 6 hours
@@ -1731,7 +1756,7 @@ setInterval(() => {
       s.blowoffTs = 0; s.lossStreak = 0; s.lossStreakBoost = 0; s.lossStreakUntil = 0;
       s.sustainedDir = null; s.sustainedCount = 0; s.sustainedTs = 0;
       s.vrevSnaps = []; s.vrevLastTs = 0;
-      s.breakRange = []; s.breakHi = 0; s.breakLo = Infinity; s.breakCoilStart = 0; s.breakCoilActive = false; s.breakLastTs = 0; s._pendingBreakout = null;
+      s.breakRange = []; s.breakHi = 0; s.breakLo = Infinity; s.breakCoilStart = 0; s.breakCoilActive = false; s.breakLastTs = 0; s.breakLastDir = null; s._pendingBreakout = null;
       s.macroPrevDir = null; s.macroFlipTs = 0; s.superFlipTs = 0;
       s.lastAT = ''; s.lastNTs = 0; s.lastReversalTs = 0;
       s.dailySignalCount = 0; s.lastSignalDir = null; s.lastSignalTs = 0;
@@ -1855,6 +1880,9 @@ app.get('/prices', (req, res) => {
       tlt: s._tlt || null,
       slv: s._slv || null,
       gdx: s._gdx || null,
+      spyCorr: sym === 'BTC' ? (() => { const sp = S['SPY']; if (!sp || !sp.lastPrice) return null; return { price: sp.lastPrice, dir: sp.pE5 && sp.pE13 ? (sp.pE5 > sp.pE13 ? 'up' : 'down') : 'flat', roc3: sp._roc3 || 0 }; })() : null,
+      qqqCorr: sym === 'BTC' ? (() => { const qp = S['QQQ']; if (!qp || !qp.lastPrice) return null; return { price: qp.lastPrice, dir: qp.pE5 && qp.pE13 ? (qp.pE5 > qp.pE13 ? 'up' : 'down') : 'flat', roc3: qp._roc3 || 0 }; })() : null,
+      dxyCorr: sym === 'BTC' ? (() => { return dxyPrice > 0 ? { price: dxyPrice, dir: dxyDir, roc3: dxyRoc3 } : null; })() : null,
       priceStructure: s._priceStructure || 'neutral',
       breakout: s._breakout || null,
       atr: s._atr || 0,
@@ -1864,7 +1892,7 @@ app.get('/prices', (req, res) => {
       rollingLow: s.rollingLow === Infinity ? 0 : s.rollingLow,
       roundNum: s._roundNum || null,
       orderBlocks: s._orderBlocks || [],
-      macro: sym === 'XAU' && s.macroSnaps.length >= 2 && s.lastPrice > 0 ? (() => {
+      macro: (sym === 'XAU' || sym === 'BTC') && s.macroSnaps.length >= 2 && s.lastPrice > 0 ? (() => {
         const p = s.lastPrice;
         return {
           snaps: s.macroSnaps.length,
