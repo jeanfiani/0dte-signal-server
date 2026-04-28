@@ -610,6 +610,12 @@ function processPrice(sym, price, hi, lo) {
     // BTC trades 24/7 — no session block
   } else {
     if (etMin < 570 || etMin >= 955) return;
+    // Midday dead zone — 12:00-14:00 ET (720-840 min). QQQ: 43% win, SPY: 42% win.
+    // Lunch chop kills both instruments. Block regular signals during this window.
+    if (etMin >= 720 && etMin < 840 && (cS >= THR || pS >= THR)) {
+      log(sym, 'Midday block: ' + etMin + ' min ET — lunch chop zone (12:00-14:00)');
+      return;
+    }
   }
   if (!isMT5 && etMin >= 945 && (cS >= THR || pS >= THR)) return;
 
@@ -718,11 +724,36 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // Flip lock
-  if (now2 - s.lastReversalTs < 180000 && (cS >= minS || pS >= minS)) return;
+  // Flip lock — 10 min for MT5 (prevents whipsaw clusters), 3 min for equities
+  const flipLockMs = isMT5 ? 600000 : 180000;
+  if (now2 - s.lastReversalTs < flipLockMs && (cS >= minS || pS >= minS)) {
+    log(sym, 'Flip lock: blocked — last reversal ' + ((now2 - s.lastReversalTs) / 60000).toFixed(1) + 'min ago (need ' + (flipLockMs / 60000) + 'min)');
+    return;
+  }
   // Daily cap — XAU/BTC uncapped (24h markets need freedom), equities keep cap
   if (!isMT5 && s.dailySignalCount >= MAX_SIG) return;
-  // Direction-flip cooldown — REMOVED (was 480s, blocked reversal catches)
+
+  // FIX 1: Minimum ROC gate — no momentum = no trade
+  // MT5: 0.015% (38% XAU, 0% BTC below this). Equities: 0.01% (33% QQQ below this).
+  const minRocGate = isBTC ? 0.015 : isXAU ? 0.015 : 0.010;
+  if (Math.abs(roc3) < minRocGate && (cS >= minS || pS >= minS)) {
+    if (sustainedOverride) {
+      log(sym, 'ROC gate override: sustained momentum (' + s.sustainedCount + ' ticks) — ROC ' + roc3.toFixed(3) + '% below ' + minRocGate + '%');
+    } else {
+      log(sym, 'ROC gate: blocked — |ROC| ' + Math.abs(roc3).toFixed(3) + '% < ' + minRocGate + '% (no momentum)');
+      return;
+    }
+  }
+
+  // FIX 4: BTC ROC exhaustion cap — signals with ROC > 0.08% are chasing (33% win rate)
+  if (isBTC && Math.abs(roc3) > 0.08 && (cS >= minS || pS >= minS)) {
+    if (sustainedOverride) {
+      log(sym, 'BTC ROC exhaustion override: sustained (' + s.sustainedCount + ' ticks) — ROC ' + roc3.toFixed(3) + '% but move still going');
+    } else {
+      log(sym, 'BTC ROC exhaustion: blocked — |ROC| ' + Math.abs(roc3).toFixed(3) + '% > 0.08% (move already over)');
+      return;
+    }
+  }
 
   // RSI sweet-spot — sustained momentum can override (move still going despite oversold/overbought)
   const rsiSweetCall = rsiV >= RSI_CALL_LO[sym] && rsiV <= RSI_CALL_HI[sym];
@@ -736,6 +767,23 @@ function processPrice(sym, price, hi, lo) {
     if (sustainedOverride && s.sustainedDir === 'put') {
       log(sym, 'RSI gate override: sustained PUT momentum (' + s.sustainedCount + ' ticks) — RSI ' + rsiV.toFixed(1) + ' outside sweet zone');
     } else return;
+  }
+
+  // FIX 3: RSI 30-45 PUT confirmation — "weak bearish" band is a trap (35% XAU, 20% BTC)
+  // PUTs in this range need stronger momentum confirmation: ROC > 0.03% OR MACD < -0.20 (XAU) / -3.0 (BTC)
+  if (isMT5 && rsiV >= 30 && rsiV < 45 && pS >= minS && pS > cS) {
+    const weakPutRocMin = isBTC ? 0.030 : 0.030;
+    const weakPutMacdMin = isBTC ? -3.0 : -0.20;
+    const rocConfirmed = roc3 < -weakPutRocMin;
+    const macdConfirmed = macdL < weakPutMacdMin;
+    if (!rocConfirmed && !macdConfirmed) {
+      if (sustainedOverride && s.sustainedDir === 'put') {
+        log(sym, 'RSI 30-45 PUT override: sustained PUT (' + s.sustainedCount + ' ticks) — weak bearish but move is real');
+      } else {
+        log(sym, 'RSI 30-45 PUT blocked: weak bearish trap — RSI ' + rsiV.toFixed(1) + ' ROC ' + roc3.toFixed(3) + '% MACD ' + macdL.toFixed(3) + ' (need ROC<-' + weakPutRocMin + '% or MACD<' + weakPutMacdMin + ')');
+        return;
+      }
+    }
   }
 
   // PM penalty removed — THR=6 is already strict enough (was +1 when THR=5)
@@ -961,9 +1009,13 @@ function processPrice(sym, price, hi, lo) {
     const distFromHigh = s.sessionHigh - price;
     const sessionRange = s.sessionHigh - s.sessionLow;
     const highWasRecent = s.prices.length >= 10 && Math.max(...s.prices.slice(-30 > -s.prices.length ? -30 : 0)) >= s.sessionHigh - 0.05;
-    // XAU session high reversal needs larger move ($10+ vs $1+) — gold price is ~5x SPY/QQQ
-    const hiRevDist = isXAU ? 10.0 : 1.0, hiRevRange = isXAU ? 15.0 : 1.5;
-    if (distFromHigh >= hiRevDist && s.rsiAtSessionHigh > 60 && sessionRange >= hiRevRange && highWasRecent && macdL < macdS && roc3 < -symRocThr) {
+    // XAU/BTC session high reversal needs larger move — gold/btc prices produce bigger absolute moves
+    const hiRevDist = isBTC ? 80.0 : isXAU ? 5.0 : 0.50;   // min pullback from high (lowered for equities from $1→$0.50)
+    const hiRevRange = isBTC ? 150.0 : isXAU ? 10.0 : 1.0;  // min session range to confirm real move
+    // Loosened: RSI at high only needs > 55 (was 60), and ROC OR MACD confirms (was AND)
+    const hiRevRocOk = roc3 < -symRocThr;
+    const hiRevMacdOk = macdL < macdS;
+    if (distFromHigh >= hiRevDist && s.rsiAtSessionHigh > 55 && sessionRange >= hiRevRange && highWasRecent && (hiRevRocOk || hiRevMacdOk)) {
       // Don't fire if we already fired a PUT recently (use cooldown)
       if (s.lastSignalDir !== 'put' || (now2 - s.lastNTs > COOLDOWN_MS)) {
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
@@ -1284,6 +1336,27 @@ function processPrice(sym, price, hi, lo) {
         return;
       }
     }
+  }
+
+  // === SESSION HIGH CALL BLOCKER ===
+  // Data shows 14 QQQ + 10 SPY bad CALLs fired right at session high — almost all losers.
+  // Block CALL signals when price is within 0.05% of session high (for equities + XAU/BTC).
+  // The move has peaked — a CALL here is chasing the top.
+  if (s.sessionHigh > 0 && s.sessionLow < Infinity && fireCall && cS >= minS) {
+    const distFromSessHigh = s.sessionHigh - price;
+    const sessRange = s.sessionHigh - s.sessionLow;
+    const pctFromHigh = sessRange > 0 ? (distFromSessHigh / s.sessionHigh) * 100 : 99;
+    // Block if within 0.05% of session high AND session has meaningful range (not first few ticks)
+    if (pctFromHigh < 0.05 && sessRange > (isBTC ? 50 : isXAU ? 2 : 0.30)) {
+      log(sym, '🛑 CALL blocked at session high — $' + price.toFixed(2) + ' is ' + pctFromHigh.toFixed(3) + '% from high $' + s.sessionHigh.toFixed(2) + ' (range $' + sessRange.toFixed(2) + ')');
+      fireCall = false;
+    }
+  }
+
+  // Overbought RSI CALL blocker — equities only (QQQ 31% win, SPY 43% win when RSI>70)
+  if (!isMT5 && fireCall && cS >= minS && rsiV > 70) {
+    log(sym, '🛑 CALL blocked: overbought RSI ' + rsiV.toFixed(1) + ' > 70 — chasing momentum');
+    fireCall = false;
   }
 
   // === FIRE SIGNALS ===
