@@ -717,8 +717,8 @@ function processPrice(sym, price, hi, lo) {
 
   // Flip lock
   if (now2 - s.lastReversalTs < 180000 && (cS >= minS || pS >= minS)) return;
-  // Daily cap
-  if (s.dailySignalCount >= MAX_SIG) return;
+  // Daily cap — XAU/BTC uncapped (24h markets need freedom), equities keep cap
+  if (!isMT5 && s.dailySignalCount >= MAX_SIG) return;
   // Direction-flip cooldown — REMOVED (was 480s, blocked reversal catches)
 
   // RSI sweet-spot — sustained momentum can override (move still going despite oversold/overbought)
@@ -954,7 +954,7 @@ function processPrice(sym, price, hi, lo) {
 
   // Session High Reversal Detector — fire high-confidence PUT when price reverses from session high
   // Conditions: hit session high, reversed >$1 from it, RSI > 60 (was overbought), MACD turning bearish
-  if (s.sessionHigh > -Infinity && s.openPrice && cool && s.dailySignalCount < MAX_SIG && etMin >= 570 && etMin < 955) {
+  if (s.sessionHigh > -Infinity && s.openPrice && cool && (isMT5 || s.dailySignalCount < MAX_SIG) && etMin >= 570 && etMin < 955) {
     const distFromHigh = s.sessionHigh - price;
     const sessionRange = s.sessionHigh - s.sessionLow;
     const highWasRecent = s.prices.length >= 10 && Math.max(...s.prices.slice(-30 > -s.prices.length ? -30 : 0)) >= s.sessionHigh - 0.05;
@@ -984,7 +984,7 @@ function processPrice(sym, price, hi, lo) {
   // This is the fastest signal: catches moves 2-3 min before EMAs/RSI/MACD confirm.
   // The coil detection + breakout pending flag is set in processTicks (runs every 1s).
   // Here we just fire the signal if a valid breakout was detected this tick.
-  if (isMT5 && s._pendingBreakout && s.dailySignalCount < MAX_SIG) {
+  if (isMT5 && s._pendingBreakout) {
     const bo = s._pendingBreakout;
     s._pendingBreakout = null; // consume it
     const cool2 = now2 - s.lastNTs > COOLDOWN_MS;
@@ -1016,7 +1016,7 @@ function processPrice(sym, price, hi, lo) {
   // ===== V-REVERSAL DETECTOR (XAU only) =====
   // Catches momentum reversals: price drops/rallies $8+ in 15 min, then ROC flips sharply
   // Different from trend-following signals — fires on the turn itself, not after EMAs catch up
-  if (isXAU && s.vrevSnaps.length >= 60 && cool && s.dailySignalCount < MAX_SIG && (now2 - s.vrevLastTs > 600000)) {
+  if (isXAU && s.vrevSnaps.length >= 60 && cool && (now2 - s.vrevLastTs > 600000)) {
     // Find the high and low in the last 15 min of snapshots
     const lookback = s.vrevSnaps.filter(sn => sn.ts > now2 - 900000); // 15 min
     if (lookback.length >= 30) {
@@ -1068,7 +1068,7 @@ function processPrice(sym, price, hi, lo) {
   // Fires when price crosses the 3-hour EMA with momentum confirmation
   // XAU SUPER SIGNAL: when TLT also flipped in same direction within 30 min — highest conviction
   // BTC SUPER SIGNAL: when SPY also trending in same direction — risk-on/risk-off correlation
-  if (isMT5 && s.macroEma !== null && s.macroSnaps.length >= 12 && cool && s.dailySignalCount < MAX_SIG && (now2 - s.macroFlipTs > 900000)) {
+  if (isMT5 && s.macroEma !== null && s.macroSnaps.length >= 12 && cool && (now2 - s.macroFlipTs > 900000)) {
     const curDir = price > s.macroEma ? 'bull' : 'bear';
     const spread = Math.abs(price - s.macroEma);
     const spreadPct = (spread / s.macroEma) * 100;
@@ -1146,7 +1146,7 @@ function processPrice(sym, price, hi, lo) {
   // ===== ATH/ATL REVERSAL DETECTOR (XAU only) =====
   // Gold tends to reverse hard at multi-day highs/lows — institutional profit-taking, algo levels
   // Fires high-confidence reversal signals when price touches 5-day extreme then pulls back
-  if (isXAU && s.rollingHigh > 0 && s.rollingLow < Infinity && cool && s.dailySignalCount < MAX_SIG) {
+  if (isXAU && s.rollingHigh > 0 && s.rollingLow < Infinity && cool) {
     const distFromATH = s.rollingHigh - price;
     const distFromATL = price - s.rollingLow;
     const athApproachRecent = now2 - s.athApproachTs < 600000; // touched ATH zone in last 10 min
@@ -1199,7 +1199,7 @@ function processPrice(sym, price, hi, lo) {
   // Window: 10 minutes after SL. Requires: score >= THR, RSI OK, MACD aligned, ROC confirming direction.
   if (isXAU && s.shakeoutDir && now2 - s.shakeoutTs < 600000 && now2 - s.shakeoutTs > 30000) {
     const shakeoutCool = now2 - s.lastNTs > 60000; // Reduced cooldown: 60s instead of 180s
-    if (shakeoutCool && s.dailySignalCount < MAX_SIG) {
+    if (shakeoutCool && (isXAU || s.dailySignalCount < MAX_SIG)) {
       const isCallRecovery = s.shakeoutDir === 'call' && price > s.shakeoutEp && fireCall && roc3 > symRocThr;
       const isPutRecovery = s.shakeoutDir === 'put' && price < s.shakeoutEp && firePut && roc3 < -symRocThr;
       if (isCallRecovery) {
@@ -1562,7 +1562,7 @@ function processTicks(symbols) {
           const coilCoolOk = bNow - s.breakLastTs > 300000; // 5-min cooldown between breakouts
 
           // Valid coil: tight range held for at least 3 minutes
-          if (coilDuration >= 180000 && coilCoolOk && s.dailySignalCount < MAX_SIG) {
+          if (coilDuration >= 180000 && coilCoolOk && ((isXAUt || isBTCt) || s.dailySignalCount < MAX_SIG)) {
             // Find the coil's range (the tight range before this expansion)
             const coilSnaps = s.breakRange.filter(b => b.ts < bNow - 5000); // exclude last 5s (the breakout itself)
             if (coilSnaps.length >= 20) {
