@@ -700,15 +700,15 @@ function processPrice(sym, price, hi, lo) {
   const sustainedOverride = s.sustainedCount >= 10 && s.sustainedDir !== null;
 
   // Blowoff — with sustained momentum override
-  const blowoffLock = now2 - s.blowoffTs < 300000;
+  // XAU/BTC: 2-min lock (fast markets, don't miss sustained moves). Equities: 5-min lock.
+  const blowoffDuration = isMT5 ? 120000 : 300000;
+  const blowoffLock = now2 - s.blowoffTs < blowoffDuration;
   if (Math.abs(roc3) > ROC_BLOWOFF[sym] && !blowoffLock) { s.blowoffTs = now2; }
   if (blowoffLock && (cS >= minS || pS >= minS)) {
-    // Sustained momentum override: if ROC has been directional for 15+ consecutive ticks
-    // AND score meets threshold AND signal matches the sustained direction, let it through
-    const sustainedOk = s.sustainedCount >= 15 && s.sustainedDir === (cS >= pS ? 'call' : 'put');
+    // Sustained momentum override: uses same 10-tick threshold as RSI/MACD exhaustion
+    const sustainedOk = sustainedOverride && s.sustainedDir === (cS >= pS ? 'call' : 'put');
     if (sustainedOk) {
       log(sym, 'Blowoff override: sustained momentum — ' + s.sustainedCount + ' consecutive ' + s.sustainedDir.toUpperCase() + ' ticks, ROC ' + roc3.toFixed(3) + '%');
-      // Reset blowoff to prevent rapid re-fire
       s.blowoffTs = now2;
     } else {
       return;
