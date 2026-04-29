@@ -1140,7 +1140,8 @@ function processPrice(sym, price, hi, lo) {
         // CALL retests need BOTH ROC+MACD (stricter — data shows 0/2 ⬆OB wins with weak confirmation)
         // PUT retests keep ROC OR MACD (bearish retests are more reliable)
         const rsiOk = rsiV >= 30 && rsiV <= 70;
-        const rocOk = (ob.dir === 'call' && roc3 > 0) || (ob.dir === 'put' && roc3 < 0);
+        const obMinRoc = 0.015; // minimum |ROC| — below this is noise (data: 0/2 ⬆OB wins at ROC +0.003/+0.009)
+        const rocOk = (ob.dir === 'call' && roc3 > obMinRoc) || (ob.dir === 'put' && roc3 < -obMinRoc);
         const macdOk = (ob.dir === 'call' && macdHist > 0) || (ob.dir === 'put' && macdHist < 0);
         const obConfirmed = ob.dir === 'call' ? (rocOk && macdOk) : (rocOk || macdOk);
 
@@ -1314,7 +1315,9 @@ function processPrice(sym, price, hi, lo) {
       }
 
       // MACRO FLIP CALL: was bearish, now price crossed above 3h EMA with upward ROC
-      if (curDir === 'bull' && roc3 > symRocThr && rsiV > 30 && rsiV < 70) {
+      // RSI cap 60 for CALL (not 70): EMA is lagging — if RSI is already 65+ the rally is exhausted
+      // Data: BTC ⬆SUPER at RSI 67.1 ($76228) was a terrible entry — caught the top, not the flip
+      if (curDir === 'bull' && roc3 > symRocThr && rsiV > 30 && rsiV < 60) {
         s.macroFlipTs = now2;
         s.macroPrevDir = curDir;
         if (isSuper) s.superFlipTs = now2;
@@ -1375,11 +1378,14 @@ function processPrice(sym, price, hi, lo) {
     const athApproachRecent = now2 - s.athApproachTs < 600000; // touched ATH zone in last 10 min
     const atlApproachRecent = now2 - s.atlApproachTs < 600000;
 
-    // ATH REVERSAL → PUT: price was near 5-day high, now pulling back $5+, RSI was overbought, MACD turning bearish
+    // ATH REVERSAL → PUT: price was near 5-day high, now pulling back $5+, RSI was overbought
     // Velocity check: pullback must happen within 3 minutes of touching ATH zone (fast rejection, not slow drift)
+    // MACD relaxed for strong pullbacks ($10+): MACD is too slow during fast drops — ROC alone confirms
+    // Data: ATH at $4553, signal fired at $4533 ($20 late) because MACD hadn't crossed at $4543
     const athPullbackSec = (now2 - s.athApproachTs) / 1000;
     const athVelocityOk = distFromATH >= 10.0 || (distFromATH >= 5.0 && athPullbackSec <= 180);
-    if (athApproachRecent && athVelocityOk && s.rsiAtRollingHigh > 62 && macdL < macdS && roc3 < -symRocThr) {
+    const athMacdOk = macdL < macdS || distFromATH >= 10.0; // skip MACD for strong $10+ pullbacks
+    if (athApproachRecent && athVelocityOk && s.rsiAtRollingHigh > 62 && athMacdOk && roc3 < -symRocThr) {
       if (s.lastSignalDir !== 'put' || (now2 - s.lastNTs > COOLDOWN_MS)) {
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
         if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
@@ -1396,9 +1402,12 @@ function processPrice(sym, price, hi, lo) {
 
     // ATL REVERSAL → CALL: price was near 5-day low, now bouncing $5+, RSI was oversold, MACD turning bullish
     // Velocity check: bounce must happen within 3 minutes of touching ATL zone (fast rejection, not slow drift)
+    // MACD relaxed for strong bounces ($10+): same logic as ATH — ROC alone confirms on fast moves
     const atlBounceSec = (now2 - s.atlApproachTs) / 1000;
     const atlVelocityOk = distFromATL >= 10.0 || (distFromATL >= 5.0 && atlBounceSec <= 180);
-    if (atlApproachRecent && atlVelocityOk && s.rsiAtRollingLow < 38 && macdL > macdS && roc3 > symRocThr) {
+    const atlMacdOk = macdL > macdS || distFromATL >= 10.0; // skip MACD for strong $10+ bounces
+    // RSI cap 75: if current RSI is already extreme, the bounce is exhausted (data: ATL CALL at RSI 89.1 lost -0.15%)
+    if (atlApproachRecent && atlVelocityOk && s.rsiAtRollingLow < 38 && rsiV < 75 && atlMacdOk && roc3 > symRocThr) {
       if (s.lastSignalDir !== 'call' || (now2 - s.lastNTs > COOLDOWN_MS)) {
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
         if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
@@ -1507,6 +1516,35 @@ function processPrice(sym, price, hi, lo) {
     if (!mt5SessionOk) {
       log(sym, '🕐 6/6 regular blocked: off-session (' + (isXAU ? xauSession : btcSession) + ') — only special detectors fire');
       return;
+    }
+  }
+
+  // === MT5 MINIMUM ROC GATE — block 6/6 regular signals when ROC is noise ===
+  // Data: XAU CALL at 09:38 with ROC +0.010% lost -0.49% — ROC was just noise during a strong downtrend
+  // Require |ROC-3| >= 0.015% for MT5 6/6 signals to confirm actual directional momentum
+  if (isMT5) {
+    const absRoc = Math.abs(roc3);
+    const mt5MinRoc = 0.015; // % threshold — below this, ROC is noise
+    if (fireCall && cS >= minS && absRoc < mt5MinRoc) {
+      log(sym, '🛑 CALL blocked: ROC ' + roc3.toFixed(3) + '% too weak (need ±' + mt5MinRoc + '%) — noise, not momentum');
+      fireCall = false;
+    }
+    if (firePut && pS >= finalMinS && absRoc < mt5MinRoc) {
+      log(sym, '🛑 PUT blocked: ROC ' + roc3.toFixed(3) + '% too weak (need ±' + mt5MinRoc + '%) — noise, not momentum');
+      firePut = false;
+    }
+  }
+
+  // === BTC OVERCONFIRMATION BLOCK — 7/6 means move is already exhausted ===
+  // Data: BTC 7/6 = 0/2 wins, both big losers (-0.32%, -0.72%). When every indicator confirms, the move is done.
+  if (isBTC) {
+    if (fireCall && cS > mi) {
+      log(sym, '🛑 CALL blocked: overconfirmation ' + cS + '/' + mi + ' — all indicators agree = move exhausted');
+      fireCall = false;
+    }
+    if (firePut && pS > mi) {
+      log(sym, '🛑 PUT blocked: overconfirmation ' + pS + '/' + mi + ' — all indicators agree = move exhausted');
+      firePut = false;
     }
   }
 
@@ -1814,7 +1852,7 @@ function processTicks(symbols) {
     const isBTCt = sym === 'BTC';
     const isXAUt = sym === 'XAU';
     if (isXAUt || isBTCt) {
-      const coilMaxRange = isBTCt ? 120.0 : 4.0;   // max range to count as consolidation
+      const coilMaxRange = isBTCt ? 120.0 : 6.0;   // max range to count as consolidation (was $4, bumped for XAU at $4500+)
       const escapeMin    = isBTCt ? 30.0  : 1.0;    // min distance beyond coil edge = confirmed breakout
       const bNow = Date.now();
       s.breakRange.push({ ts: bNow, p: price });
