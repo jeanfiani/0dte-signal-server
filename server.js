@@ -1070,7 +1070,15 @@ function processPrice(sym, price, hi, lo) {
         return;
       }
 
-      // Filter 3: MACD not fading — histogram must be growing in breakout direction (not losing steam)
+      // Filter 3: RSI exhaustion on CALL breakouts — XAU only (4/7 ⬆BREAK with RSI>75 lost)
+      // BTC excluded: Row 30 RSI 93.6 was a +0.38% winner — BTC momentum sustains longer runs
+      if (isXAU && bo.dir === 'call' && rsiV > 75) {
+        log(sym, '💥 BREAKOUT blocked: ⬆BREAK RSI ' + rsiV.toFixed(1) + ' > 75 — overbought, entering at exhaustion');
+        s._pendingBreakout = null;
+        return;
+      }
+
+      // Filter 4: MACD not fading — histogram must be growing in breakout direction (not losing steam)
       // macdAccel > 0 = histogram expanding, < 0 = shrinking
       const macdFading = (bo.dir === 'call' && macdAccel < 0 && macdHist > 0) || (bo.dir === 'put' && macdAccel > 0 && macdHist < 0);
       if (macdFading) {
@@ -1127,11 +1135,14 @@ function processPrice(sym, price, hi, lo) {
       const inZone = price >= (ob.lo - obTolerance) && price <= (ob.hi + obTolerance);
       if (inZone) {
         // Confirmation gates: RSI not extreme, ROC turning back, MACD aligned
+        // CALL retests need BOTH ROC+MACD (stricter — data shows 0/2 ⬆OB wins with weak confirmation)
+        // PUT retests keep ROC OR MACD (bearish retests are more reliable)
         const rsiOk = rsiV >= 30 && rsiV <= 70;
         const rocOk = (ob.dir === 'call' && roc3 > 0) || (ob.dir === 'put' && roc3 < 0);
         const macdOk = (ob.dir === 'call' && macdHist > 0) || (ob.dir === 'put' && macdHist < 0);
+        const obConfirmed = ob.dir === 'call' ? (rocOk && macdOk) : (rocOk || macdOk);
 
-        if (rsiOk && (rocOk || macdOk)) {
+        if (rsiOk && obConfirmed) {
           s.obFired = true;
           const dir = ob.dir;
           s.lastAT = dir; if (dir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
@@ -1435,6 +1446,18 @@ function processPrice(sym, price, hi, lo) {
   if (!isMT5 && fireCall && cS >= minS && rsiV > 70) {
     log(sym, '🛑 CALL blocked: overbought RSI ' + rsiV.toFixed(1) + ' > 70 — chasing momentum');
     fireCall = false;
+  }
+
+  // === MT5 SESSION GATE — block 6/6 regular signals during low-trend sessions ===
+  // Data: 6/6 regular = 43% XAU, 25% BTC win rate during Asia/overnight. Special detectors fire earlier and return — not affected.
+  // XAU: only fire 6/6 during London (03:00-08:00 ET) and NY (08:00-16:00 ET)
+  // BTC: only fire 6/6 during US session (09:30-16:00 ET) and pre-US (08:00-09:30 ET)
+  if (isMT5 && (cS >= minS || pS >= minS)) {
+    const mt5SessionOk = isXAU ? (xauSession === 'london' || xauSession === 'london_ny') : isBTC ? (btcSession === 'us' || btcSession === 'pre_us') : true;
+    if (!mt5SessionOk) {
+      log(sym, '🕐 6/6 regular blocked: off-session (' + (isXAU ? xauSession : btcSession) + ') — only special detectors fire');
+      return;
+    }
   }
 
   // === FIRE SIGNALS ===
