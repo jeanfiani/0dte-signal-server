@@ -130,6 +130,8 @@ SYMBOLS.forEach(sym => {
     breakLastTs: 0,          // when last breakout signal fired (cooldown)
     breakLastDir: null,      // direction of last breakout signal ('call'/'put')
     breakLastPrice: 0,       // entry price of last breakout signal
+    // Fast-move detector — catches strong directional moves when MACD lags
+    fastMoveLastTs: 0,       // when last fast-move signal fired (cooldown)
     // Order Block (SMC) — institutional supply/demand zone from breakout coil
     obZone: null,            // { dir, hi, lo, mid, coilHi, coilLo, ts, breakPrice } — active OB after breakout
     obDeparted: false,       // price left the OB zone (must leave before retest counts)
@@ -1186,6 +1188,54 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
+  // ===== FAST-MOVE DETECTOR (MT5 instruments: XAU + BTC) =====
+  // Catches strong directional moves that MACD is too slow to confirm.
+  // Uses raw price-action from vrevSnaps: if price drops/rallies significantly in < 3 min,
+  // fire a signal BYPASSING MACD alignment. MACD is a lagging indicator and won't cross
+  // during fast directional moves — this detector fills that gap.
+  // XAU threshold: $10 in 3 min | BTC threshold: $200 in 3 min
+  if (isMT5 && s.vrevSnaps.length >= 20 && cool && (now2 - s.fastMoveLastTs > 600000)) {
+    const fmWindow = 180000; // 3-minute lookback
+    const fmSnaps = s.vrevSnaps.filter(sn => sn.ts > now2 - fmWindow);
+    if (fmSnaps.length >= 10) {
+      const fmFirst = fmSnaps[0].p;
+      const fmLast = price;
+      const fmDelta = fmLast - fmFirst;
+      const fmAbsDelta = Math.abs(fmDelta);
+      const fmThreshold = isBTC ? 200 : 10; // $200 BTC, $10 XAU
+
+      // Also check velocity is accelerating: last 1-min move > first 1-min move
+      const fmMid = fmSnaps.filter(sn => sn.ts > now2 - 60000); // last 1 min
+      const fmEarly = fmSnaps.filter(sn => sn.ts <= now2 - 120000); // first 1 min
+      const fmMidDelta = fmMid.length >= 3 ? Math.abs(price - fmMid[0].p) : 0;
+      const fmEarlyDelta = fmEarly.length >= 3 ? Math.abs(fmEarly[fmEarly.length - 1].p - fmEarly[0].p) : 0;
+      const accelerating = fmMidDelta >= fmEarlyDelta * 0.8; // recent move at least 80% of early move
+
+      if (fmAbsDelta >= fmThreshold && accelerating) {
+        const fmDir = fmDelta < 0 ? 'put' : 'call';
+        // Require RSI to not be extreme against us (don't short at RSI 10, don't buy at RSI 95)
+        const fmRsiOk = (fmDir === 'put' && rsiV < 85) || (fmDir === 'call' && rsiV > 15);
+        // Require ROC to confirm direction (even slightly)
+        const fmRocOk = (fmDir === 'put' && roc3 < 0) || (fmDir === 'call' && roc3 > 0);
+
+        if (fmRsiOk && fmRocOk) {
+          s.fastMoveLastTs = now2;
+          s.lastAT = fmDir; if (fmDir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
+          if (s.lastSignalDir && s.lastSignalDir !== fmDir) s.lastReversalTs = now2;
+          s.lastSignalDir = fmDir; s.lastSignalTs = now2; s.lastNTs = now2;
+          s.lastSameDir = fmDir; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+          const fmTag = fmDir === 'call' ? '⬆FAST' : '⬇FAST';
+          const sig = { type: fmDir, time: ts(), price: price.toFixed(2), score: fmTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+          enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+          log(sym, '⚡ FAST-MOVE ' + fmDir.toUpperCase() + ' — $' + fmAbsDelta.toFixed(2) + ' move in ' + (fmWindow / 60000).toFixed(0) + 'min · price $' + price.toFixed(2) + ' from $' + fmFirst.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+          sendPush('⚡ ' + sym + ' FAST ' + fmDir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + fmAbsDelta.toFixed(2) + ' move in 3min', 'signal');
+          s.trade = { active: true, type: fmDir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+          return;
+        }
+      }
+    }
+  }
+
   // ===== V-REVERSAL DETECTOR (XAU only) =====
   // Catches momentum reversals: price drops/rallies $8+ in 15 min, then ROC flips sharply
   // Different from trend-following signals — fires on the turn itself, not after EMAs catch up
@@ -1748,8 +1798,8 @@ function processTicks(symbols) {
       s.macroEma = s.macroEma === null ? price : price * emaK + s.macroEma * (1 - emaK);
     }
 
-    // V-Reversal snapshots — XAU only, every tick, keep 20 min (max 1200 at 1s interval)
-    if (sym === 'XAU') {
+    // V-Reversal snapshots — MT5 instruments, every tick, keep 20 min (max 1200 at 1s interval)
+    if (isXAUt || isBTCt) {
       s.vrevSnaps.push({ ts: Date.now(), p: price });
       const cutoff = Date.now() - 1200000; // 20 min
       while (s.vrevSnaps.length > 0 && s.vrevSnaps[0].ts < cutoff) s.vrevSnaps.shift();
@@ -2034,6 +2084,7 @@ setInterval(() => {
       s.shakeoutDir = null; s.shakeoutTs = 0; s.shakeoutPrice = 0; s.shakeoutEp = 0;
       s.obCandles = []; s.obCurCandle = null; s.orderBlocks = [];
       s.obZone = null; s.obDeparted = false; s.obFired = false; s.obMitigated = false;
+      s.fastMoveLastTs = 0;
       s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
     });
     saveRollingLevels(); // Persist rolling ATH/ATL data across restarts
