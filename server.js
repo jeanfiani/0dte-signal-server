@@ -33,13 +33,13 @@ app.use((req, res, next) => {
 // ===== CONFIG =====
 const API = process.env.FINNHUB_API_KEY;
 const PORT = process.env.PORT || 3000;
-const SYMBOLS = ['QQQ', 'SPY', 'XAU', 'BTC'];
-const RSI_CALL_LO = { QQQ: 45, SPY: 45, XAU: 40, BTC: 42 };
-const RSI_CALL_HI = { QQQ: 65, SPY: 65, XAU: 68, BTC: 66 }; // Gate range (rsiSweetCall) — tighter
-const RSI_PUT_LO  = { QQQ: 30, SPY: 30, XAU: 28, BTC: 30 };
-const RSI_PUT_HI  = { QQQ: 55, SPY: 55, XAU: 58, BTC: 56 };
-const ROC_BLOWOFF = { QQQ: 0.15, SPY: 0.15, XAU: 0.20, BTC: 0.25 }; // BTC more volatile
-const MAX_IND = { QQQ: 6, SPY: 6, XAU: 6, BTC: 6 };
+const SYMBOLS = ['QQQ', 'SPY', 'XAU', 'BTC', 'NAS100'];
+const RSI_CALL_LO = { QQQ: 45, SPY: 45, XAU: 40, BTC: 42, NAS100: 42 };
+const RSI_CALL_HI = { QQQ: 65, SPY: 65, XAU: 68, BTC: 66, NAS100: 66 }; // Gate range (rsiSweetCall) — tighter
+const RSI_PUT_LO  = { QQQ: 30, SPY: 30, XAU: 28, BTC: 30, NAS100: 30 };
+const RSI_PUT_HI  = { QQQ: 55, SPY: 55, XAU: 58, BTC: 56, NAS100: 56 };
+const ROC_BLOWOFF = { QQQ: 0.15, SPY: 0.15, XAU: 0.20, BTC: 0.25, NAS100: 0.20 }; // NAS100 similar vol to XAU
+const MAX_IND = { QQQ: 6, SPY: 6, XAU: 6, BTC: 6, NAS100: 6 };
 const COOLDOWN_MS = 180000;
 // FLIP_COOL_MS removed — was blocking legitimate reversal signals
 const MAX_SIG = 10;
@@ -51,6 +51,8 @@ const XAU_MACD_MIN = 0.10; // XAU MACD values ~5x larger than QQQ/SPY (price ~$3
 const BTC_ROC_THR = 0.030; // BTC needs wider ROC threshold — most volatile asset
 const BTC_MACD_MIN = 2.00; // BTC MACD values ~100x larger than QQQ/SPY (price ~$90000 vs $650)
 const XAU_MACD_LINE_MIN = 0.08; // XAU MACD line minimum strength
+const NAS_ROC_THR = 0.025; // NAS100 at ~20000 — similar volatility profile to XAU
+const NAS_MACD_MIN = 1.00; // NAS100 MACD values ~30x larger than QQQ (price ~20000 vs ~$480)
 
 // VAPID setup
 try {
@@ -279,7 +281,8 @@ function processPrice(sym, price, hi, lo) {
   const mi = MAX_IND[sym];
   const isXAU = sym === 'XAU';
   const isBTC = sym === 'BTC';
-  const isMT5 = isXAU || isBTC; // MT5-fed instruments (24h, no VWAP, no Finnhub WS)
+  const isNAS = sym === 'NAS100';
+  const isMT5 = isXAU || isBTC || isNAS; // MT5-fed instruments (extended hours, no VWAP, no Finnhub WS)
 
   // XAU/BTC: set open on first price (MT5 feeds only when market is open)
   // Equities: set open at 9:30 AM ET (570 min)
@@ -419,8 +422,8 @@ function processPrice(sym, price, hi, lo) {
       else dxyBearGold = true;                 // Strong gold down = treat as DXY strong
     }
     abV = dxyBullGold; blV = dxyBearGold;
-  } else if (isBTC) {
-    // BTC: no official VWAP, use price vs EMA34 as trend anchor (above = bullish, below = bearish)
+  } else if (isBTC || isNAS) {
+    // BTC/NAS100: no official VWAP, use price vs EMA34 as trend anchor (above = bullish, below = bearish)
     if (s.pE34 && s.prices.length >= 35) {
       const ema34Pct = ((price - s.pE34) / s.pE34) * 100;
       abV = ema34Pct > 0.05; blV = ema34Pct < -0.05;
@@ -435,11 +438,15 @@ function processPrice(sym, price, hi, lo) {
   const atrVal = isMT5 ? calcATR(s.highs, s.lows, s.prices, 14) : 0;
   const atrTooLow = isXAU && s.prices.length >= 30 && atrVal < 0.50; // XAU: $0.50 ATR = dead market
   const btcAtrTooLow = isBTC && s.prices.length >= 30 && atrVal < 10; // BTC: $10 ATR = dead market
+  const nasAtrTooLow = isNAS && s.prices.length >= 30 && atrVal < 5; // NAS100: $5 ATR = dead market (~20000 price)
 
   // Session detection
   const etMin = gET();
   const xauSession = isXAU ? (etMin >= 480 && etMin < 960 ? 'london_ny' : etMin >= 180 && etMin < 480 ? 'london' : 'asia') : '';
   const btcSession = isBTC ? (etMin >= 570 && etMin < 960 ? 'us' : etMin >= 480 && etMin < 570 ? 'pre_us' : etMin >= 60 && etMin < 480 ? 'europe_asia' : 'overnight') : '';
+  // NAS100 futures: Sun 6PM - Fri 5PM ET, daily break 5-6PM ET
+  // Sessions: us (09:30-16:00), pre_us (08:00-09:30), europe (03:00-08:00), overnight (18:00-03:00)
+  const nasSession = isNAS ? (etMin >= 570 && etMin < 960 ? 'us' : etMin >= 480 && etMin < 570 ? 'pre_us' : etMin >= 180 && etMin < 480 ? 'europe' : 'overnight') : '';
   // Round-number gravity for XAU — gold stalls/reverses at $50 levels ($3300, $3350, $3400...)
   // Detect proximity to nearest $50 round number and store for signal filtering
   let roundNumDist = 99, nearestRound = 0, roundNumZone = false;
@@ -457,14 +464,14 @@ function processPrice(sym, price, hi, lo) {
   // RSI scoring: rBull/rBear for the 6-indicator SCORE (wider zone than the gate)
   // Scoring zone: QQQ/SPY 45-70, XAU 40-68 — matches bot pages exactly
   // Gate zone (rsiSweetCall/Put below): QQQ/SPY 45-65/30-55, XAU 40-68/28-58 — tighter
-  const rsiScoreHi = isXAU ? 68 : isBTC ? 66 : 70;
-  const rsiScoreLo = isXAU ? 40 : isBTC ? 42 : 45;
+  const rsiScoreHi = isXAU ? 68 : (isBTC || isNAS) ? 66 : 70;
+  const rsiScoreLo = isXAU ? 40 : (isBTC || isNAS) ? 42 : 45;
   const rBull = rsiV > rsiScoreLo && rsiV < rsiScoreHi;
   const rBear = rsiV < rsiScoreLo || rsiV > rsiScoreHi;
   // ATR-adaptive ROC threshold for XAU — scales with volatility
   // Base: 0.025%. High ATR (>$3) = raise to 0.035% (filter noise in volatile markets)
   // Low ATR (<$1) = lower to 0.018% (capture meaningful moves in quiet markets)
-  let symRocThr = isBTC ? BTC_ROC_THR : sym === 'XAU' ? XAU_ROC_THR : ROC_THR;
+  let symRocThr = isBTC ? BTC_ROC_THR : isNAS ? NAS_ROC_THR : sym === 'XAU' ? XAU_ROC_THR : ROC_THR;
   if (isXAU && atrVal > 0) {
     if (atrVal >= 3.0) symRocThr = 0.035;       // High volatility — need bigger move
     else if (atrVal >= 1.5) symRocThr = 0.025;   // Normal — keep default
@@ -475,6 +482,11 @@ function processPrice(sym, price, hi, lo) {
     if (atrVal >= 100) symRocThr = 0.045;       // BTC: high vol — need bigger move
     else if (atrVal >= 50) symRocThr = 0.030;    // Normal BTC vol
     else if (atrVal >= 10) symRocThr = 0.020;    // Quiet BTC market
+  }
+  if (isNAS && atrVal > 0) {
+    if (atrVal >= 30) symRocThr = 0.040;         // NAS100: high vol — need bigger move
+    else if (atrVal >= 15) symRocThr = 0.025;    // Normal NAS100 vol
+    else if (atrVal >= 5) symRocThr = 0.018;     // Quiet NAS100 market
   }
   s._symRocThr = symRocThr; // Store for /prices endpoint
   const rocBull = roc3 > symRocThr, rocBear = roc3 < -symRocThr;
@@ -512,12 +524,13 @@ function processPrice(sym, price, hi, lo) {
   s._slv = isXAU ? { price: slvPrice, dir: slvDir, roc3: slvRoc3 } : null;
   s._gdx = isXAU ? { price: gdxPrice, dir: gdxDir, roc3: gdxRoc3 } : null;
   s._btcSession = btcSession;
+  s._nasSession = nasSession;
   s._atr = atrVal;
   s._xauSession = xauSession;
 
   // ===== PRICE STRUCTURE DETECTOR (XAU only) =====
   // Build 3-minute bars from vrevSnaps, detect higher-highs/higher-lows or lower-highs/lower-lows
-  if (isXAU && s.vrevSnaps.length >= 30) {
+  if (isMT5 && s.vrevSnaps.length >= 30) {
     const now1 = Date.now();
     const recentSnaps = s.vrevSnaps.filter(sn => sn.ts > now1 - 900000); // last 15 min
     if (recentSnaps.length >= 20) {
@@ -553,7 +566,7 @@ function processPrice(sym, price, hi, lo) {
         else s._priceStructure = 'neutral';
       } else { s._priceStructure = 'neutral'; }
     } else { s._priceStructure = 'neutral'; }
-  } else if (isXAU) { s._priceStructure = 'neutral'; }
+  } else if (isMT5) { s._priceStructure = 'neutral'; }
 
   // Check exit for active trades
   checkExit(sym, price);
@@ -581,17 +594,23 @@ function processPrice(sym, price, hi, lo) {
       if ((isCall && tltDir === 'up') || (!isCall && tltDir === 'down')) { sc++; factors.push('TLT'); }
       if (slvPrice > 0 && ((isCall && slvDir === 'up') || (!isCall && slvDir === 'down'))) { sc++; factors.push('SLV'); }
       if (gdxPrice > 0 && ((isCall && gdxDir === 'up') || (!isCall && gdxDir === 'down'))) { sc++; factors.push('GDX'); }
-    } else if (isBTC) {
-      // BTC-specific: SPY, QQQ, DXY (risk-on correlation), news sentiment
+    } else if (isBTC || isNAS) {
+      // BTC/NAS100-specific: SPY, QQQ, DXY (risk-on correlation), cross-asset
       const spyS = S['SPY'], qqqS = S['QQQ'];
       const spyDir2 = spyS && spyS.pE5 && spyS.pE13 ? (spyS.pE5 > spyS.pE13 ? 'up' : 'down') : null;
       const qqqDir2 = qqqS && qqqS.pE5 && qqqS.pE13 ? (qqqS.pE5 > qqqS.pE13 ? 'up' : 'down') : null;
       if ((isCall && spyDir2 === 'up') || (!isCall && spyDir2 === 'down')) { sc++; factors.push('SPY'); }
       if ((isCall && qqqDir2 === 'up') || (!isCall && qqqDir2 === 'down')) { sc++; factors.push('QQQ'); }
-      // DXY inverse for BTC too (dollar up = BTC bear)
+      // DXY inverse (dollar up = equity/crypto bear)
       if ((isCall && dxyDir === 'down') || (!isCall && dxyDir === 'up')) { sc++; factors.push('DXY'); }
       // Order blocks aligned
       if (s._orderBlocks && s._orderBlocks.length > 0) { sc++; factors.push('OB'); }
+      // NAS100: also check BTC as risk-on correlation
+      if (isNAS) {
+        const btcS = S['BTC'];
+        const btcDir2 = btcS && btcS.pE5 && btcS.pE13 ? (btcS.pE5 > btcS.pE13 ? 'up' : 'down') : null;
+        if ((isCall && btcDir2 === 'up') || (!isCall && btcDir2 === 'down')) { sc++; factors.push('BTC'); }
+      }
     }
 
     const label = sc >= 5 ? 'HIGH' : sc >= 3 ? 'MOD' : 'LOW';
@@ -616,6 +635,9 @@ function processPrice(sym, price, hi, lo) {
     if (etMin >= 1020 && etMin < 1080) return; // XAU closed 5-6 PM ET
   } else if (isBTC) {
     // BTC trades 24/7 — no session block
+  } else if (isNAS) {
+    // NAS100 futures: Sun 6PM - Fri 5PM ET, daily break 5-6PM ET (1020-1080 min)
+    if (etMin >= 1020 && etMin < 1080) return; // NAS100 closed 5-6 PM ET
   } else {
     if (etMin < 570 || etMin >= 955) return;
     // Midday dead zone — 12:00-14:00 ET (720-840 min). QQQ: 43% win, SPY: 42% win.
@@ -1204,7 +1226,7 @@ function processPrice(sym, price, hi, lo) {
       const fmLast = price;
       const fmDelta = fmLast - fmFirst;
       const fmAbsDelta = Math.abs(fmDelta);
-      const fmThreshold = isBTC ? 200 : 10; // $200 BTC, $10 XAU
+      const fmThreshold = isBTC ? 200 : isNAS ? 50 : 10; // $200 BTC, $50 NAS100, $10 XAU
 
       // Also check velocity is accelerating: last 1-min move > first 1-min move
       const fmMid = fmSnaps.filter(sn => sn.ts > now2 - 60000); // last 1 min
@@ -1379,16 +1401,16 @@ function processPrice(sym, price, hi, lo) {
     const trDir = price > s.macroEma ? 'bull' : 'bear';
     const trSpread = Math.abs(price - s.macroEma);
     const trSpreadPct = (trSpread / s.macroEma) * 100;
-    const trMinSpread = isBTC ? 0.15 : 0.10; // % minimum separation — must be well above/below EMA, not just touching
+    const trMinSpread = isBTC ? 0.15 : isNAS ? 0.12 : 0.10; // % minimum separation — must be well above/below EMA, not just touching
     // Need multi-timeframe ROC alignment: both ROC-3 and ROC-6 confirming same direction
-    const roc6 = s.roc6 || 0;
+    const roc6 = s._roc6 || 0;
     const trRoc3Ok = (trDir === 'bull' && roc3 > 0) || (trDir === 'bear' && roc3 < 0);
     const trRoc6Ok = (trDir === 'bull' && roc6 > 0) || (trDir === 'bear' && roc6 < 0);
 
     if (trSpreadPct >= trMinSpread && trRoc3Ok && trRoc6Ok) {
       // Calculate 1-min ATR from vrevSnaps for dynamic stop loss
       // ATR = average of per-minute high-low ranges over last 10 minutes
-      let trAtr = isBTC ? 50 : 3; // fallback defaults
+      let trAtr = isBTC ? 50 : isNAS ? 15 : 3; // fallback defaults
       if (s.vrevSnaps.length >= 60) {
         const atrSnaps = s.vrevSnaps.filter(sn => sn.ts > now2 - 600000); // last 10 min
         if (atrSnaps.length >= 30) {
@@ -1406,11 +1428,12 @@ function processPrice(sym, price, hi, lo) {
       }
       const trSlMult = 2.5; // stop loss = 2.5x ATR — wide enough to survive noise
       const trSlDist = trAtr * trSlMult;
-      const trMinSl = isBTC ? 80 : 4; // absolute minimum stop distance ($4 XAU, $80 BTC)
+      const trMinSl = isBTC ? 80 : isNAS ? 25 : 4; // absolute minimum stop distance ($4 XAU, $25 NAS100, $80 BTC)
       const trSlFinal = Math.max(trSlDist, trMinSl);
 
       // TREND RIDE CALL: macro bullish, price well above EMA, short+medium ROC both up
-      if (trDir === 'bull' && rsiV > 35 && rsiV < 65) {
+      // RSI 30-75: wider than normal signals — sustained trends push RSI high, that's expected
+      if (trDir === 'bull' && rsiV > 30 && rsiV < 75) {
         const slPrice = price - trSlFinal;
         s.trendRideLastTs = now2;
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
@@ -1425,7 +1448,8 @@ function processPrice(sym, price, hi, lo) {
         return;
       }
       // TREND RIDE PUT: macro bearish, price well below EMA, short+medium ROC both down
-      if (trDir === 'bear' && rsiV > 35 && rsiV < 65) {
+      // RSI 25-70: wider than normal signals — sustained downtrends push RSI low, that's expected
+      if (trDir === 'bear' && rsiV > 25 && rsiV < 70) {
         const slPrice = price + trSlFinal;
         s.trendRideLastTs = now2;
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
@@ -1549,7 +1573,7 @@ function processPrice(sym, price, hi, lo) {
   if (isMT5 && s.trade.active) {
     const tDir = s.trade.type; // current trade direction
     const tPnl = tDir === 'call' ? price - s.trade.ep : s.trade.ep - price; // current P&L in $
-    const minProfit = isBTC ? 50 : isXAU ? 2 : 0.20; // minimum profit to protect ($2 for XAU, $50 for BTC)
+    const minProfit = isBTC ? 50 : isNAS ? 10 : isXAU ? 2 : 0.20; // minimum profit to protect ($2 for XAU, $50 for BTC, $10 for NAS100)
     if (tPnl >= minProfit) {
       // Trade is in profit — block opposite-direction regular signal
       if ((tDir === 'call' && firePut && pS >= minS) || (tDir === 'put' && fireCall && cS >= minS)) {
@@ -1568,7 +1592,7 @@ function processPrice(sym, price, hi, lo) {
     const sessRange = s.sessionHigh - s.sessionLow;
     const pctFromHigh = sessRange > 0 ? (distFromSessHigh / s.sessionHigh) * 100 : 99;
     // Block if within 0.05% of session high AND session has meaningful range (not first few ticks)
-    if (pctFromHigh < 0.05 && sessRange > (isBTC ? 50 : isXAU ? 2 : 0.30)) {
+    if (pctFromHigh < 0.05 && sessRange > (isBTC ? 50 : isNAS ? 20 : isXAU ? 2 : 0.30)) {
       log(sym, '🛑 CALL blocked at session high — $' + price.toFixed(2) + ' is ' + pctFromHigh.toFixed(3) + '% from high $' + s.sessionHigh.toFixed(2) + ' (range $' + sessRange.toFixed(2) + ')');
       fireCall = false;
     }
@@ -1585,9 +1609,9 @@ function processPrice(sym, price, hi, lo) {
   // XAU: only fire 6/6 during London (03:00-08:00 ET) and NY (08:00-16:00 ET)
   // BTC: only fire 6/6 during US session (09:30-16:00 ET) and pre-US (08:00-09:30 ET)
   if (isMT5 && (cS >= minS || pS >= minS)) {
-    const mt5SessionOk = isXAU ? (xauSession === 'london' || xauSession === 'london_ny') : isBTC ? (btcSession === 'us' || btcSession === 'pre_us') : true;
+    const mt5SessionOk = isXAU ? (xauSession === 'london' || xauSession === 'london_ny') : isBTC ? (btcSession === 'us' || btcSession === 'pre_us') : isNAS ? (nasSession === 'us' || nasSession === 'pre_us' || nasSession === 'europe') : true;
     if (!mt5SessionOk) {
-      log(sym, '🕐 6/6 regular blocked: off-session (' + (isXAU ? xauSession : btcSession) + ') — only special detectors fire');
+      log(sym, '🕐 6/6 regular blocked: off-session (' + (isXAU ? xauSession : isBTC ? btcSession : nasSession) + ') — only special detectors fire');
       return;
     }
   }
@@ -1900,7 +1924,7 @@ function processTicks(symbols) {
     processPrice(sym, price, hi, lo);
 
     // Macro trend snapshots — MT5 instruments (XAU + BTC), every 5 min, 6-hour rolling window
-    if ((sym === 'XAU' || sym === 'BTC') && (Date.now() - s.macroLastSnapTs >= 300000)) {
+    if ((sym === 'XAU' || sym === 'BTC' || sym === 'NAS100') && (Date.now() - s.macroLastSnapTs >= 300000)) {
       s.macroLastSnapTs = Date.now();
       s.macroSnaps.push({ ts: Date.now(), p: price });
       if (s.macroSnaps.length > 72) s.macroSnaps.shift(); // keep 6 hours
@@ -1910,7 +1934,7 @@ function processTicks(symbols) {
     }
 
     // V-Reversal snapshots — MT5 instruments, every tick, keep 20 min (max 1200 at 1s interval)
-    if (isXAUt || isBTCt) {
+    if (isXAUt || isBTCt || isNASt) {
       s.vrevSnaps.push({ ts: Date.now(), p: price });
       const cutoff = Date.now() - 1200000; // 20 min
       while (s.vrevSnaps.length > 0 && s.vrevSnaps[0].ts < cutoff) s.vrevSnaps.shift();
@@ -1918,10 +1942,10 @@ function processTicks(symbols) {
 
     // === TREND RIDE TRAILING STOP — monitor every tick for TREND signals ===
     // Dynamic ATR-based stop with trailing: breakeven at 1x ATR profit, trail at 1x ATR after 2x ATR profit
-    if ((isXAUt || isBTCt) && s.trade.active && s.trade.isTrend) {
+    if ((isXAUt || isBTCt || isNASt) && s.trade.active && s.trade.isTrend) {
       const t = s.trade;
       const tPnl = t.type === 'call' ? price - t.ep : t.ep - price;
-      const atr = t.atr || (isBTCt ? 50 : 3);
+      const atr = t.atr || (isBTCt ? 50 : sym === 'NAS100' ? 15 : 3);
 
       // Track best price for trailing
       if (t.type === 'call' && price > t.bestPrice) t.bestPrice = price;
@@ -1962,9 +1986,10 @@ function processTicks(symbols) {
     //   BTC (~$90K):  coil < $120, escape $30
     const isBTCt = sym === 'BTC';
     const isXAUt = sym === 'XAU';
-    if (isXAUt || isBTCt) {
-      const coilMaxRange = isBTCt ? 120.0 : 6.0;   // max range to count as consolidation (was $4, bumped for XAU at $4500+)
-      const escapeMin    = isBTCt ? 30.0  : 1.0;    // min distance beyond coil edge = confirmed breakout
+    const isNASt = sym === 'NAS100';
+    if (isXAUt || isBTCt || isNASt) {
+      const coilMaxRange = isBTCt ? 120.0 : isNASt ? 30.0 : 6.0;   // max range to count as consolidation
+      const escapeMin    = isBTCt ? 30.0  : isNASt ? 8.0  : 1.0;    // min distance beyond coil edge = confirmed breakout
       const bNow = Date.now();
       s.breakRange.push({ ts: bNow, p: price });
       // Trim to 5-min window
@@ -1990,7 +2015,7 @@ function processTicks(symbols) {
           const coilCoolOk = bNow - s.breakLastTs > 300000; // 5-min cooldown between breakouts
 
           // Valid coil: tight range held for at least 3 minutes
-          if (coilDuration >= 180000 && coilCoolOk && ((isXAUt || isBTCt) || s.dailySignalCount < MAX_SIG)) {
+          if (coilDuration >= 180000 && coilCoolOk && ((isXAUt || isBTCt || isNASt) || s.dailySignalCount < MAX_SIG)) {
             // Find the coil's range (the tight range before this expansion)
             const coilSnaps = s.breakRange.filter(b => b.ts < bNow - 5000); // exclude last 5s (the breakout itself)
             if (coilSnaps.length >= 20) {
@@ -2031,10 +2056,10 @@ function processTicks(symbols) {
     }
 
     // === ORDER BLOCK TRACKING — detect departure and retest each tick ===
-    if ((isXAUt || isBTCt) && s.obZone && !s.obMitigated) {
+    if ((isXAUt || isBTCt || isNASt) && s.obZone && !s.obMitigated) {
       const ob = s.obZone;
       const obAge = Date.now() - ob.ts;
-      const obTolerance = isBTCt ? 15.0 : 0.50; // zone edge tolerance
+      const obTolerance = isBTCt ? 15.0 : isNASt ? 5.0 : 0.50; // zone edge tolerance
 
       // Expire stale OBs (30 min)
       if (obAge > 1800000) {
@@ -2067,7 +2092,7 @@ function processTicks(symbols) {
   });
 }
 setInterval(() => processTicks(['QQQ', 'SPY']), 3000);
-setInterval(() => processTicks(['XAU', 'BTC']), 1000);
+setInterval(() => processTicks(['XAU', 'BTC', 'NAS100']), 1000);
 
 // Fetch VIX every 30 seconds (try multiple symbol formats)
 async function fetchVIX() {
@@ -2344,20 +2369,22 @@ app.get('/prices', (req, res) => {
       tlt: s._tlt || null,
       slv: s._slv || null,
       gdx: s._gdx || null,
-      spyCorr: sym === 'BTC' ? (() => { const sp = S['SPY']; if (!sp || !sp.lastPrice) return null; return { price: sp.lastPrice, dir: sp.pE5 && sp.pE13 ? (sp.pE5 > sp.pE13 ? 'up' : 'down') : 'flat', roc3: sp._roc3 || 0 }; })() : null,
-      qqqCorr: sym === 'BTC' ? (() => { const qp = S['QQQ']; if (!qp || !qp.lastPrice) return null; return { price: qp.lastPrice, dir: qp.pE5 && qp.pE13 ? (qp.pE5 > qp.pE13 ? 'up' : 'down') : 'flat', roc3: qp._roc3 || 0 }; })() : null,
-      dxyCorr: sym === 'BTC' ? (() => { return dxyPrice > 0 ? { price: dxyPrice, dir: dxyDir, roc3: dxyRoc3 } : null; })() : null,
+      spyCorr: (sym === 'BTC' || sym === 'NAS100') ? (() => { const sp = S['SPY']; if (!sp || !sp.lastPrice) return null; return { price: sp.lastPrice, dir: sp.pE5 && sp.pE13 ? (sp.pE5 > sp.pE13 ? 'up' : 'down') : 'flat', roc3: sp._roc3 || 0 }; })() : null,
+      qqqCorr: (sym === 'BTC' || sym === 'NAS100') ? (() => { const qp = S['QQQ']; if (!qp || !qp.lastPrice) return null; return { price: qp.lastPrice, dir: qp.pE5 && qp.pE13 ? (qp.pE5 > qp.pE13 ? 'up' : 'down') : 'flat', roc3: qp._roc3 || 0 }; })() : null,
+      dxyCorr: (sym === 'BTC' || sym === 'NAS100') ? (() => { return dxyPrice > 0 ? { price: dxyPrice, dir: dxyDir, roc3: dxyRoc3 } : null; })() : null,
+      btcCorr: sym === 'NAS100' ? (() => { const bp = S['BTC']; if (!bp || !bp.lastPrice) return null; return { price: bp.lastPrice, dir: bp.pE5 && bp.pE13 ? (bp.pE5 > bp.pE13 ? 'up' : 'down') : 'flat', roc3: bp._roc3 || 0 }; })() : null,
       priceStructure: s._priceStructure || 'neutral',
       breakout: s._breakout || null,
       atr: s._atr || 0,
       xauSession: s._xauSession || '',
       btcSession: s._btcSession || '',
+      nasSession: s._nasSession || '',
       rollingHigh: s.rollingHigh || 0,
       rollingLow: s.rollingLow === Infinity ? 0 : s.rollingLow,
       roundNum: s._roundNum || null,
       orderBlocks: s._orderBlocks || [],
       obBreakout: s.obZone ? { dir: s.obZone.dir, hi: +s.obZone.hi.toFixed(2), lo: +s.obZone.lo.toFixed(2), coilHi: +s.obZone.coilHi.toFixed(2), coilLo: +s.obZone.coilLo.toFixed(2), age: Math.round((Date.now() - s.obZone.ts) / 1000), departed: s.obDeparted, fired: s.obFired, mitigated: s.obMitigated } : null,
-      macro: (sym === 'XAU' || sym === 'BTC') && s.macroSnaps.length >= 2 && s.lastPrice > 0 ? (() => {
+      macro: (sym === 'XAU' || sym === 'BTC' || sym === 'NAS100') && s.macroSnaps.length >= 2 && s.lastPrice > 0 ? (() => {
         const p = s.lastPrice;
         return {
           snaps: s.macroSnaps.length,
