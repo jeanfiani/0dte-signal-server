@@ -132,6 +132,7 @@ SYMBOLS.forEach(sym => {
     breakLastPrice: 0,       // entry price of last breakout signal
     // Fast-move detector — catches strong directional moves when MACD lags
     fastMoveLastTs: 0,       // when last fast-move signal fired (cooldown)
+    trendRideLastTs: 0,      // when last trend-ride signal fired (cooldown)
     // Order Block (SMC) — institutional supply/demand zone from breakout coil
     obZone: null,            // { dir, hi, lo, mid, coilHi, coilLo, ts, breakPrice } — active OB after breakout
     obDeparted: false,       // price left the OB zone (must leave before retest counts)
@@ -1369,6 +1370,78 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
+  // ===== TREND RIDE DETECTOR (MT5 instruments: XAU + BTC) =====
+  // Catches sustained directional moves where macro EMA confirms trend but short-term EMAs lag behind.
+  // The macro EMA (3-hour) shows clear direction, price has meaningful separation, and multi-timeframe
+  // ROC confirms momentum — fire a signal even when 5/13/34 EMAs haven't crossed yet.
+  // Data: XAU $4577→$4594 ($17 rally) with macro EMA bullish at $4571 — 0 signals fired because EMAs lagged.
+  if (isMT5 && s.macroEma !== null && s.macroSnaps.length >= 30 && cool && (now2 - s.trendRideLastTs > 1200000)) {
+    const trDir = price > s.macroEma ? 'bull' : 'bear';
+    const trSpread = Math.abs(price - s.macroEma);
+    const trSpreadPct = (trSpread / s.macroEma) * 100;
+    const trMinSpread = isBTC ? 0.15 : 0.10; // % minimum separation — must be well above/below EMA, not just touching
+    // Need multi-timeframe ROC alignment: both ROC-3 and ROC-6 confirming same direction
+    const roc6 = s.roc6 || 0;
+    const trRoc3Ok = (trDir === 'bull' && roc3 > 0) || (trDir === 'bear' && roc3 < 0);
+    const trRoc6Ok = (trDir === 'bull' && roc6 > 0) || (trDir === 'bear' && roc6 < 0);
+
+    if (trSpreadPct >= trMinSpread && trRoc3Ok && trRoc6Ok) {
+      // Calculate 1-min ATR from vrevSnaps for dynamic stop loss
+      // ATR = average of per-minute high-low ranges over last 10 minutes
+      let trAtr = isBTC ? 50 : 3; // fallback defaults
+      if (s.vrevSnaps.length >= 60) {
+        const atrSnaps = s.vrevSnaps.filter(sn => sn.ts > now2 - 600000); // last 10 min
+        if (atrSnaps.length >= 30) {
+          const bucketSize = 60000; // 1-minute buckets
+          const buckets = {};
+          atrSnaps.forEach(sn => {
+            const bk = Math.floor(sn.ts / bucketSize);
+            if (!buckets[bk]) buckets[bk] = { hi: sn.p, lo: sn.p };
+            if (sn.p > buckets[bk].hi) buckets[bk].hi = sn.p;
+            if (sn.p < buckets[bk].lo) buckets[bk].lo = sn.p;
+          });
+          const ranges = Object.values(buckets).map(b => b.hi - b.lo);
+          if (ranges.length >= 3) trAtr = ranges.reduce((a, b) => a + b, 0) / ranges.length;
+        }
+      }
+      const trSlMult = 2.5; // stop loss = 2.5x ATR — wide enough to survive noise
+      const trSlDist = trAtr * trSlMult;
+      const trMinSl = isBTC ? 80 : 4; // absolute minimum stop distance ($4 XAU, $80 BTC)
+      const trSlFinal = Math.max(trSlDist, trMinSl);
+
+      // TREND RIDE CALL: macro bullish, price well above EMA, short+medium ROC both up
+      if (trDir === 'bull' && rsiV > 35 && rsiV < 65) {
+        const slPrice = price - trSlFinal;
+        s.trendRideLastTs = now2;
+        s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
+        if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
+        s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
+        s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+        const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆TREND', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+        log(sym, '📈 TREND RIDE CALL — macro bullish · price $' + price.toFixed(2) + ' > EMA $' + s.macroEma.toFixed(2) + ' (+' + trSpreadPct.toFixed(2) + '%) · ATR $' + trAtr.toFixed(2) + ' · SL $' + slPrice.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+        sendPush('📈 ' + sym + ' TREND CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · SL $' + slPrice.toFixed(2) + ' · riding macro uptrend', 'signal');
+        s.trade = { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, isTrend: true, slPrice: slPrice, slInitial: slPrice, atr: trAtr, bestPrice: price };
+        return;
+      }
+      // TREND RIDE PUT: macro bearish, price well below EMA, short+medium ROC both down
+      if (trDir === 'bear' && rsiV > 35 && rsiV < 65) {
+        const slPrice = price + trSlFinal;
+        s.trendRideLastTs = now2;
+        s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
+        if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
+        s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
+        s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+        const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇TREND', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+        log(sym, '📉 TREND RIDE PUT — macro bearish · price $' + price.toFixed(2) + ' < EMA $' + s.macroEma.toFixed(2) + ' (-' + trSpreadPct.toFixed(2) + '%) · ATR $' + trAtr.toFixed(2) + ' · SL $' + slPrice.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+        sendPush('📉 ' + sym + ' TREND PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · SL $' + slPrice.toFixed(2) + ' · riding macro downtrend', 'signal');
+        s.trade = { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, isTrend: true, slPrice: slPrice, slInitial: slPrice, atr: trAtr, bestPrice: price };
+        return;
+      }
+    }
+  }
+
   // ===== ATH/ATL REVERSAL DETECTOR (XAU only) =====
   // Gold tends to reverse hard at multi-day highs/lows — institutional profit-taking, algo levels
   // Fires high-confidence reversal signals when price touches 5-day extreme then pulls back
@@ -1843,6 +1916,44 @@ function processTicks(symbols) {
       while (s.vrevSnaps.length > 0 && s.vrevSnaps[0].ts < cutoff) s.vrevSnaps.shift();
     }
 
+    // === TREND RIDE TRAILING STOP — monitor every tick for TREND signals ===
+    // Dynamic ATR-based stop with trailing: breakeven at 1x ATR profit, trail at 1x ATR after 2x ATR profit
+    if ((isXAUt || isBTCt) && s.trade.active && s.trade.isTrend) {
+      const t = s.trade;
+      const tPnl = t.type === 'call' ? price - t.ep : t.ep - price;
+      const atr = t.atr || (isBTCt ? 50 : 3);
+
+      // Track best price for trailing
+      if (t.type === 'call' && price > t.bestPrice) t.bestPrice = price;
+      if (t.type === 'put' && price < t.bestPrice) t.bestPrice = price;
+
+      // Trailing stop logic — ratchet up as profit grows
+      const bestPnl = t.type === 'call' ? t.bestPrice - t.ep : t.ep - t.bestPrice;
+      let newSl = t.slPrice;
+
+      if (bestPnl >= atr * 2) {
+        // 2x ATR profit reached → trail at bestPrice - 1x ATR (lock in 1x ATR profit)
+        newSl = t.type === 'call' ? t.bestPrice - atr : t.bestPrice + atr;
+      } else if (bestPnl >= atr) {
+        // 1x ATR profit reached → move stop to breakeven (entry price)
+        newSl = t.ep;
+      }
+
+      // Only ratchet stop in profitable direction (never widen)
+      if (t.type === 'call' && newSl > t.slPrice) t.slPrice = newSl;
+      if (t.type === 'put' && newSl < t.slPrice) t.slPrice = newSl;
+
+      // Check if stop is hit
+      const stopped = (t.type === 'call' && price <= t.slPrice) || (t.type === 'put' && price >= t.slPrice);
+      if (stopped) {
+        const slPnl = t.type === 'call' ? t.slPrice - t.ep : t.ep - t.slPrice;
+        const slResult = slPnl >= 0 ? 'BREAKEVEN' : 'STOPPED';
+        log(sym, '🛑 TREND ' + t.type.toUpperCase() + ' ' + slResult + ' — SL hit $' + t.slPrice.toFixed(2) + ' · entry $' + t.ep.toFixed(2) + ' · P&L $' + slPnl.toFixed(2) + ' · best $' + t.bestPrice.toFixed(2));
+        sendPush('🛑 ' + sym + ' TREND ' + slResult, 'SL $' + t.slPrice.toFixed(2) + ' hit · entry $' + t.ep.toFixed(2) + ' · P&L $' + slPnl.toFixed(2), 'alert');
+        s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+      }
+    }
+
     // Consolidation Breakout tracker — MT5 instruments (XAU + BTC), every tick
     // Tracks rolling 5-min high/low range. When range stays tight for 3+ min, marks "coiling".
     // Breakout fires the instant price escapes the range — no lagging indicator delay.
@@ -2123,6 +2234,7 @@ setInterval(() => {
       s.obCandles = []; s.obCurCandle = null; s.orderBlocks = [];
       s.obZone = null; s.obDeparted = false; s.obFired = false; s.obMitigated = false;
       s.fastMoveLastTs = 0;
+      s.trendRideLastTs = 0;
       s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
     });
     saveRollingLevels(); // Persist rolling ATH/ATL data across restarts
@@ -2227,7 +2339,7 @@ app.get('/prices', (req, res) => {
       chopActive: s.chopActive,
       dailySignalCount: s.dailySignalCount,
       signals: s.signals.slice(-20),
-      trade: s.trade.active ? { active: true, type: s.trade.type, ep: s.trade.ep, t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl, rev: s.trade.rev } : { active: false },
+      trade: s.trade.active ? { active: true, type: s.trade.type, ep: s.trade.ep, t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl, rev: s.trade.rev, isTrend: s.trade.isTrend || false, slPrice: s.trade.slPrice || null, atr: s.trade.atr || null, bestPrice: s.trade.bestPrice || null } : { active: false },
       dxy: s._dxy || null,
       tlt: s._tlt || null,
       slv: s._slv || null,
