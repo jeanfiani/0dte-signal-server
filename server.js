@@ -1397,17 +1397,21 @@ function processPrice(sym, price, hi, lo) {
   // The macro EMA (3-hour) shows clear direction, price has meaningful separation, and multi-timeframe
   // ROC confirms momentum — fire a signal even when 5/13/34 EMAs haven't crossed yet.
   // Data: XAU $4577→$4594 ($17 rally) with macro EMA bullish at $4571 — 0 signals fired because EMAs lagged.
-  if (isMT5 && s.macroEma !== null && s.macroSnaps.length >= 30 && cool && (now2 - s.trendRideLastTs > 1200000)) {
+  // Trend Ride cooldown: 40 min between signals — reduced from 20 min to avoid signal spam
+  if (isMT5 && s.macroEma !== null && s.macroSnaps.length >= 30 && cool && (now2 - s.trendRideLastTs > 2400000)) {
     const trDir = price > s.macroEma ? 'bull' : 'bear';
     const trSpread = Math.abs(price - s.macroEma);
     const trSpreadPct = (trSpread / s.macroEma) * 100;
-    const trMinSpread = isBTC ? 0.15 : isNAS ? 0.12 : 0.10; // % minimum separation — must be well above/below EMA, not just touching
-    // Need multi-timeframe ROC alignment: both ROC-3 and ROC-6 confirming same direction
+    const trMinSpread = isBTC ? 0.25 : isNAS ? 0.20 : 0.15; // % minimum separation — raised to filter noise
+    // Minimum ROC: half the normal ROC threshold — roc3 > 0 alone catches noise (0.001% is not a trend)
+    const trMinRoc = isBTC ? BTC_ROC_THR * 0.5 : isNAS ? NAS_ROC_THR * 0.5 : XAU_ROC_THR * 0.5;
     const roc6 = s._roc6 || 0;
-    const trRoc3Ok = (trDir === 'bull' && roc3 > 0) || (trDir === 'bear' && roc3 < 0);
+    const trRoc3Ok = (trDir === 'bull' && roc3 > trMinRoc) || (trDir === 'bear' && roc3 < -trMinRoc);
     const trRoc6Ok = (trDir === 'bull' && roc6 > 0) || (trDir === 'bear' && roc6 < 0);
+    // MACD must confirm trend direction — prevents firing against momentum
+    const trMacdOk = (trDir === 'bull' && macdL > macdS) || (trDir === 'bear' && macdL < macdS);
 
-    if (trSpreadPct >= trMinSpread && trRoc3Ok && trRoc6Ok) {
+    if (trSpreadPct >= trMinSpread && trRoc3Ok && trRoc6Ok && trMacdOk) {
       // Calculate 1-min ATR from vrevSnaps for dynamic stop loss
       // ATR = average of per-minute high-low ranges over last 10 minutes
       let trAtr = isBTC ? 50 : isNAS ? 15 : 3; // fallback defaults
