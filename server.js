@@ -135,6 +135,9 @@ SYMBOLS.forEach(sym => {
     // Fast-move detector — catches strong directional moves when MACD lags
     fastMoveLastTs: 0,       // when last fast-move signal fired (cooldown)
     trendRideLastTs: 0,      // when last trend-ride signal fired (cooldown)
+    trendRideLastDir: null,   // last trend-ride direction ('call'/'put')
+    trendRideSameDirCount: 0, // consecutive same-direction trend-ride signals
+    trendRideLastPrice: 0,    // price at last trend-ride signal
     // Order Block (SMC) — institutional supply/demand zone from breakout coil
     obZone: null,            // { dir, hi, lo, mid, coilHi, coilLo, ts, breakPrice } — active OB after breakout
     obDeparted: false,       // price left the OB zone (must leave before retest counts)
@@ -1040,8 +1043,8 @@ function processPrice(sym, price, hi, lo) {
     const sessionRange = s.sessionHigh - s.sessionLow;
     const highWasRecent = s.prices.length >= 10 && Math.max(...s.prices.slice(-30 > -s.prices.length ? -30 : 0)) >= s.sessionHigh - 0.05;
     // XAU/BTC session high reversal needs larger move — gold/btc prices produce bigger absolute moves
-    const hiRevDist = isBTC ? 80.0 : isXAU ? 5.0 : 0.50;   // min pullback from high (lowered for equities from $1→$0.50)
-    const hiRevRange = isBTC ? 150.0 : isXAU ? 10.0 : 1.0;  // min session range to confirm real move
+    const hiRevDist = isBTC ? 80.0 : isNAS ? 50.0 : isXAU ? 5.0 : 0.50;   // min pullback from high
+    const hiRevRange = isBTC ? 150.0 : isNAS ? 100.0 : isXAU ? 10.0 : 1.0;  // min session range to confirm real move
     // Loosened: RSI at high only needs > 55 (was 60), and ROC OR MACD confirms (was AND)
     const hiRevRocOk = roc3 < -symRocThr;
     const hiRevMacdOk = macdL < macdS;
@@ -1411,7 +1414,21 @@ function processPrice(sym, price, hi, lo) {
     // MACD must confirm trend direction — prevents firing against momentum
     const trMacdOk = (trDir === 'bull' && macdL > macdS) || (trDir === 'bear' && macdL < macdS);
 
-    if (trSpreadPct >= trMinSpread && trRoc3Ok && trRoc6Ok && trMacdOk) {
+    // Same-direction limiter: after 2 consecutive same-direction TRENDs, require price to have
+    // moved meaningfully in the trend direction since last TREND (proves the trend is real, not range-bound)
+    const trSigDir = trDir === 'bull' ? 'call' : 'put';
+    let trSameDirOk = true;
+    if (s.trendRideLastDir === trSigDir && s.trendRideSameDirCount >= 2 && s.trendRideLastPrice > 0) {
+      const moveSinceLast = trSigDir === 'call' ? (price - s.trendRideLastPrice) / s.trendRideLastPrice * 100
+                                                 : (s.trendRideLastPrice - price) / s.trendRideLastPrice * 100;
+      const minMovePct = isBTC ? 0.15 : isNAS ? 0.10 : 0.08; // must have moved at least this % in trend dir
+      if (moveSinceLast < minMovePct) {
+        trSameDirOk = false;
+        log(sym, 'TREND RIDE blocked — ' + s.trendRideSameDirCount + ' consecutive ' + trSigDir.toUpperCase() + 's, only ' + moveSinceLast.toFixed(3) + '% move (need ' + minMovePct + '%)');
+      }
+    }
+
+    if (trSpreadPct >= trMinSpread && trRoc3Ok && trRoc6Ok && trMacdOk && trSameDirOk) {
       // Calculate 1-min ATR from vrevSnaps for dynamic stop loss
       // ATR = average of per-minute high-low ranges over last 10 minutes
       let trAtr = isBTC ? 50 : isNAS ? 15 : 3; // fallback defaults
@@ -1440,6 +1457,8 @@ function processPrice(sym, price, hi, lo) {
       if (trDir === 'bull' && rsiV > 30 && rsiV < 75) {
         const slPrice = price - trSlFinal;
         s.trendRideLastTs = now2;
+        s.trendRideSameDirCount = (s.trendRideLastDir === 'call') ? s.trendRideSameDirCount + 1 : 1;
+        s.trendRideLastDir = 'call'; s.trendRideLastPrice = price;
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
         if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
         s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
@@ -1456,6 +1475,8 @@ function processPrice(sym, price, hi, lo) {
       if (trDir === 'bear' && rsiV > 25 && rsiV < 70) {
         const slPrice = price + trSlFinal;
         s.trendRideLastTs = now2;
+        s.trendRideSameDirCount = (s.trendRideLastDir === 'put') ? s.trendRideSameDirCount + 1 : 1;
+        s.trendRideLastDir = 'put'; s.trendRideLastPrice = price;
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
         if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
         s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
@@ -2263,7 +2284,7 @@ setInterval(() => {
       s.obCandles = []; s.obCurCandle = null; s.orderBlocks = [];
       s.obZone = null; s.obDeparted = false; s.obFired = false; s.obMitigated = false;
       s.fastMoveLastTs = 0;
-      s.trendRideLastTs = 0;
+      s.trendRideLastTs = 0; s.trendRideLastDir = null; s.trendRideSameDirCount = 0; s.trendRideLastPrice = 0;
       s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
     });
     saveRollingLevels(); // Persist rolling ATH/ATL data across restarts
@@ -2343,6 +2364,21 @@ app.post('/feed', (req, res) => {
   if (!S[sym]) return res.status(400).json({ error: 'Unknown symbol: ' + sym });
   const p = parseFloat(price), h = parseFloat(high) || p, l = parseFloat(low) || p;
   if (isNaN(p) || p <= 0) return res.status(400).json({ error: 'Invalid price' });
+  // Price sanity check — reject prices wildly outside expected range (catches cross-symbol feed leaks)
+  const PRICE_RANGES = { XAU: [1000, 10000], BTC: [10000, 500000], NAS100: [10000, 50000], QQQ: [100, 1000], SPY: [100, 1000] };
+  const range = PRICE_RANGES[sym];
+  if (range && (p < range[0] || p > range[1])) {
+    console.log('[FEED] REJECTED ' + sym + ' price $' + p + ' — outside range $' + range[0] + '-$' + range[1]);
+    return res.status(400).json({ error: 'Price ' + p + ' outside expected range for ' + sym });
+  }
+  // Also reject if price jumps >5% from last known price (unless first price)
+  if (S[sym].lastPrice > 0) {
+    const pctChange = Math.abs(p - S[sym].lastPrice) / S[sym].lastPrice * 100;
+    if (pctChange > 5) {
+      console.log('[FEED] REJECTED ' + sym + ' price $' + p + ' — ' + pctChange.toFixed(1) + '% jump from $' + S[sym].lastPrice);
+      return res.status(400).json({ error: 'Price jump too large: ' + pctChange.toFixed(1) + '%' });
+    }
+  }
   S[sym].lastPrice = p;
   S[sym].tickBuf.push({ p });
   res.json({ ok: true, sym, price: p, samples: S[sym].prices.length });
