@@ -143,6 +143,18 @@ SYMBOLS.forEach(sym => {
     obDeparted: false,       // price left the OB zone (must leave before retest counts)
     obFired: false,          // retest signal already fired (one per OB)
     obMitigated: false,      // OB was fully penetrated (breakout failed)
+    // === TREND RIDE V2 (BTC/NAS100 only) — trend-following with averaged EMA ===
+    // Replaces TREND + MFLIP for BTC/NAS100. XAU keeps the old system.
+    trv2Candles: [],           // [{o, h, l, c, ts}] — completed 1-min candles (last 60)
+    trv2CurCandle: null,       // current building candle {o, h, l, c, startTs, ticks}
+    trv2Ema15: null,           // 15-minute EMA on 1-min closes
+    trv2Ema20: null,           // 20-minute EMA on 1-min closes
+    trv2Ema30: null,           // 30-minute EMA on 1-min closes
+    trv2TrendEma: null,        // average of (ema15 + ema20 + ema30) / 3
+    trv2Dir: null,             // current trend direction: 'long' or 'short' or null
+    trv2DirTs: 0,              // when current direction was established
+    trv2LastSignalTs: 0,       // cooldown: when last entry/reverse signal fired
+    trv2Trade: null,           // active trade: { dir:'long'|'short', ep, ts, sl, tp1, tp2, tp3, tp1Hit, tp2Hit, tp3Hit, bestPrice, atr, trailSl }
     // Trade monitor
     trade: { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 }
   };
@@ -379,6 +391,32 @@ function processPrice(sym, price, hi, lo) {
         s.orderBlocks = s.orderBlocks.filter(ob => !ob.mitigated && ob.ts > fourHoursAgo);
         // Start new candle
         s.obCurCandle = null;
+      }
+    }
+  }
+
+  // === TREND RIDE V2 — 1-min candle builder + 15/20/30 EMA (BTC/NAS100 only) ===
+  if (isBTC || isNAS) {
+    if (!s.trv2CurCandle) {
+      s.trv2CurCandle = { o: price, h: price, l: price, c: price, startTs: Date.now(), ticks: 1 };
+    } else {
+      s.trv2CurCandle.h = Math.max(s.trv2CurCandle.h, price);
+      s.trv2CurCandle.l = Math.min(s.trv2CurCandle.l, price);
+      s.trv2CurCandle.c = price;
+      s.trv2CurCandle.ticks++;
+      if (s.trv2CurCandle.ticks >= 60) {
+        const cc = { o: s.trv2CurCandle.o, h: s.trv2CurCandle.h, l: s.trv2CurCandle.l, c: s.trv2CurCandle.c, ts: s.trv2CurCandle.startTs };
+        s.trv2Candles.push(cc);
+        if (s.trv2Candles.length > 60) s.trv2Candles.shift();
+        const cp = cc.c;
+        const k15 = 2 / (15 + 1);
+        const k20 = 2 / (20 + 1);
+        const k30 = 2 / (30 + 1);
+        s.trv2Ema15 = s.trv2Ema15 === null ? cp : cp * k15 + s.trv2Ema15 * (1 - k15);
+        s.trv2Ema20 = s.trv2Ema20 === null ? cp : cp * k20 + s.trv2Ema20 * (1 - k20);
+        s.trv2Ema30 = s.trv2Ema30 === null ? cp : cp * k30 + s.trv2Ema30 * (1 - k30);
+        s.trv2TrendEma = (s.trv2Ema15 + s.trv2Ema20 + s.trv2Ema30) / 3;
+        s.trv2CurCandle = null;
       }
     }
   }
@@ -1313,11 +1351,177 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // ===== MACRO TREND FLIP DETECTOR (MT5 instruments: XAU + BTC) =====
+  // ===== TREND RIDE V2 — TREND-FOLLOWING SYSTEM (BTC/NAS100 only) =====
+  // Replaces TREND + MFLIP for BTC/NAS100. One entry per trend leg, hold until reversal.
+  // Uses averaged 15/20/30-min EMA as trend line. Fires entry with TP1/TP2/TP3, manages trade,
+  // exits on EMA cross-back, optionally reverses.
+  if ((isBTC || isNAS) && s.trv2TrendEma !== null && s.trv2Candles.length >= 15) {
+    const tEma = s.trv2TrendEma;
+    const spread = Math.abs(price - tEma);
+    const spreadPct = (spread / tEma) * 100;
+    const minSpreadPct = isBTC ? 0.08 : 0.06;
+    const priceAbove = price > tEma;
+    const priceBelow = price < tEma;
+    const now3 = Date.now();
+
+    // --- Calculate ATR from recent 1-min candles ---
+    let trv2Atr = isBTC ? 120 : 30;
+    if (s.trv2Candles.length >= 10) {
+      const recentC = s.trv2Candles.slice(-10);
+      const ranges = recentC.map(c => c.h - c.l);
+      trv2Atr = ranges.reduce((a, b) => a + b, 0) / ranges.length;
+    }
+
+    // --- TRADE MANAGEMENT (if trade is open) ---
+    if (s.trv2Trade) {
+      const t = s.trv2Trade;
+      const isLong = t.dir === 'long';
+      const pnl = isLong ? price - t.ep : t.ep - price;
+      const pnlPct = (pnl / t.ep) * 100;
+
+      // Track best price for trailing stop
+      if (isLong && price > t.bestPrice) t.bestPrice = price;
+      if (!isLong && price < t.bestPrice) t.bestPrice = price;
+
+      // TP1 hit — move SL to breakeven
+      if (!t.tp1Hit && ((isLong && price >= t.tp1) || (!isLong && price <= t.tp1))) {
+        t.tp1Hit = true;
+        t.trailSl = t.ep;
+        log(sym, '🎯 TRv2 TP1 HIT — $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2) + ' (' + pnlPct.toFixed(2) + '%) · SL moved to breakeven $' + t.ep.toFixed(2));
+        sendPush('🎯 ' + sym + ' TP1 HIT', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · SL → breakeven', 'signal');
+      }
+
+      // TP2 hit — trail SL to TP1
+      if (!t.tp2Hit && ((isLong && price >= t.tp2) || (!isLong && price <= t.tp2))) {
+        t.tp2Hit = true;
+        t.trailSl = t.tp1;
+        log(sym, '🎯 TRv2 TP2 HIT — $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2) + ' (' + pnlPct.toFixed(2) + '%) · SL trailed to TP1 $' + t.tp1.toFixed(2));
+        sendPush('🎯 ' + sym + ' TP2 HIT', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · SL → TP1', 'signal');
+      }
+
+      // TP3 hit — close trade (full target)
+      if (!t.tp3Hit && ((isLong && price >= t.tp3) || (!isLong && price <= t.tp3))) {
+        t.tp3Hit = true;
+        log(sym, '🏆 TRv2 TP3 HIT — FULL TARGET · $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2) + ' (' + pnlPct.toFixed(2) + '%)');
+        sendPush('🏆 ' + sym + ' TP3 — FULL TARGET', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · close trade', 'signal');
+        s.trv2Trade = null;
+        s.trv2Dir = null;
+      }
+
+      // Trailing SL hit — close trade
+      if (s.trv2Trade && t.trailSl > 0) {
+        const slHit = isLong ? price <= t.trailSl : price >= t.trailSl;
+        if (slHit) {
+          const slPnl = isLong ? t.trailSl - t.ep : t.ep - t.trailSl;
+          log(sym, '🛑 TRv2 TRAIL SL HIT — $' + price.toFixed(2) + ' · SL was $' + t.trailSl.toFixed(2) + ' · P&L $' + slPnl.toFixed(2));
+          sendPush('🛑 ' + sym + ' TRAIL SL', '$' + price.toFixed(2) + ' · P&L $' + slPnl.toFixed(2), 'signal');
+          s.trv2Trade = null;
+        }
+      }
+
+      // Initial SL hit (before TP1) — close trade
+      if (s.trv2Trade && !t.tp1Hit) {
+        const initSlHit = isLong ? price <= t.sl : price >= t.sl;
+        if (initSlHit) {
+          const slPnl = isLong ? t.sl - t.ep : t.ep - t.sl;
+          log(sym, '🛑 TRv2 INITIAL SL HIT — $' + price.toFixed(2) + ' · SL $' + t.sl.toFixed(2) + ' · P&L $' + slPnl.toFixed(2));
+          sendPush('🛑 ' + sym + ' SL HIT', '$' + price.toFixed(2) + ' · loss $' + slPnl.toFixed(2), 'signal');
+          s.trv2Trade = null;
+        }
+      }
+
+      // EXIT on EMA cross-back — trend reversed, close + potentially reverse
+      if (s.trv2Trade) {
+        const emaCross = (isLong && priceBelow && spreadPct > minSpreadPct) ||
+                         (!isLong && priceAbove && spreadPct > minSpreadPct);
+        if (emaCross) {
+          const exitPnl = isLong ? price - t.ep : t.ep - price;
+          const exitPnlPct = (exitPnl / t.ep) * 100;
+          log(sym, '🔄 TRv2 TREND REVERSED — closing ' + t.dir.toUpperCase() + ' · $' + price.toFixed(2) + ' crossed EMA $' + tEma.toFixed(2) + ' · P&L $' + exitPnl.toFixed(2) + ' (' + exitPnlPct.toFixed(2) + '%)');
+          sendPush('🔄 ' + sym + ' TREND REVERSED', 'Close ' + t.dir.toUpperCase() + ' · $' + price.toFixed(2) + ' · P&L $' + exitPnl.toFixed(2), 'signal');
+
+          // Log as exit signal
+          const exitDir = t.dir === 'long' ? 'call' : 'put';
+          const exitSig = { type: 'exit-' + exitDir, time: ts(), price: price.toFixed(2), score: '🔄EXIT', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount, pnl: exitPnl.toFixed(2) };
+          enrichSig(exitSig); s.signals.push(exitSig); logSignal(sym, exitSig);
+          s.trv2Trade = null;
+          s.trv2Dir = null;
+
+          // Auto-reverse: immediately enter the opposite direction if ROC confirms
+          const revRocOk = (priceAbove && roc3 > (isBTC ? BTC_ROC_THR * 0.5 : NAS_ROC_THR * 0.5)) ||
+                           (priceBelow && roc3 < -(isBTC ? BTC_ROC_THR * 0.5 : NAS_ROC_THR * 0.5));
+          if (revRocOk && (now3 - s.trv2LastSignalTs > 120000)) {
+            const revDir = priceAbove ? 'long' : 'short';
+            const revSl = revDir === 'long' ? price - trv2Atr * 2 : price + trv2Atr * 2;
+            const revTp1 = revDir === 'long' ? price + trv2Atr * 1.5 : price - trv2Atr * 1.5;
+            const revTp2 = revDir === 'long' ? price + trv2Atr * 2.5 : price - trv2Atr * 2.5;
+            const revTp3 = revDir === 'long' ? price + trv2Atr * 4 : price - trv2Atr * 4;
+
+            s.trv2Trade = { dir: revDir, ep: price, ts: now3, sl: revSl, tp1: revTp1, tp2: revTp2, tp3: revTp3, tp1Hit: false, tp2Hit: false, tp3Hit: false, bestPrice: price, atr: trv2Atr, trailSl: 0 };
+            s.trv2Dir = revDir;
+            s.trv2LastSignalTs = now3;
+            s.dailySignalCount++;
+            const revType = revDir === 'long' ? 'call' : 'put';
+            s.lastAT = revType; if (revType === 'call') s.nC++; else s.nP++;
+            s.lastSignalDir = revType; s.lastSignalTs = now3; s.lastNTs = now3;
+            const revSig = { type: revType, time: ts(), price: price.toFixed(2), score: (revDir === 'long' ? '⬆' : '⬇') + 'RIDE', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount, tp1: revTp1.toFixed(2), tp2: revTp2.toFixed(2), tp3: revTp3.toFixed(2), sl: revSl.toFixed(2) };
+            enrichSig(revSig); s.signals.push(revSig); logSignal(sym, revSig);
+            log(sym, '🔄 TRv2 AUTO-REVERSE ' + revDir.toUpperCase() + ' — $' + price.toFixed(2) + ' · TP1 $' + revTp1.toFixed(2) + ' · TP2 $' + revTp2.toFixed(2) + ' · TP3 $' + revTp3.toFixed(2) + ' · SL $' + revSl.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+            sendPush('🔄 ' + sym + ' REVERSE ' + revDir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · TP1 $' + revTp1.toFixed(2) + ' · SL $' + revSl.toFixed(2), 'signal');
+          }
+          return;
+        }
+      }
+
+      // If trade is still open, skip all other signal detectors — one trade at a time
+      if (s.trv2Trade) return;
+    }
+
+    // --- ENTRY DETECTION (no trade open) ---
+    // Fire when price separates from trend EMA with ROC confirming direction
+    // Macro EMA (3h) as confidence filter: with macro = wider TP, against = tighter SL
+    const entryCool = now3 - s.trv2LastSignalTs > 300000;
+    const macroDir = s.macroEma ? (price > s.macroEma ? 'bull' : 'bear') : null;
+
+    if (!s.trv2Trade && entryCool && spreadPct >= minSpreadPct) {
+      const entryRocMin = isBTC ? BTC_ROC_THR * 0.5 : NAS_ROC_THR * 0.5;
+      const longOk = priceAbove && roc3 > entryRocMin && rsiV > 30 && rsiV < 75;
+      const shortOk = priceBelow && roc3 < -entryRocMin && rsiV > 25 && rsiV < 70;
+
+      if (longOk || shortOk) {
+        const dir = longOk ? 'long' : 'short';
+        const withMacro = (dir === 'long' && macroDir === 'bull') || (dir === 'short' && macroDir === 'bear');
+        const tpMult = withMacro ? 1.0 : 0.75;
+        const slMult = withMacro ? 2.0 : 1.5;
+
+        const sl = dir === 'long' ? price - trv2Atr * slMult : price + trv2Atr * slMult;
+        const tp1 = dir === 'long' ? price + trv2Atr * 1.5 * tpMult : price - trv2Atr * 1.5 * tpMult;
+        const tp2 = dir === 'long' ? price + trv2Atr * 2.5 * tpMult : price - trv2Atr * 2.5 * tpMult;
+        const tp3 = dir === 'long' ? price + trv2Atr * 4 * tpMult : price - trv2Atr * 4 * tpMult;
+
+        s.trv2Trade = { dir: dir, ep: price, ts: now3, sl: sl, tp1: tp1, tp2: tp2, tp3: tp3, tp1Hit: false, tp2Hit: false, tp3Hit: false, bestPrice: price, atr: trv2Atr, trailSl: 0 };
+        s.trv2Dir = dir;
+        s.trv2LastSignalTs = now3;
+        s.dailySignalCount++;
+        const sigType = dir === 'long' ? 'call' : 'put';
+        s.lastAT = sigType; if (sigType === 'call') s.nC++; else s.nP++;
+        s.lastSignalDir = sigType; s.lastSignalTs = now3; s.lastNTs = now3;
+        const macroTag = withMacro ? '+MACRO' : '';
+        const sig = { type: sigType, time: ts(), price: price.toFixed(2), score: (dir === 'long' ? '⬆' : '⬇') + 'RIDE' + macroTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount, tp1: tp1.toFixed(2), tp2: tp2.toFixed(2), tp3: tp3.toFixed(2), sl: sl.toFixed(2) };
+        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+        log(sym, '🚀 TRv2 ENTRY ' + dir.toUpperCase() + (withMacro ? ' +MACRO' : '') + ' — $' + price.toFixed(2) + ' > EMA $' + tEma.toFixed(2) + ' (+' + spreadPct.toFixed(3) + '%) · ATR $' + trv2Atr.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+        sendPush('🚀 ' + sym + ' ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2), 'signal');
+        s.trade = { active: true, type: sigType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, isTrend: true, slPrice: sl, atr: trv2Atr, bestPrice: price };
+        return;
+      }
+    }
+  }
+
+  // ===== MACRO TREND FLIP DETECTOR (XAU only — BTC/NAS100 use TRv2 trend-following system) =====
   // Fires when price crosses the 3-hour EMA with momentum confirmation
   // XAU SUPER SIGNAL: when TLT also flipped in same direction within 30 min — highest conviction
-  // BTC SUPER SIGNAL: when SPY also trending in same direction — risk-on/risk-off correlation
-  if (isMT5 && s.macroEma !== null && s.macroSnaps.length >= 12 && cool && (now2 - s.macroFlipTs > 900000)) {
+  // BTC/NAS100: handled by TRv2 above (15/20/30 averaged EMA with TP management)
+  if (isXAU && isMT5 && s.macroEma !== null && s.macroSnaps.length >= 12 && cool && (now2 - s.macroFlipTs > 900000)) {
     const curDir = price > s.macroEma ? 'bull' : 'bear';
     const spread = Math.abs(price - s.macroEma);
     const spreadPct = (spread / s.macroEma) * 100;
@@ -1385,14 +1589,14 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // ===== TREND RIDE DETECTOR (MT5 instruments: XAU + BTC) =====
+  // ===== TREND RIDE DETECTOR (XAU only — BTC/NAS100 use TRv2 trend-following system) =====
   // Catches sustained directional moves where macro EMA confirms trend but short-term EMAs lag behind.
   // The macro EMA (3-hour) shows clear direction, price has meaningful separation, and multi-timeframe
   // ROC confirms momentum — fire a signal even when 5/13/34 EMAs haven't crossed yet.
   // Data: XAU $4577→$4594 ($17 rally) with macro EMA bullish at $4571 — 0 signals fired because EMAs lagged.
-  // Trend Ride cooldown: BTC 60 min (was 40 — too many range-bound CALLs), XAU/NAS 40 min
-  const trCoolMs = isBTC ? 3600000 : 2400000;
-  if (isMT5 && s.macroEma !== null && s.macroSnaps.length >= 30 && cool && (now2 - s.trendRideLastTs > trCoolMs)) {
+  // Trend Ride cooldown: 40 min for XAU
+  const trCoolMs = 2400000;
+  if (isXAU && isMT5 && s.macroEma !== null && s.macroSnaps.length >= 30 && cool && (now2 - s.trendRideLastTs > trCoolMs)) {
     const trDir = price > s.macroEma ? 'bull' : 'bear';
     const trSpread = Math.abs(price - s.macroEma);
     const trSpreadPct = (trSpread / s.macroEma) * 100;
@@ -2282,6 +2486,10 @@ setInterval(() => {
       s.obZone = null; s.obDeparted = false; s.obFired = false; s.obMitigated = false;
       s.fastMoveLastTs = 0;
       s.trendRideLastTs = 0; s.trendRideLastDir = null; s.trendRideSameDirCount = 0; s.trendRideLastPrice = 0;
+      // TRv2 trend-following state reset
+      s.trv2Candles = []; s.trv2CurCandle = null;
+      s.trv2Ema15 = null; s.trv2Ema20 = null; s.trv2Ema30 = null; s.trv2TrendEma = null;
+      s.trv2Dir = null; s.trv2DirTs = 0; s.trv2LastSignalTs = 0; s.trv2Trade = null;
       s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
     });
     saveRollingLevels(); // Persist rolling ATH/ATL data across restarts
@@ -2435,7 +2643,34 @@ app.get('/prices', (req, res) => {
           h2: s.macroSnaps.length >= 24 ? +((p - s.macroSnaps[Math.max(0, s.macroSnaps.length - 24)].p)).toFixed(2) : null,
           h4: s.macroSnaps.length >= 48 ? +((p - s.macroSnaps[Math.max(0, s.macroSnaps.length - 48)].p)).toFixed(2) : null
         };
-      })() : null
+      })() : null,
+      // TRv2 trend-following data (BTC/NAS100 only)
+      trv2: (sym === 'BTC' || sym === 'NAS100') ? {
+        trendEma: s.trv2TrendEma ? +s.trv2TrendEma.toFixed(2) : null,
+        ema15: s.trv2Ema15 ? +s.trv2Ema15.toFixed(2) : null,
+        ema20: s.trv2Ema20 ? +s.trv2Ema20.toFixed(2) : null,
+        ema30: s.trv2Ema30 ? +s.trv2Ema30.toFixed(2) : null,
+        dir: s.trv2Dir,
+        dirAge: s.trv2DirTs ? Math.round((Date.now() - s.trv2DirTs) / 1000) : null,
+        candles: s.trv2Candles.length,
+        trade: s.trv2Trade ? {
+          dir: s.trv2Trade.dir,
+          ep: s.trv2Trade.ep,
+          ts: s.trv2Trade.ts,
+          age: Math.round((Date.now() - s.trv2Trade.ts) / 1000),
+          sl: +s.trv2Trade.sl.toFixed(2),
+          tp1: +s.trv2Trade.tp1.toFixed(2),
+          tp2: +s.trv2Trade.tp2.toFixed(2),
+          tp3: +s.trv2Trade.tp3.toFixed(2),
+          tp1Hit: s.trv2Trade.tp1Hit,
+          tp2Hit: s.trv2Trade.tp2Hit,
+          tp3Hit: s.trv2Trade.tp3Hit,
+          trailSl: s.trv2Trade.trailSl ? +s.trv2Trade.trailSl.toFixed(2) : null,
+          bestPrice: s.trv2Trade.bestPrice ? +s.trv2Trade.bestPrice.toFixed(2) : null,
+          atr: s.trv2Trade.atr ? +s.trv2Trade.atr.toFixed(2) : null,
+          pnl: s.lastPrice > 0 ? +(((s.trv2Trade.dir === 'long' ? s.lastPrice - s.trv2Trade.ep : s.trv2Trade.ep - s.lastPrice) / s.trv2Trade.ep) * 100).toFixed(3) : 0
+        } : null
+      } : null
     };
   });
   res.json({ vix: vixV, dxy: { price: dxyPrice, dir: dxyDir, roc3: dxyRoc3 }, tlt: { price: tltPrice, dir: tltDir, roc3: tltRoc3 }, slv: { price: slvPrice, dir: slvDir, roc3: slvRoc3 }, gdx: { price: gdxPrice, dir: gdxDir, roc3: gdxRoc3 }, wsConnected: ws && ws.readyState === 1, ts: Date.now(), symbols: data });
