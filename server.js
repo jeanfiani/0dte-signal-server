@@ -1152,7 +1152,10 @@ function processPrice(sym, price, hi, lo) {
   }
 
   // ===== ORDER BLOCK RETEST / MITIGATION SIGNALS (MT5 only) =====
-  if (isMT5 && s.obZone && cool) {
+  // DISABLED as standalone signals — 0% win rate across all samples (4/30 + 5/1)
+  // OB zone tracking still active for scoring factor (+1/-1 boost in scoring section)
+  // Keeping detection logic commented for future re-evaluation with better confirmation
+  if (false && isMT5 && s.obZone && cool) {
     const ob = s.obZone;
     const obAge = now2 - ob.ts;
     const obTolerance = isBTC ? 15.0 : 0.50;
@@ -1162,11 +1165,8 @@ function processPrice(sym, price, hi, lo) {
     if (s.obDeparted && !s.obFired && !s.obMitigated && obAge <= 1800000 && obCool) {
       const inZone = price >= (ob.lo - obTolerance) && price <= (ob.hi + obTolerance);
       if (inZone) {
-        // Confirmation gates: RSI not extreme, ROC turning back, MACD aligned
-        // CALL retests need BOTH ROC+MACD (stricter — data shows 0/2 ⬆OB wins with weak confirmation)
-        // PUT retests keep ROC OR MACD (bearish retests are more reliable)
         const rsiOk = rsiV >= 30 && rsiV <= 70;
-        const obMinRoc = 0.015; // minimum |ROC| — below this is noise (data: 0/2 ⬆OB wins at ROC +0.003/+0.009)
+        const obMinRoc = 0.015;
         const rocOk = (ob.dir === 'call' && roc3 > obMinRoc) || (ob.dir === 'put' && roc3 < -obMinRoc);
         const macdOk = (ob.dir === 'call' && macdHist > 0) || (ob.dir === 'put' && macdHist < 0);
         const obConfirmed = ob.dir === 'call' ? (rocOk && macdOk) : (rocOk || macdOk);
@@ -1192,12 +1192,11 @@ function processPrice(sym, price, hi, lo) {
     // --- OB MITIGATION: price broke through OB → breakout failed → reversal signal ---
     if (s.obMitigated && !s.obFired && obAge <= 1800000 && obCool) {
       const revDir = ob.dir === 'call' ? 'put' : 'call';
-      // Confirmation: momentum in reversal direction
       const revRocOk = (revDir === 'call' && roc3 > 0) || (revDir === 'put' && roc3 < 0);
       const revMacdOk = (revDir === 'call' && macdHist > 0) || (revDir === 'put' && macdHist < 0);
 
       if (revRocOk || revMacdOk) {
-        s.obFired = true; // consume — no more signals from this OB
+        s.obFired = true;
         const dir = revDir;
         s.lastAT = dir; if (dir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
         if (s.lastSignalDir && s.lastSignalDir !== dir) s.lastReversalTs = now2;
@@ -1209,7 +1208,7 @@ function processPrice(sym, price, hi, lo) {
         log(sym, '🧱 OB MITIGATION ' + dir.toUpperCase() + ' — breakout FAILED, price $' + price.toFixed(2) + ' broke through OB $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('🧱 ' + sym + ' OB FAIL ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · breakout failed through OB $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2), 'signal');
         s.trade = { active: true, type: dir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
-        s.obZone = null; // Clear mitigated OB
+        s.obZone = null;
         return;
       }
     }
@@ -1340,51 +1339,42 @@ function processPrice(sym, price, hi, lo) {
         isSuper = spyDir === curDir && (now2 - s.superFlipTs > 1800000);
       }
 
+      // SUPER FILTER: when TLT/SPY correlation confirms, the move is typically EXHAUSTED — skip signal
+      // Data: SUPER 14.3% win rate vs MFLIP 61.5%. Correlation agreement = crowded trade = tops/bottoms
+      if (isSuper) {
+        s.superFlipTs = now2;
+        log(sym, '⏭️ MACRO FLIP skipped — correlation confirmed (SUPER condition) · historically 14.3% win rate · move likely exhausted');
+        s.macroPrevDir = curDir;
+        // Don't fire — but do update prevDir so next real flip can detect properly
+      }
       // MACRO FLIP CALL: was bearish, now price crossed above 3h EMA with upward ROC
       // RSI cap 60 for CALL (not 70): EMA is lagging — if RSI is already 65+ the rally is exhausted
-      // Data: BTC ⬆SUPER at RSI 67.1 ($76228) was a terrible entry — caught the top, not the flip
-      if (curDir === 'bull' && roc3 > symRocThr && rsiV > 30 && rsiV < 60) {
+      else if (curDir === 'bull' && roc3 > symRocThr && rsiV > 30 && rsiV < 60) {
         s.macroFlipTs = now2;
         s.macroPrevDir = curDir;
-        if (isSuper) s.superFlipTs = now2;
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
         if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
         s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
-        const scoreTag = isSuper ? '⬆SUPER' : '⬆MFLIP';
-        const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: scoreTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆MFLIP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
         enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
-        const superCtx = isXAU ? 'TLT ' + tltDir + ' (yields)' : 'SPY aligned';
-        if (isSuper) {
-          log(sym, '🔥 SUPER CALL — macro + ' + superCtx + ' bullish · price $' + price.toFixed(2) + ' > EMA $' + s.macroEma.toFixed(2) + ' · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
-          sendPush('🔥 ' + sym + ' SUPER CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · macro + corr both turned bullish', 'signal');
-        } else {
-          log(sym, '🔀 MACRO FLIP CALL — trend turned bullish · price $' + price.toFixed(2) + ' > EMA $' + s.macroEma.toFixed(2) + ' (+' + spreadPct.toFixed(3) + '%) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
-          sendPush('🔀 ' + sym + ' MACRO FLIP CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · trend turned bullish · above 3h EMA', 'signal');
-        }
+        log(sym, '🔀 MACRO FLIP CALL — trend turned bullish · price $' + price.toFixed(2) + ' > EMA $' + s.macroEma.toFixed(2) + ' (+' + spreadPct.toFixed(3) + '%) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
+        sendPush('🔀 ' + sym + ' MACRO FLIP CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · trend turned bullish · above 3h EMA', 'signal');
         s.trade = { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
         return;
       }
       // MACRO FLIP PUT: was bullish, now price crossed below 3h EMA with downward ROC
-      if (curDir === 'bear' && roc3 < -symRocThr && rsiV > 30 && rsiV < 70) {
+      else if (curDir === 'bear' && roc3 < -symRocThr && rsiV > 30 && rsiV < 70) {
         s.macroFlipTs = now2;
         s.macroPrevDir = curDir;
-        if (isSuper) s.superFlipTs = now2;
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
         if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
         s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
-        const scoreTag = isSuper ? '⬇SUPER' : '⬇MFLIP';
-        const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: scoreTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇MFLIP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
         enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
-        const superCtx2 = isXAU ? 'TLT ' + tltDir + ' (yields)' : 'SPY aligned';
-        if (isSuper) {
-          log(sym, '🔥 SUPER PUT — macro + ' + superCtx2 + ' bearish · price $' + price.toFixed(2) + ' < EMA $' + s.macroEma.toFixed(2) + ' · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
-          sendPush('🔥 ' + sym + ' SUPER PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · macro + corr both turned bearish', 'signal');
-        } else {
-          log(sym, '🔀 MACRO FLIP PUT — trend turned bearish · price $' + price.toFixed(2) + ' < EMA $' + s.macroEma.toFixed(2) + ' (-' + spreadPct.toFixed(3) + '%) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
-          sendPush('🔀 ' + sym + ' MACRO FLIP PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · trend turned bearish · below 3h EMA', 'signal');
-        }
+        log(sym, '🔀 MACRO FLIP PUT — trend turned bearish · price $' + price.toFixed(2) + ' < EMA $' + s.macroEma.toFixed(2) + ' (-' + spreadPct.toFixed(3) + '%) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
+        sendPush('🔀 ' + sym + ' MACRO FLIP PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · trend turned bearish · below 3h EMA', 'signal');
         s.trade = { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
         return;
       }
@@ -1421,8 +1411,12 @@ function processPrice(sym, price, hi, lo) {
     if (s.trendRideLastDir === trSigDir && s.trendRideSameDirCount >= 2 && s.trendRideLastPrice > 0) {
       const moveSinceLast = trSigDir === 'call' ? (price - s.trendRideLastPrice) / s.trendRideLastPrice * 100
                                                  : (s.trendRideLastPrice - price) / s.trendRideLastPrice * 100;
-      const minMovePct = isBTC ? 0.15 : isNAS ? 0.10 : 0.08; // must have moved at least this % in trend dir
-      if (moveSinceLast < minMovePct) {
+      const minMovePct = isBTC ? 0.15 : isNAS ? 0.10 : 0.02; // XAU lowered from 0.08% — data shows it blocks winners in slow downtrends
+      const maxSameDir = isBTC ? 4 : isNAS ? 4 : 6; // hard cap: XAU allows more continuation (slow-grinding trends), BTC/NAS tighter
+      if (s.trendRideSameDirCount >= maxSameDir) {
+        trSameDirOk = false;
+        log(sym, 'TREND RIDE blocked — hit max ' + maxSameDir + ' consecutive ' + trSigDir.toUpperCase() + 's');
+      } else if (moveSinceLast < minMovePct) {
         trSameDirOk = false;
         log(sym, 'TREND RIDE blocked — ' + s.trendRideSameDirCount + ' consecutive ' + trSigDir.toUpperCase() + 's, only ' + moveSinceLast.toFixed(3) + '% move (need ' + minMovePct + '%)');
       }
