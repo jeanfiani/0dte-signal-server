@@ -1390,14 +1390,16 @@ function processPrice(sym, price, hi, lo) {
   // The macro EMA (3-hour) shows clear direction, price has meaningful separation, and multi-timeframe
   // ROC confirms momentum — fire a signal even when 5/13/34 EMAs haven't crossed yet.
   // Data: XAU $4577→$4594 ($17 rally) with macro EMA bullish at $4571 — 0 signals fired because EMAs lagged.
-  // Trend Ride cooldown: 40 min between signals — reduced from 20 min to avoid signal spam
-  if (isMT5 && s.macroEma !== null && s.macroSnaps.length >= 30 && cool && (now2 - s.trendRideLastTs > 2400000)) {
+  // Trend Ride cooldown: BTC 60 min (was 40 — too many range-bound CALLs), XAU/NAS 40 min
+  const trCoolMs = isBTC ? 3600000 : 2400000;
+  if (isMT5 && s.macroEma !== null && s.macroSnaps.length >= 30 && cool && (now2 - s.trendRideLastTs > trCoolMs)) {
     const trDir = price > s.macroEma ? 'bull' : 'bear';
     const trSpread = Math.abs(price - s.macroEma);
     const trSpreadPct = (trSpread / s.macroEma) * 100;
-    const trMinSpread = isBTC ? 0.25 : isNAS ? 0.20 : 0.15; // % minimum separation — raised to filter noise
-    // Minimum ROC: half the normal ROC threshold — roc3 > 0 alone catches noise (0.001% is not a trend)
-    const trMinRoc = isBTC ? BTC_ROC_THR * 0.5 : isNAS ? NAS_ROC_THR * 0.5 : XAU_ROC_THR * 0.5;
+    const trMinSpread = isBTC ? 0.35 : isNAS ? 0.20 : 0.15; // BTC raised from 0.25% — range-bound drift above EMA causes false CALLs
+    // Minimum ROC: BTC 0.75x (0.0225), NAS 0.6x (0.015), XAU 0.5x (0.0125)
+    // Full 1x blocks too many winners. 0.5x lets through noise (0.004%). Sweet spot in between.
+    const trMinRoc = isBTC ? BTC_ROC_THR * 0.75 : isNAS ? NAS_ROC_THR * 0.6 : XAU_ROC_THR * 0.5;
     const roc6 = s._roc6 || 0;
     const trRoc3Ok = (trDir === 'bull' && roc3 > trMinRoc) || (trDir === 'bear' && roc3 < -trMinRoc);
     const trRoc6Ok = (trDir === 'bull' && roc6 > 0) || (trDir === 'bear' && roc6 < 0);
@@ -1447,8 +1449,9 @@ function processPrice(sym, price, hi, lo) {
       const trSlFinal = Math.max(trSlDist, trMinSl);
 
       // TREND RIDE CALL: macro bullish, price well above EMA, short+medium ROC both up
-      // RSI 30-75: wider than normal signals — sustained trends push RSI high, that's expected
-      if (trDir === 'bull' && rsiV > 30 && rsiV < 75) {
+      // RSI cap: 75 for all — data shows RSI 74 CALLs win during genuine trends (5/1 23:16 BTC +0.72%)
+      const trCallRsiMax = 75;
+      if (trDir === 'bull' && rsiV > 30 && rsiV < trCallRsiMax) {
         const slPrice = price - trSlFinal;
         s.trendRideLastTs = now2;
         s.trendRideSameDirCount = (s.trendRideLastDir === 'call') ? s.trendRideSameDirCount + 1 : 1;
