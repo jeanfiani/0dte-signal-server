@@ -1355,7 +1355,7 @@ function processPrice(sym, price, hi, lo) {
   // Replaces TREND + MFLIP for BTC/NAS100. One entry per trend leg, hold until reversal.
   // Uses averaged 15/20/30-min EMA as trend line. Fires entry with TP1/TP2/TP3, manages trade,
   // exits on EMA cross-back, optionally reverses.
-  if ((isBTC || isNAS) && s.trv2TrendEma !== null && s.trv2Candles.length >= 15) {
+  if ((isBTC || isNAS) && s.trv2TrendEma !== null && s.trv2Candles.length >= 30) {
     const tEma = s.trv2TrendEma;
     const spread = Math.abs(price - tEma);
     const spreadPct = (spread / tEma) * 100;
@@ -1404,7 +1404,7 @@ function processPrice(sym, price, hi, lo) {
         t.tp3Hit = true;
         log(sym, '🏆 TRv2 TP3 HIT — FULL TARGET · $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2) + ' (' + pnlPct.toFixed(2) + '%)');
         sendPush('🏆 ' + sym + ' TP3 — FULL TARGET', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · close trade', 'signal');
-        s.trv2Trade = null;
+        s.trv2Trade = null; s.trv2LastSignalTs = now3;
         s.trv2Dir = null;
       }
 
@@ -1415,7 +1415,7 @@ function processPrice(sym, price, hi, lo) {
           const slPnl = isLong ? t.trailSl - t.ep : t.ep - t.trailSl;
           log(sym, '🛑 TRv2 TRAIL SL HIT — $' + price.toFixed(2) + ' · SL was $' + t.trailSl.toFixed(2) + ' · P&L $' + slPnl.toFixed(2));
           sendPush('🛑 ' + sym + ' TRAIL SL', '$' + price.toFixed(2) + ' · P&L $' + slPnl.toFixed(2), 'signal');
-          s.trv2Trade = null;
+          s.trv2Trade = null; s.trv2LastSignalTs = now3;
         }
       }
 
@@ -1426,7 +1426,7 @@ function processPrice(sym, price, hi, lo) {
           const slPnl = isLong ? t.sl - t.ep : t.ep - t.sl;
           log(sym, '🛑 TRv2 INITIAL SL HIT — $' + price.toFixed(2) + ' · SL $' + t.sl.toFixed(2) + ' · P&L $' + slPnl.toFixed(2));
           sendPush('🛑 ' + sym + ' SL HIT', '$' + price.toFixed(2) + ' · loss $' + slPnl.toFixed(2), 'signal');
-          s.trv2Trade = null;
+          s.trv2Trade = null; s.trv2LastSignalTs = now3;
         }
       }
 
@@ -1440,17 +1440,18 @@ function processPrice(sym, price, hi, lo) {
           log(sym, '🔄 TRv2 TREND REVERSED — closing ' + t.dir.toUpperCase() + ' · $' + price.toFixed(2) + ' crossed EMA $' + tEma.toFixed(2) + ' · P&L $' + exitPnl.toFixed(2) + ' (' + exitPnlPct.toFixed(2) + '%)');
           sendPush('🔄 ' + sym + ' TREND REVERSED', 'Close ' + t.dir.toUpperCase() + ' · $' + price.toFixed(2) + ' · P&L $' + exitPnl.toFixed(2), 'signal');
 
-          // Log as exit signal
+          // Log as exit signal + update cooldown timestamp to prevent rapid re-entry
+          s.trv2LastSignalTs = now3;
           const exitDir = t.dir === 'long' ? 'call' : 'put';
           const exitSig = { type: 'exit-' + exitDir, time: ts(), price: price.toFixed(2), score: '🔄EXIT', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount, pnl: exitPnl.toFixed(2) };
           enrichSig(exitSig); s.signals.push(exitSig); logSignal(sym, exitSig);
           s.trv2Trade = null;
           s.trv2Dir = null;
 
-          // Auto-reverse: immediately enter the opposite direction if ROC confirms
+          // Auto-reverse: enter opposite direction if ROC confirms + 5min cooldown since last signal
           const revRocOk = (priceAbove && roc3 > (isBTC ? BTC_ROC_THR * 0.5 : NAS_ROC_THR * 0.5)) ||
                            (priceBelow && roc3 < -(isBTC ? BTC_ROC_THR * 0.5 : NAS_ROC_THR * 0.5));
-          if (revRocOk && (now3 - s.trv2LastSignalTs > 120000)) {
+          if (revRocOk && (now3 - s.trv2LastSignalTs > 300000)) {
             const revDir = priceAbove ? 'long' : 'short';
             const revSl = revDir === 'long' ? price - trv2Atr * 2 : price + trv2Atr * 2;
             const revTp1 = revDir === 'long' ? price + trv2Atr * 1.5 : price - trv2Atr * 1.5;
