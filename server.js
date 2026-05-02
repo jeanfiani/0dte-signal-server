@@ -155,6 +155,7 @@ SYMBOLS.forEach(sym => {
     trv2DirTs: 0,              // when current direction was established
     trv2LastSignalTs: 0,       // cooldown: when last entry/reverse signal fired
     trv2Trade: null,           // active trade: { dir:'long'|'short', ep, ts, sl, tp1, tp2, tp3, tp1Hit, tp2Hit, tp3Hit, bestPrice, atr, trailSl }
+    trv2CrossCount: 0,         // consecutive candle closes on wrong side of EMA (for exit confirmation)
     // Trade monitor
     trade: { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 }
   };
@@ -187,6 +188,58 @@ function saveRollingLevels() {
 }
 // Save rolling levels every 5 minutes
 setInterval(saveRollingLevels, 300000);
+
+// ===== TRv2 STATE PERSISTENCE (survives server restarts / deploys) =====
+const TRV2_FILE = path.join(__dirname, 'trv2_state.json');
+function loadTrv2State() {
+  try {
+    const data = JSON.parse(fs.readFileSync(TRV2_FILE, 'utf8'));
+    ['BTC', 'NAS100'].forEach(sym => {
+      if (data[sym] && S[sym]) {
+        const d = data[sym];
+        // Only restore if data is fresh (< 2 hours old)
+        if (d.savedAt && Date.now() - d.savedAt < 7200000) {
+          S[sym].trv2Candles = d.candles || [];
+          S[sym].trv2Ema15 = d.ema15;
+          S[sym].trv2Ema20 = d.ema20;
+          S[sym].trv2Ema30 = d.ema30;
+          S[sym].trv2TrendEma = d.trendEma;
+          S[sym].trv2Dir = d.dir;
+          S[sym].trv2DirTs = d.dirTs || 0;
+          S[sym].trv2Trade = d.trade;
+          S[sym].trv2CrossCount = d.crossCount || 0;
+          S[sym].trv2LastSignalTs = d.lastSignalTs || 0;
+          console.log('[' + ts() + '] TRv2 ' + sym + ' state restored — EMA:' + (d.trendEma ? '$' + d.trendEma.toFixed(2) : 'null') + ' dir:' + (d.dir || 'none') + ' trade:' + (d.trade ? d.trade.dir + ' @$' + d.trade.ep.toFixed(2) : 'none') + ' candles:' + (d.candles ? d.candles.length : 0));
+        } else {
+          console.log('[' + ts() + '] TRv2 ' + sym + ' state too old (' + ((Date.now() - (d.savedAt || 0)) / 3600000).toFixed(1) + 'h) — starting fresh');
+        }
+      }
+    });
+  } catch (e) { console.log('[' + ts() + '] No TRv2 state file — starting fresh'); }
+}
+function saveTrv2State() {
+  const data = {};
+  ['BTC', 'NAS100'].forEach(sym => {
+    const s = S[sym];
+    if (!s) return;
+    data[sym] = {
+      savedAt: Date.now(),
+      candles: s.trv2Candles,
+      ema15: s.trv2Ema15,
+      ema20: s.trv2Ema20,
+      ema30: s.trv2Ema30,
+      trendEma: s.trv2TrendEma,
+      dir: s.trv2Dir,
+      dirTs: s.trv2DirTs,
+      trade: s.trv2Trade,
+      crossCount: s.trv2CrossCount,
+      lastSignalTs: s.trv2LastSignalTs
+    };
+  });
+  try { fs.writeFileSync(TRV2_FILE, JSON.stringify(data, null, 2)); } catch (e) {}
+}
+// Save TRv2 state every 60 seconds
+setInterval(saveTrv2State, 60000);
 
 // ===== DXY STATE (for XAU inverse correlation) =====
 let dxyPrice = 0, dxyPrices = [], dxyPrevEma5 = null, dxyPrevEma13 = null;
@@ -416,6 +469,11 @@ function processPrice(sym, price, hi, lo) {
         s.trv2Ema20 = s.trv2Ema20 === null ? cp : cp * k20 + s.trv2Ema20 * (1 - k20);
         s.trv2Ema30 = s.trv2Ema30 === null ? cp : cp * k30 + s.trv2Ema30 * (1 - k30);
         s.trv2TrendEma = (s.trv2Ema15 + s.trv2Ema20 + s.trv2Ema30) / 3;
+        // Track consecutive candle closes on wrong side of EMA for exit confirmation
+        if (s.trv2Trade) {
+          const wrongSide = (s.trv2Trade.dir === 'long' && cp < s.trv2TrendEma) || (s.trv2Trade.dir === 'short' && cp > s.trv2TrendEma);
+          if (wrongSide) { s.trv2CrossCount++; } else { s.trv2CrossCount = 0; }
+        } else { s.trv2CrossCount = 0; }
         s.trv2CurCandle = null;
       }
     }
@@ -1430,29 +1488,39 @@ function processPrice(sym, price, hi, lo) {
         }
       }
 
-      // EXIT on EMA cross-back — trend reversed, close + potentially reverse
+      // EXIT on EMA cross-back — requires sustained crossback (candle confirmations), not just a single tick
+      // With macro trend: need 3 candle closes on wrong side (strong conviction to hold)
+      // Against macro: need 2 candle closes (quicker exit when fighting the big trend)
       if (s.trv2Trade) {
-        const emaCross = (isLong && priceBelow && spreadPct > minSpreadPct) ||
-                         (!isLong && priceAbove && spreadPct > minSpreadPct);
-        if (emaCross) {
+        const tradeWithMacro = s.macroEma ? ((isLong && t.ep > s.macroEma) || (!isLong && t.ep < s.macroEma)) : false;
+        const exitSpreadMin = isBTC ? 0.15 : 0.10; // wider than entry — need more evidence to close a trade
+        const crossOnWrongSide = (isLong && priceBelow && spreadPct > exitSpreadMin) ||
+                                  (!isLong && priceAbove && spreadPct > exitSpreadMin);
+        const requiredCrosses = tradeWithMacro ? 3 : 2; // 3 candles (~3 min) with macro, 2 against
+
+        if (crossOnWrongSide && s.trv2CrossCount >= requiredCrosses) {
           const exitPnl = isLong ? price - t.ep : t.ep - price;
           const exitPnlPct = (exitPnl / t.ep) * 100;
-          log(sym, '🔄 TRv2 TREND REVERSED — closing ' + t.dir.toUpperCase() + ' · $' + price.toFixed(2) + ' crossed EMA $' + tEma.toFixed(2) + ' · P&L $' + exitPnl.toFixed(2) + ' (' + exitPnlPct.toFixed(2) + '%)');
+          log(sym, '🔄 TRv2 TREND REVERSED — closing ' + t.dir.toUpperCase() + ' · $' + price.toFixed(2) + ' crossed EMA $' + tEma.toFixed(2) + ' · ' + s.trv2CrossCount + ' candle confirmations · ' + (tradeWithMacro ? 'WITH' : 'AGAINST') + ' macro · P&L $' + exitPnl.toFixed(2) + ' (' + exitPnlPct.toFixed(2) + '%)');
           sendPush('🔄 ' + sym + ' TREND REVERSED', 'Close ' + t.dir.toUpperCase() + ' · $' + price.toFixed(2) + ' · P&L $' + exitPnl.toFixed(2), 'signal');
 
           // Log as exit signal + update cooldown timestamp to prevent rapid re-entry
           s.trv2LastSignalTs = now3;
+          s.trv2CrossCount = 0;
           const exitDir = t.dir === 'long' ? 'call' : 'put';
           const exitSig = { type: 'exit-' + exitDir, time: ts(), price: price.toFixed(2), score: '🔄EXIT', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount, pnl: exitPnl.toFixed(2) };
           enrichSig(exitSig); s.signals.push(exitSig); logSignal(sym, exitSig);
           s.trv2Trade = null;
           s.trv2Dir = null;
 
-          // Auto-reverse: enter opposite direction if ROC confirms + 5min cooldown since last signal
+          // Auto-reverse: only if reversing INTO the macro trend (don't reverse against macro)
+          // e.g. was LONG against macro, now reversing SHORT into macro = ok
+          // was LONG WITH macro, now reversing SHORT against macro = DON'T
+          const revDir = priceAbove ? 'long' : 'short';
+          const revWithMacro = s.macroEma ? ((revDir === 'long' && price > s.macroEma) || (revDir === 'short' && price < s.macroEma)) : true;
           const revRocOk = (priceAbove && roc3 > (isBTC ? BTC_ROC_THR * 0.5 : NAS_ROC_THR * 0.5)) ||
                            (priceBelow && roc3 < -(isBTC ? BTC_ROC_THR * 0.5 : NAS_ROC_THR * 0.5));
-          if (revRocOk && (now3 - s.trv2LastSignalTs > 300000)) {
-            const revDir = priceAbove ? 'long' : 'short';
+          if (revRocOk && revWithMacro) {
             const revSl = revDir === 'long' ? price - trv2Atr * 2 : price + trv2Atr * 2;
             const revTp1 = revDir === 'long' ? price + trv2Atr * 1.5 : price - trv2Atr * 1.5;
             const revTp2 = revDir === 'long' ? price + trv2Atr * 2.5 : price - trv2Atr * 2.5;
@@ -1465,12 +1533,21 @@ function processPrice(sym, price, hi, lo) {
             const revType = revDir === 'long' ? 'call' : 'put';
             s.lastAT = revType; if (revType === 'call') s.nC++; else s.nP++;
             s.lastSignalDir = revType; s.lastSignalTs = now3; s.lastNTs = now3;
-            const revSig = { type: revType, time: ts(), price: price.toFixed(2), score: (revDir === 'long' ? '⬆' : '⬇') + 'RIDE', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount, tp1: revTp1.toFixed(2), tp2: revTp2.toFixed(2), tp3: revTp3.toFixed(2), sl: revSl.toFixed(2) };
+            const macroTag = revWithMacro ? '+MACRO' : '';
+            const revSig = { type: revType, time: ts(), price: price.toFixed(2), score: (revDir === 'long' ? '⬆' : '⬇') + 'RIDE' + macroTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount, tp1: revTp1.toFixed(2), tp2: revTp2.toFixed(2), tp3: revTp3.toFixed(2), sl: revSl.toFixed(2) };
             enrichSig(revSig); s.signals.push(revSig); logSignal(sym, revSig);
-            log(sym, '🔄 TRv2 AUTO-REVERSE ' + revDir.toUpperCase() + ' — $' + price.toFixed(2) + ' · TP1 $' + revTp1.toFixed(2) + ' · TP2 $' + revTp2.toFixed(2) + ' · TP3 $' + revTp3.toFixed(2) + ' · SL $' + revSl.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+            log(sym, '🔄 TRv2 AUTO-REVERSE ' + revDir.toUpperCase() + ' +MACRO — $' + price.toFixed(2) + ' · TP1 $' + revTp1.toFixed(2) + ' · TP2 $' + revTp2.toFixed(2) + ' · TP3 $' + revTp3.toFixed(2) + ' · SL $' + revSl.toFixed(2) + ' [#' + s.dailySignalCount + ']');
             sendPush('🔄 ' + sym + ' REVERSE ' + revDir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · TP1 $' + revTp1.toFixed(2) + ' · SL $' + revSl.toFixed(2), 'signal');
+            s.trade = { active: true, type: revType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, isTrend: true, slPrice: revSl, atr: trv2Atr, bestPrice: price };
+          } else {
+            log(sym, '⏭️ TRv2 no auto-reverse — ' + (revWithMacro ? 'ROC too weak' : 'would reverse AGAINST macro (' + (s.macroEma ? '$' + s.macroEma.toFixed(2) : 'null') + ')'));
           }
           return;
+        } else if (crossOnWrongSide) {
+          // Price is on wrong side but not enough candle confirmations yet — log warning
+          if (s.trv2CrossCount === 1) {
+            log(sym, '⚠️ TRv2 ' + t.dir.toUpperCase() + ' — price crossed EMA ($' + tEma.toFixed(2) + ') · ' + s.trv2CrossCount + '/' + requiredCrosses + ' candle confirmations · holding...');
+          }
         }
       }
 
@@ -1486,12 +1563,24 @@ function processPrice(sym, price, hi, lo) {
 
     if (!s.trv2Trade && entryCool && spreadPct >= minSpreadPct) {
       const entryRocMin = isBTC ? BTC_ROC_THR * 0.5 : NAS_ROC_THR * 0.5;
-      const longOk = priceAbove && roc3 > entryRocMin && rsiV > 30 && rsiV < 75;
-      const shortOk = priceBelow && roc3 < -entryRocMin && rsiV > 25 && rsiV < 70;
+      let longOk = priceAbove && roc3 > entryRocMin && rsiV > 30 && rsiV < 75;
+      let shortOk = priceBelow && roc3 < -entryRocMin && rsiV > 25 && rsiV < 70;
+
+      // MACRO GATE: only enter in the direction of the macro (3h) trend
+      // If macro is bull → only LONG. If macro is bear → only SHORT.
+      // This prevents counter-trend entries that get chopped up in pullbacks.
+      if (macroDir === 'bull' && shortOk) {
+        log(sym, '⏭️ TRv2 SHORT blocked — macro is BULLISH (3h EMA $' + (s.macroEma ? s.macroEma.toFixed(2) : '?') + ')');
+        shortOk = false;
+      }
+      if (macroDir === 'bear' && longOk) {
+        log(sym, '⏭️ TRv2 LONG blocked — macro is BEARISH (3h EMA $' + (s.macroEma ? s.macroEma.toFixed(2) : '?') + ')');
+        longOk = false;
+      }
 
       if (longOk || shortOk) {
         const dir = longOk ? 'long' : 'short';
-        const withMacro = (dir === 'long' && macroDir === 'bull') || (dir === 'short' && macroDir === 'bear');
+        const withMacro = true; // entries always align with macro now (counter-trend blocked above)
         const tpMult = withMacro ? 1.0 : 0.75;
         const slMult = withMacro ? 2.0 : 1.5;
 
@@ -2488,9 +2577,15 @@ setInterval(() => {
       s.fastMoveLastTs = 0;
       s.trendRideLastTs = 0; s.trendRideLastDir = null; s.trendRideSameDirCount = 0; s.trendRideLastPrice = 0;
       // TRv2 trend-following state reset
-      s.trv2Candles = []; s.trv2CurCandle = null;
-      s.trv2Ema15 = null; s.trv2Ema20 = null; s.trv2Ema30 = null; s.trv2TrendEma = null;
-      s.trv2Dir = null; s.trv2DirTs = 0; s.trv2LastSignalTs = 0; s.trv2Trade = null;
+      // BTC is 24/7 — preserve candles, EMAs, and active trade across daily reset
+      // NAS100 has market hours — full reset so stale overnight data doesn't pollute
+      if (sym !== 'BTC') {
+        s.trv2Candles = []; s.trv2CurCandle = null;
+        s.trv2Ema15 = null; s.trv2Ema20 = null; s.trv2Ema30 = null; s.trv2TrendEma = null;
+        s.trv2Dir = null; s.trv2DirTs = 0; s.trv2Trade = null; s.trv2CrossCount = 0;
+      }
+      // Always reset cooldown so first signal of new day isn't blocked by yesterday's timestamp
+      s.trv2LastSignalTs = 0;
       s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
     });
     saveRollingLevels(); // Persist rolling ATH/ATL data across restarts
@@ -2738,10 +2833,15 @@ app.listen(PORT, () => {
   console.log(`[${ts()}] FINNHUB_API_KEY: ${API ? API.substring(0, 4) + '...' + API.substring(API.length - 4) : 'NOT SET'}`);
   console.log(`[${ts()}] VAPID keys: ${process.env.VAPID_PUBLIC_KEY ? 'set' : 'NOT SET'}`);
   loadRollingLevels();
+  loadTrv2State();
   connectFinnhub();
   fetchVIX();
   fetchDXY();
   fetchTLT();
   fetchSLV();
   fetchGDX();
+
+  // Save state on shutdown (deploy/restart) so TRv2 trades survive
+  process.on('SIGTERM', () => { console.log('[' + ts() + '] SIGTERM — saving state...'); saveTrv2State(); saveRollingLevels(); process.exit(0); });
+  process.on('SIGINT', () => { console.log('[' + ts() + '] SIGINT — saving state...'); saveTrv2State(); saveRollingLevels(); process.exit(0); });
 });
