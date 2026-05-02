@@ -105,6 +105,9 @@ SYMBOLS.forEach(sym => {
     shakeoutTs: 0,         // when SL was hit
     shakeoutPrice: 0,      // price at SL
     shakeoutEp: 0,         // original entry price
+    // Session extreme reversal tracking — suppresses TRv2 entries at tops/bottoms
+    lastHiRevTs: 0,        // when ⬇HI fired (PUT signal at session high)
+    lastLoRevTs: 0,        // when ⬆LO fired (CALL signal at session low)
     // Order Block detection — 1-min candle aggregation + OB zones
     obCandles: [],       // [{o, h, l, c, ts}] — completed 1-min candles (last 60)
     obCurCandle: null,   // current building candle {o, h, l, c, startTs, ticks}
@@ -1154,6 +1157,7 @@ function processPrice(sym, price, hi, lo) {
         const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇HI', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
         enrichSig(sig); s.signals.push(sig);
         logSignal(sym, sig);
+        s.lastHiRevTs = now2; // Track for TRv2 entry suppression
         log(sym, '🔻 SESSION HIGH REVERSAL PUT — $' + distFromHigh.toFixed(2) + ' off high $' + s.sessionHigh.toFixed(2) + ' RSI@high:' + s.rsiAtSessionHigh.toFixed(1) + ' RSInow:' + rsiV.toFixed(1) + ' [#' + s.dailySignalCount + ']');
         sendPush('🔻 ' + sym + ' HIGH REVERSAL PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromHigh.toFixed(2) + ' off high · RSI@high:' + s.rsiAtSessionHigh.toFixed(1), 'signal');
         s.trade = { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
@@ -1518,9 +1522,17 @@ function processPrice(sym, price, hi, lo) {
           // was LONG WITH macro, now reversing SHORT against macro = DON'T
           const revDir = priceAbove ? 'long' : 'short';
           const revWithMacro = s.macroEma ? ((revDir === 'long' && price > s.macroEma) || (revDir === 'short' && price < s.macroEma)) : true;
-          const revRocOk = (priceAbove && roc3 > (isBTC ? BTC_ROC_THR * 0.5 : NAS_ROC_THR * 0.5)) ||
-                           (priceBelow && roc3 < -(isBTC ? BTC_ROC_THR * 0.5 : NAS_ROC_THR * 0.5));
-          if (revRocOk && revWithMacro) {
+          // ATR-scaled ROC for reverse (same logic as entry)
+          const revBaselineAtr = isBTC ? 120 : 30;
+          const revAtrRatio = trv2Atr > 0 ? Math.min(revBaselineAtr / trv2Atr, 2.0) : 1.0;
+          const revRocMin = (isBTC ? BTC_ROC_THR * 0.5 : NAS_ROC_THR * 0.5) * revAtrRatio;
+          const revRocOk = (priceAbove && roc3 > revRocMin) || (priceBelow && roc3 < -revRocMin);
+          // Session extreme gate for reverse too
+          const revHiBlock = s.lastHiRevTs && (now3 - s.lastHiRevTs < 1800000) && revDir === 'long';
+          const revLoBlock = s.lastLoRevTs && (now3 - s.lastLoRevTs < 1800000) && revDir === 'short';
+          if (revHiBlock || revLoBlock) {
+            log(sym, '🏔️ TRv2 auto-reverse ' + revDir.toUpperCase() + ' blocked — session extreme reversal signal active');
+          } else if (revRocOk && revWithMacro) {
             const revSl = revDir === 'long' ? price - trv2Atr * 2 : price + trv2Atr * 2;
             const revTp1 = revDir === 'long' ? price + trv2Atr * 1.5 : price - trv2Atr * 1.5;
             const revTp2 = revDir === 'long' ? price + trv2Atr * 2.5 : price - trv2Atr * 2.5;
@@ -1561,8 +1573,27 @@ function processPrice(sym, price, hi, lo) {
     const entryCool = now3 - s.trv2LastSignalTs > 300000;
     const macroDir = s.macroEma ? (price > s.macroEma ? 'bull' : 'bear') : null;
 
-    if (!s.trv2Trade && entryCool && spreadPct >= minSpreadPct) {
-      const entryRocMin = isBTC ? BTC_ROC_THR * 0.5 : NAS_ROC_THR * 0.5;
+    // MINIMUM TREND AGE: after exit/reverse, require trend direction to hold 15+ min before new entry
+    // Prevents rapid re-entry whipsaws on range-bound days where price oscillates around EMA
+    const trendAgeMs = s.trv2DirTs ? now3 - s.trv2DirTs : Infinity;
+    const minTrendAgeMs = 900000; // 15 minutes
+    const trendAgeMature = trendAgeMs >= minTrendAgeMs;
+
+    if (!s.trv2Trade && entryCool && spreadPct >= minSpreadPct && !trendAgeMature) {
+      // Log once per minute when trend age is blocking
+      if (!s._trendAgeLogTs || now3 - s._trendAgeLogTs > 60000) {
+        log(sym, '⏳ TRv2 entry blocked — trend dir ' + (s.trv2Dir || '?') + ' only ' + Math.round(trendAgeMs / 1000) + 's old (need ' + Math.round(minTrendAgeMs / 1000) + 's)');
+        s._trendAgeLogTs = now3;
+      }
+    }
+
+    if (!s.trv2Trade && entryCool && spreadPct >= minSpreadPct && trendAgeMature) {
+      // ATR-SCALED ROC FILTER: on low-vol days, raise ROC threshold to filter noise
+      // When ATR is below baseline, multiply ROC requirement by (baseline/ATR) capped at 2x
+      const baselineAtr = isBTC ? 120 : 30;
+      const atrRatio = trv2Atr > 0 ? Math.min(baselineAtr / trv2Atr, 2.0) : 1.0;
+      const entryRocBase = isBTC ? BTC_ROC_THR * 0.5 : NAS_ROC_THR * 0.5;
+      const entryRocMin = entryRocBase * atrRatio;
       let longOk = priceAbove && roc3 > entryRocMin && rsiV > 30 && rsiV < 75;
       let shortOk = priceBelow && roc3 < -entryRocMin && rsiV > 25 && rsiV < 70;
 
@@ -1576,6 +1607,20 @@ function processPrice(sym, price, hi, lo) {
       if (macroDir === 'bear' && longOk) {
         log(sym, '⏭️ TRv2 LONG blocked — macro is BEARISH (3h EMA $' + (s.macroEma ? s.macroEma.toFixed(2) : '?') + ')');
         longOk = false;
+      }
+
+      // SESSION EXTREME GATE: block entries in same direction as recent HI/LO reversal
+      // If ⬇HI fired in last 30 min → block LONG (don't buy the top)
+      // If ⬆LO fired in last 30 min → block SHORT (don't sell the bottom)
+      const hiRevRecent = s.lastHiRevTs && (now3 - s.lastHiRevTs < 1800000);
+      const loRevRecent = s.lastLoRevTs && (now3 - s.lastLoRevTs < 1800000);
+      if (hiRevRecent && longOk) {
+        log(sym, '🏔️ TRv2 LONG blocked — ⬇HI reversal fired ' + Math.round((now3 - s.lastHiRevTs) / 60000) + 'm ago (suppress 30m)');
+        longOk = false;
+      }
+      if (loRevRecent && shortOk) {
+        log(sym, '🏔️ TRv2 SHORT blocked — ⬆LO reversal fired ' + Math.round((now3 - s.lastLoRevTs) / 60000) + 'm ago (suppress 30m)');
+        shortOk = false;
       }
 
       if (longOk || shortOk) {
@@ -1961,7 +2006,12 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // === FIRE SIGNALS ===
+  // === FIRE SIGNALS (0DTE indicator engine — QQQ/SPY/XAU/LABU only) ===
+  // BTC/NAS100 use TRv2 trend-following system exclusively — block base engine
+  if (isBTC || isNAS) {
+    // Don't fire 6/6 indicator signals for BTC/NAS100 — TRv2 handles them
+    return;
+  }
   if (fireCall && cool) {
     s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
     if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
@@ -2567,6 +2617,7 @@ setInterval(() => {
       s.signals = []; s.tickBuf = [];
       s.crossAssetDir = null; s.crossAssetTs = 0;
       s.sessionHigh = -Infinity; s.sessionLow = Infinity; s.rsiAtSessionHigh = 50;
+      s.lastHiRevTs = 0; s.lastLoRevTs = 0; // reset session extreme tracking
       // Rolling ATH/ATL: keep data (persists across days), just reset approach timestamps
       s.athApproachTs = 0; s.athApproachPrice = 0; s.atlApproachTs = 0; s.atlApproachPrice = 0;
       s.gapDayMode = false; s.gapDirection = null;
