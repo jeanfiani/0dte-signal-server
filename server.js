@@ -18,6 +18,15 @@ process.on('unhandledRejection', (err) => {
   console.error('[CRASH] Unhandled rejection:', err && err.message ? err.message : err);
 });
 
+// Graceful shutdown — save persistent state before Railway kills the process
+process.on('SIGTERM', () => {
+  console.log('[SHUTDOWN] SIGTERM received — saving state...');
+  try { saveSignalHistory(); } catch (e) {}
+  try { saveRollingLevels(); } catch (e) {}
+  try { saveTrv2State(); } catch (e) {}
+  process.exit(0);
+});
+
 const app = express();
 app.use(express.json());
 
@@ -336,14 +345,85 @@ function todayDateET() {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' }); // YYYY-MM-DD
 }
 
+// ===== 7-DAY SIGNAL HISTORY (survives daily resets + redeploys) =====
+const HISTORY_FILE = path.join(__dirname, 'signal_history.json');
+const HISTORY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+let signalHistory = []; // [{date, time, ts, symbol, type, price, score, rsi, macd, roc, vix, chop, num, trv2}]
+
+function loadSignalHistory() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
+    const cutoff = Date.now() - HISTORY_MAX_AGE_MS;
+    signalHistory = (raw || []).filter(h => h.ts > cutoff);
+    console.log('[' + ts() + '] Signal history loaded — ' + signalHistory.length + ' signals (last 7 days)');
+    // Also restore per-symbol s.signals for today
+    const today = todayDateET();
+    SYMBOLS.forEach(sym => {
+      const todaySignals = signalHistory.filter(h => h.date === today && h.symbol === sym);
+      if (todaySignals.length > 0) {
+        S[sym].signals = todaySignals.map(h => ({
+          type: h.type, time: h.time, price: h.price, score: h.score,
+          rsi: h.rsi, macd: h.macd, roc: h.roc, num: h.num, conv: h.conv || null
+        }));
+        S[sym].dailySignalCount = todaySignals.length;
+        console.log('[' + ts() + '] ' + sym + ' — restored ' + todaySignals.length + ' signals for today');
+      }
+    });
+  } catch (e) { console.log('[' + ts() + '] No signal history file — starting fresh'); }
+}
+
+function saveSignalHistory() {
+  try {
+    // Prune entries older than 7 days before saving
+    const cutoff = Date.now() - HISTORY_MAX_AGE_MS;
+    signalHistory = signalHistory.filter(h => h.ts > cutoff);
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(signalHistory));
+  } catch (e) { console.error('[' + ts() + '] Failed to save signal history:', e.message); }
+}
+
+// Save signal history every 5 minutes
+setInterval(saveSignalHistory, 300000);
+
 function logSignal(sym, sig) {
   const dateStr = todayDateET();
+  // CSV log (legacy)
   const file = path.join(SIGNALS_DIR, dateStr + '.csv');
   const exists = fs.existsSync(file);
   const header = 'date,time,symbol,type,price,score,rsi,macd,roc,vix,chop,dailyNum\n';
   const row = [dateStr, sig.time, sym, sig.type, sig.price, sig.score, sig.rsi, sig.macd, sig.roc, vixV.toFixed(1), S[sym].chopActive ? 1 : 0, sig.num].join(',') + '\n';
   if (!exists) fs.writeFileSync(file, header + row);
   else fs.appendFileSync(file, row);
+
+  // JSON history (7-day persistent store)
+  const histEntry = {
+    date: dateStr,
+    time: sig.time,
+    ts: Date.now(),
+    symbol: sym,
+    type: sig.type,
+    price: sig.price,
+    score: sig.score,
+    rsi: sig.rsi,
+    macd: sig.macd,
+    roc: sig.roc,
+    vix: vixV.toFixed(1),
+    chop: S[sym].chopActive ? 1 : 0,
+    num: sig.num,
+    conv: sig.conv || null
+  };
+  // Add TRv2 trade context if active (BTC/NAS100)
+  if (S[sym].trv2Trade) {
+    histEntry.trv2 = {
+      dir: S[sym].trv2Trade.dir,
+      ep: S[sym].trv2Trade.ep,
+      sl: +S[sym].trv2Trade.sl.toFixed(2),
+      tp1: +S[sym].trv2Trade.tp1.toFixed(2),
+      tp2: +S[sym].trv2Trade.tp2.toFixed(2),
+      tp3: +S[sym].trv2Trade.tp3.toFixed(2),
+      atr: S[sym].trv2Trade.atr ? +S[sym].trv2Trade.atr.toFixed(2) : null
+    };
+  }
+  signalHistory.push(histEntry);
 }
 
 // ===== PROCESS PRICE (same engine as mobile/desktop) =====
@@ -2614,7 +2694,7 @@ setInterval(() => {
       s.dailySignalCount = 0; s.lastSignalDir = null; s.lastSignalTs = 0;
       s.nC = 0; s.nP = 0; s.nBl = 0;
       s.chopShort = []; s.chopLong = []; s.chopCount = 0; s.trendCount = 0; s.chopActive = false;
-      s.signals = []; s.tickBuf = [];
+      s.signals = []; s.tickBuf = []; // in-memory today array cleared — full history persisted in signalHistory[]
       s.crossAssetDir = null; s.crossAssetTs = 0;
       s.sessionHigh = -Infinity; s.sessionLow = Infinity; s.rsiAtSessionHigh = 50;
       s.lastHiRevTs = 0; s.lastLoRevTs = 0; // reset session extreme tracking
@@ -2640,6 +2720,7 @@ setInterval(() => {
       s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
     });
     saveRollingLevels(); // Persist rolling ATH/ATL data across restarts
+    saveSignalHistory(); // Flush signal history before daily reset
     // Reset global flip trackers
     tltFlipTs = 0; tltPrevDir = tltDir || 'neutral';
     // Reset WS uptime counters daily
@@ -2842,30 +2923,84 @@ app.get('/status', (req, res) => {
   res.json({ running: ws && ws.readyState === 1, vix: vixV, subscribers: subscriptions.length, ws: wsInfo, symbols: status });
 });
 
-// Signal log — today's signals as CSV
+// Signal history — today shortcut (JSON) — must be before /:date to avoid matching "today" as date param
 app.get('/signals/today', (req, res) => {
-  const file = path.join(SIGNALS_DIR, todayDateET() + '.csv');
-  if (!fs.existsSync(file)) return res.status(200).send('date,time,symbol,type,price,score,rsi,macd,roc,vix,chop,dailyNum\n');
-  res.header('Content-Type', 'text/csv');
-  res.sendFile(file);
+  const today = todayDateET();
+  const todaySignals = signalHistory.filter(h => h.date === today);
+  const bySymbol = {};
+  SYMBOLS.forEach(sym => {
+    const symSigs = todaySignals.filter(h => h.symbol === sym);
+    if (symSigs.length > 0) bySymbol[sym] = symSigs.length;
+  });
+  res.json({ date: today, total: todaySignals.length, bySymbol: bySymbol, signals: todaySignals });
 });
 
-// Signal log — specific date (e.g. /signals/2026-04-11)
-app.get('/signals/:date', (req, res) => {
+// CSV export — legacy endpoint (must be before /:date)
+app.get('/signals/csv/:date', (req, res) => {
   const dateStr = req.params.date;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return res.status(400).json({ error: 'Use YYYY-MM-DD format' });
   const file = path.join(SIGNALS_DIR, dateStr + '.csv');
-  if (!fs.existsSync(file)) return res.status(404).json({ error: 'No signals for ' + dateStr });
+  if (!fs.existsSync(file)) return res.status(404).json({ error: 'No CSV for ' + dateStr });
   res.header('Content-Type', 'text/csv');
   res.sendFile(file);
 });
 
-// Signal log — list all available dates
+// Signal history — specific date (JSON)
+app.get('/signals/:date', (req, res) => {
+  const dateStr = req.params.date;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return res.status(400).json({ error: 'Use YYYY-MM-DD format' });
+  const dateSigs = signalHistory.filter(h => h.date === dateStr);
+  if (dateSigs.length === 0) return res.status(404).json({ error: 'No signals for ' + dateStr, hint: 'History covers last 7 days only' });
+  const bySymbol = {};
+  SYMBOLS.forEach(sym => {
+    const symSigs = dateSigs.filter(h => h.symbol === sym);
+    if (symSigs.length > 0) bySymbol[sym] = symSigs.length;
+  });
+  res.json({ date: dateStr, total: dateSigs.length, bySymbol: bySymbol, signals: dateSigs });
+});
+
+// Signal history — full JSON API (7-day persistent store) — must be LAST (catch-all for /signals)
+// GET /signals?symbol=BTC&date=2026-05-03&days=3&type=call
 app.get('/signals', (req, res) => {
-  try {
-    const files = fs.readdirSync(SIGNALS_DIR).filter(f => f.endsWith('.csv')).map(f => f.replace('.csv', '')).sort();
-    res.json({ dates: files, count: files.length });
-  } catch (e) { res.json({ dates: [], count: 0 }); }
+  let filtered = signalHistory;
+  // Filter by symbol
+  if (req.query.symbol) {
+    const sym = req.query.symbol.toUpperCase();
+    filtered = filtered.filter(h => h.symbol === sym);
+  }
+  // Filter by date (exact)
+  if (req.query.date) {
+    filtered = filtered.filter(h => h.date === req.query.date);
+  }
+  // Filter by last N days
+  if (req.query.days) {
+    const daysMs = parseInt(req.query.days) * 24 * 60 * 60 * 1000;
+    const cutoff = Date.now() - daysMs;
+    filtered = filtered.filter(h => h.ts > cutoff);
+  }
+  // Filter by signal type (call/put)
+  if (req.query.type) {
+    filtered = filtered.filter(h => h.type === req.query.type.toLowerCase());
+  }
+  // Filter by score (e.g. RIDE, MFLIP, TREND, 6/6, ⬇HI, etc.)
+  if (req.query.score) {
+    const scoreQ = req.query.score.toUpperCase();
+    filtered = filtered.filter(h => h.score && h.score.toUpperCase().includes(scoreQ));
+  }
+  // Summary stats
+  const dates = [...new Set(filtered.map(h => h.date))].sort();
+  const symbols = [...new Set(filtered.map(h => h.symbol))].sort();
+  const bySymbol = {};
+  symbols.forEach(sym => { bySymbol[sym] = filtered.filter(h => h.symbol === sym).length; });
+
+  res.json({
+    total: filtered.length,
+    dates: dates,
+    bySymbol: bySymbol,
+    signals: filtered,
+    historyAge: signalHistory.length > 0 ? signalHistory[0].date : null,
+    totalStored: signalHistory.length
+  });
 });
 
 // Debug endpoint — recent WS events (wsEvents + wsLog defined near WS vars at top)
@@ -2885,6 +3020,7 @@ app.listen(PORT, () => {
   console.log(`[${ts()}] VAPID keys: ${process.env.VAPID_PUBLIC_KEY ? 'set' : 'NOT SET'}`);
   loadRollingLevels();
   loadTrv2State();
+  loadSignalHistory();
   connectFinnhub();
   fetchVIX();
   fetchDXY();
