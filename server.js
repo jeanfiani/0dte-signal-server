@@ -135,6 +135,9 @@ SYMBOLS.forEach(sym => {
     macroPrevDir: null,    // 'bull' or 'bear' — last settled macro direction
     macroFlipTs: 0,        // when last macro flip signal fired (cooldown)
     superFlipTs: 0,        // when last super signal fired (cooldown)
+    // 5-minute candles for proper ATR calculation (MT5 instruments get 1 tick/sec, so tick-level hi/lo is useless)
+    atrCandles: [],          // [{o, h, l, c, ts}] — completed 5-min candles (last 20)
+    atrCurCandle: null,      // current building 5-min candle {o, h, l, c, startTs}
     // Consolidation Breakout detector (XAU only) — fires on range escape, not lagging indicators
     breakRange: [],          // [{ts, hi, lo}] — 1-second snapshots for rolling 5-min window (max 300)
     breakHi: 0,              // current consolidation high
@@ -500,7 +503,13 @@ function processPrice(sym, price, hi, lo) {
           const prev = s.obCandles[s.obCandles.length - 2]; // candle before displacement
           const disp = cc; // just-closed candle (potential displacement)
           const candleRange = disp.h - disp.l;
-          const atrNow = calcATR(s.highs, s.lows, s.prices, 14);
+          let atrNow = 0;
+          if (s.atrCandles && s.atrCandles.length >= 3) {
+            const acOb = s.atrCandles, pOb = Math.min(14, acOb.length);
+            let aSum = 0;
+            for (let ai = acOb.length - pOb; ai < acOb.length; ai++) { aSum += Math.max(acOb[ai].h - acOb[ai].l, ai > 0 ? Math.abs(acOb[ai].h - acOb[ai-1].c) : acOb[ai].h - acOb[ai].l, ai > 0 ? Math.abs(acOb[ai].l - acOb[ai-1].c) : acOb[ai].h - acOb[ai].l); }
+            atrNow = aSum / pOb;
+          } else { atrNow = calcATR(s.highs, s.lows, s.prices, 14); }
           const isDisplacement = atrNow > 0 && candleRange > atrNow * 2;
           if (isDisplacement) {
             const bullDisp = disp.c > disp.o; // bullish displacement (big green candle)
@@ -618,8 +627,21 @@ function processPrice(sym, price, hi, lo) {
     abV = vwapPct > vwapZone; blV = vwapPct < -vwapZone;
   }
 
-  // ATR for MT5 instruments — used as volatility filter (block signals when market is dead)
-  const atrVal = isMT5 ? calcATR(s.highs, s.lows, s.prices, 14) : 0;
+  // ATR for MT5 instruments — use proper 5-min candles when available (tick-level hi≈lo gives ATR≈0)
+  let atrVal = 0;
+  if (isMT5 && s.atrCandles && s.atrCandles.length >= 3) {
+    // Calculate ATR from 5-min candles (proper OHLC data)
+    const ac = s.atrCandles, period = Math.min(14, ac.length);
+    let atrSum = 0;
+    for (let ai = ac.length - period; ai < ac.length; ai++) {
+      const tr = Math.max(ac[ai].h - ac[ai].l, ai > 0 ? Math.abs(ac[ai].h - ac[ai - 1].c) : ac[ai].h - ac[ai].l, ai > 0 ? Math.abs(ac[ai].l - ac[ai - 1].c) : ac[ai].h - ac[ai].l);
+      atrSum += tr;
+    }
+    atrVal = atrSum / period;
+  } else if (isMT5) {
+    // Fallback to tick-level ATR during warmup (first 15 min)
+    atrVal = calcATR(s.highs, s.lows, s.prices, 14);
+  }
   const atrTooLow = isXAU && s.prices.length >= 30 && atrVal < 0.50; // XAU: $0.50 ATR = dead market
   const btcAtrTooLow = isBTC && s.prices.length >= 30 && atrVal < 10; // BTC: $10 ATR = dead market
   const nasAtrTooLow = isNAS && s.prices.length >= 30 && atrVal < 5; // NAS100: $5 ATR = dead market (~20000 price)
@@ -1850,7 +1872,7 @@ function processPrice(sym, price, hi, lo) {
   // Data: XAU $4577→$4594 ($17 rally) with macro EMA bullish at $4571 — 0 signals fired because EMAs lagged.
   // Trend Ride cooldown: 40 min for XAU
   const trCoolMs = 2400000;
-  if (isXAU && isMT5 && s.macroEma !== null && s.macroSnaps.length >= 30 && cool && (now2 - s.trendRideLastTs > trCoolMs)) {
+  if (isXAU && isMT5 && s.macroEma !== null && s.macroSnaps.length >= 12 && cool && (now2 - s.trendRideLastTs > trCoolMs)) {
     const trDir = price > s.macroEma ? 'bull' : 'bear';
     const trSpread = Math.abs(price - s.macroEma);
     const trSpreadPct = (trSpread / s.macroEma) * 100;
@@ -2529,6 +2551,24 @@ function processTicks(symbols) {
     s.tickBuf = [];
     processPrice(sym, price, hi, lo);
 
+    // 5-minute candle aggregation for proper ATR (MT5 instruments send 1 tick/sec — tick-level hi≈lo gives ATR≈0)
+    if (sym === 'XAU' || sym === 'BTC' || sym === 'NAS100') {
+      const bNow5 = Date.now();
+      if (!s.atrCurCandle) {
+        s.atrCurCandle = { o: price, h: price, l: price, c: price, startTs: bNow5 };
+      } else {
+        if (price > s.atrCurCandle.h) s.atrCurCandle.h = price;
+        if (price < s.atrCurCandle.l) s.atrCurCandle.l = price;
+        s.atrCurCandle.c = price;
+        // Close candle after 5 minutes
+        if (bNow5 - s.atrCurCandle.startTs >= 300000) {
+          s.atrCandles.push({ o: s.atrCurCandle.o, h: s.atrCurCandle.h, l: s.atrCurCandle.l, c: s.atrCurCandle.c, ts: s.atrCurCandle.startTs });
+          if (s.atrCandles.length > 20) s.atrCandles.shift();
+          s.atrCurCandle = { o: price, h: price, l: price, c: price, startTs: bNow5 };
+        }
+      }
+    }
+
     // Macro trend snapshots — MT5 instruments (XAU + BTC), every 5 min, 6-hour rolling window
     if ((sym === 'XAU' || sym === 'BTC' || sym === 'NAS100') && (Date.now() - s.macroLastSnapTs >= 300000)) {
       s.macroLastSnapTs = Date.now();
@@ -2619,10 +2659,8 @@ function processTicks(symbols) {
           s.breakFrozenHi = bHi;  // locked coil high — won't move with rolling window
           s.breakFrozenLo = bLo;  // locked coil low
         } else if (s.breakCoilActive && bRange < coilMaxRange) {
-          // STILL COILING — update frozen boundaries if range tightens (allows narrowing, not widening)
-          // Only widen if still within coil threshold (catches slow drift within coil)
-          if (bHi > s.breakFrozenHi) s.breakFrozenHi = bHi;
-          if (bLo < s.breakFrozenLo) s.breakFrozenLo = bLo;
+          // STILL COILING — boundaries stay FROZEN. Do not update.
+          // If we widen them, the breakout detection drifts with price (the original bug).
         }
 
         // BREAKOUT CHECK — every tick while coil is active, compare price to FROZEN boundaries
@@ -2867,6 +2905,7 @@ setInterval(() => {
       s.lastSameDir = null; s.lastSameDirMacd = 0; s.lastSameDirTs = 0; s.lastSameDirPrice = 0;
       s.shakeoutDir = null; s.shakeoutTs = 0; s.shakeoutPrice = 0; s.shakeoutEp = 0;
       s.obCandles = []; s.obCurCandle = null; s.orderBlocks = [];
+      s.atrCandles = []; s.atrCurCandle = null;
       s.obZone = null; s.obDeparted = false; s.obFired = false; s.obMitigated = false;
       s.fastMoveLastTs = 0;
       s.trendRideLastTs = 0; s.trendRideLastDir = null; s.trendRideSameDirCount = 0; s.trendRideLastPrice = 0;
