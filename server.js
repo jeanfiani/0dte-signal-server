@@ -831,11 +831,22 @@ function processPrice(sym, price, hi, lo) {
   }
   if (!isMT5 && etMin >= 945 && (cS >= THR || pS >= THR)) return;
 
-  // ATR filter — block signals when market is dead (low volatility)
-  if ((atrTooLow || btcAtrTooLow) && (cS >= THR || pS >= THR)) {
-    log(sym, 'ATR filter: blocked — ATR $' + atrVal.toFixed(2) + ' (dead market)');
-    return;
+  // ATR filter — block BASE scoring signals when market is dead (low volatility)
+  // NOTE: This is a FLAG, not a return. Specialized detectors (fast-move, breakout, session high
+  // reversal, ATH/ATL, V-reversal, TRv2) must still run — a "dead" market can wake up suddenly
+  // and those detectors are designed to catch exactly that scenario.
+  const atrBlocked = (atrTooLow || btcAtrTooLow || nasAtrTooLow) && (cS >= THR || pS >= THR);
+  if (atrBlocked) {
+    log(sym, 'ATR filter: base scoring skipped — ATR $' + atrVal.toFixed(2) + ' (dead market, specialized detectors still active)');
   }
+
+  // ===== BASE SCORING ENGINE =====
+  // When atrBlocked, skip the entire base scoring chain and jump to specialized detectors.
+  // The specialized detectors (session high reversal, breakout, fast-move, V-reversal, TRv2,
+  // MFLIP, TREND, ATH/ATL, shakeout) must always run — they catch exactly the sudden moves
+  // that happen when a "dead" market wakes up.
+  if (atrBlocked) { /* skip base scoring — fall through to specialized detectors below */ }
+  else {
 
   // Round-number gravity (XAU) — tighten threshold near $50 levels instead of hard block
   // These levels act as support/resistance; require stronger conviction to push through
@@ -1214,6 +1225,11 @@ function processPrice(sym, price, hi, lo) {
       }
     }
   }
+
+  } // end else (!atrBlocked) — base scoring engine
+
+  // ===== SPECIALIZED DETECTORS — always run regardless of ATR =====
+  // These catch sudden moves, reversals, breakouts that happen when a "dead" market wakes up
 
   // Session High Reversal Detector — fire high-confidence PUT when price reverses from session high
   // Conditions: hit session high, reversed >$1 from it, RSI > 60 (was overbought), MACD turning bearish
@@ -1668,16 +1684,11 @@ function processPrice(sym, price, hi, lo) {
     const minTrendAgeMs = 900000; // 15 minutes
     const trendAgeMature = trendAgeMs >= minTrendAgeMs;
 
-    // CHOP GATE: block all TRv2 entries when chop detector is active
-    // Chop = price oscillating around EMA with no follow-through → trend entries bleed
-    if (!s.trv2Trade && entryCool && spreadPct >= minSpreadPct && s.chopActive) {
-      if (!s._chopBlockLogTs || now3 - s._chopBlockLogTs > 60000) {
-        log(sym, '🌊 TRv2 entry blocked — CHOP MODE active (signals:' + s.dailySignalCount + ')');
-        s._chopBlockLogTs = now3;
-      }
-    }
+    // CHOP GATE REMOVED: chop can break suddenly and we need TRv2 to catch the move.
+    // The macro gate + trend age + ATR-scaled ROC filter already prevent noise entries.
+    // Chop status is still logged for awareness but doesn't block entries.
 
-    if (!s.trv2Trade && entryCool && spreadPct >= minSpreadPct && !trendAgeMature && !s.chopActive) {
+    if (!s.trv2Trade && entryCool && spreadPct >= minSpreadPct && !trendAgeMature) {
       // Log once per minute when trend age is blocking
       if (!s._trendAgeLogTs || now3 - s._trendAgeLogTs > 60000) {
         log(sym, '⏳ TRv2 entry blocked — trend dir ' + (s.trv2Dir || '?') + ' only ' + Math.round(trendAgeMs / 1000) + 's old (need ' + Math.round(minTrendAgeMs / 1000) + 's)');
@@ -1685,7 +1696,7 @@ function processPrice(sym, price, hi, lo) {
       }
     }
 
-    if (!s.trv2Trade && entryCool && spreadPct >= minSpreadPct && trendAgeMature && !s.chopActive) {
+    if (!s.trv2Trade && entryCool && spreadPct >= minSpreadPct && trendAgeMature) {
       // ATR-SCALED ROC FILTER: on low-vol days, raise ROC threshold to filter noise
       // When ATR is below baseline, multiply ROC requirement by (baseline/ATR) capped at 2x
       const baselineAtr = isBTC ? 120 : 30;
