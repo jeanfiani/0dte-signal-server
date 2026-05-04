@@ -1669,7 +1669,7 @@ function processPrice(sym, price, hi, lo) {
             const revTp2 = revDir === 'long' ? price + Math.max(trv2Atr * revMults.t2, revMin * 1.5) : price - Math.max(trv2Atr * revMults.t2, revMin * 1.5);
             const revTp3 = revDir === 'long' ? price + Math.max(trv2Atr * revMults.t3, revMin * 3) : price - Math.max(trv2Atr * revMults.t3, revMin * 3);
 
-            s.trv2Trade = { dir: revDir, ep: price, ts: now3, sl: revSl, tp1: revTp1, tp2: revTp2, tp3: revTp3, tp1Hit: false, tp2Hit: false, tp3Hit: false, bestPrice: price, atr: trv2Atr, trailSl: 0 };
+            s.trv2Trade = { dir: revDir, ep: price, ts: now3, sl: revSl, tp1: revTp1, tp2: revTp2, tp3: revTp3, tp1Hit: false, tp2Hit: false, tp3Hit: false, bestPrice: price, atr: trv2Atr, trailSl: 0, isCfd: true };
             s.trv2Dir = revDir;
             s.trv2DirTs = now3;
             s.trv2LastSignalTs = now3;
@@ -1772,7 +1772,7 @@ function processPrice(sym, price, hi, lo) {
         const tp2 = dir === 'long' ? price + Math.max(trv2Atr * entMults.t2 * tpMult, entMin * 1.5) : price - Math.max(trv2Atr * entMults.t2 * tpMult, entMin * 1.5);
         const tp3 = dir === 'long' ? price + Math.max(trv2Atr * entMults.t3 * tpMult, entMin * 3) : price - Math.max(trv2Atr * entMults.t3 * tpMult, entMin * 3);
 
-        s.trv2Trade = { dir: dir, ep: price, ts: now3, sl: sl, tp1: tp1, tp2: tp2, tp3: tp3, tp1Hit: false, tp2Hit: false, tp3Hit: false, bestPrice: price, atr: trv2Atr, trailSl: 0 };
+        s.trv2Trade = { dir: dir, ep: price, ts: now3, sl: sl, tp1: tp1, tp2: tp2, tp3: tp3, tp1Hit: false, tp2Hit: false, tp3Hit: false, bestPrice: price, atr: trv2Atr, trailSl: 0, isCfd: true };
         s.trv2Dir = dir;
         s.trv2DirTs = now3;
         s.trv2LastSignalTs = now3;
