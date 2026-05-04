@@ -958,7 +958,7 @@ function processPrice(sym, price, hi, lo) {
 
   // FIX 1: Minimum ROC gate — no momentum = no trade
   // MT5: 0.015% (38% XAU, 0% BTC below this). Equities: 0.01% (33% QQQ below this).
-  const minRocGate = isBTC ? 0.015 : isXAU ? 0.015 : 0.010;
+  const minRocGate = isBTC ? 0.015 : isNAS ? 0.015 : isXAU ? 0.015 : 0.010;
   if (Math.abs(roc3) < minRocGate && (cS >= minS || pS >= minS)) {
     if (sustainedOverride) {
       log(sym, 'ROC gate override: sustained momentum (' + s.sustainedCount + ' ticks) — ROC ' + roc3.toFixed(3) + '% below ' + minRocGate + '%');
@@ -1022,8 +1022,8 @@ function processPrice(sym, price, hi, lo) {
   // MACD line (macdL) measures actual trend strength — near-zero = no trend
   // XAU uses higher thresholds because price (~$3300) produces ~5x larger MACD values
   const macdStr = Math.abs(macdL - macdS);
-  const macdMinStr = isXAU ? XAU_MACD_MIN : isBTC ? BTC_MACD_MIN : 0.020;
-  const macdLineMin = isXAU ? XAU_MACD_LINE_MIN : isBTC ? 1.50 : 0.015;
+  const macdMinStr = isXAU ? XAU_MACD_MIN : isBTC ? BTC_MACD_MIN : isNAS ? 0.50 : 0.020;
+  const macdLineMin = isXAU ? XAU_MACD_LINE_MIN : isBTC ? 1.50 : isNAS ? 0.50 : 0.015;
   if (macdStr < macdMinStr && (cS >= finalMinS || pS >= finalMinS)) return;
   if (Math.abs(macdL) < macdLineMin && (cS >= finalMinS || pS >= finalMinS)) {
     log(sym, 'MACD line filter: blocked — |macdL| = ' + Math.abs(macdL).toFixed(3) + ' < ' + macdLineMin);
@@ -1035,8 +1035,8 @@ function processPrice(sym, price, hi, lo) {
   // Histogram deeply extended → immediate momentum spent
   // Line deeply extended → trend has been running too long, reversal likely
   if (isMT5) {
-    const macdExhThr = isBTC ? 12.0 : 0.80;       // histogram exhaustion threshold (BTC ~$77k vs XAU ~$4700)
-    const macdLineDepth = isBTC ? 15.0 : 1.00;    // line depth exhaustion threshold
+    const macdExhThr = isBTC ? 12.0 : isNAS ? 5.0 : 0.80;       // histogram exhaustion threshold (BTC ~$77k, NAS ~$27k, XAU ~$4600)
+    const macdLineDepth = isBTC ? 15.0 : isNAS ? 6.0 : 1.00;    // line depth exhaustion threshold
     // MACD LINE depth check — trend running too long (sustained momentum can override)
     if (Math.abs(macdL) > macdLineDepth) {
       if (macdL < -macdLineDepth && pS >= finalMinS && pS > cS) {
@@ -1165,7 +1165,7 @@ function processPrice(sym, price, hi, lo) {
     const recent = s.prices.slice(-30);
     const recentHi = Math.max(...recent), recentLo = Math.min(...recent);
     const moveSize = recentHi - recentLo;
-    const retraceMin = isBTC ? 80.0 : isXAU ? 5.0 : 0.50; // BTC ~$77k needs $80, XAU ~$4700 needs $5, equities $0.50
+    const retraceMin = isBTC ? 80.0 : isNAS ? 30.0 : isXAU ? 5.0 : 0.50; // BTC ~$77k needs $80, NAS ~$27k needs $30, XAU ~$4600 needs $5, equities $0.50
     if (moveSize >= retraceMin) {
       const retracePct = recentHi > recentLo ? (price - recentLo) / (recentHi - recentLo) : 0.5;
       // For CALL: price should be above 50% retrace (not bouncing off the bottom)
@@ -1196,7 +1196,7 @@ function processPrice(sym, price, hi, lo) {
   // Prevents clustered signals at similar prices while allowing signals after real moves
   // XAU: 0.15% (~$7 at $4700). Equities: 0.25% (~$1.25 at $500) — tighter to prevent clustering
   { const cDir3 = cS >= pS ? 'call' : 'put';
-    const minPctMove = isBTC ? 0.12 : isXAU ? 0.15 : 0.25;
+    const minPctMove = isBTC ? 0.12 : isNAS ? 0.12 : isXAU ? 0.15 : 0.25;
     if (s.lastSameDir === cDir3 && s.lastSameDirPrice > 0) {
       const pctMove = Math.abs((price - s.lastSameDirPrice) / s.lastSameDirPrice) * 100;
       if (pctMove < minPctMove && ((cDir3 === 'call' && cS >= finalMinS) || (cDir3 === 'put' && pS >= finalMinS))) {
@@ -1211,8 +1211,8 @@ function processPrice(sym, price, hi, lo) {
   if (s.openPrice && s.openPrice > 0) {
     const dayMove = price - s.openPrice;
     const absDayMove = Math.abs(dayMove);
-    const postMoveThr = isBTC ? 300.0 : isXAU ? 20.0 : 2.0;
-    const postMoveMacd = isBTC ? 3.0 : isXAU ? 0.20 : 0.040;
+    const postMoveThr = isBTC ? 300.0 : isNAS ? 100.0 : isXAU ? 20.0 : 2.0;
+    const postMoveMacd = isBTC ? 3.0 : isNAS ? 1.0 : isXAU ? 0.20 : 0.040;
     if (absDayMove >= postMoveThr) {
       const macdStrNow = Math.abs(macdL - macdS);
       if (dayMove >= postMoveThr && cS >= finalMinS && cS >= pS && macdStrNow < postMoveMacd) {
@@ -1570,7 +1570,7 @@ function processPrice(sym, price, hi, lo) {
         log(sym, '🏆 TRv2 TP3 HIT — FULL TARGET · $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2) + ' (' + pnlPct.toFixed(2) + '%)');
         sendPush('🏆 ' + sym + ' TP3 — FULL TARGET', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · close trade', 'signal');
         s.trv2Trade = null; s.trv2LastSignalTs = now3;
-        s.trv2Dir = null;
+        s.trv2Dir = null; s.trv2DirTs = 0;
       }
 
       // Trailing SL hit — close trade
@@ -1618,7 +1618,7 @@ function processPrice(sym, price, hi, lo) {
           const exitSig = { type: 'exit-' + exitDir, time: ts(), price: price.toFixed(2), score: '🔄EXIT', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount, pnl: exitPnl.toFixed(2) };
           enrichSig(exitSig); s.signals.push(exitSig); logSignal(sym, exitSig);
           s.trv2Trade = null;
-          s.trv2Dir = null;
+          s.trv2Dir = null; s.trv2DirTs = 0;
 
           // Auto-reverse: only if reversing INTO the macro trend (don't reverse against macro)
           // e.g. was LONG against macro, now reversing SHORT into macro = ok
@@ -1645,6 +1645,7 @@ function processPrice(sym, price, hi, lo) {
 
             s.trv2Trade = { dir: revDir, ep: price, ts: now3, sl: revSl, tp1: revTp1, tp2: revTp2, tp3: revTp3, tp1Hit: false, tp2Hit: false, tp3Hit: false, bestPrice: price, atr: trv2Atr, trailSl: 0 };
             s.trv2Dir = revDir;
+            s.trv2DirTs = now3;
             s.trv2LastSignalTs = now3;
             s.dailySignalCount++;
             const revType = revDir === 'long' ? 'call' : 'put';
@@ -1655,7 +1656,7 @@ function processPrice(sym, price, hi, lo) {
             enrichSig(revSig); s.signals.push(revSig); logSignal(sym, revSig);
             log(sym, '🔄 TRv2 AUTO-REVERSE ' + revDir.toUpperCase() + ' +MACRO — $' + price.toFixed(2) + ' · TP1 $' + revTp1.toFixed(2) + ' · TP2 $' + revTp2.toFixed(2) + ' · TP3 $' + revTp3.toFixed(2) + ' · SL $' + revSl.toFixed(2) + ' [#' + s.dailySignalCount + ']');
             sendPush('🔄 ' + sym + ' REVERSE ' + revDir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · TP1 $' + revTp1.toFixed(2) + ' · SL $' + revSl.toFixed(2), 'signal');
-            s.trade = { active: true, type: revType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, isTrend: true, slPrice: revSl, atr: trv2Atr, bestPrice: price };
+            s.trade = { active: true, type: revType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: revSl, tp1Price: revTp1, tp2Price: revTp2, tp3Price: revTp3, atr: trv2Atr, bestPrice: price, trailSl: 0 };
           } else {
             log(sym, '⏭️ TRv2 no auto-reverse — ' + (revWithMacro ? 'ROC too weak' : 'would reverse AGAINST macro (' + (s.macroEma ? '$' + s.macroEma.toFixed(2) : 'null') + ')'));
           }
@@ -1745,6 +1746,7 @@ function processPrice(sym, price, hi, lo) {
 
         s.trv2Trade = { dir: dir, ep: price, ts: now3, sl: sl, tp1: tp1, tp2: tp2, tp3: tp3, tp1Hit: false, tp2Hit: false, tp3Hit: false, bestPrice: price, atr: trv2Atr, trailSl: 0 };
         s.trv2Dir = dir;
+        s.trv2DirTs = now3;
         s.trv2LastSignalTs = now3;
         s.dailySignalCount++;
         const sigType = dir === 'long' ? 'call' : 'put';
@@ -1755,7 +1757,7 @@ function processPrice(sym, price, hi, lo) {
         enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
         log(sym, '🚀 TRv2 ENTRY ' + dir.toUpperCase() + (withMacro ? ' +MACRO' : '') + ' — $' + price.toFixed(2) + ' > EMA $' + tEma.toFixed(2) + ' (+' + spreadPct.toFixed(3) + '%) · ATR $' + trv2Atr.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('🚀 ' + sym + ' ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2), 'signal');
-        s.trade = { active: true, type: sigType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, isTrend: true, slPrice: sl, atr: trv2Atr, bestPrice: price };
+        s.trade = { active: true, type: sigType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: sl, tp1Price: tp1, tp2Price: tp2, tp3Price: tp3, atr: trv2Atr, bestPrice: price, trailSl: 0 };
         return;
       }
     }
@@ -1914,7 +1916,9 @@ function processPrice(sym, price, hi, lo) {
         enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
         log(sym, '📈 TREND RIDE CALL — macro bullish · price $' + price.toFixed(2) + ' > EMA $' + s.macroEma.toFixed(2) + ' (+' + trSpreadPct.toFixed(2) + '%) · ATR $' + trAtr.toFixed(2) + ' · SL $' + slPrice.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('📈 ' + sym + ' TREND CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · SL $' + slPrice.toFixed(2) + ' · riding macro uptrend', 'signal');
-        s.trade = { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, isTrend: true, slPrice: slPrice, slInitial: slPrice, atr: trAtr, bestPrice: price };
+        if (isMT5) attachTpSl(sig, 'call', price, trAtr);
+        s.trade = isMT5 ? buildCfdTrade('call', price, trAtr) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        s.trade.isTrend = true;
         return;
       }
       // TREND RIDE PUT: macro bearish, price well below EMA, short+medium ROC both down
@@ -1932,7 +1936,9 @@ function processPrice(sym, price, hi, lo) {
         enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
         log(sym, '📉 TREND RIDE PUT — macro bearish · price $' + price.toFixed(2) + ' < EMA $' + s.macroEma.toFixed(2) + ' (-' + trSpreadPct.toFixed(2) + '%) · ATR $' + trAtr.toFixed(2) + ' · SL $' + slPrice.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('📉 ' + sym + ' TREND PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · SL $' + slPrice.toFixed(2) + ' · riding macro downtrend', 'signal');
-        s.trade = { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, isTrend: true, slPrice: slPrice, slInitial: slPrice, atr: trAtr, bestPrice: price };
+        if (isMT5) attachTpSl(sig, 'put', price, trAtr);
+        s.trade = isMT5 ? buildCfdTrade('put', price, trAtr) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        s.trade.isTrend = true;
         return;
       }
     }
@@ -2843,11 +2849,13 @@ setInterval(() => {
       s.trendRideLastTs = 0; s.trendRideLastDir = null; s.trendRideSameDirCount = 0; s.trendRideLastPrice = 0;
       // TRv2 trend-following state reset
       // BTC is 24/7 — preserve candles, EMAs, and active trade across daily reset
-      // NAS100 has market hours — full reset so stale overnight data doesn't pollute
+      // NAS100/XAU have market hours — full reset so stale overnight data doesn't pollute
       if (sym !== 'BTC') {
         s.trv2Candles = []; s.trv2CurCandle = null;
         s.trv2Ema15 = null; s.trv2Ema20 = null; s.trv2Ema30 = null; s.trv2TrendEma = null;
         s.trv2Dir = null; s.trv2DirTs = 0; s.trv2Trade = null; s.trv2CrossCount = 0;
+        // Reset macro EMA + snapshots — overnight gap would distort the 3h moving average
+        s.macroEma = null; s.macroSnaps = [];
       }
       // Always reset cooldown so first signal of new day isn't blocked by yesterday's timestamp
       s.trv2LastSignalTs = 0;
