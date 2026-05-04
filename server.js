@@ -2511,6 +2511,11 @@ function processTicks(symbols) {
       s.macroEma = s.macroEma === null ? price : price * emaK + s.macroEma * (1 - emaK);
     }
 
+    // Symbol type flags (used by all tick-level trackers below)
+    const isXAUt = sym === 'XAU';
+    const isBTCt = sym === 'BTC';
+    const isNASt = sym === 'NAS100';
+
     // V-Reversal snapshots — MT5 instruments, every tick, keep 20 min (max 1200 at 1s interval)
     if (isXAUt || isBTCt || isNASt) {
       s.vrevSnaps.push({ ts: Date.now(), p: price });
@@ -2562,9 +2567,6 @@ function processTicks(symbols) {
     // Thresholds scale per instrument:
     //   XAU (~$3300): coil < $4, escape $1
     //   BTC (~$90K):  coil < $120, escape $30
-    const isBTCt = sym === 'BTC';
-    const isXAUt = sym === 'XAU';
-    const isNASt = sym === 'NAS100';
     if (isXAUt || isBTCt || isNASt) {
       const coilMaxRange = isBTCt ? 120.0 : isNASt ? 30.0 : 6.0;   // max range to count as consolidation
       const escapeMin    = isBTCt ? 30.0  : isNASt ? 8.0  : 1.0;    // min distance beyond coil edge = confirmed breakout
