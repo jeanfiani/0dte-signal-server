@@ -480,7 +480,7 @@ function processPrice(sym, price, hi, lo) {
     const thrS = 0.30, thrL = 0.35, resS = 0.35, resL = 0.40;
     const isChoppy = effS < thrS || effL < thrL;
     const isTrending = effS > resS && effL > resL;
-    if (!s.chopActive) { if (isChoppy) { s.chopCount++; s.trendCount = 0; } else s.chopCount = 0; if (s.chopCount >= 3) { s.chopActive = true; s.chopCount = 0; log(sym, '🌊 CHOP MODE'); sendPush('🌊 ' + sym + ' CHOP MODE', 'Efficiency low — signals paused'); } }
+    if (!s.chopActive) { if (isChoppy) { s.chopCount++; s.trendCount = 0; } else s.chopCount = 0; if (s.chopCount >= 3) { s.chopActive = true; s.chopCount = 0; log(sym, '🌊 CHOP MODE'); sendPush('🌊 ' + sym + ' CHOP MODE', 'Efficiency low — 6/6 only'); } }
     else { if (isTrending) { s.trendCount++; s.chopCount = 0; } else s.trendCount = 0; if (s.trendCount >= 3) { s.chopActive = false; s.trendCount = 0; log(sym, '📈 TREND RESUMED'); sendPush('📈 ' + sym + ' TREND BACK', 'Signals active'); } }
   }
 
@@ -885,24 +885,9 @@ function processPrice(sym, price, hi, lo) {
 
   // Chop override — require 5/6 + RSI sweet zone + ROC confirmation for all symbols
   // 3 conditions is stricter than normal mode but doesn't kill real breakouts
-  // IMPORTANT: This only blocks BASE scoring. Specialized detectors (TREND, BREAKOUT, FAST,
-  // ATH/ATL, V-REV, MFLIP) MUST still run — they catch sudden moves in choppy markets.
-  // Before the fix, this `return` killed the entire evaluate() including specialized detectors.
+  // Chop mode: forces 6/6 minimum for base scoring (tighter filter, not a block).
+  // Specialized detectors (TREND, BREAKOUT, FAST, ATH/ATL, V-REV, MFLIP) always run regardless.
   const domT = cS >= pS ? 'call' : 'put';
-  let chopBlocked = false;
-  if (s.chopActive && (cS >= THR || pS >= THR)) {
-    const chopScore = domT === 'call' ? cS : pS;
-    const chopRsiOk = (domT === 'call' && rsiV >= RSI_CALL_LO[sym] && rsiV <= RSI_CALL_HI[sym]) || (domT === 'put' && rsiV >= RSI_PUT_LO[sym] && rsiV <= RSI_PUT_HI[sym]);
-    const chopRocOk = (domT === 'call' && roc3 > symRocThr) || (domT === 'put' && roc3 < -symRocThr);
-    if (!(chopScore >= THR && chopRsiOk && chopRocOk)) {
-      chopBlocked = true; // Don't return — fall through to specialized detectors
-      log(sym, 'Chop: base scoring blocked — specialized detectors still active');
-    }
-  }
-
-  // When chopBlocked, skip entire base scoring chain — fall through to specialized detectors
-  if (chopBlocked) { /* skip to specialized detectors after the atrBlocked else block */ }
-  else {
 
   // Dynamic threshold
   const refPrice = s.openPrice || 0;
@@ -911,7 +896,9 @@ function processPrice(sym, price, hi, lo) {
   const streakActive = now2 < s.lossStreakUntil;
   // XAU session-specific threshold: Asia = 6/6 (choppy, low volume), London/NY = 5/6 (cleaner trends)
   const sessionThr = isXAU && xauSession === 'asia' ? 6 : THR;
-  let minS = (tightMode ? 6 : sessionThr) + (streakActive ? s.lossStreakBoost : 0) + roundNumPenalty;
+  // Chop mode forces 6/6 minimum — only perfect-score signals pass through choppy markets
+  const chopThr = s.chopActive ? 6 : 0;
+  let minS = Math.max(chopThr, (tightMode ? 6 : sessionThr)) + (streakActive ? s.lossStreakBoost : 0) + roundNumPenalty;
 
   // XAU Asia session: HARD ROC gate — no signal without actual momentum
   // Asia is choppy and low volume, EMAs/MACD can drift into alignment without real moves
@@ -1260,8 +1247,6 @@ function processPrice(sym, price, hi, lo) {
       }
     }
   }
-
-  } // end if (!chopBlocked) — base scoring when chop is not active
 
   } // end else (!atrBlocked) — base scoring engine
 
