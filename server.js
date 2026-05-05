@@ -106,6 +106,7 @@ SYMBOLS.forEach(sym => {
     rsiAtRollingHigh: 50, // RSI when rolling high was touched
     rsiAtRollingLow: 50,  // RSI when rolling low was touched
     athApproachTs: 0,   // when price last entered ATH zone
+    athBreakLastTs: 0,  // when last ATH/ATL breakout signal fired
     athApproachPrice: 0, // price when ATH zone was touched
     atlApproachTs: 0,   // when price last entered ATL zone
     atlApproachPrice: 0, // price when ATL zone was touched
@@ -2044,14 +2045,12 @@ function processPrice(sym, price, hi, lo) {
     const athApproachRecent = now2 - s.athApproachTs < 600000; // touched ATH zone in last 10 min
     const atlApproachRecent = now2 - s.atlApproachTs < 600000;
 
-    // ATH REVERSAL → PUT: price was near 5-day high, now pulling back $5+, RSI was overbought
-    // Velocity check: pullback must happen within 3 minutes of touching ATH zone (fast rejection, not slow drift)
-    // MACD relaxed for strong pullbacks ($10+): MACD is too slow during fast drops — ROC alone confirms
-    // Data: ATH at $4553, signal fired at $4533 ($20 late) because MACD hadn't crossed at $4543
-    const athPullbackSec = (now2 - s.athApproachTs) / 1000;
-    const athVelocityOk = distFromATH >= 10.0 || (distFromATH >= 5.0 && athPullbackSec <= 180);
-    const athMacdOk = macdL < macdS || distFromATH >= 10.0; // skip MACD for strong $10+ pullbacks
-    if (athApproachRecent && athVelocityOk && s.rsiAtRollingHigh > 62 && athMacdOk && roc3 < -symRocThr) {
+    // ATH REVERSAL → PUT: price was near 5-day high, now pulling back $1+
+    // Gold reverses hard at multi-day highs — institutional profit-taking kicks in fast
+    // Only need $1 pullback (confirmed rejection) + ROC turning negative
+    // MACD relaxed: it lags too much for fast reversals — ROC alone confirms direction
+    const athMacdOk = macdL < macdS || distFromATH >= 3.0; // skip MACD for $3+ pullbacks
+    if (athApproachRecent && distFromATH >= 1.0 && s.rsiAtRollingHigh > 55 && athMacdOk && roc3 < 0) {
       if (s.lastSignalDir !== 'put' || (now2 - s.lastNTs > COOLDOWN_MS)) {
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
         if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
@@ -2067,14 +2066,12 @@ function processPrice(sym, price, hi, lo) {
       }
     }
 
-    // ATL REVERSAL → CALL: price was near 5-day low, now bouncing $5+, RSI was oversold, MACD turning bullish
-    // Velocity check: bounce must happen within 3 minutes of touching ATL zone (fast rejection, not slow drift)
-    // MACD relaxed for strong bounces ($10+): same logic as ATH — ROC alone confirms on fast moves
-    const atlBounceSec = (now2 - s.atlApproachTs) / 1000;
-    const atlVelocityOk = distFromATL >= 10.0 || (distFromATL >= 5.0 && atlBounceSec <= 180);
-    const atlMacdOk = macdL > macdS || distFromATL >= 10.0; // skip MACD for strong $10+ bounces
-    // RSI cap 75: if current RSI is already extreme, the bounce is exhausted (data: ATL CALL at RSI 89.1 lost -0.15%)
-    if (atlApproachRecent && atlVelocityOk && s.rsiAtRollingLow < 38 && rsiV < 75 && atlMacdOk && roc3 > symRocThr) {
+    // ATL REVERSAL → CALL: price was near 5-day low, now bouncing $1+
+    // Gold bounces hard at multi-day lows — dip-buyers and short-covering kick in fast
+    // Only need $1 bounce + ROC turning positive
+    const atlMacdOk = macdL > macdS || distFromATL >= 3.0; // skip MACD for $3+ bounces
+    // RSI cap 75: if current RSI is already extreme, the bounce is exhausted
+    if (atlApproachRecent && distFromATL >= 1.0 && s.rsiAtRollingLow < 45 && rsiV < 75 && atlMacdOk && roc3 > 0) {
       if (s.lastSignalDir !== 'call' || (now2 - s.lastNTs > COOLDOWN_MS)) {
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
         if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
@@ -2965,6 +2962,7 @@ setInterval(() => {
       s.lastHiRevTs = 0; s.lastLoRevTs = 0; // reset session extreme tracking
       // Rolling ATH/ATL: keep data (persists across days), just reset approach timestamps
       s.athApproachTs = 0; s.athApproachPrice = 0; s.atlApproachTs = 0; s.atlApproachPrice = 0;
+      s.athBreakLastTs = 0;
       s.gapDayMode = false; s.gapDirection = null;
       s.lastSameDir = null; s.lastSameDirMacd = 0; s.lastSameDirTs = 0; s.lastSameDirPrice = 0;
       s.shakeoutDir = null; s.shakeoutTs = 0; s.shakeoutPrice = 0; s.shakeoutEp = 0;
