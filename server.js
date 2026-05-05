@@ -469,7 +469,9 @@ function processPrice(sym, price, hi, lo) {
   }
 
   s.prices.push(price); s.highs.push(hi || price); s.lows.push(lo || price);
-  if (s.prices.length > 200) { s.prices.shift(); s.highs.shift(); s.lows.shift(); }
+  // MT5 needs 720+ entries for 12-min ROC (1 tick/sec), equities need 200
+  const maxPrices = isMT5 ? 800 : 200;
+  if (s.prices.length > maxPrices) { s.prices.shift(); s.highs.shift(); s.lows.shift(); }
 
   // Chop detector
   s.chopShort.push(price); if (s.chopShort.length > 30) s.chopShort.shift();
@@ -583,9 +585,11 @@ function processPrice(sym, price, hi, lo) {
   const vwap = s.vwapSum / s.vwapCount;
   const macdL = +(s.pMF - s.pMS).toFixed(3), macdS = +(s.pMSig || 0).toFixed(3);
   const rsiV = calcRSI(s.prices);
-  const roc3 = calcROC(s.prices, 3);
-  const roc6 = isMT5 ? calcROC(s.prices, 6) : 0;   // medium-term momentum (MT5 instruments)
-  const roc12 = isMT5 ? calcROC(s.prices, 12) : 0;  // longer-term momentum (MT5 instruments)
+  // MT5 ticks arrive every 1s — use minute-based lookback (180/360/720 ticks = 3/6/12 min)
+  // Equities tick every 3s — keep short lookback (3/6/12 ticks = 9/18/36 sec)
+  const roc3 = isMT5 ? calcROC(s.prices, 180) : calcROC(s.prices, 3);
+  const roc6 = isMT5 ? calcROC(s.prices, 360) : 0;
+  const roc12 = isMT5 ? calcROC(s.prices, 720) : 0;
 
   // Track RSI at session high — used by Session High Reversal Detector
   if (price >= s.sessionHigh) s.rsiAtSessionHigh = rsiV;
