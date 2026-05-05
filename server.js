@@ -2544,8 +2544,8 @@ function processTicks(symbols) {
     if (s.tickBuf.length === 0) return;
     const price = s.tickBuf[s.tickBuf.length - 1].p;
     if (!price || isNaN(price) || price <= 0) { s.tickBuf = []; return; } // Guard bad data
-    const hi = Math.max(...s.tickBuf.map(t => t.p));
-    const lo = Math.min(...s.tickBuf.map(t => t.p));
+    const hi = Math.max(...s.tickBuf.map(t => t.h || t.p));
+    const lo = Math.min(...s.tickBuf.map(t => t.l || t.p));
     s.tickBuf = [];
     processPrice(sym, price, hi, lo);
 
@@ -3020,7 +3020,7 @@ app.post('/feed', (req, res) => {
     }
   }
   S[sym].lastPrice = p;
-  S[sym].tickBuf.push({ p });
+  S[sym].tickBuf.push({ p, h, l });
   res.json({ ok: true, sym, price: p, samples: S[sym].prices.length });
 });
 
