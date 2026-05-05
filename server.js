@@ -2553,10 +2553,10 @@ function processTicks(symbols) {
     if (sym === 'XAU' || sym === 'BTC' || sym === 'NAS100') {
       const bNow5 = Date.now();
       if (!s.atrCurCandle) {
-        s.atrCurCandle = { o: price, h: price, l: price, c: price, startTs: bNow5 };
+        s.atrCurCandle = { o: price, h: hi, l: lo, c: price, startTs: bNow5 };
       } else {
-        if (price > s.atrCurCandle.h) s.atrCurCandle.h = price;
-        if (price < s.atrCurCandle.l) s.atrCurCandle.l = price;
+        if (hi > s.atrCurCandle.h) s.atrCurCandle.h = hi;
+        if (lo < s.atrCurCandle.l) s.atrCurCandle.l = lo;
         s.atrCurCandle.c = price;
         // Close candle after 5 minutes
         if (bNow5 - s.atrCurCandle.startTs >= 300000) {
