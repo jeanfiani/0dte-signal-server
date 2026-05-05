@@ -885,13 +885,24 @@ function processPrice(sym, price, hi, lo) {
 
   // Chop override — require 5/6 + RSI sweet zone + ROC confirmation for all symbols
   // 3 conditions is stricter than normal mode but doesn't kill real breakouts
+  // IMPORTANT: This only blocks BASE scoring. Specialized detectors (TREND, BREAKOUT, FAST,
+  // ATH/ATL, V-REV, MFLIP) MUST still run — they catch sudden moves in choppy markets.
+  // Before the fix, this `return` killed the entire evaluate() including specialized detectors.
   const domT = cS >= pS ? 'call' : 'put';
+  let chopBlocked = false;
   if (s.chopActive && (cS >= THR || pS >= THR)) {
     const chopScore = domT === 'call' ? cS : pS;
     const chopRsiOk = (domT === 'call' && rsiV >= RSI_CALL_LO[sym] && rsiV <= RSI_CALL_HI[sym]) || (domT === 'put' && rsiV >= RSI_PUT_LO[sym] && rsiV <= RSI_PUT_HI[sym]);
     const chopRocOk = (domT === 'call' && roc3 > symRocThr) || (domT === 'put' && roc3 < -symRocThr);
-    if (!(chopScore >= THR && chopRsiOk && chopRocOk)) return;
+    if (!(chopScore >= THR && chopRsiOk && chopRocOk)) {
+      chopBlocked = true; // Don't return — fall through to specialized detectors
+      log(sym, 'Chop: base scoring blocked — specialized detectors still active');
+    }
   }
+
+  // When chopBlocked, skip entire base scoring chain — fall through to specialized detectors
+  if (chopBlocked) { /* skip to specialized detectors after the atrBlocked else block */ }
+  else {
 
   // Dynamic threshold
   const refPrice = s.openPrice || 0;
@@ -1249,6 +1260,8 @@ function processPrice(sym, price, hi, lo) {
       }
     }
   }
+
+  } // end if (!chopBlocked) — base scoring when chop is not active
 
   } // end else (!atrBlocked) — base scoring engine
 
@@ -2892,6 +2905,7 @@ setInterval(() => {
       s.breakRange = []; s.breakHi = 0; s.breakLo = Infinity; s.breakCoilStart = 0; s.breakCoilActive = false; s.breakFrozenHi = 0; s.breakFrozenLo = Infinity; s.breakLastTs = 0; s.breakLastDir = null; s.breakLastPrice = 0; s._pendingBreakout = null;
       s.macroPrevDir = null; s.macroFlipTs = 0; s.superFlipTs = 0;
       s.lastAT = ''; s.lastNTs = 0; s.lastReversalTs = 0;
+      s.lastPrice = 0; // Reset so first price after daily gap is always accepted by /feed sanity check
       s.dailySignalCount = 0; s.lastSignalDir = null; s.lastSignalTs = 0;
       s.nC = 0; s.nP = 0; s.nBl = 0;
       s.chopShort = []; s.chopLong = []; s.chopCount = 0; s.trendCount = 0; s.chopActive = false;
@@ -3008,11 +3022,15 @@ app.post('/feed', (req, res) => {
     console.log('[FEED] REJECTED ' + sym + ' price $' + p + ' — outside range $' + range[0] + '-$' + range[1]);
     return res.status(400).json({ error: 'Price ' + p + ' outside expected range for ' + sym });
   }
-  // Also reject if price jumps >5% from last known price (unless first price)
+  // Also reject if price jumps too far from last known price (unless first price)
+  // MT5 instruments (XAU/BTC/NAS100): 10% threshold — weekend gaps, daily resets cause legitimate large jumps
+  // Equities (SPY/QQQ): 5% threshold — less volatile, tighter check
   if (S[sym].lastPrice > 0) {
+    const isMT5sym = sym === 'XAU' || sym === 'BTC' || sym === 'NAS100';
+    const maxJump = isMT5sym ? 10 : 5;
     const pctChange = Math.abs(p - S[sym].lastPrice) / S[sym].lastPrice * 100;
-    if (pctChange > 5) {
-      console.log('[FEED] REJECTED ' + sym + ' price $' + p + ' — ' + pctChange.toFixed(1) + '% jump from $' + S[sym].lastPrice);
+    if (pctChange > maxJump) {
+      console.log('[FEED] REJECTED ' + sym + ' price $' + p + ' — ' + pctChange.toFixed(1) + '% jump from $' + S[sym].lastPrice + ' (limit ' + maxJump + '%)');
       return res.status(400).json({ error: 'Price jump too large: ' + pctChange.toFixed(1) + '%' });
     }
   }
