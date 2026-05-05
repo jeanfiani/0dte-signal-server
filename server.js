@@ -1726,8 +1726,8 @@ function processPrice(sym, price, hi, lo) {
           } else if (revHiBlock || revLoBlock) {
             log(sym, '🏔️ TRv2 auto-reverse ' + revDir.toUpperCase() + ' blocked — session extreme reversal signal active');
           } else if (revRocOk && revWithMacro) {
-            const revMults = sym === 'XAU' ? { sl: 3, t1: 3, t2: 4, t3: 6 } : sym === 'NAS100' ? { sl: 3, t1: 3, t2: 4, t3: 6 } : { sl: 2, t1: 2, t2: 2.5, t3: 4 };
-            const revMin = sym === 'XAU' ? 5 : sym === 'NAS100' ? 20 : 0;
+            const revMults = { sl: 1.5, t1: 1, t2: 2, t3: 3 };
+            const revMin = sym === 'XAU' ? 3 : sym === 'NAS100' ? 10 : 0;
             const revSl = revDir === 'long' ? price - Math.max(trv2Atr * revMults.sl, revMin) : price + Math.max(trv2Atr * revMults.sl, revMin);
             const revTp1 = revDir === 'long' ? price + Math.max(trv2Atr * revMults.t1, revMin) : price - Math.max(trv2Atr * revMults.t1, revMin);
             const revTp2 = revDir === 'long' ? price + Math.max(trv2Atr * revMults.t2, revMin * 1.5) : price - Math.max(trv2Atr * revMults.t2, revMin * 1.5);
@@ -1829,8 +1829,8 @@ function processPrice(sym, price, hi, lo) {
         const tpMult = withMacro ? 1.0 : 0.75;
         const slMult = withMacro ? 2.0 : 1.5;
 
-        const entMults = sym === 'XAU' ? { sl: 3, t1: 3, t2: 4, t3: 6 } : sym === 'NAS100' ? { sl: 3, t1: 3, t2: 4, t3: 6 } : { sl: 2, t1: 2, t2: 2.5, t3: 4 };
-        const entMin = sym === 'XAU' ? 5 : sym === 'NAS100' ? 20 : 0;
+        const entMults = { sl: 1.5, t1: 1, t2: 2, t3: 3 };
+        const entMin = sym === 'XAU' ? 3 : sym === 'NAS100' ? 10 : 0;
         const sl = dir === 'long' ? price - Math.max(trv2Atr * entMults.sl * slMult, entMin) : price + Math.max(trv2Atr * entMults.sl * slMult, entMin);
         const tp1 = dir === 'long' ? price + Math.max(trv2Atr * entMults.t1 * tpMult, entMin) : price - Math.max(trv2Atr * entMults.t1 * tpMult, entMin);
         const tp2 = dir === 'long' ? price + Math.max(trv2Atr * entMults.t2 * tpMult, entMin * 1.5) : price - Math.max(trv2Atr * entMults.t2 * tpMult, entMin * 1.5);
@@ -2038,7 +2038,9 @@ function processPrice(sym, price, hi, lo) {
 
   // ===== ATH/ATL REVERSAL DETECTOR (XAU only) =====
   // Gold tends to reverse hard at multi-day highs/lows — institutional profit-taking, algo levels
-  // Fires high-confidence reversal signals when price touches 5-day extreme then pulls back
+  // Fires ONE high-confidence reversal signal when price touches 5-day extreme then pulls back
+  // Once fired, won't re-fire until price re-approaches the extreme (resets the approach timestamp)
+  const athAtlCooldown = 1200000; // 20 min cooldown between ATH/ATL signals
   if (isXAU && s.rollingHigh > 0 && s.rollingLow < Infinity && cool) {
     const distFromATH = s.rollingHigh - price;
     const distFromATL = price - s.rollingLow;
@@ -2051,7 +2053,7 @@ function processPrice(sym, price, hi, lo) {
     // MACD relaxed: it lags too much for fast reversals — ROC alone confirms direction
     const athMacdOk = macdL < macdS || distFromATH >= 3.0; // skip MACD for $3+ pullbacks
     if (athApproachRecent && distFromATH >= 1.0 && s.rsiAtRollingHigh > 55 && athMacdOk && roc3 < 0) {
-      if (s.lastSignalDir !== 'put' || (now2 - s.lastNTs > COOLDOWN_MS)) {
+      if (s.lastSignalDir !== 'put' || (now2 - s.lastNTs > athAtlCooldown)) {
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
         if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
         s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
@@ -2062,6 +2064,7 @@ function processPrice(sym, price, hi, lo) {
         log(sym, '🔻 ATH REVERSAL PUT — $' + distFromATH.toFixed(2) + ' off 5-day high $' + s.rollingHigh.toFixed(2) + ' RSI@ATH:' + s.rsiAtRollingHigh.toFixed(1) + ' [#' + s.dailySignalCount + ']');
         sendPush('🔻 ' + sym + ' ATH REVERSAL PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromATH.toFixed(2) + ' off ATH $' + s.rollingHigh.toFixed(2), 'signal');
         s.trade = isMT5 ? buildCfdTrade('put', price, atrVal, sym) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        s.athApproachTs = 0; // clear so it won't re-fire until price re-touches ATH
         return;
       }
     }
@@ -2072,7 +2075,7 @@ function processPrice(sym, price, hi, lo) {
     const atlMacdOk = macdL > macdS || distFromATL >= 3.0; // skip MACD for $3+ bounces
     // RSI cap 75: if current RSI is already extreme, the bounce is exhausted
     if (atlApproachRecent && distFromATL >= 1.0 && s.rsiAtRollingLow < 45 && rsiV < 75 && atlMacdOk && roc3 > 0) {
-      if (s.lastSignalDir !== 'call' || (now2 - s.lastNTs > COOLDOWN_MS)) {
+      if (s.lastSignalDir !== 'call' || (now2 - s.lastNTs > athAtlCooldown)) {
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
         if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
         s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
@@ -2083,6 +2086,7 @@ function processPrice(sym, price, hi, lo) {
         log(sym, '🚀 ATL REVERSAL CALL — $' + distFromATL.toFixed(2) + ' off 5-day low $' + s.rollingLow.toFixed(2) + ' RSI@ATL:' + s.rsiAtRollingLow.toFixed(1) + ' [#' + s.dailySignalCount + ']');
         sendPush('🚀 ' + sym + ' ATL REVERSAL CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromATL.toFixed(2) + ' off ATL $' + s.rollingLow.toFixed(2), 'signal');
         s.trade = isMT5 ? buildCfdTrade('call', price, atrVal, sym) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        s.atlApproachTs = 0; // clear so it won't re-fire until price re-touches ATL
         return;
       }
     }
@@ -2257,17 +2261,14 @@ function processPrice(sym, price, hi, lo) {
 
 // ===== ATR-BASED TRADE BUILDER (XAU/BTC/NAS100 — CFD signals) =====
 // Creates trade object with price-based TP/SL levels from ATR
-// TP1=2x ATR, TP2=2.5x ATR, TP3=4x ATR, SL=2x ATR (1:1 R:R on TP1)
+// TP1=1x ATR, TP2=2x ATR, TP3=3x ATR, SL=1.5x ATR
 function buildCfdTrade(type, price, atr, sym) {
   const iC = type === 'call';
-  // XAU: ATR ~$3-5, levels were hitting too fast — widen multipliers + $5 floor
-  // NAS100: ATR ~$15-50, similar issue — wider multipliers + $20 floor
-  // BTC: ATR ~$8 on $97K — original multipliers are fine
-  const mults = sym === 'XAU' ? { sl: 3, t1: 3, t2: 4, t3: 6 }
-              : sym === 'NAS100' ? { sl: 3, t1: 3, t2: 4, t3: 6 }
-              : { sl: 2, t1: 2, t2: 2.5, t3: 4 }; // BTC + default
+  const mults = sym === 'XAU' ? { sl: 1.5, t1: 1, t2: 2, t3: 3 }
+              : sym === 'NAS100' ? { sl: 1.5, t1: 1, t2: 2, t3: 3 }
+              : { sl: 1.5, t1: 1, t2: 2, t3: 3 }; // BTC + default
   // Enforce minimum distances so low-ATR periods don't create noise-level TP/SL
-  const minDist = sym === 'XAU' ? 5 : sym === 'NAS100' ? 20 : 0;
+  const minDist = sym === 'XAU' ? 3 : sym === 'NAS100' ? 10 : 0;
   const slDist = Math.max(atr * mults.sl, minDist);
   const tp1Dist = Math.max(atr * mults.t1, minDist);
   const tp2Dist = Math.max(atr * mults.t2, minDist * 1.5);
@@ -2289,10 +2290,10 @@ function buildCfdTrade(type, price, atr, sym) {
 // Attaches TP/SL levels to a signal object (for display in bots/mobile)
 function attachTpSl(sig, type, price, atr, sym) {
   const iC = type === 'call';
-  const mults = sym === 'XAU' ? { sl: 3, t1: 3, t2: 4, t3: 6 }
-              : sym === 'NAS100' ? { sl: 3, t1: 3, t2: 4, t3: 6 }
-              : { sl: 2, t1: 2, t2: 2.5, t3: 4 };
-  const minDist = sym === 'XAU' ? 5 : sym === 'NAS100' ? 20 : 0;
+  const mults = sym === 'XAU' ? { sl: 1.5, t1: 1, t2: 2, t3: 3 }
+              : sym === 'NAS100' ? { sl: 1.5, t1: 1, t2: 2, t3: 3 }
+              : { sl: 1.5, t1: 1, t2: 2, t3: 3 };
+  const minDist = sym === 'XAU' ? 3 : sym === 'NAS100' ? 10 : 0;
   sig.tp1 = (iC ? price + Math.max(atr * mults.t1, minDist) : price - Math.max(atr * mults.t1, minDist)).toFixed(2);
   sig.tp2 = (iC ? price + Math.max(atr * mults.t2, minDist * 1.5) : price - Math.max(atr * mults.t2, minDist * 1.5)).toFixed(2);
   sig.tp3 = (iC ? price + Math.max(atr * mults.t3, minDist * 3) : price - Math.max(atr * mults.t3, minDist * 3)).toFixed(2);
