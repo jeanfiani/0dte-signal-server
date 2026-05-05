@@ -151,6 +151,7 @@ SYMBOLS.forEach(sym => {
     breakLastPrice: 0,       // entry price of last breakout signal
     // Fast-move detector — catches strong directional moves when MACD lags
     fastMoveLastTs: 0,       // when last fast-move signal fired (cooldown)
+    sustainedMoveLastTs: 0,  // when last sustained-move signal fired (cooldown)
     trendRideLastTs: 0,      // when last trend-ride signal fired (cooldown)
     trendRideLastDir: null,   // last trend-ride direction ('call'/'put')
     trendRideSameDirCount: 0, // consecutive same-direction trend-ride signals
@@ -1489,6 +1490,66 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
+  // ===== SUSTAINED MOVE DETECTOR (MT5 instruments: XAU + BTC + NAS100) =====
+  // Catches gradual but significant directional moves that are too slow for FAST-MOVE
+  // but too strong for the market to ignore. Example: XAU $20 rise over 25 min.
+  // FAST-MOVE needs $10 in 3 min (sharp spike). This detector catches $15 in 10 min or $18 in 20 min.
+  // Uses vrevSnaps with multiple time windows. Fires with a separate cooldown from FAST-MOVE.
+  if (isMT5 && s.vrevSnaps.length >= 120 && cool && (now2 - (s.sustainedMoveLastTs || 0) > 1200000)) {
+    // Multi-window check: [{window ms, min snaps, thresholds per instrument}]
+    const smWindows = [
+      { ms: 600000,  minSnaps: 60,  thr: isBTC ? 400 : isNAS ? 80 : 15 },  // 10 min: $15 XAU, $400 BTC, $80 NAS
+      { ms: 1200000, minSnaps: 120, thr: isBTC ? 600 : isNAS ? 120 : 18 }, // 20 min: $18 XAU, $600 BTC, $120 NAS
+    ];
+    let smFired = false;
+    for (const w of smWindows) {
+      if (smFired) break;
+      const smSnaps = s.vrevSnaps.filter(sn => sn.ts > now2 - w.ms);
+      if (smSnaps.length < w.minSnaps) continue;
+      const smFirst = smSnaps[0].p;
+      const smDelta = price - smFirst;
+      const smAbsDelta = Math.abs(smDelta);
+      if (smAbsDelta < w.thr) continue;
+
+      const smDir = smDelta > 0 ? 'call' : 'put';
+      // Direction must be consistent: check price at 1/3 and 2/3 through the window
+      // to confirm it's a sustained trend, not a V-shape that happened to end higher
+      const smOneThird = smSnaps[Math.floor(smSnaps.length / 3)].p;
+      const smTwoThird = smSnaps[Math.floor(smSnaps.length * 2 / 3)].p;
+      const progressOk = smDir === 'call'
+        ? (smOneThird > smFirst && smTwoThird > smOneThird)
+        : (smOneThird < smFirst && smTwoThird < smOneThird);
+      if (!progressOk) continue;
+
+      // ROC3 must confirm direction
+      const smRocOk = (smDir === 'call' && roc3 > 0) || (smDir === 'put' && roc3 < 0);
+      if (!smRocOk) continue;
+      // RSI not at extreme
+      const smRsiOk = (smDir === 'call' && rsiV > 20 && rsiV < 80) || (smDir === 'put' && rsiV > 20 && rsiV < 80);
+      if (!smRsiOk) continue;
+      // MACD confirms direction (even slightly)
+      const smMacdOk = (smDir === 'call' && macdL > macdS) || (smDir === 'put' && macdL < macdS);
+      if (!smMacdOk) continue;
+
+      // All checks pass — fire signal
+      smFired = true;
+      s.sustainedMoveLastTs = now2;
+      s.lastAT = smDir; if (smDir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
+      if (s.lastSignalDir && s.lastSignalDir !== smDir) s.lastReversalTs = now2;
+      s.lastSignalDir = smDir; s.lastSignalTs = now2; s.lastNTs = now2;
+      s.lastSameDir = smDir; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+      const smMinutes = Math.round(w.ms / 60000);
+      const smTag = smDir === 'call' ? '⬆SUST' : '⬇SUST';
+      const sig = { type: smDir, time: ts(), price: price.toFixed(2), score: smTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+      enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+      if (isMT5) attachTpSl(sig, smDir, price, atrVal, sym);
+      log(sym, '🔥 SUSTAINED MOVE ' + smDir.toUpperCase() + ' — $' + smAbsDelta.toFixed(2) + ' move in ' + smMinutes + 'min · price $' + price.toFixed(2) + ' from $' + smFirst.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+      sendPush('🔥 ' + sym + ' SUSTAINED ' + smDir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + smAbsDelta.toFixed(2) + ' move in ' + smMinutes + 'min', 'signal');
+      s.trade = isMT5 ? buildCfdTrade(smDir, price, atrVal, sym) : { active: true, type: smDir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+      return;
+    }
+  }
+
   // ===== V-REVERSAL DETECTOR (XAU only) =====
   // Catches momentum reversals: price drops/rallies $8+ in 15 min, then ROC flips sharply
   // Different from trend-following signals — fires on the turn itself, not after EMAs catch up
@@ -1797,7 +1858,7 @@ function processPrice(sym, price, hi, lo) {
   // Fires when price crosses the 3-hour EMA with momentum confirmation
   // XAU SUPER SIGNAL: when TLT also flipped in same direction within 30 min — highest conviction
   // BTC/NAS100: handled by TRv2 above (15/20/30 averaged EMA with TP management)
-  if (isXAU && isMT5 && s.macroEma !== null && s.macroSnaps.length >= 12 && cool && (now2 - s.macroFlipTs > 900000)) {
+  if (isXAU && isMT5 && s.macroEma !== null && s.macroSnaps.length >= 4 && cool && (now2 - s.macroFlipTs > 900000)) {
     const curDir = price > s.macroEma ? 'bull' : 'bear';
     const spread = Math.abs(price - s.macroEma);
     const spreadPct = (spread / s.macroEma) * 100;
@@ -1874,7 +1935,7 @@ function processPrice(sym, price, hi, lo) {
   // Data: XAU $4577→$4594 ($17 rally) with macro EMA bullish at $4571 — 0 signals fired because EMAs lagged.
   // Trend Ride cooldown: 40 min for XAU
   const trCoolMs = 2400000;
-  if (isXAU && isMT5 && s.macroEma !== null && s.macroSnaps.length >= 12 && cool && (now2 - s.trendRideLastTs > trCoolMs)) {
+  if (isXAU && isMT5 && s.macroEma !== null && s.macroSnaps.length >= 4 && cool && (now2 - s.trendRideLastTs > trCoolMs)) {
     const trDir = price > s.macroEma ? 'bull' : 'bear';
     const trSpread = Math.abs(price - s.macroEma);
     const trSpreadPct = (trSpread / s.macroEma) * 100;
@@ -2911,6 +2972,7 @@ setInterval(() => {
       s.atrCandles = []; s.atrCurCandle = null;
       s.obZone = null; s.obDeparted = false; s.obFired = false; s.obMitigated = false;
       s.fastMoveLastTs = 0;
+      s.sustainedMoveLastTs = 0;
       s.trendRideLastTs = 0; s.trendRideLastDir = null; s.trendRideSameDirCount = 0; s.trendRideLastPrice = 0;
       // TRv2 trend-following state reset
       // BTC is 24/7 — preserve candles, EMAs, and active trade across daily reset
