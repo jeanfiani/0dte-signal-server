@@ -99,10 +99,10 @@ SYMBOLS.forEach(sym => {
     gapDayMode: false, gapDirection: null, prevClose: null,
     lastSameDir: null, lastSameDirMacd: 0, lastSameDirTs: 0, lastSameDirPrice: 0,
     // Rolling multi-day high/low for ATH/ATL reversal detection
-    rollingHighs: [],   // [{price, ts}] — last 5 days of session highs
-    rollingLows: [],    // [{price, ts}] — last 5 days of session lows
-    rollingHigh: 0,     // current 5-day high
-    rollingLow: Infinity, // current 5-day low
+    // Simple: one entry per day {high, low, date}. rollingHigh/Low computed from 5 daily entries + today's session.
+    dailyLevels: [],     // [{high, low, date}] — last 5 completed days
+    rollingHigh: 0,      // current 5-day high (max of dailyLevels highs + today's sessionHigh)
+    rollingLow: Infinity, // current 5-day low (min of dailyLevels lows + today's sessionLow)
     rsiAtRollingHigh: 50, // RSI when rolling high was touched
     rsiAtRollingLow: 50,  // RSI when rolling low was touched
     athApproachTs: 0,   // when price last entered ATH zone
@@ -162,8 +162,8 @@ SYMBOLS.forEach(sym => {
     obDeparted: false,       // price left the OB zone (must leave before retest counts)
     obFired: false,          // retest signal already fired (one per OB)
     obMitigated: false,      // OB was fully penetrated (breakout failed)
-    // === TREND RIDE V2 (BTC/NAS100 only) — trend-following with averaged EMA ===
-    // Replaces TREND + MFLIP for BTC/NAS100. XAU keeps the old system.
+    // === TREND RIDE V2 (NAS100 only) — trend-following with averaged EMA ===
+    // Replaces TREND + MFLIP for NAS100. XAU keeps the old system. BTC removed (0/6 -$872 in chop).
     trv2Candles: [],           // [{o, h, l, c, ts}] — completed 1-min candles (last 60)
     trv2CurCandle: null,       // current building candle {o, h, l, c, startTs, ticks}
     trv2Ema15: null,           // 15-minute EMA on 1-min closes
@@ -186,22 +186,28 @@ const ROLLING_FILE = path.join(__dirname, 'rolling_levels.json');
 function loadRollingLevels() {
   try {
     const data = JSON.parse(fs.readFileSync(ROLLING_FILE, 'utf8'));
+    const fiveDaysAgo = Date.now() - 5 * 24 * 60 * 60 * 1000;
     SYMBOLS.forEach(sym => {
-      if (data[sym]) {
-        const fiveDaysAgo = Date.now() - 5 * 24 * 60 * 60 * 1000;
-        S[sym].rollingHighs = (data[sym].rollingHighs || []).filter(h => h.ts > fiveDaysAgo);
-        S[sym].rollingLows = (data[sym].rollingLows || []).filter(l => l.ts > fiveDaysAgo);
-        if (S[sym].rollingHighs.length > 0) S[sym].rollingHigh = Math.max(...S[sym].rollingHighs.map(h => h.price));
-        if (S[sym].rollingLows.length > 0) S[sym].rollingLow = Math.min(...S[sym].rollingLows.map(l => l.price));
+      if (!data[sym]) return;
+      // New format: dailyLevels [{high, low, date}]
+      if (data[sym].dailyLevels) {
+        S[sym].dailyLevels = data[sym].dailyLevels.filter(d => new Date(d.date).getTime() > fiveDaysAgo);
+        if (S[sym].dailyLevels.length > 0) {
+          S[sym].rollingHigh = Math.max(...S[sym].dailyLevels.map(d => d.high));
+          S[sym].rollingLow = Math.min(...S[sym].dailyLevels.map(d => d.low));
+        }
       }
+      // Migration: if old format (rollingHighs/rollingLows arrays), discard — will rebuild from today's session
     });
-    console.log('[' + ts() + '] Rolling levels loaded — XAU high:$' + (S.XAU.rollingHigh || 0).toFixed(2) + ' low:$' + (S.XAU.rollingLow === Infinity ? 0 : S.XAU.rollingLow).toFixed(2));
-  } catch (e) {}
+    console.log('[' + ts() + '] Rolling levels loaded — XAU: ' + S.XAU.dailyLevels.length + ' days, high:$' + (S.XAU.rollingHigh || 0).toFixed(2) + ' low:$' + (S.XAU.rollingLow === Infinity ? 0 : S.XAU.rollingLow).toFixed(2));
+  } catch (e) {
+    console.log('[' + ts() + '] Rolling levels: no data file (will build from scratch)');
+  }
 }
 function saveRollingLevels() {
   const data = {};
   SYMBOLS.forEach(sym => {
-    data[sym] = { rollingHighs: S[sym].rollingHighs, rollingLows: S[sym].rollingLows };
+    data[sym] = { dailyLevels: S[sym].dailyLevels || [] };
   });
   try { fs.writeFileSync(ROLLING_FILE, JSON.stringify(data, null, 2)); } catch (e) {}
 }
@@ -213,7 +219,7 @@ const TRV2_FILE = path.join(__dirname, 'trv2_state.json');
 function loadTrv2State() {
   try {
     const data = JSON.parse(fs.readFileSync(TRV2_FILE, 'utf8'));
-    ['BTC', 'NAS100'].forEach(sym => {
+    ['NAS100'].forEach(sym => {
       if (data[sym] && S[sym]) {
         const d = data[sym];
         // Only restore if data is fresh (< 2 hours old)
@@ -238,7 +244,7 @@ function loadTrv2State() {
 }
 function saveTrv2State() {
   const data = {};
-  ['BTC', 'NAS100'].forEach(sym => {
+  ['NAS100'].forEach(sym => {
     const s = S[sym];
     if (!s) return;
     data[sym] = {
@@ -456,26 +462,18 @@ function processPrice(sym, price, hi, lo) {
   if (price < s.sessionLow) s.sessionLow = price;
 
   // Update rolling 5-day high/low for ATH/ATL detector
+  // Simple approach: rollingHigh = max(past 5 daily highs, today's sessionHigh)
+  // rollingLow = min(past 5 daily lows, today's sessionLow)
+  // Daily levels are saved at daily reset time.
   if (isMT5 && price > 0) {
-    const fiveDaysAgo = Date.now() - 5 * 24 * 60 * 60 * 1000;
-
-    // Always keep rollingHigh/rollingLow in sync with current session extremes (real-time)
-    // This ensures ATH/ATL detection reacts immediately, not just every 60 ticks
+    // Seed from current price if unset
+    if (s.rollingHigh === 0) s.rollingHigh = price;
+    if (s.rollingLow === Infinity || s.rollingLow === 0) s.rollingLow = price;
+    // Update from today's session extremes + current price (real-time, every tick)
+    if (price > s.rollingHigh) s.rollingHigh = price;
+    if (price < s.rollingLow) s.rollingLow = price;
     if (s.sessionHigh > -Infinity && s.sessionHigh > s.rollingHigh) s.rollingHigh = s.sessionHigh;
-    if (s.sessionLow < Infinity && (s.rollingLow === 0 || s.rollingLow === Infinity || s.sessionLow < s.rollingLow)) s.rollingLow = s.sessionLow;
-
-    // Persist snapshots to rolling array every ~60 ticks (1 min) for multi-day history
-    if (!s._rollingTickCount) s._rollingTickCount = 0;
-    s._rollingTickCount++;
-    if (s._rollingTickCount % 60 === 0 && s.sessionHigh > -Infinity) {
-      s.rollingHighs.push({ price: s.sessionHigh, ts: Date.now() });
-      if (s.sessionLow < Infinity) s.rollingLows.push({ price: s.sessionLow, ts: Date.now() });
-      // Prune older than 5 days
-      s.rollingHighs = s.rollingHighs.filter(h => h.ts > fiveDaysAgo);
-      s.rollingLows = s.rollingLows.filter(l => l.ts > fiveDaysAgo);
-      if (s.rollingHighs.length > 0) s.rollingHigh = Math.max(...s.rollingHighs.map(h => h.price));
-      if (s.rollingLows.length > 0) s.rollingLow = Math.min(...s.rollingLows.map(l => l.price));
-    }
+    if (s.sessionLow < Infinity && s.sessionLow < s.rollingLow) s.rollingLow = s.sessionLow;
   }
 
   s.prices.push(price); s.highs.push(hi || price); s.lows.push(lo || price);
@@ -554,8 +552,10 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // === TREND RIDE V2 — 1-min candle builder + 15/20/30 EMA (BTC/NAS100 only) ===
-  if (isBTC || isNAS) {
+  // === TREND RIDE V2 — 1-min candle builder + 15/20/30 EMA (NAS100 only) ===
+  // Removed from BTC: TRv2 went 0/6 -$872 on 5/6 in chop, chop detector overfires,
+  // and BTC's volatile micro-structure doesn't suit the averaged-EMA trend approach.
+  if (isNAS) {
     if (!s.trv2CurCandle) {
       s.trv2CurCandle = { o: price, h: price, l: price, c: price, startTs: Date.now(), ticks: 1 };
     } else {
@@ -641,11 +641,16 @@ function processPrice(sym, price, hi, lo) {
     abV = vwapPct > vwapZone; blV = vwapPct < -vwapZone;
   }
 
-  // ATR for MT5 instruments — use proper 5-min candles when available (tick-level hi≈lo gives ATR≈0)
+  // ATR for MT5 instruments — use proper 5-min candles when available
+  // Also include current building candle for faster warmup and more responsive ATR
   let atrVal = 0;
-  if (isMT5 && s.atrCandles && s.atrCandles.length >= 3) {
-    // Calculate ATR from 5-min candles (proper OHLC data)
-    const ac = s.atrCandles, period = Math.min(14, ac.length);
+  if (isMT5 && s.atrCandles && s.atrCandles.length >= 1) {
+    // Combine completed candles + current building candle for ATR
+    const ac = [...s.atrCandles];
+    if (s.atrCurCandle && s.atrCurCandle.h > s.atrCurCandle.l) {
+      ac.push(s.atrCurCandle); // include partial candle for faster response
+    }
+    const period = Math.min(14, ac.length);
     let atrSum = 0;
     for (let ai = ac.length - period; ai < ac.length; ai++) {
       const tr = Math.max(ac[ai].h - ac[ai].l, ai > 0 ? Math.abs(ac[ai].h - ac[ai - 1].c) : ac[ai].h - ac[ai].l, ai > 0 ? Math.abs(ac[ai].l - ac[ai - 1].c) : ac[ai].h - ac[ai].l);
@@ -653,8 +658,12 @@ function processPrice(sym, price, hi, lo) {
     }
     atrVal = atrSum / period;
   } else if (isMT5) {
-    // Fallback to tick-level ATR during warmup (first 15 min)
-    atrVal = calcATR(s.highs, s.lows, s.prices, 14);
+    // Fallback: use session range / time elapsed as rough ATR estimate during first 5 min
+    if (s.sessionHigh > -Infinity && s.sessionLow < Infinity && s.sessionHigh > s.sessionLow) {
+      atrVal = s.sessionHigh - s.sessionLow;
+    } else {
+      atrVal = calcATR(s.highs, s.lows, s.prices, 14);
+    }
   }
   const atrTooLow = isXAU && s.prices.length >= 30 && atrVal < 0.50; // XAU: $0.50 ATR = dead market
   const btcAtrTooLow = isBTC && s.prices.length >= 30 && atrVal < 10; // BTC: $10 ATR = dead market
@@ -880,6 +889,18 @@ function processPrice(sym, price, hi, lo) {
     }
   }
   if (!isMT5 && etMin >= 945 && (cS >= THR || pS >= THR)) return;
+
+  // Global dedup guard: no two signals within 30 seconds of each other
+  // Server restarts can burst multiple price ticks at once, causing duplicate signals at the same timestamp.
+  // This catches that by enforcing a minimum gap between ANY signals (all cooldowns above only apply to specific directions).
+  const GLOBAL_DEDUP_MS = 30000; // 30 seconds
+  if (s.lastNTs && now2 - s.lastNTs < GLOBAL_DEDUP_MS) {
+    // Allow same-direction signals through if the 3-min cooldown already passed (handled elsewhere)
+    // But block rapid-fire different-type signals from restart bursts
+    if (now2 - s.lastNTs < 5000) { // hard 5-second dedup — nothing gets through
+      return;
+    }
+  }
 
   // ATR filter — block BASE scoring signals when market is dead (low volatility)
   // NOTE: This is a FLAG, not a return. Specialized detectors (fast-move, breakout, session high
@@ -1297,7 +1318,9 @@ function processPrice(sym, price, hi, lo) {
 
   // Session High Reversal Detector — fire high-confidence PUT when price reverses from session high
   // Conditions: hit session high, reversed >$1 from it, RSI > 60 (was overbought), MACD turning bearish
-  if (s.sessionHigh > -Infinity && s.openPrice && cool && flipCoolFor('put') && winProtectDir !== 'call' && (isMT5 || s.dailySignalCount < MAX_SIG) && etMin >= 570 && etMin < 955) {
+  // RSI sanity: skip when RSI is corrupted from reconnection gaps (RSI 13.8, 99.2 artifacts)
+  const hiLoRsiSane = rsiV >= 10 && rsiV <= 90;
+  if (s.sessionHigh > -Infinity && s.openPrice && cool && hiLoRsiSane && flipCoolFor('put') && winProtectDir !== 'call' && (isMT5 || s.dailySignalCount < MAX_SIG) && etMin >= 570 && etMin < 955) {
     const distFromHigh = s.sessionHigh - price;
     const sessionRange = s.sessionHigh - s.sessionLow;
     const highWasRecent = s.prices.length >= 10 && Math.max(...s.prices.slice(-30 > -s.prices.length ? -30 : 0)) >= s.sessionHigh - 0.05;
@@ -1339,7 +1362,10 @@ function processPrice(sym, price, hi, lo) {
     const cool2 = now2 - s.lastNTs > COOLDOWN_MS;
     const breakCool = now2 - s.breakLastTs > 300000; // 5-min cooldown
 
-    if (cool2 && breakCool && flipCoolFor(bo.dir) && (winProtectDir === null || winProtectDir === bo.dir)) {
+    // RSI sanity: block breakout signals when RSI is corrupted (reconnection gap artifact)
+    // BTC had RSI 99.2 and 5.4 on BREAK signals; NAS100 had RSI 13.8 on ATH after reconnection
+    const breakRsiSane = rsiV >= 10 && rsiV <= 90;
+    if (cool2 && breakCool && breakRsiSane && flipCoolFor(bo.dir) && (winProtectDir === null || winProtectDir === bo.dir)) {
       // === BREAKOUT QUALITY FILTERS ===
 
       // Filter 1: No consecutive same-direction breakouts (first catches the move, second stacks into exhaustion)
@@ -1642,11 +1668,12 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // ===== TREND RIDE V2 — TREND-FOLLOWING SYSTEM (BTC/NAS100 only) =====
-  // Replaces TREND + MFLIP for BTC/NAS100. One entry per trend leg, hold until reversal.
+  // ===== TREND RIDE V2 — TREND-FOLLOWING SYSTEM (NAS100 only) =====
+  // Replaces TREND + MFLIP for NAS100. One entry per trend leg, hold until reversal.
   // Uses averaged 15/20/30-min EMA as trend line. Fires entry with TP1/TP2/TP3, manages trade,
   // exits on EMA cross-back, optionally reverses.
-  if ((isBTC || isNAS) && s.trv2TrendEma !== null && s.trv2Candles.length >= 30) {
+  // Removed from BTC: 0/6 -$872 on 5/6 in chop, volatile micro-structure doesn't suit averaged-EMA.
+  if (isNAS && s.trv2TrendEma !== null && s.trv2Candles.length >= 30) {
     const tEma = s.trv2TrendEma;
     const spread = Math.abs(price - tEma);
     const spreadPct = (spread / tEma) * 100;
@@ -1751,17 +1778,15 @@ function processPrice(sym, price, hi, lo) {
           // was LONG WITH macro, now reversing SHORT against macro = DON'T
           const revDir = priceAbove ? 'long' : 'short';
           const revWithMacro = s.macroEma ? ((revDir === 'long' && price > s.macroEma) || (revDir === 'short' && price < s.macroEma)) : true;
-          // ATR-scaled ROC for reverse (same logic as entry)
-          const revBaselineAtr = isBTC ? 120 : 30;
+          // ATR-scaled ROC for reverse (same logic as entry) — NAS100 only
+          const revBaselineAtr = 30;
           const revAtrRatio = trv2Atr > 0 ? Math.min(revBaselineAtr / trv2Atr, 2.0) : 1.0;
-          const revRocMin = (isBTC ? BTC_ROC_THR * 0.5 : NAS_ROC_THR * 0.5) * revAtrRatio;
+          const revRocMin = NAS_ROC_THR * 0.5 * revAtrRatio;
           const revRocOk = (priceAbove && roc3 > revRocMin) || (priceBelow && roc3 < -revRocMin);
           // Session extreme gate for reverse too
           const revHiBlock = s.lastHiRevTs && (now3 - s.lastHiRevTs < 1800000) && revDir === 'long';
           const revLoBlock = s.lastLoRevTs && (now3 - s.lastLoRevTs < 1800000) && revDir === 'short';
-          if (s.chopActive) {
-            log(sym, '🌊 TRv2 auto-reverse ' + revDir.toUpperCase() + ' blocked — CHOP MODE active');
-          } else if (revHiBlock || revLoBlock) {
+          if (revHiBlock || revLoBlock) {
             log(sym, '🏔️ TRv2 auto-reverse ' + revDir.toUpperCase() + ' blocked — session extreme reversal signal active');
           } else if (revRocOk && revWithMacro) {
             const revMults = { sl: 1.5, t1: 1, t2: 2, t3: 3 };
@@ -1804,7 +1829,6 @@ function processPrice(sym, price, hi, lo) {
     // --- ENTRY DETECTION (no trade open) ---
     // Fire when price separates from trend EMA with ROC confirming direction
     // Macro EMA (3h) as confidence filter: with macro = wider TP, against = tighter SL
-    const entryCool = now3 - s.trv2LastSignalTs > 300000;
     const macroDir = s.macroEma ? (price > s.macroEma ? 'bull' : 'bear') : null;
 
     // MINIMUM TREND AGE: after exit/reverse, require trend direction to hold 15+ min before new entry
@@ -1813,11 +1837,12 @@ function processPrice(sym, price, hi, lo) {
     const minTrendAgeMs = 900000; // 15 minutes
     const trendAgeMature = trendAgeMs >= minTrendAgeMs;
 
-    // CHOP GATE REMOVED: chop can break suddenly and we need TRv2 to catch the move.
-    // The macro gate + trend age + ATR-scaled ROC filter already prevent noise entries.
-    // Chop status is still logged for awareness but doesn't block entries.
+    // TRv2 is now NAS100-only. No chop gating — NAS chop detector overfires on staircase trends
+    // (94% chop=1 on +185pt day, 5/6). NAS TRv2 went 6/6 TP1 hit during "chop".
+    // BTC was removed entirely from TRv2 due to 0/6 -$872 performance in chop.
+    const entryReady = now3 - s.trv2LastSignalTs > 300000; // 5 min cooldown
 
-    if (!s.trv2Trade && entryCool && spreadPct >= minSpreadPct && !trendAgeMature) {
+    if (!s.trv2Trade && entryReady && spreadPct >= minSpreadPct && !trendAgeMature) {
       // Log once per minute when trend age is blocking
       if (!s._trendAgeLogTs || now3 - s._trendAgeLogTs > 60000) {
         log(sym, '⏳ TRv2 entry blocked — trend dir ' + (s.trv2Dir || '?') + ' only ' + Math.round(trendAgeMs / 1000) + 's old (need ' + Math.round(minTrendAgeMs / 1000) + 's)');
@@ -1825,12 +1850,12 @@ function processPrice(sym, price, hi, lo) {
       }
     }
 
-    if (!s.trv2Trade && entryCool && spreadPct >= minSpreadPct && trendAgeMature) {
+    if (!s.trv2Trade && entryReady && spreadPct >= minSpreadPct && trendAgeMature) {
       // ATR-SCALED ROC FILTER: on low-vol days, raise ROC threshold to filter noise
       // When ATR is below baseline, multiply ROC requirement by (baseline/ATR) capped at 2x
-      const baselineAtr = isBTC ? 120 : 30;
+      const baselineAtr = 30; // NAS100 only now
       const atrRatio = trv2Atr > 0 ? Math.min(baselineAtr / trv2Atr, 2.0) : 1.0;
-      const entryRocBase = isBTC ? BTC_ROC_THR * 0.5 : NAS_ROC_THR * 0.5;
+      const entryRocBase = NAS_ROC_THR * 0.5;
       const entryRocMin = entryRocBase * atrRatio;
       let longOk = priceAbove && roc3 > entryRocMin && rsiV > 30 && rsiV < 75;
       let shortOk = priceBelow && roc3 < -entryRocMin && rsiV > 25 && rsiV < 70;
@@ -2062,8 +2087,8 @@ function processPrice(sym, price, hi, lo) {
         return;
       }
       // TREND RIDE PUT: macro bearish, price well below EMA, short+medium ROC both down
-      // RSI 25-70: wider than normal signals — sustained downtrends push RSI low, that's expected
-      if (trDir === 'bear' && rsiV > 25 && rsiV < 70 && flipCoolFor('put') && winProtectDir !== 'call') {
+      // RSI 35-70: floor raised from 25 — RSI 29.5 fired PUT at absolute bottom, bounced $5.65 (5/6 12:58)
+      if (trDir === 'bear' && rsiV > 35 && rsiV < 70 && flipCoolFor('put') && winProtectDir !== 'call') {
         const slPrice = price + trSlFinal;
         s.trendRideLastTs = now2;
         s.trendRideSameDirCount = (s.trendRideLastDir === 'put') ? s.trendRideSameDirCount + 1 : 1;
@@ -2092,15 +2117,36 @@ function processPrice(sym, price, hi, lo) {
   const athAtlCooldown = 1200000; // 20 min cooldown between ATH/ATL signals
   const athAtlPullback = isBTC ? 80 : isNAS ? 15 : 1;       // min pullback to confirm rejection
   const athAtlMacdSkip = isBTC ? 200 : isNAS ? 40 : 3;      // skip MACD check for large pullbacks
-  if (isMT5 && s.rollingHigh > 0 && s.rollingLow < Infinity && cool) {
+  // Minimum rolling range: ATH/ATL is meaningless if the 5-day range is too tight
+  // XAU needs >$15 range, BTC >$500, NAS >$100 for reversal signals to be meaningful
+  const athAtlMinRange = isBTC ? 500 : isNAS ? 100 : 15;
+  const athAtlRange = s.rollingHigh - (s.rollingLow === Infinity ? 0 : s.rollingLow);
+  // Warmup guard: need at least 120 price samples (~2 min) for RSI to stabilize after restart
+  // RSI sanity: if RSI < 10 or > 90, indicators are corrupted (reconnection gap, price spike).
+  // NAS100 signal #15 on 5/6 had RSI 13.8, MACD -12.088 after what looks like a reconnection.
+  const athAtlWarm = s.prices.length >= 120;
+  const athAtlRsiSane = rsiV >= 10 && rsiV <= 90;
+  if (isMT5 && s.rollingHigh > 0 && s.rollingLow < Infinity && cool && athAtlRange >= athAtlMinRange && athAtlWarm && athAtlRsiSane) {
     const distFromATH = s.rollingHigh - price;
     const distFromATL = price - s.rollingLow;
     const athApproachRecent = now2 - s.athApproachTs < 600000; // touched ATH zone in last 10 min
     const atlApproachRecent = now2 - s.atlApproachTs < 600000;
 
     // ATH REVERSAL → PUT: price was near 5-day high, now pulling back
+    // Quality filters (backtested on 39 ATH PUT signals, 4/24–5/6):
+    //   ROC3 < -0.02: kills weak pullbacks (false reversal noise). Blocked 3 marginal "wins" (+0.06%), caught 2 big losers.
+    //   RSI > 60 AND MACD > 0: price still in bullish territory, "pullback" is just a dip in an uptrend.
+    //   Combined: 25W/10L=71% → 21W/7L=75%, and the 3 blocked losers were the biggest (-0.66%, -0.45%, -0.33%).
     const athMacdOk = macdL < macdS || distFromATH >= athAtlMacdSkip;
-    if (athApproachRecent && distFromATH >= athAtlPullback && s.rsiAtRollingHigh > 55 && athMacdOk && roc3 < 0 && flipCoolFor('put') && winProtectDir !== 'call') {
+    const athRocStrong = roc3 < -0.02; // minimum selling pressure — kills -0.009, -0.011 noise signals
+    // NAS100: lower RSI threshold from 60→55. On 5/6, ATH PUT went 0/4 — signals #8 and #12 had RSI 56-57
+    // with MACD>0, clearly still in uptrend. XAU/BTC keep 60 (backtested on XAU).
+    const athBullRsiThr = isNAS ? 55 : 60;
+    const athBullBlock = rsiV > athBullRsiThr && macdHist > 0; // RSI high + MACD bullish = still in uptrend, not a real reversal
+    // Minimum conviction: require at least 2 cross-asset factors (same as ATL CALL)
+    const athConv = convictionFor('put');
+    const athConvOk = athConv.score >= 2;
+    if (athApproachRecent && distFromATH >= athAtlPullback && s.rsiAtRollingHigh > 55 && athMacdOk && athRocStrong && !athBullBlock && athConvOk && flipCoolFor('put') && winProtectDir !== 'call') {
       if (s.lastSignalDir !== 'put' || (now2 - s.lastNTs > athAtlCooldown)) {
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
         if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
@@ -2118,8 +2164,16 @@ function processPrice(sym, price, hi, lo) {
     }
 
     // ATL REVERSAL → CALL: price was near 5-day low, now bouncing
+    // Lighter filters than ATH PUT — ATL bounces naturally start with small ROC, so tight ROC gate kills real signals.
+    // Backtested: ROC>0.02 + bearBlock dropped ATL from 63% to 54% (blocked too many winners).
+    // Keep existing filters (rsiAtRollingLow<45, rsiV<75, roc3>0) which are already reasonable.
+    // Minimum conviction: require at least 2 cross-asset factors. NAS100 signal #3 on 5/6 fired with
+    // conv=0 (zero confirmation) — no cross-asset support at all. Reversal signals without any
+    // confirmation are low-quality noise.
     const atlMacdOk = macdL > macdS || distFromATL >= athAtlMacdSkip;
-    if (atlApproachRecent && distFromATL >= athAtlPullback && s.rsiAtRollingLow < 45 && rsiV < 75 && atlMacdOk && roc3 > 0 && flipCoolFor('call') && winProtectDir !== 'put') {
+    const atlConv = convictionFor('call');
+    const atlConvOk = atlConv.score >= 2;
+    if (atlApproachRecent && distFromATL >= athAtlPullback && s.rsiAtRollingLow < 45 && rsiV < 75 && atlMacdOk && roc3 > 0 && atlConvOk && flipCoolFor('call') && winProtectDir !== 'put') {
       if (s.lastSignalDir !== 'call' || (now2 - s.lastNTs > athAtlCooldown)) {
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
         if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
@@ -3005,7 +3059,22 @@ setInterval(() => {
       s.crossAssetDir = null; s.crossAssetTs = 0;
       s.sessionHigh = -Infinity; s.sessionLow = Infinity; s.rsiAtSessionHigh = 50;
       s.lastHiRevTs = 0; s.lastLoRevTs = 0; // reset session extreme tracking
-      // Rolling ATH/ATL: keep data (persists across days), just reset approach timestamps
+      // Rolling ATH/ATL: save today's high/low before resetting, keep 5 days
+      if (s.sessionHigh > -Infinity && s.sessionLow < Infinity) {
+        const today = new Date().toISOString().slice(0, 10);
+        // Don't duplicate if already saved for today
+        if (!s.dailyLevels.find(d => d.date === today)) {
+          s.dailyLevels.push({ high: s.sessionHigh, low: s.sessionLow, date: today });
+        }
+        // Keep only last 5 days
+        if (s.dailyLevels.length > 5) s.dailyLevels = s.dailyLevels.slice(-5);
+        // Recompute rolling from daily levels (today's session about to reset)
+        if (s.dailyLevels.length > 0) {
+          s.rollingHigh = Math.max(...s.dailyLevels.map(d => d.high));
+          s.rollingLow = Math.min(...s.dailyLevels.map(d => d.low));
+        }
+        log(sym, 'Daily levels saved — today H:$' + s.sessionHigh.toFixed(2) + ' L:$' + s.sessionLow.toFixed(2) + ' · 5-day H:$' + s.rollingHigh.toFixed(2) + ' L:$' + s.rollingLow.toFixed(2) + ' (' + s.dailyLevels.length + ' days)');
+      }
       s.athApproachTs = 0; s.athApproachPrice = 0; s.atlApproachTs = 0; s.atlApproachPrice = 0;
       s.athBreakLastTs = 0;
       s.gapDayMode = false; s.gapDirection = null;
