@@ -47,7 +47,7 @@ const RSI_CALL_LO = { QQQ: 45, SPY: 45, XAU: 40, BTC: 42, NAS100: 42 };
 const RSI_CALL_HI = { QQQ: 65, SPY: 65, XAU: 68, BTC: 66, NAS100: 66 }; // Gate range (rsiSweetCall) — tighter
 const RSI_PUT_LO  = { QQQ: 30, SPY: 30, XAU: 28, BTC: 30, NAS100: 30 };
 const RSI_PUT_HI  = { QQQ: 55, SPY: 55, XAU: 58, BTC: 56, NAS100: 56 };
-const ROC_BLOWOFF = { QQQ: 0.15, SPY: 0.15, XAU: 0.20, BTC: 0.25, NAS100: 0.20 }; // NAS100 similar vol to XAU
+const ROC_BLOWOFF = { QQQ: 0.15, SPY: 0.15, XAU: 0.35, BTC: 0.25, NAS100: 0.20 }; // XAU raised from 0.20 — was catching real trends as blowoffs
 const MAX_IND = { QQQ: 6, SPY: 6, XAU: 6, BTC: 6, NAS100: 6 };
 const COOLDOWN_MS = 180000;
 // FLIP_COOL_MS removed — was blocking legitimate reversal signals
@@ -981,7 +981,7 @@ function processPrice(sym, price, hi, lo) {
     const sustainedOk = sustainedOverride && s.sustainedDir === (cS >= pS ? 'call' : 'put');
     if (sustainedOk) {
       log(sym, 'Blowoff override: sustained momentum — ' + s.sustainedCount + ' consecutive ' + s.sustainedDir.toUpperCase() + ' ticks, ROC ' + roc3.toFixed(3) + '%');
-      s.blowoffTs = now2;
+      s.blowoffTs = 0;  // CLEAR the lock (was "= now2" which restarted the 2-min timer — missed real trends)
     } else {
       return;
     }
