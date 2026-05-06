@@ -458,9 +458,13 @@ function processPrice(sym, price, hi, lo) {
   // Update rolling 5-day high/low for ATH/ATL detector
   if (isMT5 && price > 0) {
     const fiveDaysAgo = Date.now() - 5 * 24 * 60 * 60 * 1000;
-    // Add current session extremes every ~60 ticks
-    // BUG FIX: was using s.prices.length % 60 which stops working once prices array caps at 800
-    // (800 % 60 = 20, never hits 0 again). Use a dedicated counter instead.
+
+    // Always keep rollingHigh/rollingLow in sync with current session extremes (real-time)
+    // This ensures ATH/ATL detection reacts immediately, not just every 60 ticks
+    if (s.sessionHigh > -Infinity && s.sessionHigh > s.rollingHigh) s.rollingHigh = s.sessionHigh;
+    if (s.sessionLow < Infinity && (s.rollingLow === 0 || s.rollingLow === Infinity || s.sessionLow < s.rollingLow)) s.rollingLow = s.sessionLow;
+
+    // Persist snapshots to rolling array every ~60 ticks (1 min) for multi-day history
     if (!s._rollingTickCount) s._rollingTickCount = 0;
     s._rollingTickCount++;
     if (s._rollingTickCount % 60 === 0 && s.sessionHigh > -Infinity) {
