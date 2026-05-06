@@ -458,8 +458,12 @@ function processPrice(sym, price, hi, lo) {
   // Update rolling 5-day high/low for ATH/ATL detector
   if (isMT5 && price > 0) {
     const fiveDaysAgo = Date.now() - 5 * 24 * 60 * 60 * 1000;
-    // Add current session extremes periodically (every ~60 ticks)
-    if (s.prices.length % 60 === 0 && s.sessionHigh > -Infinity) {
+    // Add current session extremes every ~60 ticks
+    // BUG FIX: was using s.prices.length % 60 which stops working once prices array caps at 800
+    // (800 % 60 = 20, never hits 0 again). Use a dedicated counter instead.
+    if (!s._rollingTickCount) s._rollingTickCount = 0;
+    s._rollingTickCount++;
+    if (s._rollingTickCount % 60 === 0 && s.sessionHigh > -Infinity) {
       s.rollingHighs.push({ price: s.sessionHigh, ts: Date.now() });
       if (s.sessionLow < Infinity) s.rollingLows.push({ price: s.sessionLow, ts: Date.now() });
       // Prune older than 5 days
@@ -1281,7 +1285,7 @@ function processPrice(sym, price, hi, lo) {
   if (isMT5 && s.trade.active && s.trade.ep > 0) {
     const wpDir = s.trade.type;
     const wpPnl = wpDir === 'call' ? price - s.trade.ep : s.trade.ep - price;
-    const wpMin = isBTC ? 50 : isNAS ? 10 : isXAU ? 2 : 0.20;
+    const wpMin = isBTC ? 50 : isNAS ? 10 : isXAU ? 1 : 0.20; // XAU lowered from $2 to $1 — $1.76 profit PUT wasn't protected, allowed false TREND CALL
     if (wpPnl >= wpMin) {
       winProtectDir = wpDir; // protect this direction — block opposite
     }
@@ -1998,7 +2002,17 @@ function processPrice(sym, price, hi, lo) {
       }
     }
 
-    if (trSpreadPct >= trMinSpread && trRoc3Ok && trRoc6Ok && trMacdOk && trSameDirOk) {
+    // TREND RIDE extended flip guard: if the last signal was opposite-direction and fired within 30 min,
+    // block TREND RIDE. The macro EMA (3-hour) lags badly at turning points — a FAST PUT at 4710 followed
+    // by a TREND CALL at 4708 (13 min later) means the EMA hasn't caught up to the reversal yet.
+    // The normal 10-min flipCool isn't enough for TREND RIDE because the macro EMA can stay wrong for hours.
+    const trFlipGuardMs = 1800000; // 30 min
+    const trFlipBlocked = s.lastSignalDir && s.lastSignalDir !== trSigDir && (now2 - s.lastNTs < trFlipGuardMs);
+    if (trFlipBlocked) {
+      log(sym, 'TREND RIDE blocked — last signal was ' + s.lastSignalDir.toUpperCase() + ' ' + Math.round((now2 - s.lastNTs) / 60000) + 'm ago (need 30m for opposite TREND)');
+    }
+
+    if (trSpreadPct >= trMinSpread && trRoc3Ok && trRoc6Ok && trMacdOk && trSameDirOk && !trFlipBlocked) {
       // Calculate 1-min ATR from vrevSnaps for dynamic stop loss
       // ATR = average of per-minute high-low ranges over last 10 minutes
       let trAtr = isBTC ? 50 : isNAS ? 15 : 3; // fallback defaults
