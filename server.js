@@ -839,6 +839,18 @@ function processPrice(sym, price, hi, lo) {
   const now2 = Date.now();
   const cool = now2 - s.lastNTs > COOLDOWN_MS;
 
+  // === OPPOSITE-DIRECTION FLIP GUARD ===
+  // Prevent PUT+CALL firing within 10 min of each other (different detectors can disagree at tops/bottoms)
+  // Same-direction signals still use normal 3-min cooldown. Opposite direction needs 10 min.
+  const FLIP_COOLDOWN_MS = 600000; // 10 minutes
+  const flipCool = !s.lastSignalDir || (now2 - s.lastNTs > FLIP_COOLDOWN_MS);
+  // flipCoolFor(dir): returns true if firing 'dir' is allowed given the last signal's direction
+  function flipCoolFor(dir) {
+    if (!s.lastSignalDir) return true; // no previous signal
+    if (s.lastSignalDir === dir) return cool; // same direction: normal 3-min cooldown
+    return now2 - s.lastNTs > FLIP_COOLDOWN_MS; // opposite direction: 10-min cooldown
+  }
+
   // === SIGNAL GATES ===
   // XAU: full session 6PM-5PM ET (Sun-Fri) = nearly 23h, block 5PM-6PM ET (1020-1080 min)
   // BTC: 24/7, no block window (crypto never sleeps)
@@ -1259,9 +1271,24 @@ function processPrice(sym, price, hi, lo) {
   // ===== SPECIALIZED DETECTORS — always run regardless of ATR =====
   // These catch sudden moves, reversals, breakouts that happen when a "dead" market wakes up
 
+  // === GLOBAL WINNING TRADE GUARD — protect profitable trades from ALL detectors ===
+  // If a CFD trade is active and in profit, block opposite-direction signals from ALL detectors.
+  // Previously only blocked regular 5/6 signals — specialized detectors (Session High Rev, ATH Rev)
+  // could fire PUTs against a profitable CALL, wrecking a winning trade.
+  // Same-direction signals are still allowed (e.g., trend continuation CALL when CALL trade is running).
+  let winProtectDir = null; // set to 'call'|'put' = direction being protected (block opposite)
+  if (isMT5 && s.trade.active && s.trade.ep > 0) {
+    const wpDir = s.trade.type;
+    const wpPnl = wpDir === 'call' ? price - s.trade.ep : s.trade.ep - price;
+    const wpMin = isBTC ? 50 : isNAS ? 10 : isXAU ? 2 : 0.20;
+    if (wpPnl >= wpMin) {
+      winProtectDir = wpDir; // protect this direction — block opposite
+    }
+  }
+
   // Session High Reversal Detector — fire high-confidence PUT when price reverses from session high
   // Conditions: hit session high, reversed >$1 from it, RSI > 60 (was overbought), MACD turning bearish
-  if (s.sessionHigh > -Infinity && s.openPrice && cool && (isMT5 || s.dailySignalCount < MAX_SIG) && etMin >= 570 && etMin < 955) {
+  if (s.sessionHigh > -Infinity && s.openPrice && cool && flipCoolFor('put') && winProtectDir !== 'call' && (isMT5 || s.dailySignalCount < MAX_SIG) && etMin >= 570 && etMin < 955) {
     const distFromHigh = s.sessionHigh - price;
     const sessionRange = s.sessionHigh - s.sessionLow;
     const highWasRecent = s.prices.length >= 10 && Math.max(...s.prices.slice(-30 > -s.prices.length ? -30 : 0)) >= s.sessionHigh - 0.05;
@@ -1303,7 +1330,7 @@ function processPrice(sym, price, hi, lo) {
     const cool2 = now2 - s.lastNTs > COOLDOWN_MS;
     const breakCool = now2 - s.breakLastTs > 300000; // 5-min cooldown
 
-    if (cool2 && breakCool) {
+    if (cool2 && breakCool && flipCoolFor(bo.dir) && (winProtectDir === null || winProtectDir === bo.dir)) {
       // === BREAKOUT QUALITY FILTERS ===
 
       // Filter 1: No consecutive same-direction breakouts (first catches the move, second stacks into exhaustion)
@@ -1388,7 +1415,7 @@ function processPrice(sym, price, hi, lo) {
     const obCool = now2 - s.lastNTs > COOLDOWN_MS;
 
     // --- OB RETEST: price departed, then returned to OB zone → re-entry in breakout direction ---
-    if (s.obDeparted && !s.obFired && !s.obMitigated && obAge <= 1800000 && obCool) {
+    if (s.obDeparted && !s.obFired && !s.obMitigated && obAge <= 1800000 && obCool && flipCoolFor(ob.dir) && (winProtectDir === null || winProtectDir === ob.dir)) {
       const inZone = price >= (ob.lo - obTolerance) && price <= (ob.hi + obTolerance);
       if (inZone) {
         const rsiOk = rsiV >= 30 && rsiV <= 70;
@@ -1419,6 +1446,9 @@ function processPrice(sym, price, hi, lo) {
     // --- OB MITIGATION: price broke through OB → breakout failed → reversal signal ---
     if (s.obMitigated && !s.obFired && obAge <= 1800000 && obCool) {
       const revDir = ob.dir === 'call' ? 'put' : 'call';
+      if (!flipCoolFor(revDir) || (winProtectDir !== null && winProtectDir !== revDir)) {
+        // blocked by flip cooldown or winning trade protection — skip
+      } else {
       const revRocOk = (revDir === 'call' && roc3 > 0) || (revDir === 'put' && roc3 < 0);
       const revMacdOk = (revDir === 'call' && macdHist > 0) || (revDir === 'put' && macdHist < 0);
 
@@ -1439,6 +1469,7 @@ function processPrice(sym, price, hi, lo) {
         s.obZone = null;
         return;
       }
+      } // end else (flipCool/winProtect ok)
     }
   }
 
@@ -1456,7 +1487,7 @@ function processPrice(sym, price, hi, lo) {
       const fmLast = price;
       const fmDelta = fmLast - fmFirst;
       const fmAbsDelta = Math.abs(fmDelta);
-      const fmThreshold = isBTC ? 200 : isNAS ? 50 : 10; // $200 BTC, $50 NAS100, $10 XAU
+      const fmThreshold = isBTC ? 200 : isNAS ? 50 : 5; // $200 BTC, $50 NAS100, $5 XAU (was $10 — missed $40 rallies during Asia)
 
       // Also check velocity is accelerating: last 1-min move > first 1-min move
       const fmMid = fmSnaps.filter(sn => sn.ts > now2 - 60000); // last 1 min
@@ -1472,7 +1503,7 @@ function processPrice(sym, price, hi, lo) {
         // Require ROC to confirm direction (even slightly)
         const fmRocOk = (fmDir === 'put' && roc3 < 0) || (fmDir === 'call' && roc3 > 0);
 
-        if (fmRsiOk && fmRocOk) {
+        if (fmRsiOk && fmRocOk && flipCoolFor(fmDir) && (winProtectDir === null || winProtectDir === fmDir)) {
           s.fastMoveLastTs = now2;
           s.lastAT = fmDir; if (fmDir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
           if (s.lastSignalDir && s.lastSignalDir !== fmDir) s.lastReversalTs = now2;
@@ -1491,12 +1522,10 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // ===== SUSTAINED MOVE DETECTOR (MT5 instruments: XAU + BTC + NAS100) =====
-  // Catches gradual but significant directional moves that are too slow for FAST-MOVE
-  // but too strong for the market to ignore. Example: XAU $20 rise over 25 min.
-  // FAST-MOVE needs $10 in 3 min (sharp spike). This detector catches $15 in 10 min or $18 in 20 min.
-  // Uses vrevSnaps with multiple time windows. Fires with a separate cooldown from FAST-MOVE.
-  if (isMT5 && s.vrevSnaps.length >= 120 && cool && (now2 - (s.sustainedMoveLastTs || 0) > 1200000)) {
+  // ===== SUSTAINED MOVE DETECTOR (DISABLED — replaced by ATH/ATL reversal for all MT5) =====
+  // Was catching gradual moves but entering too late (at exhaustion). ATH/ATL reversal
+  // fires on confirmed pullback from extremes instead, which has better timing.
+  if (false && isMT5 && s.vrevSnaps.length >= 120 && cool && (now2 - (s.sustainedMoveLastTs || 0) > 1200000)) {
     // Multi-window check: [{window ms, min snaps, thresholds per instrument}]
     const smWindows = [
       { ms: 600000,  minSnaps: 60,  thr: isBTC ? 400 : isNAS ? 80 : 15 },  // 10 min: $15 XAU, $400 BTC, $80 NAS
@@ -1570,7 +1599,7 @@ function processPrice(sym, price, hi, lo) {
       // V-REVERSAL PUT: price rallied to a high, then dropped back down
       const rallyThenDrop = range >= 8.0 && lbHighTs < now2 - 60000 && (lbHigh - price) >= range * 0.4 && lbHighTs > lbLowTs;
 
-      if (dropThenBounce && roc3 > symRocThr * 2 && rsiV > 35 && rsiV < 65) {
+      if (dropThenBounce && roc3 > symRocThr * 2 && rsiV > 35 && rsiV < 65 && flipCoolFor('call') && winProtectDir !== 'put') {
         // CALL reversal: was dropping, now bouncing with strong upward ROC
         s.vrevLastTs = now2;
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
@@ -1586,7 +1615,7 @@ function processPrice(sym, price, hi, lo) {
         return;
       }
 
-      if (rallyThenDrop && roc3 < -symRocThr * 2 && rsiV > 35 && rsiV < 65) {
+      if (rallyThenDrop && roc3 < -symRocThr * 2 && rsiV > 35 && rsiV < 65 && flipCoolFor('put') && winProtectDir !== 'call') {
         // PUT reversal: was rallying, now dropping with strong downward ROC
         s.vrevLastTs = now2;
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
@@ -1891,7 +1920,7 @@ function processPrice(sym, price, hi, lo) {
       }
       // MACRO FLIP CALL: was bearish, now price crossed above 3h EMA with upward ROC
       // RSI cap 60 for CALL (not 70): EMA is lagging — if RSI is already 65+ the rally is exhausted
-      else if (curDir === 'bull' && roc3 > symRocThr && rsiV > 30 && rsiV < 60) {
+      else if (curDir === 'bull' && roc3 > symRocThr && rsiV > 30 && rsiV < 60 && flipCoolFor('call') && winProtectDir !== 'put') {
         s.macroFlipTs = now2;
         s.macroPrevDir = curDir;
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
@@ -1907,7 +1936,7 @@ function processPrice(sym, price, hi, lo) {
         return;
       }
       // MACRO FLIP PUT: was bullish, now price crossed below 3h EMA with downward ROC
-      else if (curDir === 'bear' && roc3 < -symRocThr && rsiV > 30 && rsiV < 70) {
+      else if (curDir === 'bear' && roc3 < -symRocThr && rsiV > 30 && rsiV < 70 && flipCoolFor('put') && winProtectDir !== 'call') {
         s.macroFlipTs = now2;
         s.macroPrevDir = curDir;
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
@@ -1995,7 +2024,7 @@ function processPrice(sym, price, hi, lo) {
       // TREND RIDE CALL: macro bullish, price well above EMA, short+medium ROC both up
       // RSI cap: 75 for all — data shows RSI 74 CALLs win during genuine trends (5/1 23:16 BTC +0.72%)
       const trCallRsiMax = 75;
-      if (trDir === 'bull' && rsiV > 30 && rsiV < trCallRsiMax) {
+      if (trDir === 'bull' && rsiV > 30 && rsiV < trCallRsiMax && flipCoolFor('call') && winProtectDir !== 'put') {
         const slPrice = price - trSlFinal;
         s.trendRideLastTs = now2;
         s.trendRideSameDirCount = (s.trendRideLastDir === 'call') ? s.trendRideSameDirCount + 1 : 1;
@@ -2015,7 +2044,7 @@ function processPrice(sym, price, hi, lo) {
       }
       // TREND RIDE PUT: macro bearish, price well below EMA, short+medium ROC both down
       // RSI 25-70: wider than normal signals — sustained downtrends push RSI low, that's expected
-      if (trDir === 'bear' && rsiV > 25 && rsiV < 70) {
+      if (trDir === 'bear' && rsiV > 25 && rsiV < 70 && flipCoolFor('put') && winProtectDir !== 'call') {
         const slPrice = price + trSlFinal;
         s.trendRideLastTs = now2;
         s.trendRideSameDirCount = (s.trendRideLastDir === 'put') ? s.trendRideSameDirCount + 1 : 1;
@@ -2036,23 +2065,23 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // ===== ATH/ATL REVERSAL DETECTOR (XAU only) =====
-  // Gold tends to reverse hard at multi-day highs/lows — institutional profit-taking, algo levels
+  // ===== ATH/ATL REVERSAL DETECTOR (all MT5: XAU, BTC, NAS100) =====
+  // Price reverses hard at multi-day highs/lows — institutional profit-taking, algo levels
   // Fires ONE high-confidence reversal signal when price touches 5-day extreme then pulls back
   // Once fired, won't re-fire until price re-approaches the extreme (resets the approach timestamp)
+  // Per-instrument pullback thresholds: XAU $1, BTC $80, NAS100 $15
   const athAtlCooldown = 1200000; // 20 min cooldown between ATH/ATL signals
-  if (isXAU && s.rollingHigh > 0 && s.rollingLow < Infinity && cool) {
+  const athAtlPullback = isBTC ? 80 : isNAS ? 15 : 1;       // min pullback to confirm rejection
+  const athAtlMacdSkip = isBTC ? 200 : isNAS ? 40 : 3;      // skip MACD check for large pullbacks
+  if (isMT5 && s.rollingHigh > 0 && s.rollingLow < Infinity && cool) {
     const distFromATH = s.rollingHigh - price;
     const distFromATL = price - s.rollingLow;
     const athApproachRecent = now2 - s.athApproachTs < 600000; // touched ATH zone in last 10 min
     const atlApproachRecent = now2 - s.atlApproachTs < 600000;
 
-    // ATH REVERSAL → PUT: price was near 5-day high, now pulling back $1+
-    // Gold reverses hard at multi-day highs — institutional profit-taking kicks in fast
-    // Only need $1 pullback (confirmed rejection) + ROC turning negative
-    // MACD relaxed: it lags too much for fast reversals — ROC alone confirms direction
-    const athMacdOk = macdL < macdS || distFromATH >= 3.0; // skip MACD for $3+ pullbacks
-    if (athApproachRecent && distFromATH >= 1.0 && s.rsiAtRollingHigh > 55 && athMacdOk && roc3 < 0) {
+    // ATH REVERSAL → PUT: price was near 5-day high, now pulling back
+    const athMacdOk = macdL < macdS || distFromATH >= athAtlMacdSkip;
+    if (athApproachRecent && distFromATH >= athAtlPullback && s.rsiAtRollingHigh > 55 && athMacdOk && roc3 < 0 && flipCoolFor('put') && winProtectDir !== 'call') {
       if (s.lastSignalDir !== 'put' || (now2 - s.lastNTs > athAtlCooldown)) {
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
         if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
@@ -2069,12 +2098,9 @@ function processPrice(sym, price, hi, lo) {
       }
     }
 
-    // ATL REVERSAL → CALL: price was near 5-day low, now bouncing $1+
-    // Gold bounces hard at multi-day lows — dip-buyers and short-covering kick in fast
-    // Only need $1 bounce + ROC turning positive
-    const atlMacdOk = macdL > macdS || distFromATL >= 3.0; // skip MACD for $3+ bounces
-    // RSI cap 75: if current RSI is already extreme, the bounce is exhausted
-    if (atlApproachRecent && distFromATL >= 1.0 && s.rsiAtRollingLow < 45 && rsiV < 75 && atlMacdOk && roc3 > 0) {
+    // ATL REVERSAL → CALL: price was near 5-day low, now bouncing
+    const atlMacdOk = macdL > macdS || distFromATL >= athAtlMacdSkip;
+    if (atlApproachRecent && distFromATL >= athAtlPullback && s.rsiAtRollingLow < 45 && rsiV < 75 && atlMacdOk && roc3 > 0 && flipCoolFor('call') && winProtectDir !== 'put') {
       if (s.lastSignalDir !== 'call' || (now2 - s.lastNTs > athAtlCooldown)) {
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
         if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
@@ -2140,10 +2166,9 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // === WINNING TRADE PROTECTION ===
-  // Don't let regular signals reverse a trade that's currently in profit.
-  // Special detectors (BREAKOUT, V-REV, MACRO FLIP, SUPER) bypass this — they fire earlier and return.
-  // Only regular 5/6, 6/6 signals are subject to this protection.
+  // === WINNING TRADE PROTECTION (regular signals — backup for global guard above) ===
+  // Global winProtectDir guard blocks all specialized detectors already.
+  // This is a safety net for regular 5/6, 6/6 signals + provides a log message.
   if (isMT5 && s.trade.active) {
     const tDir = s.trade.type; // current trade direction
     const tPnl = tDir === 'call' ? price - s.trade.ep : s.trade.ep - price; // current P&L in $
@@ -2179,13 +2204,13 @@ function processPrice(sym, price, hi, lo) {
   }
 
   // === MT5 SESSION GATE — block 6/6 regular signals during low-trend sessions ===
-  // Data: 6/6 regular = 43% XAU, 25% BTC win rate during Asia/overnight. Special detectors fire earlier and return — not affected.
-  // XAU: only fire 6/6 during London (03:00-08:00 ET) and NY (08:00-16:00 ET)
+  // XAU: allowed ALL sessions (Asia still requires 6/6 via sessionThr, plus Asia ROC gate)
   // BTC: only fire 6/6 during US session (09:30-16:00 ET) and pre-US (08:00-09:30 ET)
-  if (isMT5 && (cS >= minS || pS >= minS)) {
-    const mt5SessionOk = isXAU ? (xauSession === 'london' || xauSession === 'london_ny') : isBTC ? (btcSession === 'us' || btcSession === 'pre_us') : isNAS ? (nasSession === 'us' || nasSession === 'pre_us' || nasSession === 'europe') : true;
+  // NAS100: US + pre-US + Europe
+  if (isMT5 && !isXAU && (cS >= minS || pS >= minS)) {
+    const mt5SessionOk = isBTC ? (btcSession === 'us' || btcSession === 'pre_us') : isNAS ? (nasSession === 'us' || nasSession === 'pre_us' || nasSession === 'europe') : true;
     if (!mt5SessionOk) {
-      log(sym, '🕐 6/6 regular blocked: off-session (' + (isXAU ? xauSession : isBTC ? btcSession : nasSession) + ') — only special detectors fire');
+      log(sym, '🕐 6/6 regular blocked: off-session (' + (isBTC ? btcSession : nasSession) + ') — only special detectors fire');
       return;
     }
   }
@@ -2225,7 +2250,7 @@ function processPrice(sym, price, hi, lo) {
     // Don't fire 6/6 indicator signals for BTC/NAS100 — TRv2 handles them
     return;
   }
-  if (fireCall && cool) {
+  if (fireCall && cool && flipCoolFor('call')) {
     s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
     if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
     s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
@@ -2241,7 +2266,7 @@ function processPrice(sym, price, hi, lo) {
     s.trade = isMT5 ? buildCfdTrade('call', price, atrVal, sym) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
     // Cross-asset
     SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'call'; S[other].crossAssetTs = now2; } });
-  } else if (firePut && cool) {
+  } else if (firePut && cool && flipCoolFor('put')) {
     s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
     if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
     s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
@@ -2697,8 +2722,8 @@ function processTicks(symbols) {
     //   XAU (~$3300): coil < $4, escape $1
     //   BTC (~$90K):  coil < $120, escape $30
     if (isXAUt || isBTCt || isNASt) {
-      const coilMaxRange = isBTCt ? 120.0 : isNASt ? 30.0 : 6.0;   // max range to count as consolidation
-      const escapeMin    = isBTCt ? 30.0  : isNASt ? 8.0  : 1.0;    // min distance beyond coil edge = confirmed breakout
+      const coilMaxRange = isBTCt ? 120.0 : isNASt ? 30.0 : 10.0;  // max range to count as consolidation (XAU was $6 — too tight, missed $9-range coils)
+      const escapeMin    = isBTCt ? 30.0  : isNASt ? 8.0  : 1.5;   // min distance beyond coil edge = confirmed breakout (XAU raised to $1.50)
       const bNow = Date.now();
       s.breakRange.push({ ts: bNow, p: price });
       // Trim to 5-min window
