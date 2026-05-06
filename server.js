@@ -971,19 +971,20 @@ function processPrice(sym, price, hi, lo) {
   // If ROC has been directional for 10+ consecutive ticks, the move is real regardless of "exhaustion"
   const sustainedOverride = s.sustainedCount >= 10 && s.sustainedDir !== null;
 
-  // Blowoff — with sustained momentum override
-  // XAU/BTC: 2-min lock (fast markets, don't miss sustained moves). Equities: 5-min lock.
-  const blowoffDuration = isMT5 ? 120000 : 300000;
-  const blowoffLock = now2 - s.blowoffTs < blowoffDuration;
-  if (Math.abs(roc3) > ROC_BLOWOFF[sym] && !blowoffLock) { s.blowoffTs = now2; }
-  if (blowoffLock && (cS >= minS || pS >= minS)) {
-    // Sustained momentum override: uses same 10-tick threshold as RSI/MACD exhaustion
-    const sustainedOk = sustainedOverride && s.sustainedDir === (cS >= pS ? 'call' : 'put');
-    if (sustainedOk) {
-      log(sym, 'Blowoff override: sustained momentum — ' + s.sustainedCount + ' consecutive ' + s.sustainedDir.toUpperCase() + ' ticks, ROC ' + roc3.toFixed(3) + '%');
-      s.blowoffTs = 0;  // CLEAR the lock (was "= now2" which restarted the 2-min timer — missed real trends)
-    } else {
-      return;
+  // Blowoff lock REMOVED — was blocking signals during real momentum moves (missed $26 XAU rally 2025-05-06).
+  // Other guards (cooldown, flipCool, winProtect, RSI/MACD exhaustion) already prevent bad entries.
+  // Kept for equities only (5-min lock) where 0DTE chasing after spikes is genuinely dangerous.
+  if (!isMT5) {
+    const blowoffLock = now2 - s.blowoffTs < 300000;
+    if (Math.abs(roc3) > ROC_BLOWOFF[sym] && !blowoffLock) { s.blowoffTs = now2; }
+    if (blowoffLock && (cS >= minS || pS >= minS)) {
+      const sustainedOk = sustainedOverride && s.sustainedDir === (cS >= pS ? 'call' : 'put');
+      if (sustainedOk) {
+        log(sym, 'Blowoff override: sustained momentum — ' + s.sustainedCount + ' consecutive ' + s.sustainedDir.toUpperCase() + ' ticks');
+        s.blowoffTs = 0;
+      } else {
+        return;
+      }
     }
   }
 
