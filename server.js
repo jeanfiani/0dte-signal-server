@@ -59,6 +59,11 @@ const ROC_BLOWOFF = { QQQ: 0.15, SPY: 0.15, XAU: 0.35, BTC: 0.25, NAS100: 0.20 }
 const MAX_IND = { QQQ: 6, SPY: 6, XAU: 6, BTC: 6, NAS100: 6 };
 const COOLDOWN_MS = 180000;
 // FLIP_COOL_MS removed — was blocking legitimate reversal signals
+// Minimum hold period after entry before a reversal warning can fire — prevents the popup
+// from firing on the same tick as the entry signal because lastETs is still 0 then.
+// 3 minutes — short enough to catch genuine fast reversals, long enough that the entry
+// signal doesn't get killed before it has any chance to develop.
+const REV_MIN_HOLD_MS = 180000;
 const MAX_SIG = 10;
 const THR = 6;
 const ROC_THR = 0.018;
@@ -188,7 +193,7 @@ SYMBOLS.forEach(sym => {
     trv2Trade: null,           // active trade: { dir:'long'|'short', ep, ts, sl, tp1, tp2, tp3, tp1Hit, tp2Hit, tp3Hit, bestPrice, atr, trailSl }
     trv2CrossCount: 0,         // consecutive candle closes on wrong side of EMA (for exit confirmation)
     // Trade monitor
-    trade: { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 }
+    trade: { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() }
   };
 });
 let vixV = 0;
@@ -1493,7 +1498,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastHiRevTs = now2; // Track for TRv2 entry suppression
         log(sym, '🔻 SESSION HIGH REVERSAL PUT — $' + distFromHigh.toFixed(2) + ' off high $' + s.sessionHigh.toFixed(2) + ' RSI@high:' + s.rsiAtSessionHigh.toFixed(1) + ' RSInow:' + rsiV.toFixed(1) + ' [#' + s.dailySignalCount + ']');
         sendPush('🔻 ' + sym + ' HIGH REVERSAL PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromHigh.toFixed(2) + ' off high · RSI@high:' + s.rsiAtSessionHigh.toFixed(1), 'signal');
-        s.trade = isMT5 ? buildCfdTrade('put', price, atrVal, sym) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        s.trade = isMT5 ? buildCfdTrade('put', price, atrVal, sym) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
         SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'put'; S[other].crossAssetTs = now2; } });
         return; // Signal fired, don't continue to regular signal logic
       }
@@ -1580,7 +1585,7 @@ function processPrice(sym, price, hi, lo) {
       const rangeStr = '$' + bo.coilLo.toFixed(2) + '-$' + bo.coilHi.toFixed(2);
       log(sym, '💥 BREAKOUT ' + dir.toUpperCase() + ' — coiled ' + coilMin + 'min in ' + rangeStr + ' · escaped $' + bo.escape.toFixed(2) + ' · accel ' + bo.accel.toFixed(1) + 'x [#' + s.dailySignalCount + ']');
       sendPush('💥 ' + sym + ' BREAKOUT ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · broke ' + (dir === 'call' ? 'above' : 'below') + ' ' + rangeStr + ' (' + coilMin + 'min coil)', 'signal');
-      s.trade = isMT5 ? buildCfdTrade(dir, price, atrVal, sym) : { active: true, type: dir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+      s.trade = isMT5 ? buildCfdTrade(dir, price, atrVal, sym) : { active: true, type: dir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
       return;
     } else {
       // Cooldown blocked — clear pending
@@ -1621,7 +1626,7 @@ function processPrice(sym, price, hi, lo) {
           if (isMT5) attachTpSl(sig, dir, price, atrVal, sym);
           log(sym, '🧱 OB RETEST ' + dir.toUpperCase() + ' — price $' + price.toFixed(2) + ' retested OB zone $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' (age ' + (obAge / 60000).toFixed(1) + 'min) [#' + s.dailySignalCount + ']');
           sendPush('🧱 ' + sym + ' OB RETEST ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · retested OB $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2), 'signal');
-          s.trade = isMT5 ? buildCfdTrade(dir, price, atrVal, sym) : { active: true, type: dir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+          s.trade = isMT5 ? buildCfdTrade(dir, price, atrVal, sym) : { active: true, type: dir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
           return;
         }
       }
@@ -1649,7 +1654,7 @@ function processPrice(sym, price, hi, lo) {
         if (isMT5) attachTpSl(sig, dir, price, atrVal, sym);
         log(sym, '🧱 OB MITIGATION ' + dir.toUpperCase() + ' — breakout FAILED, price $' + price.toFixed(2) + ' broke through OB $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('🧱 ' + sym + ' OB FAIL ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · breakout failed through OB $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2), 'signal');
-        s.trade = isMT5 ? buildCfdTrade(dir, price, atrVal, sym) : { active: true, type: dir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        s.trade = isMT5 ? buildCfdTrade(dir, price, atrVal, sym) : { active: true, type: dir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
         s.obZone = null;
         return;
       }
@@ -1709,7 +1714,7 @@ function processPrice(sym, price, hi, lo) {
           if (isMT5) attachTpSl(sig, fmDir, price, atrVal, sym);
           log(sym, '⚡ FAST-MOVE ' + fmDir.toUpperCase() + ' — $' + fmAbsDelta.toFixed(2) + ' move in ' + (fmWindow / 60000).toFixed(0) + 'min · price $' + price.toFixed(2) + ' from $' + fmFirst.toFixed(2) + ' [#' + s.dailySignalCount + ']');
           sendPush('⚡ ' + sym + ' FAST ' + fmDir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + fmAbsDelta.toFixed(2) + ' move in 3min', 'signal');
-          s.trade = isMT5 ? buildCfdTrade(fmDir, price, atrVal, sym) : { active: true, type: fmDir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+          s.trade = isMT5 ? buildCfdTrade(fmDir, price, atrVal, sym) : { active: true, type: fmDir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
           return;
         }
       }
@@ -1769,7 +1774,7 @@ function processPrice(sym, price, hi, lo) {
       if (isMT5) attachTpSl(sig, smDir, price, atrVal, sym);
       log(sym, '🔥 SUSTAINED MOVE ' + smDir.toUpperCase() + ' — $' + smAbsDelta.toFixed(2) + ' move in ' + smMinutes + 'min · price $' + price.toFixed(2) + ' from $' + smFirst.toFixed(2) + ' [#' + s.dailySignalCount + ']');
       sendPush('🔥 ' + sym + ' SUSTAINED ' + smDir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + smAbsDelta.toFixed(2) + ' move in ' + smMinutes + 'min', 'signal');
-      s.trade = isMT5 ? buildCfdTrade(smDir, price, atrVal, sym) : { active: true, type: smDir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+      s.trade = isMT5 ? buildCfdTrade(smDir, price, atrVal, sym) : { active: true, type: smDir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
       return;
     }
   }
@@ -1805,7 +1810,7 @@ function processPrice(sym, price, hi, lo) {
         if (isMT5) attachTpSl(sig, 'call', price, atrVal, sym);
         log(sym, '🔄 V-REVERSAL CALL — dropped $' + (lbHigh - lbLow).toFixed(2) + ' to $' + lbLow.toFixed(2) + ', bounced $' + (price - lbLow).toFixed(2) + ' · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
         sendPush('🔄 ' + sym + ' V-REVERSAL CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · bounced $' + (price - lbLow).toFixed(2) + ' off $' + lbLow.toFixed(2) + ' low', 'signal');
-        s.trade = isMT5 ? buildCfdTrade('call', price, atrVal, sym) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        s.trade = isMT5 ? buildCfdTrade('call', price, atrVal, sym) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
         return;
       }
 
@@ -1821,7 +1826,7 @@ function processPrice(sym, price, hi, lo) {
         if (isMT5) attachTpSl(sig, 'put', price, atrVal, sym);
         log(sym, '🔄 V-REVERSAL PUT — rallied $' + (lbHigh - lbLow).toFixed(2) + ' to $' + lbHigh.toFixed(2) + ', dropped $' + (lbHigh - price).toFixed(2) + ' · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
         sendPush('🔄 ' + sym + ' V-REVERSAL PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · dropped $' + (lbHigh - price).toFixed(2) + ' off $' + lbHigh.toFixed(2) + ' high', 'signal');
-        s.trade = isMT5 ? buildCfdTrade('put', price, atrVal, sym) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        s.trade = isMT5 ? buildCfdTrade('put', price, atrVal, sym) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
         return;
       }
     }
@@ -1968,7 +1973,7 @@ function processPrice(sym, price, hi, lo) {
             enrichSig(revSig); s.signals.push(revSig); logSignal(sym, revSig);
             log(sym, '🔄 TRv2 AUTO-REVERSE ' + revDir.toUpperCase() + ' +MACRO — $' + price.toFixed(2) + ' · TP1 $' + revTp1.toFixed(2) + ' · TP2 $' + revTp2.toFixed(2) + ' · TP3 $' + revTp3.toFixed(2) + ' · SL $' + revSl.toFixed(2) + ' [#' + s.dailySignalCount + ']');
             sendPush('🔄 ' + sym + ' REVERSE ' + revDir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · TP1 $' + revTp1.toFixed(2) + ' · SL $' + revSl.toFixed(2), 'signal');
-            s.trade = { active: true, type: revType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: revSl, tp1Price: revTp1, tp2Price: revTp2, tp3Price: revTp3, atr: trv2Atr, bestPrice: price, trailSl: 0 };
+            s.trade = { active: true, type: revType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, ts: Date.now(), pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: revSl, tp1Price: revTp1, tp2Price: revTp2, tp3Price: revTp3, atr: trv2Atr, bestPrice: price, trailSl: 0 };
           } else {
             log(sym, '⏭️ TRv2 no auto-reverse — ' + (revWithMacro ? 'ROC too weak' : 'would reverse AGAINST macro (' + (s.macroEma ? '$' + s.macroEma.toFixed(2) : 'null') + ')'));
           }
@@ -2067,7 +2072,7 @@ function processPrice(sym, price, hi, lo) {
         if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
         log(sym, '🚀 TRv2 ENTRY ' + dir.toUpperCase() + (withMacro ? ' +MACRO' : '') + ' — $' + price.toFixed(2) + ' > EMA $' + tEma.toFixed(2) + ' (+' + spreadPct.toFixed(3) + '%) · ATR $' + trv2Atr.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('🚀 ' + sym + ' ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2), 'signal');
-        s.trade = { active: true, type: sigType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: sl, tp1Price: tp1, tp2Price: tp2, tp3Price: tp3, atr: trv2Atr, bestPrice: price, trailSl: 0 };
+        s.trade = { active: true, type: sigType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, ts: Date.now(), pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: sl, tp1Price: tp1, tp2Price: tp2, tp3Price: tp3, atr: trv2Atr, bestPrice: price, trailSl: 0 };
         return;
       }
     }
@@ -2122,7 +2127,7 @@ function processPrice(sym, price, hi, lo) {
         if (isMT5) attachTpSl(sig, 'call', price, atrVal, sym);
         log(sym, '🔀 MACRO FLIP CALL — trend turned bullish · price $' + price.toFixed(2) + ' > EMA $' + s.macroEma.toFixed(2) + ' (+' + spreadPct.toFixed(3) + '%) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
         sendPush('🔀 ' + sym + ' MACRO FLIP CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · trend turned bullish · above 3h EMA', 'signal');
-        s.trade = isMT5 ? buildCfdTrade('call', price, atrVal, sym) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        s.trade = isMT5 ? buildCfdTrade('call', price, atrVal, sym) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
         return;
       }
       // MACRO FLIP PUT: was bullish, now price crossed below 3h EMA with downward ROC
@@ -2138,7 +2143,7 @@ function processPrice(sym, price, hi, lo) {
         if (isMT5) attachTpSl(sig, 'put', price, atrVal, sym);
         log(sym, '🔀 MACRO FLIP PUT — trend turned bearish · price $' + price.toFixed(2) + ' < EMA $' + s.macroEma.toFixed(2) + ' (-' + spreadPct.toFixed(3) + '%) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
         sendPush('🔀 ' + sym + ' MACRO FLIP PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · trend turned bearish · below 3h EMA', 'signal');
-        s.trade = isMT5 ? buildCfdTrade('put', price, atrVal, sym) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        s.trade = isMT5 ? buildCfdTrade('put', price, atrVal, sym) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
         return;
       }
     }
@@ -2238,7 +2243,7 @@ function processPrice(sym, price, hi, lo) {
         log(sym, '📈 TREND RIDE CALL — macro bullish · price $' + price.toFixed(2) + ' > EMA $' + s.macroEma.toFixed(2) + ' (+' + trSpreadPct.toFixed(2) + '%) · ATR $' + trAtr.toFixed(2) + ' · SL $' + slPrice.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('📈 ' + sym + ' TREND CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · SL $' + slPrice.toFixed(2) + ' · riding macro uptrend', 'signal');
         if (isMT5) attachTpSl(sig, 'call', price, trAtr, sym);
-        s.trade = isMT5 ? buildCfdTrade('call', price, trAtr, sym) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        s.trade = isMT5 ? buildCfdTrade('call', price, trAtr, sym) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
         s.trade.isTrend = true;
         return;
       }
@@ -2258,7 +2263,7 @@ function processPrice(sym, price, hi, lo) {
         log(sym, '📉 TREND RIDE PUT — macro bearish · price $' + price.toFixed(2) + ' < EMA $' + s.macroEma.toFixed(2) + ' (-' + trSpreadPct.toFixed(2) + '%) · ATR $' + trAtr.toFixed(2) + ' · SL $' + slPrice.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('📉 ' + sym + ' TREND PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · SL $' + slPrice.toFixed(2) + ' · riding macro downtrend', 'signal');
         if (isMT5) attachTpSl(sig, 'put', price, trAtr, sym);
-        s.trade = isMT5 ? buildCfdTrade('put', price, trAtr, sym) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        s.trade = isMT5 ? buildCfdTrade('put', price, trAtr, sym) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
         s.trade.isTrend = true;
         return;
       }
@@ -2313,7 +2318,7 @@ function processPrice(sym, price, hi, lo) {
         if (isMT5) attachTpSl(sig, 'put', price, atrVal, sym);
         log(sym, '🔻 ATH REVERSAL PUT — $' + distFromATH.toFixed(2) + ' off 5-day high $' + s.rollingHigh.toFixed(2) + ' RSI@ATH:' + s.rsiAtRollingHigh.toFixed(1) + ' [#' + s.dailySignalCount + ']');
         sendPush('🔻 ' + sym + ' ATH REVERSAL PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromATH.toFixed(2) + ' off ATH $' + s.rollingHigh.toFixed(2), 'signal');
-        s.trade = isMT5 ? buildCfdTrade('put', price, atrVal, sym) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        s.trade = isMT5 ? buildCfdTrade('put', price, atrVal, sym) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
         s.athApproachTs = 0; // clear so it won't re-fire until price re-touches ATH
         s.lastAthPutTs = now2; s.lastAthPutPrice = price; // track for failed pullback guard
         return;
@@ -2343,7 +2348,7 @@ function processPrice(sym, price, hi, lo) {
         if (isMT5) attachTpSl(sig, 'call', price, atrVal, sym);
         log(sym, '🚀 ATL REVERSAL CALL — $' + distFromATL.toFixed(2) + ' off 5-day low $' + s.rollingLow.toFixed(2) + ' RSI@ATL:' + s.rsiAtRollingLow.toFixed(1) + ' [#' + s.dailySignalCount + ']');
         sendPush('🚀 ' + sym + ' ATL REVERSAL CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromATL.toFixed(2) + ' off ATL $' + s.rollingLow.toFixed(2), 'signal');
-        s.trade = isMT5 ? buildCfdTrade('call', price, atrVal, sym) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        s.trade = isMT5 ? buildCfdTrade('call', price, atrVal, sym) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
         s.atlApproachTs = 0; // clear so it won't re-fire until price re-touches ATL
         s.lastAtlCallTs = now2; s.lastAtlCallPrice = price; // track for failed bounce guard
         return;
@@ -2377,7 +2382,7 @@ function processPrice(sym, price, hi, lo) {
         if (isMT5) attachTpSl(sig, 'call', price, atrVal, sym);
         log(sym, '🔄 SHAKEOUT RECOVERY CALL — price $' + price.toFixed(2) + ' recovered past entry $' + s.shakeoutEp.toFixed(2) + ' after SL @ $' + s.shakeoutPrice.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('🔄 ' + sym + ' RECOVERY CALL #' + s.dailySignalCount, '$' + sig.price + ' · Recovered from SL @ $' + s.shakeoutPrice.toFixed(2), 'signal');
-        s.trade = isMT5 ? buildCfdTrade('call', price, atrVal, sym) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        s.trade = isMT5 ? buildCfdTrade('call', price, atrVal, sym) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
         s.shakeoutDir = null; // Clear shakeout state
         SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'call'; S[other].crossAssetTs = now2; } });
         return;
@@ -2391,7 +2396,7 @@ function processPrice(sym, price, hi, lo) {
         if (isMT5) attachTpSl(sig, 'put', price, atrVal, sym);
         log(sym, '🔄 SHAKEOUT RECOVERY PUT — price $' + price.toFixed(2) + ' recovered past entry $' + s.shakeoutEp.toFixed(2) + ' after SL @ $' + s.shakeoutPrice.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('🔄 ' + sym + ' RECOVERY PUT #' + s.dailySignalCount, '$' + sig.price + ' · Recovered from SL @ $' + s.shakeoutPrice.toFixed(2), 'signal');
-        s.trade = isMT5 ? buildCfdTrade('put', price, atrVal, sym) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        s.trade = isMT5 ? buildCfdTrade('put', price, atrVal, sym) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
         s.shakeoutDir = null;
         SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'put'; S[other].crossAssetTs = now2; } });
         return;
@@ -2496,7 +2501,7 @@ function processPrice(sym, price, hi, lo) {
     sendPush('🚀 ' + sym + ' CALL ' + sig.score + ' #' + s.dailySignalCount, '$' + sig.price + ' · RSI:' + sig.rsi + ' · ROC:' + sig.roc + (sig.conv ? ' · ' + sig.conv.label + ' ' + sig.conv.score + '/7' : ''), 'signal');
     if (isMT5) attachTpSl(sig, 'call', price, atrVal, sym);
     // Activate trade monitor for this signal
-    s.trade = isMT5 ? buildCfdTrade('call', price, atrVal, sym) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+    s.trade = isMT5 ? buildCfdTrade('call', price, atrVal, sym) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
     // Cross-asset
     SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'call'; S[other].crossAssetTs = now2; } });
   } else if (firePut && cool && flipCoolFor('put')) {
@@ -2512,7 +2517,7 @@ function processPrice(sym, price, hi, lo) {
     sendPush('📉 ' + sym + ' PUT ' + sig.score + ' #' + s.dailySignalCount, '$' + sig.price + ' · RSI:' + sig.rsi + ' · ROC:' + sig.roc + (sig.conv ? ' · ' + sig.conv.label + ' ' + sig.conv.score + '/7' : ''), 'signal');
     if (isMT5) attachTpSl(sig, 'put', price, atrVal, sym);
     // Activate trade monitor for this signal
-    s.trade = isMT5 ? buildCfdTrade('put', price, atrVal, sym) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+    s.trade = isMT5 ? buildCfdTrade('put', price, atrVal, sym) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
     SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'put'; S[other].crossAssetTs = now2; } });
   }
 }
@@ -2539,6 +2544,7 @@ function buildCfdTrade(type, price, atr, sym) {
     active: true, type: type, ep: price,
     t1: false, t2: false, sl: false, rev: false,
     lastETs: 0,
+    ts: Date.now(),  // entry timestamp — used by reversal-warning hold gate
     slPrice: sl, tp1Price: tp1, tp2Price: tp2, tp3Price: tp3,
     atr: atr, bestPrice: price, trailSl: 0,
     isCfd: true
@@ -2626,10 +2632,22 @@ function checkExit(sym, price) {
     let fl = 0;
     if (iC) { if (!e5b) fl++; if (!e13b) fl++; if (roc3Now < 0) fl++; }
     else { if (e5b) fl++; if (e13b) fl++; if (roc3Now > 0) fl++; }
-    if (fl >= 3 && !t.rev && now - t.lastETs > 120000) {
+    // Reversal gates: 3/3 indicators flipped + 2 min since last exit event + trade open at least REV_MIN_HOLD_MS.
+    // The hold gate (added 2026-05-07) stops reversal warnings firing immediately after entry —
+    // lastETs starts at 0 so the cooldown alone never protects fresh trades.
+    const heldLongEnough = t.ts && (now - t.ts > REV_MIN_HOLD_MS);
+    if (fl >= 3 && !t.rev && now - t.lastETs > 120000 && heldLongEnough) {
       t.rev = true; t.lastETs = now;
-      log(sym, '⚠️ REVERSAL WARNING — ' + fl + '/3 indicators flipped · P&L $' + pnl.toFixed(2));
+      log(sym, '⚠️ REVERSAL WARNING — ' + fl + '/3 indicators flipped · P&L $' + pnl.toFixed(2) + ' · age ' + Math.round((now - t.ts) / 60000) + 'min');
       sendPush('⚠️ ' + sym + ' REVERSAL', fl + '/3 flipped — watch trade', 'exit');
+    } else if (fl >= 3 && !t.rev && t.ts && !heldLongEnough) {
+      // Suppressed — log once per minute via lastETs nudge so the user can see it in logs but no spam
+      const ageMin = Math.round((now - t.ts) / 60000);
+      const holdMin = Math.round(REV_MIN_HOLD_MS / 60000);
+      if (now - (t.lastRevSuppressLog || 0) > 60000) {
+        log(sym, '… REVERSAL suppressed — trade age ' + ageMin + 'min < ' + holdMin + 'min hold (signal needs time to play out)');
+        t.lastRevSuppressLog = now;
+      }
     }
     return;
   }
@@ -2657,9 +2675,10 @@ function checkExit(sym, price) {
     t.t1 = true; t.lastETs = now;
     log(sym, '💰 PT1 +' + dm.toFixed(2) + '% — PARTIAL EXIT');
     sendPush('💰 PT1 ' + sym, '+' + dm.toFixed(2) + '% — close 50%', 'exit');
-  } else if (fl >= 3 && cd && !t.sl && !t.rev) {
+  } else if (fl >= 3 && cd && !t.sl && !t.rev && t.ts && (now - t.ts > REV_MIN_HOLD_MS)) {
+    // Same hold gate applies to legacy 0DTE — give the signal time to play out before warning.
     t.rev = true; t.lastETs = now;
-    log(sym, '⚠️ REVERSAL — ' + fl + '/4 flipped · ' + dm.toFixed(2) + '%');
+    log(sym, '⚠️ REVERSAL — ' + fl + '/4 flipped · ' + dm.toFixed(2) + '% · age ' + Math.round((now - t.ts) / 60000) + 'min');
     sendPush('⚠️ REVERSAL ' + sym, fl + '/4 indicators flipped — exit zone', 'exit');
   }
 }
@@ -2946,7 +2965,7 @@ function processTicks(symbols) {
         const slResult = slPnl >= 0 ? 'BREAKEVEN' : 'STOPPED';
         log(sym, '🛑 TREND ' + t.type.toUpperCase() + ' ' + slResult + ' — SL hit $' + t.slPrice.toFixed(2) + ' · entry $' + t.ep.toFixed(2) + ' · P&L $' + slPnl.toFixed(2) + ' · best $' + t.bestPrice.toFixed(2));
         sendPush('🛑 ' + sym + ' TREND ' + slResult, 'SL $' + t.slPrice.toFixed(2) + ' hit · entry $' + t.ep.toFixed(2) + ' · P&L $' + slPnl.toFixed(2), 'alert');
-        s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+        s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
       }
     }
 
@@ -3261,7 +3280,7 @@ setInterval(() => {
       }
       // Always reset cooldown so first signal of new day isn't blocked by yesterday's timestamp
       s.trv2LastSignalTs = 0;
-      s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+      s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
     });
     saveRollingLevels(); // Persist rolling ATH/ATL data across restarts
     saveSignalHistory(); // Flush signal history before daily reset
@@ -3320,7 +3339,7 @@ app.post('/trade', (req, res) => {
   const { sym, type, price } = req.body;
   if (!sym || !type || !price) return res.status(400).json({ error: 'Missing sym, type, or price' });
   if (!S[sym]) return res.status(400).json({ error: 'Unknown symbol' });
-  S[sym].trade = { active: true, type, ep: parseFloat(price), t1: false, t2: false, sl: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+  S[sym].trade = { active: true, type, ep: parseFloat(price), t1: false, t2: false, sl: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
   log(sym, '📍 Trade monitor ON — ' + type.toUpperCase() + ' @ $' + parseFloat(price).toFixed(2));
   res.json({ ok: true });
 });
@@ -3328,7 +3347,7 @@ app.post('/trade', (req, res) => {
 // Clear trade monitor
 app.post('/trade/clear', (req, res) => {
   const { sym } = req.body;
-  if (S[sym]) S[sym].trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
+  if (S[sym]) S[sym].trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
   res.json({ ok: true });
 });
 
