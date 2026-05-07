@@ -1026,6 +1026,18 @@ function processPrice(sym, price, hi, lo) {
   // XAU: full session 6PM-5PM ET (Sun-Fri) = nearly 23h, block 5PM-6PM ET (1020-1080 min)
   // BTC: 24/7, no block window (crypto never sleeps)
   // Equities: 9:30 AM - 3:55 PM ET (570-955 min)
+  //
+  // Opening-bell noise filter (added 2026-05-07): for XAU and NAS100, block all signals in
+  // the first 5 minutes of the futures session reopen (6:00-6:05 PM ET = 1080-1085 min).
+  // Right after the 5-6 PM daily break, liquidity is thin and the first prints can produce
+  // false directional reads before the session settles.
+  if ((isXAU || isNAS) && etMin >= 1080 && etMin < 1085) {
+    if (now2 - (s.openBlockLogTs || 0) > 60000) {
+      log(sym, '⏸ Opening-bell block: first 5 min of 6:00 PM futures reopen — too noisy for entries');
+      s.openBlockLogTs = now2;
+    }
+    return;
+  }
   if (isXAU) {
     if (etMin >= 1020 && etMin < 1080) return; // XAU closed 5-6 PM ET
   } else if (isBTC) {
