@@ -110,6 +110,10 @@ SYMBOLS.forEach(sym => {
     athApproachPrice: 0, // price when ATH zone was touched
     atlApproachTs: 0,   // when price last entered ATL zone
     atlApproachPrice: 0, // price when ATL zone was touched
+    lastAtlCallTs: 0,    // when last ATL CALL fired (for failed bounce guard)
+    lastAtlCallPrice: 0, // price of last ATL CALL (if current price <= this, bounce failed)
+    lastAthPutTs: 0,     // when last ATH PUT fired (for failed pullback guard)
+    lastAthPutPrice: 0,  // price of last ATH PUT
     // Shakeout recovery — tracks SL events for re-entry detection
     shakeoutDir: null,     // direction that got stopped ('call' or 'put')
     shakeoutTs: 0,         // when SL was hit
@@ -1918,7 +1922,8 @@ function processPrice(sym, price, hi, lo) {
   // Fires when price crosses the 3-hour EMA with momentum confirmation
   // XAU SUPER SIGNAL: when TLT also flipped in same direction within 30 min — highest conviction
   // BTC/NAS100: handled by TRv2 above (15/20/30 averaged EMA with TP management)
-  if (isXAU && isMT5 && s.macroEma !== null && s.macroSnaps.length >= 4 && cool && (now2 - s.macroFlipTs > 900000)) {
+  // MFLIP blocked during chop — macro flips during chop are unreliable (XAU 5/7: MFLIP CALL at top before sell-off, chop=1)
+  if (isXAU && isMT5 && s.macroEma !== null && s.macroSnaps.length >= 4 && cool && (now2 - s.macroFlipTs > 900000) && !s.chopActive) {
     const curDir = price > s.macroEma ? 'bull' : 'bear';
     const spread = Math.abs(price - s.macroEma);
     const spreadPct = (spread / s.macroEma) * 100;
@@ -2155,6 +2160,7 @@ function processPrice(sym, price, hi, lo) {
         sendPush('🔻 ' + sym + ' ATH REVERSAL PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromATH.toFixed(2) + ' off ATH $' + s.rollingHigh.toFixed(2), 'signal');
         s.trade = isMT5 ? buildCfdTrade('put', price, atrVal, sym) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
         s.athApproachTs = 0; // clear so it won't re-fire until price re-touches ATH
+        s.lastAthPutTs = now2; s.lastAthPutPrice = price; // track for failed pullback guard
         return;
       }
     }
@@ -2162,14 +2168,16 @@ function processPrice(sym, price, hi, lo) {
     // ATL REVERSAL → CALL: price was near 5-day low, now bouncing
     // Lighter filters than ATH PUT — ATL bounces naturally start with small ROC, so tight ROC gate kills real signals.
     // Backtested: ROC>0.02 + bearBlock dropped ATL from 63% to 54% (blocked too many winners).
-    // Keep existing filters (rsiAtRollingLow<45, rsiV<75, roc3>0) which are already reasonable.
-    // Minimum conviction: require at least 2 cross-asset factors. NAS100 signal #3 on 5/6 fired with
-    // conv=0 (zero confirmation) — no cross-asset support at all. Reversal signals without any
-    // confirmation are low-quality noise.
+    // Minimum conviction: require at least 2 cross-asset factors.
+    // Minimum ROC > 0.01: kills ROC 0.000% falling-knife signals (XAU 5/7: ATL CALL at ROC +0.000% in downtrend).
+    // Failed bounce guard: if last ATL CALL was within 60 min and price is at/below that entry, the bounce
+    // failed — don't fire another one into the same falling knife (XAU 5/7: two ATL CALLs $1 apart in 20 min).
     const atlMacdOk = macdL > macdS || distFromATL >= athAtlMacdSkip;
     const atlConv = convictionFor('call');
     const atlConvOk = atlConv.score >= 2;
-    if (atlApproachRecent && distFromATL >= athAtlPullback && s.rsiAtRollingLow < 45 && rsiV < 75 && atlMacdOk && roc3 > 0 && atlConvOk && flipCoolFor('call') && winProtectDir !== 'put') {
+    const atlRocMin = roc3 > 0.01; // require real positive momentum, not just > 0
+    const atlBounceFailed = s.lastAtlCallTs && (now2 - s.lastAtlCallTs < 3600000) && price <= s.lastAtlCallPrice;
+    if (atlApproachRecent && distFromATL >= athAtlPullback && s.rsiAtRollingLow < 45 && rsiV < 75 && atlMacdOk && atlRocMin && !atlBounceFailed && atlConvOk && flipCoolFor('call') && winProtectDir !== 'put') {
       if (s.lastSignalDir !== 'call' || (now2 - s.lastNTs > athAtlCooldown)) {
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
         if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
@@ -2182,6 +2190,7 @@ function processPrice(sym, price, hi, lo) {
         sendPush('🚀 ' + sym + ' ATL REVERSAL CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromATL.toFixed(2) + ' off ATL $' + s.rollingLow.toFixed(2), 'signal');
         s.trade = isMT5 ? buildCfdTrade('call', price, atrVal, sym) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25 };
         s.atlApproachTs = 0; // clear so it won't re-fire until price re-touches ATL
+        s.lastAtlCallTs = now2; s.lastAtlCallPrice = price; // track for failed bounce guard
         return;
       }
     }
@@ -2361,8 +2370,10 @@ function buildCfdTrade(type, price, atr, sym) {
   // Unified TP/SL policy: SL=2×ATR, TP1=1.5×, TP2=2.5×, TP3=4×
   const mults = { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
   // Minimum $5 for SL and TP1 — prevents noise-level levels during low-ATR periods
-  const slDist = Math.max(atr * mults.sl, 5);
-  const tp1Dist = Math.max(atr * mults.t1, 5);
+  // XAU max $10 cap — keeps risk tight on gold's typical ATR range
+  const isXAU = sym === 'XAU';
+  const slDist = isXAU ? Math.min(Math.max(atr * mults.sl, 5), 10) : Math.max(atr * mults.sl, 5);
+  const tp1Dist = isXAU ? Math.min(Math.max(atr * mults.t1, 5), 10) : Math.max(atr * mults.t1, 5);
   const tp2Dist = atr * mults.t2;
   const tp3Dist = atr * mults.t3;
   const sl = iC ? price - slDist : price + slDist;
@@ -2383,11 +2394,15 @@ function buildCfdTrade(type, price, atr, sym) {
 function attachTpSl(sig, type, price, atr, sym) {
   const iC = type === 'call';
   // Unified TP/SL policy: SL=2×ATR, TP1=1.5×, TP2=2.5×, TP3=4×
+  // XAU: SL and TP1 clamped to $5–$10 range
   const mults = { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
-  sig.tp1 = (iC ? price + Math.max(atr * mults.t1, 5) : price - Math.max(atr * mults.t1, 5)).toFixed(2);
+  const isXAU = sym === 'XAU';
+  const tp1D = isXAU ? Math.min(Math.max(atr * mults.t1, 5), 10) : Math.max(atr * mults.t1, 5);
+  const slD = isXAU ? Math.min(Math.max(atr * mults.sl, 5), 10) : Math.max(atr * mults.sl, 5);
+  sig.tp1 = (iC ? price + tp1D : price - tp1D).toFixed(2);
   sig.tp2 = (iC ? price + atr * mults.t2 : price - atr * mults.t2).toFixed(2);
   sig.tp3 = (iC ? price + atr * mults.t3 : price - atr * mults.t3).toFixed(2);
-  sig.sl = (iC ? price - Math.max(atr * mults.sl, 5) : price + Math.max(atr * mults.sl, 5)).toFixed(2);
+  sig.sl = (iC ? price - slD : price + slD).toFixed(2);
   return sig;
 }
 
@@ -3068,6 +3083,7 @@ setInterval(() => {
         log(sym, 'Daily levels saved — today H:$' + s.sessionHigh.toFixed(2) + ' L:$' + s.sessionLow.toFixed(2) + ' · 5-day H:$' + s.rollingHigh.toFixed(2) + ' L:$' + s.rollingLow.toFixed(2) + ' (' + s.dailyLevels.length + ' days)');
       }
       s.athApproachTs = 0; s.athApproachPrice = 0; s.atlApproachTs = 0; s.atlApproachPrice = 0;
+      s.lastAtlCallTs = 0; s.lastAtlCallPrice = 0; s.lastAthPutTs = 0; s.lastAthPutPrice = 0;
       s.athBreakLastTs = 0;
       s.gapDayMode = false; s.gapDirection = null;
       s.lastSameDir = null; s.lastSameDirMacd = 0; s.lastSameDirTs = 0; s.lastSameDirPrice = 0;
