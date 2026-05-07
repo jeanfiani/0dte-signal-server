@@ -2226,10 +2226,27 @@ function processPrice(sym, price, hi, lo) {
       const trMinSl = isBTC ? 80 : isNAS ? 25 : 4; // absolute minimum stop distance ($4 XAU, $25 NAS100, $80 BTC)
       const trSlFinal = Math.max(trSlDist, trMinSl);
 
+      // MACD extremity gate (added 2026-05-07) — mirror of the FAST gate. Don't fire TREND
+      // when MACD line is already at exhaustion in the trade direction. Empirical: 5/7 16:03 ET
+      // ⬆TREND CALL at MACD +1.447 (way past XAU's typical ±1.0) lost — move had played out
+      // by the time the TREND detector saw the directional bias. Per-instrument thresholds
+      // because MACD scale differs ~100x across XAU/BTC/NAS100.
+      const trMacdExtreme = isXAU ? 1.0 : isBTC ? 100 : isNAS ? 25 : 1.0;
+      const trCallMacdOk = macdL < trMacdExtreme;   // CALL blocked when MACD already > +threshold
+      const trPutMacdOk  = macdL > -trMacdExtreme;  // PUT  blocked when MACD already < -threshold
+      // Throttled log when this gate blocks an otherwise-eligible TREND signal
+      if (trDir === 'bull' && !trCallMacdOk && (now2 - (s.trendMacdBlockLogTs || 0) > 60000)) {
+        log(sym, '📈 TREND CALL BLOCKED — MACD ' + macdL.toFixed(3) + ' >= +' + trMacdExtreme + ' (uptrend exhausted)');
+        s.trendMacdBlockLogTs = now2;
+      } else if (trDir === 'bear' && !trPutMacdOk && (now2 - (s.trendMacdBlockLogTs || 0) > 60000)) {
+        log(sym, '📉 TREND PUT BLOCKED — MACD ' + macdL.toFixed(3) + ' <= -' + trMacdExtreme + ' (downtrend exhausted)');
+        s.trendMacdBlockLogTs = now2;
+      }
+
       // TREND RIDE CALL: macro bullish, price well above EMA, short+medium ROC both up
       // RSI cap: 75 for all — data shows RSI 74 CALLs win during genuine trends (5/1 23:16 BTC +0.72%)
       const trCallRsiMax = 75;
-      if (trDir === 'bull' && rsiV > 30 && rsiV < trCallRsiMax && flipCoolFor('call') && winProtectDir !== 'put') {
+      if (trDir === 'bull' && rsiV > 30 && rsiV < trCallRsiMax && trCallMacdOk && flipCoolFor('call') && winProtectDir !== 'put') {
         const slPrice = price - trSlFinal;
         s.trendRideLastTs = now2;
         s.trendRideSameDirCount = (s.trendRideLastDir === 'call') ? s.trendRideSameDirCount + 1 : 1;
@@ -2249,7 +2266,7 @@ function processPrice(sym, price, hi, lo) {
       }
       // TREND RIDE PUT: macro bearish, price well below EMA, short+medium ROC both down
       // RSI 35-70: floor raised from 25 — RSI 29.5 fired PUT at absolute bottom, bounced $5.65 (5/6 12:58)
-      if (trDir === 'bear' && rsiV > 35 && rsiV < 70 && flipCoolFor('put') && winProtectDir !== 'call') {
+      if (trDir === 'bear' && rsiV > 35 && rsiV < 70 && trPutMacdOk && flipCoolFor('put') && winProtectDir !== 'call') {
         const slPrice = price + trSlFinal;
         s.trendRideLastTs = now2;
         s.trendRideSameDirCount = (s.trendRideLastDir === 'put') ? s.trendRideSameDirCount + 1 : 1;
