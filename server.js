@@ -2635,13 +2635,26 @@ function checkExit(sym, price) {
     // Reversal gates: 3/3 indicators flipped + 2 min since last exit event + trade open at least REV_MIN_HOLD_MS.
     // The hold gate (added 2026-05-07) stops reversal warnings firing immediately after entry —
     // lastETs starts at 0 so the cooldown alone never protects fresh trades.
+    // Profitability gate (added 2026-05-07): only auto-close on reversal when P&L is positive
+    // (lock in the win). Losing trades stay open — let them work toward the ATR-based SL or recover.
     const heldLongEnough = t.ts && (now - t.ts > REV_MIN_HOLD_MS);
     if (fl >= 3 && !t.rev && now - t.lastETs > 120000 && heldLongEnough) {
-      t.rev = true; t.lastETs = now;
-      log(sym, '⚠️ REVERSAL WARNING — ' + fl + '/3 indicators flipped · P&L $' + pnl.toFixed(2) + ' · age ' + Math.round((now - t.ts) / 60000) + 'min');
-      sendPush('⚠️ ' + sym + ' REVERSAL', fl + '/3 flipped — watch trade', 'exit');
+      if (pnl > 0) {
+        // Profitable + indicators flipped → exit now to lock in the win
+        t.rev = true; t.lastETs = now;
+        log(sym, '🎯 REVERSAL EXIT — locking +$' + pnl.toFixed(2) + ' · ' + fl + '/3 indicators flipped · age ' + Math.round((now - t.ts) / 60000) + 'min');
+        sendPush('🎯 ' + sym + ' REVERSAL EXIT', '+$' + pnl.toFixed(2) + ' locked · ' + fl + '/3 flipped — close now', 'exit');
+      } else {
+        // Not profitable yet — don't auto-close. Trade either recovers or hits SL.
+        // Log once per minute (no push) so the user can see in logs without notification spam.
+        if (now - (t.lastRevHoldLog || 0) > 60000) {
+          log(sym, '⏸ Reversal detected but trade negative ($' + pnl.toFixed(2) + ') — holding for recovery or SL');
+          t.lastRevHoldLog = now;
+        }
+        // Note: t.rev stays false here, so this branch can re-evaluate later if P&L flips positive.
+      }
     } else if (fl >= 3 && !t.rev && t.ts && !heldLongEnough) {
-      // Suppressed — log once per minute via lastETs nudge so the user can see it in logs but no spam
+      // Suppressed — log once per minute so the user can see it in logs but no spam
       const ageMin = Math.round((now - t.ts) / 60000);
       const holdMin = Math.round(REV_MIN_HOLD_MS / 60000);
       if (now - (t.lastRevSuppressLog || 0) > 60000) {
@@ -2676,10 +2689,15 @@ function checkExit(sym, price) {
     log(sym, '💰 PT1 +' + dm.toFixed(2) + '% — PARTIAL EXIT');
     sendPush('💰 PT1 ' + sym, '+' + dm.toFixed(2) + '% — close 50%', 'exit');
   } else if (fl >= 3 && cd && !t.sl && !t.rev && t.ts && (now - t.ts > REV_MIN_HOLD_MS)) {
-    // Same hold gate applies to legacy 0DTE — give the signal time to play out before warning.
-    t.rev = true; t.lastETs = now;
-    log(sym, '⚠️ REVERSAL — ' + fl + '/4 flipped · ' + dm.toFixed(2) + '% · age ' + Math.round((now - t.ts) / 60000) + 'min');
-    sendPush('⚠️ REVERSAL ' + sym, fl + '/4 indicators flipped — exit zone', 'exit');
+    // Same hold gate + profitability gate as CFD path: only auto-exit if trade is positive.
+    if (dm > 0) {
+      t.rev = true; t.lastETs = now;
+      log(sym, '🎯 REVERSAL EXIT — locking +' + dm.toFixed(2) + '% · ' + fl + '/4 flipped · age ' + Math.round((now - t.ts) / 60000) + 'min');
+      sendPush('🎯 REVERSAL EXIT ' + sym, '+' + dm.toFixed(2) + '% locked · ' + fl + '/4 flipped — close now', 'exit');
+    } else if (now - (t.lastRevHoldLog || 0) > 60000) {
+      log(sym, '⏸ Reversal detected but trade negative (' + dm.toFixed(2) + '%) — holding for recovery or SL');
+      t.lastRevHoldLog = now;
+    }
   }
 }
 
