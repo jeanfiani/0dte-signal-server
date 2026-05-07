@@ -1789,12 +1789,12 @@ function processPrice(sym, price, hi, lo) {
           if (revHiBlock || revLoBlock) {
             log(sym, '🏔️ TRv2 auto-reverse ' + revDir.toUpperCase() + ' blocked — session extreme reversal signal active');
           } else if (revRocOk && revWithMacro) {
-            const revMults = { sl: 1.5, t1: 1, t2: 2, t3: 3 };
-            const revMin = sym === 'XAU' ? 3 : sym === 'NAS100' ? 10 : 0;
-            const revSl = revDir === 'long' ? price - Math.max(trv2Atr * revMults.sl, revMin) : price + Math.max(trv2Atr * revMults.sl, revMin);
-            const revTp1 = revDir === 'long' ? price + Math.max(trv2Atr * revMults.t1, revMin) : price - Math.max(trv2Atr * revMults.t1, revMin);
-            const revTp2 = revDir === 'long' ? price + Math.max(trv2Atr * revMults.t2, revMin * 1.5) : price - Math.max(trv2Atr * revMults.t2, revMin * 1.5);
-            const revTp3 = revDir === 'long' ? price + Math.max(trv2Atr * revMults.t3, revMin * 3) : price - Math.max(trv2Atr * revMults.t3, revMin * 3);
+            // Unified TP/SL policy: SL=2×ATR, TP1=1.5×, TP2=2.5×, TP3=4× (min $5 for SL/TP1)
+            const revMults = { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
+            const revSl = revDir === 'long' ? price - Math.max(trv2Atr * revMults.sl, 5) : price + Math.max(trv2Atr * revMults.sl, 5);
+            const revTp1 = revDir === 'long' ? price + Math.max(trv2Atr * revMults.t1, 5) : price - Math.max(trv2Atr * revMults.t1, 5);
+            const revTp2 = revDir === 'long' ? price + trv2Atr * revMults.t2 : price - trv2Atr * revMults.t2;
+            const revTp3 = revDir === 'long' ? price + trv2Atr * revMults.t3 : price - trv2Atr * revMults.t3;
 
             s.trv2Trade = { dir: revDir, ep: price, ts: now3, sl: revSl, tp1: revTp1, tp2: revTp2, tp3: revTp3, tp1Hit: false, tp2Hit: false, tp3Hit: false, bestPrice: price, atr: trv2Atr, trailSl: 0, isCfd: true };
             s.trv2Dir = revDir;
@@ -1888,16 +1888,12 @@ function processPrice(sym, price, hi, lo) {
 
       if (longOk || shortOk) {
         const dir = longOk ? 'long' : 'short';
-        const withMacro = true; // entries always align with macro now (counter-trend blocked above)
-        const tpMult = withMacro ? 1.0 : 0.75;
-        const slMult = withMacro ? 2.0 : 1.5;
-
-        const entMults = { sl: 1.5, t1: 1, t2: 2, t3: 3 };
-        const entMin = sym === 'XAU' ? 3 : sym === 'NAS100' ? 10 : 0;
-        const sl = dir === 'long' ? price - Math.max(trv2Atr * entMults.sl * slMult, entMin) : price + Math.max(trv2Atr * entMults.sl * slMult, entMin);
-        const tp1 = dir === 'long' ? price + Math.max(trv2Atr * entMults.t1 * tpMult, entMin) : price - Math.max(trv2Atr * entMults.t1 * tpMult, entMin);
-        const tp2 = dir === 'long' ? price + Math.max(trv2Atr * entMults.t2 * tpMult, entMin * 1.5) : price - Math.max(trv2Atr * entMults.t2 * tpMult, entMin * 1.5);
-        const tp3 = dir === 'long' ? price + Math.max(trv2Atr * entMults.t3 * tpMult, entMin * 3) : price - Math.max(trv2Atr * entMults.t3 * tpMult, entMin * 3);
+        // Unified TP/SL policy: SL=2×ATR, TP1=1.5×, TP2=2.5×, TP3=4× (min $5 for SL/TP1)
+        const entMults = { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
+        const sl = dir === 'long' ? price - Math.max(trv2Atr * entMults.sl, 5) : price + Math.max(trv2Atr * entMults.sl, 5);
+        const tp1 = dir === 'long' ? price + Math.max(trv2Atr * entMults.t1, 5) : price - Math.max(trv2Atr * entMults.t1, 5);
+        const tp2 = dir === 'long' ? price + trv2Atr * entMults.t2 : price - trv2Atr * entMults.t2;
+        const tp3 = dir === 'long' ? price + trv2Atr * entMults.t3 : price - trv2Atr * entMults.t3;
 
         s.trv2Trade = { dir: dir, ep: price, ts: now3, sl: sl, tp1: tp1, tp2: tp2, tp3: tp3, tp1Hit: false, tp2Hit: false, tp3Hit: false, bestPrice: price, atr: trv2Atr, trailSl: 0, isCfd: true };
         s.trv2Dir = dir;
@@ -2362,15 +2358,13 @@ function processPrice(sym, price, hi, lo) {
 // TP1=1x ATR, TP2=2x ATR, TP3=3x ATR, SL=1.5x ATR
 function buildCfdTrade(type, price, atr, sym) {
   const iC = type === 'call';
-  const mults = sym === 'XAU' ? { sl: 1.5, t1: 1, t2: 2, t3: 3 }
-              : sym === 'NAS100' ? { sl: 1.5, t1: 1, t2: 2, t3: 3 }
-              : { sl: 1.5, t1: 1, t2: 2, t3: 3 }; // BTC + default
-  // Enforce minimum distances so low-ATR periods don't create noise-level TP/SL
-  const minDist = sym === 'XAU' ? 3 : sym === 'NAS100' ? 10 : 0;
-  const slDist = Math.max(atr * mults.sl, minDist);
-  const tp1Dist = Math.max(atr * mults.t1, minDist);
-  const tp2Dist = Math.max(atr * mults.t2, minDist * 1.5);
-  const tp3Dist = Math.max(atr * mults.t3, minDist * 3);
+  // Unified TP/SL policy: SL=2×ATR, TP1=1.5×, TP2=2.5×, TP3=4×
+  const mults = { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
+  // Minimum $5 for SL and TP1 — prevents noise-level levels during low-ATR periods
+  const slDist = Math.max(atr * mults.sl, 5);
+  const tp1Dist = Math.max(atr * mults.t1, 5);
+  const tp2Dist = atr * mults.t2;
+  const tp3Dist = atr * mults.t3;
   const sl = iC ? price - slDist : price + slDist;
   const tp1 = iC ? price + tp1Dist : price - tp1Dist;
   const tp2 = iC ? price + tp2Dist : price - tp2Dist;
@@ -2388,14 +2382,12 @@ function buildCfdTrade(type, price, atr, sym) {
 // Attaches TP/SL levels to a signal object (for display in bots/mobile)
 function attachTpSl(sig, type, price, atr, sym) {
   const iC = type === 'call';
-  const mults = sym === 'XAU' ? { sl: 1.5, t1: 1, t2: 2, t3: 3 }
-              : sym === 'NAS100' ? { sl: 1.5, t1: 1, t2: 2, t3: 3 }
-              : { sl: 1.5, t1: 1, t2: 2, t3: 3 };
-  const minDist = sym === 'XAU' ? 3 : sym === 'NAS100' ? 10 : 0;
-  sig.tp1 = (iC ? price + Math.max(atr * mults.t1, minDist) : price - Math.max(atr * mults.t1, minDist)).toFixed(2);
-  sig.tp2 = (iC ? price + Math.max(atr * mults.t2, minDist * 1.5) : price - Math.max(atr * mults.t2, minDist * 1.5)).toFixed(2);
-  sig.tp3 = (iC ? price + Math.max(atr * mults.t3, minDist * 3) : price - Math.max(atr * mults.t3, minDist * 3)).toFixed(2);
-  sig.sl = (iC ? price - Math.max(atr * mults.sl, minDist) : price + Math.max(atr * mults.sl, minDist)).toFixed(2);
+  // Unified TP/SL policy: SL=2×ATR, TP1=1.5×, TP2=2.5×, TP3=4×
+  const mults = { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
+  sig.tp1 = (iC ? price + Math.max(atr * mults.t1, 5) : price - Math.max(atr * mults.t1, 5)).toFixed(2);
+  sig.tp2 = (iC ? price + atr * mults.t2 : price - atr * mults.t2).toFixed(2);
+  sig.tp3 = (iC ? price + atr * mults.t3 : price - atr * mults.t3).toFixed(2);
+  sig.sl = (iC ? price - Math.max(atr * mults.sl, 5) : price + Math.max(atr * mults.sl, 5)).toFixed(2);
   return sig;
 }
 
