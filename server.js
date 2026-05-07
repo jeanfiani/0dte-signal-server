@@ -27,6 +27,14 @@ process.on('SIGTERM', () => {
   process.exit(0);
 });
 
+// ===== PERSISTENT DATA DIRECTORY =====
+// On Railway, attach a Volume and set DATA_DIR=/data so signal_history,
+// subscriptions, rolling levels, TRv2 state and per-day CSVs survive redeploys.
+// Locally / when DATA_DIR is unset, we fall back to __dirname (old behaviour).
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
+console.log('[STARTUP] DATA_DIR:', DATA_DIR, DATA_DIR === __dirname ? '(ephemeral — set DATA_DIR env var to a Railway volume mount)' : '(persistent)');
+
 const app = express();
 app.use(express.json());
 
@@ -75,7 +83,7 @@ try {
 }
 
 // Subscription storage (in-memory, persisted to file)
-const SUBS_FILE = path.join(__dirname, 'subscriptions.json');
+const SUBS_FILE = path.join(DATA_DIR, 'subscriptions.json');
 let subscriptions = [];
 try { subscriptions = JSON.parse(fs.readFileSync(SUBS_FILE, 'utf8')); } catch (e) {}
 function saveSubs() { fs.writeFileSync(SUBS_FILE, JSON.stringify(subscriptions, null, 2)); }
@@ -186,7 +194,7 @@ SYMBOLS.forEach(sym => {
 let vixV = 0;
 
 // ===== ROLLING HIGH/LOW PERSISTENCE (ATH/ATL detector) =====
-const ROLLING_FILE = path.join(__dirname, 'rolling_levels.json');
+const ROLLING_FILE = path.join(DATA_DIR, 'rolling_levels.json');
 function loadRollingLevels() {
   try {
     const data = JSON.parse(fs.readFileSync(ROLLING_FILE, 'utf8'));
@@ -219,7 +227,7 @@ function saveRollingLevels() {
 setInterval(saveRollingLevels, 300000);
 
 // ===== TRv2 STATE PERSISTENCE (survives server restarts / deploys) =====
-const TRV2_FILE = path.join(__dirname, 'trv2_state.json');
+const TRV2_FILE = path.join(DATA_DIR, 'trv2_state.json');
 function loadTrv2State() {
   try {
     const data = JSON.parse(fs.readFileSync(TRV2_FILE, 'utf8'));
@@ -355,7 +363,7 @@ function log(sym, msg) {
 }
 
 // ===== PERSISTENT SIGNAL LOGGING =====
-const SIGNALS_DIR = path.join(__dirname, 'signal_logs');
+const SIGNALS_DIR = path.join(DATA_DIR, 'signal_logs');
 try { fs.mkdirSync(SIGNALS_DIR, { recursive: true }); } catch (e) {}
 
 function todayDateET() {
@@ -363,7 +371,7 @@ function todayDateET() {
 }
 
 // ===== 7-DAY SIGNAL HISTORY (survives daily resets + redeploys) =====
-const HISTORY_FILE = path.join(__dirname, 'signal_history.json');
+const HISTORY_FILE = path.join(DATA_DIR, 'signal_history.json');
 const HISTORY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 let signalHistory = []; // [{date, time, ts, symbol, type, price, score, rsi, macd, roc, vix, chop, num, trv2}]
 
@@ -401,13 +409,128 @@ function saveSignalHistory() {
 // Save signal history every 5 minutes
 setInterval(saveSignalHistory, 300000);
 
+// ===== DAILY CSV BACKUP =====
+// Posts the previous day's CSV to BACKUP_WEBHOOK_URL so we have an off-server copy
+// even if the Railway volume is wiped. Auto-detects Discord webhook URLs and sends
+// the CSV as a multipart file attachment; otherwise sends a JSON POST with
+// { date, filename, totalSignals, csv } so any generic catcher (Pipedream, n8n,
+// Cloudflare Worker, your own endpoint) can store it.
+const BACKUP_URL = process.env.BACKUP_WEBHOOK_URL || '';
+let lastBackupDate = '';
+
+function postDiscordCsv(url, filename, csv) {
+  return new Promise((resolve, reject) => {
+    try {
+      const httpsLib = require('https');
+      const u = new URL(url);
+      const boundary = '----signalbackup' + Date.now();
+      const payloadJson = JSON.stringify({ content: '📊 Daily signal backup — ' + filename });
+      const parts = [];
+      parts.push(Buffer.from('--' + boundary + '\r\n' +
+        'Content-Disposition: form-data; name="payload_json"\r\n' +
+        'Content-Type: application/json\r\n\r\n' +
+        payloadJson + '\r\n'));
+      parts.push(Buffer.from('--' + boundary + '\r\n' +
+        'Content-Disposition: form-data; name="files[0]"; filename="' + filename + '"\r\n' +
+        'Content-Type: text/csv\r\n\r\n'));
+      parts.push(Buffer.from(csv));
+      parts.push(Buffer.from('\r\n--' + boundary + '--\r\n'));
+      const body = Buffer.concat(parts);
+      const req = httpsLib.request({
+        hostname: u.hostname, path: u.pathname + u.search, method: 'POST',
+        headers: { 'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Content-Length': body.length }
+      }, (res) => {
+        let resp = '';
+        res.on('data', (c) => resp += c);
+        res.on('end', () => res.statusCode < 300 ? resolve(res.statusCode) : reject(new Error('HTTP ' + res.statusCode + ' ' + resp.slice(0, 200))));
+      });
+      req.on('error', reject);
+      req.write(body);
+      req.end();
+    } catch (e) { reject(e); }
+  });
+}
+
+function postJsonCsv(url, filename, csv, totalSignals, dateStr) {
+  return new Promise((resolve, reject) => {
+    try {
+      const u = new URL(url);
+      const httpsLib = u.protocol === 'http:' ? require('http') : require('https');
+      const body = JSON.stringify({ date: dateStr, filename, totalSignals, csv });
+      const req = httpsLib.request({
+        hostname: u.hostname, port: u.port || (u.protocol === 'http:' ? 80 : 443),
+        path: u.pathname + u.search, method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+      }, (res) => {
+        let resp = '';
+        res.on('data', (c) => resp += c);
+        res.on('end', () => res.statusCode < 300 ? resolve(res.statusCode) : reject(new Error('HTTP ' + res.statusCode + ' ' + resp.slice(0, 200))));
+      });
+      req.on('error', reject);
+      req.write(body);
+      req.end();
+    } catch (e) { reject(e); }
+  });
+}
+
+async function backupCsvForDate(dateStr) {
+  if (!BACKUP_URL) return { ok: false, reason: 'BACKUP_WEBHOOK_URL not set' };
+  const file = path.join(SIGNALS_DIR, dateStr + '.csv');
+  if (!fs.existsSync(file)) return { ok: false, reason: 'no CSV for ' + dateStr };
+  let csv;
+  try { csv = fs.readFileSync(file, 'utf8'); } catch (e) { return { ok: false, reason: 'read failed: ' + e.message }; }
+  const lineCount = csv.split('\n').filter(Boolean).length;
+  const totalSignals = Math.max(0, lineCount - 1); // minus header
+  const filename = 'signals_' + dateStr + '.csv';
+  const isDiscord = /discord(app)?\.com\/api\/webhooks\//.test(BACKUP_URL);
+  try {
+    const status = isDiscord
+      ? await postDiscordCsv(BACKUP_URL, filename, csv)
+      : await postJsonCsv(BACKUP_URL, filename, csv, totalSignals, dateStr);
+    console.log('[' + ts() + '] Backup OK — ' + filename + ' (' + totalSignals + ' signals) → HTTP ' + status);
+    return { ok: true, status, totalSignals, filename };
+  } catch (e) {
+    console.error('[' + ts() + '] Backup FAILED — ' + filename + ': ' + e.message);
+    return { ok: false, reason: e.message };
+  }
+}
+
+// Daily check: at 00:05 ET, back up yesterday's CSV (once per day, idempotent via lastBackupDate)
+setInterval(() => {
+  if (!BACKUP_URL) return;
+  const nowEt = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const minOfDay = nowEt.getHours() * 60 + nowEt.getMinutes();
+  if (minOfDay < 5) return; // wait until 00:05 ET so the daily CSV is settled
+  const today = todayDateET();
+  if (lastBackupDate === today) return; // already ran today
+  // Compute yesterday in ET
+  const y = new Date(nowEt.getTime() - 24 * 60 * 60 * 1000);
+  const yesterday = y.toISOString().slice(0, 10);
+  lastBackupDate = today;
+  backupCsvForDate(yesterday);
+}, 60000); // check once a minute
+
 function logSignal(sym, sig) {
   const dateStr = todayDateET();
   // CSV log (legacy)
   const file = path.join(SIGNALS_DIR, dateStr + '.csv');
   const exists = fs.existsSync(file);
-  const header = 'date,time,symbol,type,price,score,rsi,macd,roc,vix,chop,dailyNum\n';
-  const row = [dateStr, sig.time, sym, sig.type, sig.price, sig.score, sig.rsi, sig.macd, sig.roc, vixV.toFixed(1), S[sym].chopActive ? 1 : 0, sig.num].join(',') + '\n';
+  // Conviction columns added 2026-05-07 — convScore (1-5), convLabel (HIGH/MED/LOW),
+  // convFactors (pipe-separated list of factor names). All blank if engine didn't compute.
+  const header = 'date,time,symbol,type,price,score,rsi,macd,roc,vix,chop,dailyNum,convScore,convLabel,convFactors\n';
+  const convScore = sig.conv && sig.conv.score != null ? sig.conv.score : '';
+  const convLabel = sig.conv && sig.conv.label ? sig.conv.label : '';
+  // Wrap factors in quotes because the field uses commas-as-separators internally would break CSV;
+  // we use pipe (|) inside the field, but quote the cell anyway to be explicit/safe.
+  const convFactors = sig.conv && Array.isArray(sig.conv.factors)
+    ? '"' + sig.conv.factors.join('|') + '"'
+    : '';
+  const row = [
+    dateStr, sig.time, sym, sig.type, sig.price, sig.score,
+    sig.rsi, sig.macd, sig.roc, vixV.toFixed(1),
+    S[sym].chopActive ? 1 : 0, sig.num,
+    convScore, convLabel, convFactors
+  ].join(',') + '\n';
   if (!exists) fs.writeFileSync(file, header + row);
   else fs.appendFileSync(file, row);
 
@@ -849,12 +972,34 @@ function processPrice(sym, price, hi, lo) {
     const label = sc >= 5 ? 'HIGH' : sc >= 3 ? 'MOD' : 'LOW';
     return { score: sc, label, factors };
   }
-  // Enriches a signal object with conviction data (MT5 instruments, no-op for QQQ/SPY)
+  // Enriches a signal object with conviction data and applies the conviction gate.
+  // Returns true if the signal should emit, false if it must be blocked.
+  // QQQ/SPY (non-MT5) skip both enrichment and gate — they don't have cross-asset factors.
+  //
+  // Conviction gate (added 2026-05-07, after XAU 5/7 retro):
+  //   - Trend-aligned signals require conv.score >= 3 (out of 7) — blocks "LOW" conviction
+  //   - Counter-trend OR specialist fades (ATH PUT, ATL CALL) require conv.score >= 4
+  //     because fighting the macro trend needs strong confirmation
+  // The thresholds are deliberately moderate for the first deployment; tune after a week
+  // of conv-logged data shows what wins / loses.
   function enrichSig(sig) {
-    if (!isMT5) return sig;
+    if (!isMT5) return true; // non-MT5 instruments don't have conv — let them through
     const conv = convictionFor(sig.type);
     sig.conv = conv;
-    return sig;
+
+    const macroDir = s.macroEma ? (price > s.macroEma ? 'bull' : 'bear') : null;
+    const isCall = sig.type === 'call';
+    const isCounterTrend = macroDir && ((isCall && macroDir === 'bear') || (!isCall && macroDir === 'bull'));
+    // Specialist fade tags — by design these signals fight extremes and need extra confirmation
+    const tag = sig.score || '';
+    const isFadeSignal = /ATH|ATL|HI|LO/.test(tag) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tag);
+    const minConv = (isCounterTrend || isFadeSignal) ? 4 : 3;
+    if (conv.score < minConv) {
+      const reason = isCounterTrend ? 'counter-trend' : isFadeSignal ? 'fade' : 'trend';
+      log(sym, '🚫 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — conv ' + conv.score + '/7 [' + conv.label + '] < ' + minConv + ' (' + reason + ')' + (conv.factors.length ? ' factors:' + conv.factors.join(',') : ''));
+      return false;
+    }
+    return true;
   }
 
   const now2 = Date.now();
@@ -1342,7 +1487,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇HI', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        enrichSig(sig); s.signals.push(sig);
+        if (!enrichSig(sig)) return; s.signals.push(sig);
         logSignal(sym, sig);
         if (isMT5) attachTpSl(sig, 'put', price, atrVal, sym);
         s.lastHiRevTs = now2; // Track for TRv2 entry suppression
@@ -1429,7 +1574,7 @@ function processPrice(sym, price, hi, lo) {
       s.lastSameDir = dir; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
       const scoreTag = dir === 'call' ? '⬆BREAK' : '⬇BREAK';
       const sig = { type: dir, time: ts(), price: price.toFixed(2), score: scoreTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-      enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+      if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
       if (isMT5) attachTpSl(sig, dir, price, atrVal, sym);
       const coilMin = (bo.coilDuration / 60000).toFixed(1);
       const rangeStr = '$' + bo.coilLo.toFixed(2) + '-$' + bo.coilHi.toFixed(2);
@@ -1472,7 +1617,7 @@ function processPrice(sym, price, hi, lo) {
           s.lastSameDir = dir; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
           const scoreTag = dir === 'call' ? '⬆OB' : '⬇OB';
           const sig = { type: dir, time: ts(), price: price.toFixed(2), score: scoreTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-          enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+          if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
           if (isMT5) attachTpSl(sig, dir, price, atrVal, sym);
           log(sym, '🧱 OB RETEST ' + dir.toUpperCase() + ' — price $' + price.toFixed(2) + ' retested OB zone $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' (age ' + (obAge / 60000).toFixed(1) + 'min) [#' + s.dailySignalCount + ']');
           sendPush('🧱 ' + sym + ' OB RETEST ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · retested OB $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2), 'signal');
@@ -1500,7 +1645,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSameDir = dir; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const scoreTag = dir === 'call' ? '⬆OBFAIL' : '⬇OBFAIL';
         const sig = { type: dir, time: ts(), price: price.toFixed(2), score: scoreTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+        if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
         if (isMT5) attachTpSl(sig, dir, price, atrVal, sym);
         log(sym, '🧱 OB MITIGATION ' + dir.toUpperCase() + ' — breakout FAILED, price $' + price.toFixed(2) + ' broke through OB $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('🧱 ' + sym + ' OB FAIL ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · breakout failed through OB $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2), 'signal');
@@ -1541,8 +1686,18 @@ function processPrice(sym, price, hi, lo) {
         const fmRsiOk = (fmDir === 'put' && rsiV < 85) || (fmDir === 'call' && rsiV > 15);
         // Require ROC to confirm direction (even slightly)
         const fmRocOk = (fmDir === 'put' && roc3 < 0) || (fmDir === 'call' && roc3 > 0);
+        // MACD-extremity gate (added 2026-05-07) — don't fire FAST when MACD line is already
+        // at exhaustion in the move's direction. Empirical from 5/7 XAU: a FAST PUT at MACD
+        // -1.225 (way past XAU's typical ±1.0 range) lost -0.20% as the move had already
+        // played out. The winning FAST CALL the same day had MACD +0.422, well inside range.
+        // Per-instrument because MACD scale differs by ~100x across XAU/BTC/NAS100.
+        const fmMacdExtreme = isXAU ? 1.0 : isBTC ? 100 : isNAS ? 25 : 1.0;
+        const fmMacdOk = (fmDir === 'put' && macdL > -fmMacdExtreme) || (fmDir === 'call' && macdL < fmMacdExtreme);
+        if (!fmMacdOk) {
+          log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — MACD ' + macdL.toFixed(3) + ' beyond ±' + fmMacdExtreme + ' (move exhausted)');
+        }
 
-        if (fmRsiOk && fmRocOk && flipCoolFor(fmDir) && (winProtectDir === null || winProtectDir === fmDir)) {
+        if (fmRsiOk && fmRocOk && fmMacdOk && flipCoolFor(fmDir) && (winProtectDir === null || winProtectDir === fmDir)) {
           s.fastMoveLastTs = now2;
           s.lastAT = fmDir; if (fmDir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
           if (s.lastSignalDir && s.lastSignalDir !== fmDir) s.lastReversalTs = now2;
@@ -1550,7 +1705,7 @@ function processPrice(sym, price, hi, lo) {
           s.lastSameDir = fmDir; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
           const fmTag = fmDir === 'call' ? '⬆FAST' : '⬇FAST';
           const sig = { type: fmDir, time: ts(), price: price.toFixed(2), score: fmTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-          enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+          if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
           if (isMT5) attachTpSl(sig, fmDir, price, atrVal, sym);
           log(sym, '⚡ FAST-MOVE ' + fmDir.toUpperCase() + ' — $' + fmAbsDelta.toFixed(2) + ' move in ' + (fmWindow / 60000).toFixed(0) + 'min · price $' + price.toFixed(2) + ' from $' + fmFirst.toFixed(2) + ' [#' + s.dailySignalCount + ']');
           sendPush('⚡ ' + sym + ' FAST ' + fmDir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + fmAbsDelta.toFixed(2) + ' move in 3min', 'signal');
@@ -1610,7 +1765,7 @@ function processPrice(sym, price, hi, lo) {
       const smMinutes = Math.round(w.ms / 60000);
       const smTag = smDir === 'call' ? '⬆SUST' : '⬇SUST';
       const sig = { type: smDir, time: ts(), price: price.toFixed(2), score: smTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-      enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+      if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
       if (isMT5) attachTpSl(sig, smDir, price, atrVal, sym);
       log(sym, '🔥 SUSTAINED MOVE ' + smDir.toUpperCase() + ' — $' + smAbsDelta.toFixed(2) + ' move in ' + smMinutes + 'min · price $' + price.toFixed(2) + ' from $' + smFirst.toFixed(2) + ' [#' + s.dailySignalCount + ']');
       sendPush('🔥 ' + sym + ' SUSTAINED ' + smDir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + smAbsDelta.toFixed(2) + ' move in ' + smMinutes + 'min', 'signal');
@@ -1646,7 +1801,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆VREV', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+        if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
         if (isMT5) attachTpSl(sig, 'call', price, atrVal, sym);
         log(sym, '🔄 V-REVERSAL CALL — dropped $' + (lbHigh - lbLow).toFixed(2) + ' to $' + lbLow.toFixed(2) + ', bounced $' + (price - lbLow).toFixed(2) + ' · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
         sendPush('🔄 ' + sym + ' V-REVERSAL CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · bounced $' + (price - lbLow).toFixed(2) + ' off $' + lbLow.toFixed(2) + ' low', 'signal');
@@ -1662,7 +1817,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇VREV', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+        if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
         if (isMT5) attachTpSl(sig, 'put', price, atrVal, sym);
         log(sym, '🔄 V-REVERSAL PUT — rallied $' + (lbHigh - lbLow).toFixed(2) + ' to $' + lbHigh.toFixed(2) + ', dropped $' + (lbHigh - price).toFixed(2) + ' · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
         sendPush('🔄 ' + sym + ' V-REVERSAL PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · dropped $' + (lbHigh - price).toFixed(2) + ' off $' + lbHigh.toFixed(2) + ' high', 'signal');
@@ -1909,7 +2064,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = sigType; s.lastSignalTs = now3; s.lastNTs = now3;
         const macroTag = withMacro ? '+MACRO' : '';
         const sig = { type: sigType, time: ts(), price: price.toFixed(2), score: (dir === 'long' ? '⬆' : '⬇') + 'RIDE' + macroTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount, tp1: tp1.toFixed(2), tp2: tp2.toFixed(2), tp3: tp3.toFixed(2), sl: sl.toFixed(2) };
-        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+        if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
         log(sym, '🚀 TRv2 ENTRY ' + dir.toUpperCase() + (withMacro ? ' +MACRO' : '') + ' — $' + price.toFixed(2) + ' > EMA $' + tEma.toFixed(2) + ' (+' + spreadPct.toFixed(3) + '%) · ATR $' + trv2Atr.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('🚀 ' + sym + ' ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2), 'signal');
         s.trade = { active: true, type: sigType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: sl, tp1Price: tp1, tp2Price: tp2, tp3Price: tp3, atr: trv2Atr, bestPrice: price, trailSl: 0 };
@@ -1963,7 +2118,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆MFLIP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+        if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
         if (isMT5) attachTpSl(sig, 'call', price, atrVal, sym);
         log(sym, '🔀 MACRO FLIP CALL — trend turned bullish · price $' + price.toFixed(2) + ' > EMA $' + s.macroEma.toFixed(2) + ' (+' + spreadPct.toFixed(3) + '%) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
         sendPush('🔀 ' + sym + ' MACRO FLIP CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · trend turned bullish · above 3h EMA', 'signal');
@@ -1979,7 +2134,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇MFLIP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+        if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
         if (isMT5) attachTpSl(sig, 'put', price, atrVal, sym);
         log(sym, '🔀 MACRO FLIP PUT — trend turned bearish · price $' + price.toFixed(2) + ' < EMA $' + s.macroEma.toFixed(2) + ' (-' + spreadPct.toFixed(3) + '%) · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
         sendPush('🔀 ' + sym + ' MACRO FLIP PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · trend turned bearish · below 3h EMA', 'signal');
@@ -2079,7 +2234,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆TREND', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+        if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
         log(sym, '📈 TREND RIDE CALL — macro bullish · price $' + price.toFixed(2) + ' > EMA $' + s.macroEma.toFixed(2) + ' (+' + trSpreadPct.toFixed(2) + '%) · ATR $' + trAtr.toFixed(2) + ' · SL $' + slPrice.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('📈 ' + sym + ' TREND CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · SL $' + slPrice.toFixed(2) + ' · riding macro uptrend', 'signal');
         if (isMT5) attachTpSl(sig, 'call', price, trAtr, sym);
@@ -2099,7 +2254,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇TREND', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+        if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
         log(sym, '📉 TREND RIDE PUT — macro bearish · price $' + price.toFixed(2) + ' < EMA $' + s.macroEma.toFixed(2) + ' (-' + trSpreadPct.toFixed(2) + '%) · ATR $' + trAtr.toFixed(2) + ' · SL $' + slPrice.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('📉 ' + sym + ' TREND PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · SL $' + slPrice.toFixed(2) + ' · riding macro downtrend', 'signal');
         if (isMT5) attachTpSl(sig, 'put', price, trAtr, sym);
@@ -2154,7 +2309,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇ATH', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+        if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
         if (isMT5) attachTpSl(sig, 'put', price, atrVal, sym);
         log(sym, '🔻 ATH REVERSAL PUT — $' + distFromATH.toFixed(2) + ' off 5-day high $' + s.rollingHigh.toFixed(2) + ' RSI@ATH:' + s.rsiAtRollingHigh.toFixed(1) + ' [#' + s.dailySignalCount + ']');
         sendPush('🔻 ' + sym + ' ATH REVERSAL PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromATH.toFixed(2) + ' off ATH $' + s.rollingHigh.toFixed(2), 'signal');
@@ -2184,7 +2339,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆ATL', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+        if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
         if (isMT5) attachTpSl(sig, 'call', price, atrVal, sym);
         log(sym, '🚀 ATL REVERSAL CALL — $' + distFromATL.toFixed(2) + ' off 5-day low $' + s.rollingLow.toFixed(2) + ' RSI@ATL:' + s.rsiAtRollingLow.toFixed(1) + ' [#' + s.dailySignalCount + ']');
         sendPush('🚀 ' + sym + ' ATL REVERSAL CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromATL.toFixed(2) + ' off ATL $' + s.rollingLow.toFixed(2), 'signal');
@@ -2218,7 +2373,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆REC', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+        if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
         if (isMT5) attachTpSl(sig, 'call', price, atrVal, sym);
         log(sym, '🔄 SHAKEOUT RECOVERY CALL — price $' + price.toFixed(2) + ' recovered past entry $' + s.shakeoutEp.toFixed(2) + ' after SL @ $' + s.shakeoutPrice.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('🔄 ' + sym + ' RECOVERY CALL #' + s.dailySignalCount, '$' + sig.price + ' · Recovered from SL @ $' + s.shakeoutPrice.toFixed(2), 'signal');
@@ -2232,7 +2387,7 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇REC', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        enrichSig(sig); s.signals.push(sig); logSignal(sym, sig);
+        if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
         if (isMT5) attachTpSl(sig, 'put', price, atrVal, sym);
         log(sym, '🔄 SHAKEOUT RECOVERY PUT — price $' + price.toFixed(2) + ' recovered past entry $' + s.shakeoutEp.toFixed(2) + ' after SL @ $' + s.shakeoutPrice.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('🔄 ' + sym + ' RECOVERY PUT #' + s.dailySignalCount, '$' + sig.price + ' · Recovered from SL @ $' + s.shakeoutPrice.toFixed(2), 'signal');
@@ -2334,7 +2489,7 @@ function processPrice(sym, price, hi, lo) {
     s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
     s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
     const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: cS + '/' + mi, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-    enrichSig(sig); s.signals.push(sig);
+    if (!enrichSig(sig)) return; s.signals.push(sig);
     logSignal(sym, sig);
     const convLbl = sig.conv ? ' [' + sig.conv.label + ' ' + sig.conv.score + '/7]' : '';
     log(sym, '🚀 CALL ' + sig.score + ' RSI:' + sig.rsi + ' $' + sig.price + convLbl + ' [#' + s.dailySignalCount + ']');
@@ -2350,7 +2505,7 @@ function processPrice(sym, price, hi, lo) {
     s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
     s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
     const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: pS + '/' + mi, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-    enrichSig(sig); s.signals.push(sig);
+    if (!enrichSig(sig)) return; s.signals.push(sig);
     logSignal(sym, sig);
     const convLbl2 = sig.conv ? ' [' + sig.conv.label + ' ' + sig.conv.score + '/7]' : '';
     log(sym, '📉 PUT ' + sig.score + ' RSI:' + sig.rsi + ' $' + sig.price + convLbl2 + ' [#' + s.dailySignalCount + ']');
@@ -3349,6 +3504,20 @@ app.get('/signals/csv/:date', (req, res) => {
   if (!fs.existsSync(file)) return res.status(404).json({ error: 'No CSV for ' + dateStr });
   res.header('Content-Type', 'text/csv');
   res.sendFile(file);
+});
+
+// Manual CSV backup trigger — POST yesterday's (or any date's) CSV to BACKUP_WEBHOOK_URL on demand
+// Lightly protected: requires the ADMIN_TOKEN env var to be supplied via ?token= query param.
+// If ADMIN_TOKEN is unset the endpoint is disabled.
+app.post('/admin/backup/:date', async (req, res) => {
+  const adminToken = process.env.ADMIN_TOKEN;
+  if (!adminToken) return res.status(503).json({ error: 'ADMIN_TOKEN not configured — endpoint disabled' });
+  if (req.query.token !== adminToken) return res.status(401).json({ error: 'Invalid or missing token' });
+  const dateStr = req.params.date;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return res.status(400).json({ error: 'Use YYYY-MM-DD format' });
+  const result = await backupCsvForDate(dateStr);
+  if (result.ok) res.json({ ok: true, ...result });
+  else res.status(500).json({ ok: false, ...result });
 });
 
 // Signal history — specific date (JSON)
