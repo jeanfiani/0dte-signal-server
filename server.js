@@ -662,21 +662,40 @@ function processPrice(sym, price, hi, lo) {
     const effS = calcEfficiency(s.chopShort);
     const effL = s.chopLong.length >= 30 ? calcEfficiency(s.chopLong) : 1;
     const thrS = 0.30, thrL = 0.35, resS = 0.35, resL = 0.40;
-    // Activation/deactivation symmetry (changed 2026-05-08):
-    //   - Activation now requires AND (both windows below threshold) — only enter chop when
-    //     truly choppy on both short AND long timeframes. Old logic used OR which was too
-    //     sticky: a 30-second flat patch during a real trend would trip the short window
-    //     and lock chop on for hours even though the long window was clearly directional.
-    //   - Deactivation now requires OR (either window above reset) — leave chop as soon as
-    //     either timeframe resumes trending. Old AND-logic kept chop active long after
-    //     the long-timeframe trend had clearly resumed.
-    // Empirical: 5/8 11:00 ET chart showed XAU stair-step down $4726→$4713 in 16 min
-    // (clearly trending on long timeframe) but stayed in chop because short window
-    // oscillated. New logic deactivates as soon as long window > 0.40.
+    // Symmetric AND + longer dwell (changed 2026-05-08, second pass):
+    //   - Both activation AND deactivation use AND (both windows must agree)
+    //   - Dwell increased from 3 → 10 consecutive ticks (~10s on MT5 1-tick/sec feed)
+    // Why both AND:
+    //   - First pass made activation AND (correct: only enter chop when truly choppy on both
+    //     short and long timeframes — a 30-sec flat patch during a real trend doesn't trip it).
+    //   - First pass also made deactivation OR — that was too eager. Single borderline tick
+    //     where ONE window briefly exceeded its reset would flip chop off, then both windows
+    //     would dip back below threshold and it'd flip back on. Rapid flicker.
+    //   - Symmetric AND fixes that: chop only deactivates when both timeframes clearly resume
+    //     (effS > 0.35 AND effL > 0.40 simultaneously for 10 consecutive ticks).
+    // Why dwell 10:
+    //   - 3 ticks (3 sec on MT5) was too easy to trip with normal price-tick noise.
+    //   - 10 ticks ≈ 10s of consistent state required before flipping. Real transitions take
+    //     longer than 10s anyway; this kills only the noise-driven flicker.
     const isChoppy   = effS < thrS && effL < thrL;
-    const isTrending = effS > resS || effL > resL;
-    if (!s.chopActive) { if (isChoppy) { s.chopCount++; s.trendCount = 0; } else s.chopCount = 0; if (s.chopCount >= 3) { s.chopActive = true; s.chopCount = 0; log(sym, '🌊 CHOP MODE'); sendPush('🌊 ' + sym + ' CHOP MODE', 'Efficiency low — 6/6 only'); } }
-    else { if (isTrending) { s.trendCount++; s.chopCount = 0; } else s.trendCount = 0; if (s.trendCount >= 3) { s.chopActive = false; s.trendCount = 0; log(sym, '📈 TREND RESUMED'); sendPush('📈 ' + sym + ' TREND BACK', 'Signals active'); } }
+    const isTrending = effS > resS && effL > resL;
+    const dwellTicks = 10;
+    if (!s.chopActive) {
+      if (isChoppy) { s.chopCount++; s.trendCount = 0; } else { s.chopCount = 0; }
+      if (s.chopCount >= dwellTicks) {
+        s.chopActive = true; s.chopCount = 0;
+        log(sym, '🌊 CHOP MODE');
+        // Push notification removed (2026-05-08, by user request) — chop transitions are
+        // logged for debugging but no longer alert the phone. Reduces notification noise.
+      }
+    } else {
+      if (isTrending) { s.trendCount++; s.chopCount = 0; } else { s.trendCount = 0; }
+      if (s.trendCount >= dwellTicks) {
+        s.chopActive = false; s.trendCount = 0;
+        log(sym, '📈 TREND RESUMED');
+        // Push notification removed (2026-05-08) — see CHOP MODE comment above.
+      }
+    }
   }
 
   // === ORDER BLOCK — 1-min candle builder + OB zone detection ===
