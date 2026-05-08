@@ -2294,17 +2294,12 @@ function processPrice(sym, price, hi, lo) {
       // statistically marginal — most winners had RSI < 70 with strong MACD continuation.
       const trCallRsiMax = 70;
       if (trDir === 'bull' && rsiV > 30 && rsiV < trCallRsiMax && trCallMacdOk && flipCoolFor('call') && winProtectDir !== 'put') {
-        // Same-direction TREND cap (added 2026-05-07): if 2+ ⬆TREND CALLs already fired in this
-        // leg without an opposite-direction signal resetting the count, the leg is exhausted —
-        // block further continuation entries. Empirical: 5/7 ⬆TREND CALLs at $4745 → $4748 →
-        // $4757 (3 in a row) all lost. The first one is the trade; later ones are stacking risk.
-        if (s.trendRideLastDir === 'call' && s.trendRideSameDirCount >= 2) {
-          if (now2 - (s.trendCapLogTs || 0) > 60000) {
-            log(sym, '📈 TREND CALL BLOCKED — already ' + s.trendRideSameDirCount + ' same-direction signals this leg (max 2)');
-            s.trendCapLogTs = now2;
-          }
-          return;
-        }
+        // (Removed 2026-05-08): hard cap at 2 same-direction signals was too aggressive — it
+        // could lock out the entire direction for hours when overnight signals had already
+        // pushed the count to 2 and no opposite TREND had fired to reset it. The existing
+        // progress-check at line ~2196 (allows up to 6 same-dir IF price progresses 0.02%+
+        // between each) is smarter, and the MACD-extremity gate above catches the actual
+        // failure case (3rd ⬆TREND CALL at MACD +1.447 on 5/7 was blocked there).
         const slPrice = price - trSlFinal;
         s.trendRideLastTs = now2;
         s.trendRideSameDirCount = (s.trendRideLastDir === 'call') ? s.trendRideSameDirCount + 1 : 1;
@@ -2325,14 +2320,8 @@ function processPrice(sym, price, hi, lo) {
       // TREND RIDE PUT: macro bearish, price well below EMA, short+medium ROC both down
       // RSI 35-70: floor raised from 25 — RSI 29.5 fired PUT at absolute bottom, bounced $5.65 (5/6 12:58)
       if (trDir === 'bear' && rsiV > 35 && rsiV < 70 && trPutMacdOk && flipCoolFor('put') && winProtectDir !== 'call') {
-        // Same-direction cap mirror of CALL — block 3rd+ ⬇TREND PUT in the same downleg.
-        if (s.trendRideLastDir === 'put' && s.trendRideSameDirCount >= 2) {
-          if (now2 - (s.trendCapLogTs || 0) > 60000) {
-            log(sym, '📉 TREND PUT BLOCKED — already ' + s.trendRideSameDirCount + ' same-direction signals this leg (max 2)');
-            s.trendCapLogTs = now2;
-          }
-          return;
-        }
+        // (Removed 2026-05-08): see CALL block above for rationale. Existing progress-check
+        // + MACD-extremity gate handle this without locking out the direction.
         const slPrice = price + trSlFinal;
         s.trendRideLastTs = now2;
         s.trendRideSameDirCount = (s.trendRideLastDir === 'put') ? s.trendRideSameDirCount + 1 : 1;
