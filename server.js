@@ -620,8 +620,19 @@ function processPrice(sym, price, hi, lo) {
     const effS = calcEfficiency(s.chopShort);
     const effL = s.chopLong.length >= 30 ? calcEfficiency(s.chopLong) : 1;
     const thrS = 0.30, thrL = 0.35, resS = 0.35, resL = 0.40;
-    const isChoppy = effS < thrS || effL < thrL;
-    const isTrending = effS > resS && effL > resL;
+    // Activation/deactivation symmetry (changed 2026-05-08):
+    //   - Activation now requires AND (both windows below threshold) — only enter chop when
+    //     truly choppy on both short AND long timeframes. Old logic used OR which was too
+    //     sticky: a 30-second flat patch during a real trend would trip the short window
+    //     and lock chop on for hours even though the long window was clearly directional.
+    //   - Deactivation now requires OR (either window above reset) — leave chop as soon as
+    //     either timeframe resumes trending. Old AND-logic kept chop active long after
+    //     the long-timeframe trend had clearly resumed.
+    // Empirical: 5/8 11:00 ET chart showed XAU stair-step down $4726→$4713 in 16 min
+    // (clearly trending on long timeframe) but stayed in chop because short window
+    // oscillated. New logic deactivates as soon as long window > 0.40.
+    const isChoppy   = effS < thrS && effL < thrL;
+    const isTrending = effS > resS || effL > resL;
     if (!s.chopActive) { if (isChoppy) { s.chopCount++; s.trendCount = 0; } else s.chopCount = 0; if (s.chopCount >= 3) { s.chopActive = true; s.chopCount = 0; log(sym, '🌊 CHOP MODE'); sendPush('🌊 ' + sym + ' CHOP MODE', 'Efficiency low — 6/6 only'); } }
     else { if (isTrending) { s.trendCount++; s.chopCount = 0; } else s.trendCount = 0; if (s.trendCount >= 3) { s.chopActive = false; s.trendCount = 0; log(sym, '📈 TREND RESUMED'); sendPush('📈 ' + sym + ' TREND BACK', 'Signals active'); } }
   }
@@ -1532,10 +1543,12 @@ function processPrice(sym, price, hi, lo) {
   // This is the fastest signal: catches moves 2-3 min before EMAs/RSI/MACD confirm.
   // The coil detection + breakout pending flag is set in processTicks (runs every 1s).
   // Here we just fire the signal if a valid breakout was detected this tick.
-  // Chop-mode block (added 2026-05-07): trend-riding detectors should not fire during chop.
-  // BREAKOUT, FAST, V-REV, TREND all skip when efficiency-ratio chop detector is active.
-  // Reversal/fade detectors (HI/LO Rev, ATH/ATL) are NOT blocked — those are designed for ranges.
-  if (isMT5 && s._pendingBreakout && !s.chopActive) {
+  // BREAKOUT is NOT blocked during chop (changed 2026-05-08): a breakout BY DEFINITION fires
+  // after a coil — i.e., the resolution of chop. The detector exists specifically to catch
+  // chop-end transitions. Blocking it during chop kills the very pattern we want.
+  // Quality is enforced by the detector's own filters (consecutive same-dir cooldown, ROC
+  // confirmation, RSI exhaustion at >75 for XAU CALL, MACD-fading check).
+  if (isMT5 && s._pendingBreakout) {
     const bo = s._pendingBreakout;
     s._pendingBreakout = null; // consume it
     const cool2 = now2 - s.lastNTs > COOLDOWN_MS;
@@ -1693,7 +1706,10 @@ function processPrice(sym, price, hi, lo) {
   // fire a signal BYPASSING MACD alignment. MACD is a lagging indicator and won't cross
   // during fast directional moves — this detector fills that gap.
   // XAU threshold: $10 in 3 min | BTC threshold: $200 in 3 min
-  if (isMT5 && s.vrevSnaps.length >= 20 && cool && (now2 - s.fastMoveLastTs > 600000) && !s.chopActive) {
+  // FAST is NOT blocked during chop (changed 2026-05-08): a $5 burst in 3 min during a quiet
+  // range can BE the moment chop ends. The new MACD-extremity gate (XAU ±1.0, BTC ±100,
+  // NAS ±25) already prevents FAST from firing into exhausted moves — chop block was redundant.
+  if (isMT5 && s.vrevSnaps.length >= 20 && cool && (now2 - s.fastMoveLastTs > 600000)) {
     const fmWindow = 180000; // 3-minute lookback
     const fmSnaps = s.vrevSnaps.filter(sn => sn.ts > now2 - fmWindow);
     if (fmSnaps.length >= 10) {
