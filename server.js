@@ -1098,12 +1098,21 @@ function processPrice(sym, price, hi, lo) {
     log(sym, 'ATR filter: base scoring skipped — ATR $' + atrVal.toFixed(2) + ' (dead market, specialized detectors still active)');
   }
 
-  // RSI sweet-zone flags — hoisted to function scope (2026-05-08 fix) so they're visible
-  // both inside the base scoring block (atrBlocked === false) AND below it where Shakeout
-  // Recovery + 6/6 emit logic also reference them. Previously declared inside the else{}
-  // below which made them inaccessible to line ~2433+, throwing ReferenceError every tick.
+  // Variables hoisted to function scope (2026-05-08 fix) so they're visible both inside the
+  // base scoring block (atrBlocked === false) AND below it where Shakeout Recovery + 6/6 emit
+  // logic also reference them. Previously declared inside the else{} below which made them
+  // inaccessible to line ~2438+, throwing ReferenceError every tick.
+  // - Booleans computed at function scope (no else-block dependencies)
   const rsiSweetCall = rsiV >= RSI_CALL_LO[sym] && rsiV <= RSI_CALL_HI[sym];
   const rsiSweetPut = rsiV >= RSI_PUT_LO[sym] && rsiV <= RSI_PUT_HI[sym];
+  const sustainedOverride = s.sustainedCount >= 10 && s.sustainedDir !== null;
+  const macdAlignCall = macdL > macdS;
+  const macdAlignPut = macdL < macdS;
+  // - Numeric thresholds — safe default of 99 (unreachable score) when atrBlocked,
+  //   so 6/6 signals don't fire during low-ATR periods (the original intent).
+  //   Inside the else block these get reassigned via bare `minS = ...` (no let/const).
+  let minS = 99;
+  let finalMinS = 99;
 
   // ===== BASE SCORING ENGINE =====
   // When atrBlocked, skip the entire base scoring chain and jump to specialized detectors.
@@ -1139,7 +1148,8 @@ function processPrice(sym, price, hi, lo) {
   const sessionThr = isXAU && xauSession === 'asia' ? 6 : THR;
   // Chop mode forces 6/6 minimum — only perfect-score signals pass through choppy markets
   const chopThr = s.chopActive ? 6 : 0;
-  let minS = Math.max(chopThr, (tightMode ? 6 : sessionThr)) + (streakActive ? s.lossStreakBoost : 0) + roundNumPenalty;
+  // Reassigning the function-scope `let minS = 99` declared above the if/else (no `let` here).
+  minS = Math.max(chopThr, (tightMode ? 6 : sessionThr)) + (streakActive ? s.lossStreakBoost : 0) + roundNumPenalty;
 
   // XAU Asia session: HARD ROC gate — no signal without actual momentum
   // Asia is choppy and low volume, EMAs/MACD can drift into alignment without real moves
@@ -1190,9 +1200,9 @@ function processPrice(sym, price, hi, lo) {
     s.sustainedTs = now2;
   }
 
-  // Sustained momentum override flag — used by blowoff, RSI, and MACD exhaustion gates
-  // If ROC has been directional for 10+ consecutive ticks, the move is real regardless of "exhaustion"
-  const sustainedOverride = s.sustainedCount >= 10 && s.sustainedDir !== null;
+  // sustainedOverride is now declared at function scope above the if/else (line ~1101).
+  // Kept here as a comment so the original logic intent is still readable in this section:
+  //   "If ROC has been directional for 10+ consecutive ticks, the move is real regardless of exhaustion."
 
   // Blowoff lock REMOVED — was blocking signals during real momentum moves (missed $26 XAU rally 2025-05-06).
   // Other guards (cooldown, flipCool, winProtect, RSI/MACD exhaustion) already prevent bad entries.
@@ -1274,10 +1284,12 @@ function processPrice(sym, price, hi, lo) {
   }
 
   // PM penalty removed — THR=6 is already strict enough (was +1 when THR=5)
-  const finalMinS = minS;
+  // Reassigning function-scope `let finalMinS = 99` declared above the if/else (no `const` here).
+  finalMinS = minS;
 
   // MACD alignment
-  const macdAlignCall = macdL > macdS, macdAlignPut = macdL < macdS;
+  // macdAlignCall and macdAlignPut hoisted to function scope above (line ~1101) — kept here for reference
+  // const macdAlignCall = macdL > macdS, macdAlignPut = macdL < macdS;
   if (!macdAlignCall && cS >= finalMinS && cS >= pS) return;
   if (!macdAlignPut && pS >= finalMinS && pS > cS) return;
 
@@ -2439,8 +2451,11 @@ function processPrice(sym, price, hi, lo) {
   // Sustained momentum allows RSI override in fire conditions
   const rsiOkCall = rsiSweetCall || (sustainedOverride && s.sustainedDir === 'call');
   const rsiOkPut = rsiSweetPut || (sustainedOverride && s.sustainedDir === 'put');
-  const fireCall = cS >= finalMinS && vixOk && rsiOkCall && macdAlignCall;
-  const firePut = pS >= finalMinS && rsiOkPut && macdAlignPut;
+  // fireCall/firePut declared as `let` because the gate code below (session-high blocker,
+  // overbought CALL blocker, MT5 ROC gate, BTC overconfirmation block) sets them to false
+  // when their respective filters trip.
+  let fireCall = cS >= finalMinS && vixOk && rsiOkCall && macdAlignCall;
+  let firePut = pS >= finalMinS && rsiOkPut && macdAlignPut;
 
   // === SHAKEOUT RECOVERY DETECTOR ===
   // If a signal got stopped out and price recovers past the original entry in the same direction,
