@@ -1098,6 +1098,13 @@ function processPrice(sym, price, hi, lo) {
     log(sym, 'ATR filter: base scoring skipped — ATR $' + atrVal.toFixed(2) + ' (dead market, specialized detectors still active)');
   }
 
+  // RSI sweet-zone flags — hoisted to function scope (2026-05-08 fix) so they're visible
+  // both inside the base scoring block (atrBlocked === false) AND below it where Shakeout
+  // Recovery + 6/6 emit logic also reference them. Previously declared inside the else{}
+  // below which made them inaccessible to line ~2433+, throwing ReferenceError every tick.
+  const rsiSweetCall = rsiV >= RSI_CALL_LO[sym] && rsiV <= RSI_CALL_HI[sym];
+  const rsiSweetPut = rsiV >= RSI_PUT_LO[sym] && rsiV <= RSI_PUT_HI[sym];
+
   // ===== BASE SCORING ENGINE =====
   // When atrBlocked, skip the entire base scoring chain and jump to specialized detectors.
   // The specialized detectors (session high reversal, breakout, fast-move, V-reversal, TRv2,
@@ -1236,8 +1243,8 @@ function processPrice(sym, price, hi, lo) {
   }
 
   // RSI sweet-spot — sustained momentum can override (move still going despite oversold/overbought)
-  const rsiSweetCall = rsiV >= RSI_CALL_LO[sym] && rsiV <= RSI_CALL_HI[sym];
-  const rsiSweetPut = rsiV >= RSI_PUT_LO[sym] && rsiV <= RSI_PUT_HI[sym];
+  // Note: rsiSweetCall and rsiSweetPut are now declared at function scope above (line ~1101)
+  // so they're visible to Shakeout Recovery + 6/6 emit logic that runs below.
   if (!rsiSweetCall && cS >= minS && cS >= pS) {
     if (sustainedOverride && s.sustainedDir === 'call') {
       log(sym, 'RSI gate override: sustained CALL momentum (' + s.sustainedCount + ' ticks) — RSI ' + rsiV.toFixed(1) + ' outside sweet zone');
