@@ -580,6 +580,48 @@ function processPrice(sym, price, hi, lo) {
   const isNAS = sym === 'NAS100';
   const isMT5 = isXAU || isBTC || isNAS; // MT5-fed instruments (extended hours, no VWAP, no Finnhub WS)
 
+  // ===== SIGNAL-EMIT STATE SNAPSHOT (added 2026-05-08) =====
+  // Captures all signal-emit-related state at the start of every tick. Used by enrichSig()
+  // below: when the conviction gate blocks a signal, the emit code has already mutated
+  // dailySignalCount, cooldown timers, and detector-specific timestamps. We restore
+  // those mutations from this snapshot so blocked signals don't leave gaps in the num
+  // sequence (#3 → ??? → #5) and don't burn cooldown windows for signals that didn't
+  // actually fire. Indicator state (prices/EMAs/RSI/etc.) is intentionally NOT in here —
+  // those are mutated continuously by tick processing, not by emit code.
+  const _emitSnapshot = {
+    dailySignalCount: s.dailySignalCount,
+    nC: s.nC, nP: s.nP,
+    lastAT: s.lastAT,
+    lastSignalDir: s.lastSignalDir,
+    lastSignalTs: s.lastSignalTs,
+    lastNTs: s.lastNTs,
+    lastSameDir: s.lastSameDir,
+    lastSameDirMacd: s.lastSameDirMacd,
+    lastSameDirTs: s.lastSameDirTs,
+    lastSameDirPrice: s.lastSameDirPrice,
+    lastReversalTs: s.lastReversalTs,
+    fastMoveLastTs: s.fastMoveLastTs,
+    sustainedMoveLastTs: s.sustainedMoveLastTs,
+    vrevLastTs: s.vrevLastTs,
+    breakLastTs: s.breakLastTs,
+    breakLastDir: s.breakLastDir,
+    breakLastPrice: s.breakLastPrice,
+    macroFlipTs: s.macroFlipTs,
+    macroPrevDir: s.macroPrevDir,
+    superFlipTs: s.superFlipTs,
+    trendRideLastTs: s.trendRideLastTs,
+    trendRideSameDirCount: s.trendRideSameDirCount,
+    trendRideLastDir: s.trendRideLastDir,
+    trendRideLastPrice: s.trendRideLastPrice,
+    athApproachTs: s.athApproachTs,
+    lastAthPutTs: s.lastAthPutTs,
+    lastAthPutPrice: s.lastAthPutPrice,
+    atlApproachTs: s.atlApproachTs,
+    lastAtlCallTs: s.lastAtlCallTs,
+    lastAtlCallPrice: s.lastAtlCallPrice,
+    lastHiRevTs: s.lastHiRevTs
+  };
+
   // XAU/BTC: set open on first price (MT5 feeds only when market is open)
   // Equities: set open at 9:30 AM ET (570 min)
   if (s.openPrice === null && (isMT5 || gET() >= 570)) {
@@ -1021,6 +1063,12 @@ function processPrice(sym, price, hi, lo) {
       : ((isCounterTrend || isFadeSignal) ? 4    // ATH / ATL / HI / LO / counter-trend MFLIP·TREND: need 4
                                           : 3);  // trend-aligned: 3 is enough
     if (conv.score < minConv) {
+      // Rollback emit-related state to start-of-tick snapshot. Without this, the emit
+      // code's pre-gate mutations (dailySignalCount++, lastNTs = now2, fastMoveLastTs = now2,
+      // breakLastTs = now2, etc.) would persist even though the signal didn't fire — leaving
+      // gaps in num sequence and burning cooldowns. The snapshot was taken at the top of
+      // processPrice before any emit code could mutate.
+      Object.assign(s, _emitSnapshot);
       const reason = isMomentumCatch ? 'momentum-catch' : isCounterTrend ? 'counter-trend' : isFadeSignal ? 'fade' : 'trend';
       log(sym, '🚫 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — conv ' + conv.score + '/7 [' + conv.label + '] < ' + minConv + ' (' + reason + ')' + (conv.factors.length ? ' factors:' + conv.factors.join(',') : ''));
       return false;
