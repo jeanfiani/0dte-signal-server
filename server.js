@@ -998,9 +998,19 @@ function processPrice(sym, price, hi, lo) {
     // Specialist fade tags — by design these signals fight extremes and need extra confirmation
     const tag = sig.score || '';
     const isFadeSignal = /ATH|ATL|HI|LO/.test(tag) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tag);
-    const minConv = (isCounterTrend || isFadeSignal) ? 4 : 3;
+    // Momentum-catch detectors (V-REV, FAST): the price pattern is itself the primary evidence
+    // (sharp drop + 40% bounce, or $5 in 3 min). Cross-asset confirmation lags the move by
+    // minutes — by the time MACRO/TLT/SLV/GDX flip, the move is over. So don't apply the
+    // counter-trend penalty: keep them at conv ≥ 3 regardless of macro direction.
+    // Added 2026-05-08 after 5/8 morning bounce ($4711→$4733) was missed: V-REV had the right
+    // pattern but conv stayed low because cross-asset hadn't flipped yet.
+    const isMomentumCatch = /VREV|FAST/.test(tag);
+    const minConv = isMomentumCatch
+      ? 3                                        // V-REV / FAST: pattern is evidence, no counter-trend bump
+      : ((isCounterTrend || isFadeSignal) ? 4    // ATH / ATL / HI / LO / counter-trend MFLIP·TREND: need 4
+                                          : 3);  // trend-aligned: 3 is enough
     if (conv.score < minConv) {
-      const reason = isCounterTrend ? 'counter-trend' : isFadeSignal ? 'fade' : 'trend';
+      const reason = isMomentumCatch ? 'momentum-catch' : isCounterTrend ? 'counter-trend' : isFadeSignal ? 'fade' : 'trend';
       log(sym, '🚫 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — conv ' + conv.score + '/7 [' + conv.label + '] < ' + minConv + ' (' + reason + ')' + (conv.factors.length ? ' factors:' + conv.factors.join(',') : ''));
       return false;
     }
@@ -1522,7 +1532,10 @@ function processPrice(sym, price, hi, lo) {
   // This is the fastest signal: catches moves 2-3 min before EMAs/RSI/MACD confirm.
   // The coil detection + breakout pending flag is set in processTicks (runs every 1s).
   // Here we just fire the signal if a valid breakout was detected this tick.
-  if (isMT5 && s._pendingBreakout) {
+  // Chop-mode block (added 2026-05-07): trend-riding detectors should not fire during chop.
+  // BREAKOUT, FAST, V-REV, TREND all skip when efficiency-ratio chop detector is active.
+  // Reversal/fade detectors (HI/LO Rev, ATH/ATL) are NOT blocked — those are designed for ranges.
+  if (isMT5 && s._pendingBreakout && !s.chopActive) {
     const bo = s._pendingBreakout;
     s._pendingBreakout = null; // consume it
     const cool2 = now2 - s.lastNTs > COOLDOWN_MS;
@@ -1680,7 +1693,7 @@ function processPrice(sym, price, hi, lo) {
   // fire a signal BYPASSING MACD alignment. MACD is a lagging indicator and won't cross
   // during fast directional moves — this detector fills that gap.
   // XAU threshold: $10 in 3 min | BTC threshold: $200 in 3 min
-  if (isMT5 && s.vrevSnaps.length >= 20 && cool && (now2 - s.fastMoveLastTs > 600000)) {
+  if (isMT5 && s.vrevSnaps.length >= 20 && cool && (now2 - s.fastMoveLastTs > 600000) && !s.chopActive) {
     const fmWindow = 180000; // 3-minute lookback
     const fmSnaps = s.vrevSnaps.filter(sn => sn.ts > now2 - fmWindow);
     if (fmSnaps.length >= 10) {
@@ -1794,6 +1807,9 @@ function processPrice(sym, price, hi, lo) {
   // ===== V-REVERSAL DETECTOR (XAU only) =====
   // Catches momentum reversals: price drops/rallies $8+ in 15 min, then ROC flips sharply
   // Different from trend-following signals — fires on the turn itself, not after EMAs catch up
+  // NOTE: V-REV does NOT have a chop block. It's a reversal detector — designed exactly for the
+  // sharp drop+bounce pattern that often happens during ranging/chop sessions. Sits with HI/LO Rev
+  // and ATH/ATL as a "fade in chop" detector. (Earlier audit lumped it with TREND/BREAKOUT — wrong.)
   if (isXAU && s.vrevSnaps.length >= 60 && cool && (now2 - s.vrevLastTs > 600000)) {
     // Find the high and low in the last 15 min of snapshots
     const lookback = s.vrevSnaps.filter(sn => sn.ts > now2 - 900000); // 15 min
@@ -2172,7 +2188,7 @@ function processPrice(sym, price, hi, lo) {
   // Data: XAU $4577→$4594 ($17 rally) with macro EMA bullish at $4571 — 0 signals fired because EMAs lagged.
   // Trend Ride cooldown: 40 min for XAU
   const trCoolMs = 2400000;
-  if (isXAU && isMT5 && s.macroEma !== null && s.macroSnaps.length >= 4 && cool && (now2 - s.trendRideLastTs > trCoolMs)) {
+  if (isXAU && isMT5 && s.macroEma !== null && s.macroSnaps.length >= 4 && cool && (now2 - s.trendRideLastTs > trCoolMs) && !s.chopActive) {
     const trDir = price > s.macroEma ? 'bull' : 'bear';
     const trSpread = Math.abs(price - s.macroEma);
     const trSpreadPct = (trSpread / s.macroEma) * 100;
@@ -2256,9 +2272,23 @@ function processPrice(sym, price, hi, lo) {
       }
 
       // TREND RIDE CALL: macro bullish, price well above EMA, short+medium ROC both up
-      // RSI cap: 75 for all — data shows RSI 74 CALLs win during genuine trends (5/1 23:16 BTC +0.72%)
-      const trCallRsiMax = 75;
+      // RSI cap: 70 (lowered from 75 on 2026-05-07). The MACD-extreme gate above already catches
+      // the over-extended setups (5/7 row 44 RSI 70.4, MACD +1.447 → blocked there). Capping RSI
+      // at 70 is a second line of defence: RSI 70-75 entries that slip past the MACD gate are
+      // statistically marginal — most winners had RSI < 70 with strong MACD continuation.
+      const trCallRsiMax = 70;
       if (trDir === 'bull' && rsiV > 30 && rsiV < trCallRsiMax && trCallMacdOk && flipCoolFor('call') && winProtectDir !== 'put') {
+        // Same-direction TREND cap (added 2026-05-07): if 2+ ⬆TREND CALLs already fired in this
+        // leg without an opposite-direction signal resetting the count, the leg is exhausted —
+        // block further continuation entries. Empirical: 5/7 ⬆TREND CALLs at $4745 → $4748 →
+        // $4757 (3 in a row) all lost. The first one is the trade; later ones are stacking risk.
+        if (s.trendRideLastDir === 'call' && s.trendRideSameDirCount >= 2) {
+          if (now2 - (s.trendCapLogTs || 0) > 60000) {
+            log(sym, '📈 TREND CALL BLOCKED — already ' + s.trendRideSameDirCount + ' same-direction signals this leg (max 2)');
+            s.trendCapLogTs = now2;
+          }
+          return;
+        }
         const slPrice = price - trSlFinal;
         s.trendRideLastTs = now2;
         s.trendRideSameDirCount = (s.trendRideLastDir === 'call') ? s.trendRideSameDirCount + 1 : 1;
@@ -2279,6 +2309,14 @@ function processPrice(sym, price, hi, lo) {
       // TREND RIDE PUT: macro bearish, price well below EMA, short+medium ROC both down
       // RSI 35-70: floor raised from 25 — RSI 29.5 fired PUT at absolute bottom, bounced $5.65 (5/6 12:58)
       if (trDir === 'bear' && rsiV > 35 && rsiV < 70 && trPutMacdOk && flipCoolFor('put') && winProtectDir !== 'call') {
+        // Same-direction cap mirror of CALL — block 3rd+ ⬇TREND PUT in the same downleg.
+        if (s.trendRideLastDir === 'put' && s.trendRideSameDirCount >= 2) {
+          if (now2 - (s.trendCapLogTs || 0) > 60000) {
+            log(sym, '📉 TREND PUT BLOCKED — already ' + s.trendRideSameDirCount + ' same-direction signals this leg (max 2)');
+            s.trendCapLogTs = now2;
+          }
+          return;
+        }
         const slPrice = price + trSlFinal;
         s.trendRideLastTs = now2;
         s.trendRideSameDirCount = (s.trendRideLastDir === 'put') ? s.trendRideSameDirCount + 1 : 1;
