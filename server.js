@@ -2801,10 +2801,12 @@ function checkExit(sym, price) {
     const heldLongEnough = t.ts && (now - t.ts > REV_MIN_HOLD_MS);
     if (fl >= 3 && !t.rev && now - t.lastETs > 120000 && heldLongEnough) {
       if (pnl > 0) {
-        // Profitable + indicators flipped → exit now to lock in the win
+        // Profitable + indicators flipped → set t.rev=true and log only.
+        // Push notification removed (2026-05-08, by user request) — reversal warnings used
+        // to ping the phone, but only the user should close trades (via ✕ Clear button,
+        // popup accept, or new signal). Log stays so we can correlate post-hoc.
         t.rev = true; t.lastETs = now;
-        log(sym, '🎯 REVERSAL EXIT — locking +$' + pnl.toFixed(2) + ' · ' + fl + '/3 indicators flipped · age ' + Math.round((now - t.ts) / 60000) + 'min');
-        sendPush('🎯 ' + sym + ' REVERSAL EXIT', '+$' + pnl.toFixed(2) + ' locked · ' + fl + '/3 flipped — close now', 'exit');
+        log(sym, '🎯 REVERSAL EXIT (log-only) — +$' + pnl.toFixed(2) + ' · ' + fl + '/3 indicators flipped · age ' + Math.round((now - t.ts) / 60000) + 'min');
       } else {
         // Not profitable yet — don't auto-close. Trade either recovers or hits SL.
         // Log once per minute (no push) so the user can see in logs without notification spam.
@@ -2852,9 +2854,9 @@ function checkExit(sym, price) {
   } else if (fl >= 3 && cd && !t.sl && !t.rev && t.ts && (now - t.ts > REV_MIN_HOLD_MS)) {
     // Same hold gate + profitability gate as CFD path: only auto-exit if trade is positive.
     if (dm > 0) {
+      // Log-only — push notification removed (see CFD path comment for rationale)
       t.rev = true; t.lastETs = now;
-      log(sym, '🎯 REVERSAL EXIT — locking +' + dm.toFixed(2) + '% · ' + fl + '/4 flipped · age ' + Math.round((now - t.ts) / 60000) + 'min');
-      sendPush('🎯 REVERSAL EXIT ' + sym, '+' + dm.toFixed(2) + '% locked · ' + fl + '/4 flipped — close now', 'exit');
+      log(sym, '🎯 REVERSAL EXIT (log-only) — +' + dm.toFixed(2) + '% · ' + fl + '/4 flipped · age ' + Math.round((now - t.ts) / 60000) + 'min');
     } else if (now - (t.lastRevHoldLog || 0) > 60000) {
       log(sym, '⏸ Reversal detected but trade negative (' + dm.toFixed(2) + '%) — holding for recovery or SL');
       t.lastRevHoldLog = now;
