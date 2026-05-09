@@ -167,6 +167,8 @@ SYMBOLS.forEach(sym => {
     breakLastTs: 0,          // when last breakout signal fired (cooldown)
     breakLastDir: null,      // direction of last breakout signal ('call'/'put')
     breakLastPrice: 0,       // entry price of last breakout signal
+    breakSameDirCount: 0,    // consecutive same-direction breakouts in current leg
+    breakLegStartTs: 0,      // when current same-direction leg started (resets on direction flip OR after 2h gap)
     // Fast-move detector — catches strong directional moves when MACD lags
     fastMoveLastTs: 0,       // when last fast-move signal fired (cooldown)
     sustainedMoveLastTs: 0,  // when last sustained-move signal fired (cooldown)
@@ -606,6 +608,8 @@ function processPrice(sym, price, hi, lo) {
     breakLastTs: s.breakLastTs,
     breakLastDir: s.breakLastDir,
     breakLastPrice: s.breakLastPrice,
+    breakSameDirCount: s.breakSameDirCount,
+    breakLegStartTs: s.breakLegStartTs,
     macroFlipTs: s.macroFlipTs,
     macroPrevDir: s.macroPrevDir,
     superFlipTs: s.superFlipTs,
@@ -1679,6 +1683,56 @@ function processPrice(sym, price, hi, lo) {
         s._pendingBreakout = null;
         return;
       }
+
+      // Filter 5: MACD line direction alignment (added 2026-05-09)
+      // Filter 4 only checked the histogram. A PUT could still fire when macdL was POSITIVE
+      // (bullish bias) if the histogram happened to be negative. Empirical: BTC 5/9 05:14
+      // ⬇BREAK PUT fired at macdL +0.290 — direction misalignment slipped past filter 4.
+      // Now require macdL to agree with breakout direction (≤ 0 for PUT, ≥ 0 for CALL).
+      const macdLineMisaligned = (bo.dir === 'call' && macdL < 0) || (bo.dir === 'put' && macdL > 0);
+      if (macdLineMisaligned) {
+        log(sym, '💥 BREAKOUT blocked: MACD line ' + macdL.toFixed(3) + ' wrong side for ' + bo.dir.toUpperCase() + ' (need ' + (bo.dir === 'call' ? '≥ 0' : '≤ 0') + ')');
+        s._pendingBreakout = null;
+        return;
+      }
+
+      // Filter 6: 1-hour range gate (added 2026-05-09)
+      // BTC 5/8–5/9 fired 16 BREAKOUTs in a $256 range over 20h — every breakout was a
+      // false escape inside a tight consolidation. If the broader 1h range is too narrow,
+      // a "breakout" is just noise. Use 5-min ATR candles (12 = 1 hour).
+      // Per-instrument min range as % of price: BTC 0.30, XAU 0.20, NAS 0.25.
+      if (s.atrCandles && s.atrCandles.length >= 12) {
+        const last12 = s.atrCandles.slice(-12);
+        const hi1h = Math.max(...last12.map(c => c.h));
+        const lo1h = Math.min(...last12.map(c => c.l));
+        const range1h = hi1h - lo1h;
+        const rangePct = (range1h / price) * 100;
+        const minRangePct = isBTC ? 0.30 : isNAS ? 0.25 : isXAU ? 0.20 : 0.20;
+        if (rangePct < minRangePct) {
+          log(sym, '💥 BREAKOUT blocked: 1h range too tight — ' + rangePct.toFixed(2) + '% < ' + minRangePct + '% (range $' + range1h.toFixed(2) + ' on $' + price.toFixed(2) + ')');
+          s._pendingBreakout = null;
+          return;
+        }
+      }
+
+      // Filter 7: Same-direction breakout cap (added 2026-05-09)
+      // Filter 1 only blocks consecutive same-dir within 15 min. The BTC 5/8 chain (4 CALLs
+      // 18:00 → 20:33 → 21:12 → 21:31, all ⬆BREAK) spanned 3.5 hours so filter 1 missed it.
+      // Hard cap: max 3 same-direction breakouts in any 2-hour rolling window. Forces the
+      // detector to wait for a real direction flip before stacking again.
+      const breakLegMs = 7200000; // 2 hours
+      const breakMaxSameDir = 3;
+      // Reset the leg counter if direction flipped OR if it's been >2h since the leg started
+      if (s.breakLastDir !== bo.dir || (s.breakLegStartTs && now2 - s.breakLegStartTs > breakLegMs)) {
+        s.breakSameDirCount = 0;
+        s.breakLegStartTs = now2;
+      }
+      if (s.breakSameDirCount >= breakMaxSameDir) {
+        log(sym, '💥 BREAKOUT blocked: ' + s.breakSameDirCount + ' same-direction ' + bo.dir.toUpperCase() + ' breakouts already in this 2h leg (max ' + breakMaxSameDir + ')');
+        s._pendingBreakout = null;
+        return;
+      }
+      s.breakSameDirCount++;
 
       s.breakLastTs = now2;
       s.breakLastDir = bo.dir;
