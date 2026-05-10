@@ -300,10 +300,13 @@ const TRUMP_MIN_INTENSITY = parseInt(process.env.TRUMP_MIN_INTENSITY) || 3;   //
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const TRUMP_CLASSIFIER_MODEL = process.env.TRUMP_CLASSIFIER_MODEL || 'claude-haiku-4-5-20251001';
 
-let trumpBias = 'neutral';            // 'bullish' | 'bearish' | 'neutral'
-let trumpBiasTs = 0;                  // when bias was last set
+// Per-instrument bias map (added 2026-05-10). Replaces the legacy single trumpBias +
+// trumpInstruments combo so a single tweet can express OPPOSITE directions across symbols
+// (e.g. Iran geopolitical post = bearish for SPY/QQQ/NAS100, bullish for XAU, neutral for BTC).
+const TRUMP_VALID_SYMBOLS = ['SPY','QQQ','BTC','XAU','NAS100'];
+let trumpBiases = { SPY: 'neutral', QQQ: 'neutral', BTC: 'neutral', XAU: 'neutral', NAS100: 'neutral' };
+let trumpBiasTs = 0;                  // when biases were last set
 let trumpIntensity = 0;               // 1-5 (only intensity >= TRUMP_MIN_INTENSITY counts)
-let trumpInstruments = [];            // ['SPY','QQQ','XAU','BTC','ALL'] — which symbols are affected
 let trumpLastPostId = '';             // most-recent classified post ID (kept for /trump/state)
 let trumpRecentIds = new Set();       // dedupe — last 100 classified post IDs (proper Set-based)
 let trumpLastPostText = '';           // for /trump/state monitoring
@@ -322,11 +325,22 @@ function loadTrumpState() {
     const data = JSON.parse(fs.readFileSync(TRUMP_STATE_FILE, 'utf8'));
     // Only restore bias if still within TTL — stale bias is worse than no bias
     if (data.trumpBiasTs && Date.now() - data.trumpBiasTs < TRUMP_BIAS_TTL_MS) {
-      trumpBias = data.trumpBias || 'neutral';
       trumpBiasTs = data.trumpBiasTs || 0;
       trumpIntensity = data.trumpIntensity || 0;
-      trumpInstruments = data.trumpInstruments || [];
-      console.log('[' + ts() + '] Trump state restored — ' + trumpBias + ' (intensity ' + trumpIntensity + ', age ' + Math.round((Date.now() - trumpBiasTs) / 60000) + 'min)');
+      // Prefer new per-symbol biases map; fall back to legacy single-bias state for migration
+      if (data.trumpBiases && typeof data.trumpBiases === 'object') {
+        TRUMP_VALID_SYMBOLS.forEach(s => { trumpBiases[s] = data.trumpBiases[s] || 'neutral'; });
+      } else if (data.trumpBias) {
+        // Legacy migration: spread old bias across the symbols in old instruments list
+        const legacyBias = data.trumpBias;
+        const legacyInst = Array.isArray(data.trumpInstruments) ? data.trumpInstruments : [];
+        const isAll = legacyInst.includes('ALL');
+        TRUMP_VALID_SYMBOLS.forEach(s => {
+          trumpBiases[s] = (isAll || legacyInst.includes(s)) ? legacyBias : 'neutral';
+        });
+      }
+      const summary = TRUMP_VALID_SYMBOLS.map(s => s + ':' + (trumpBiases[s] || 'neutral')[0]).join(' ');
+      console.log('[' + ts() + '] Trump state restored — i' + trumpIntensity + ', age ' + Math.round((Date.now() - trumpBiasTs) / 60000) + 'min · ' + summary);
     }
     trumpLastPostId = data.trumpLastPostId || '';
     trumpLastPostText = data.trumpLastPostText || '';
@@ -343,7 +357,7 @@ function loadTrumpState() {
 function saveTrumpState() {
   try {
     fs.writeFileSync(TRUMP_STATE_FILE, JSON.stringify({
-      trumpBias, trumpBiasTs, trumpIntensity, trumpInstruments,
+      trumpBiases, trumpBiasTs, trumpIntensity,
       trumpLastPostId, trumpLastPostText, trumpLastClassification, trumpClassifyCount,
       trumpRecentIds: Array.from(trumpRecentIds), trumpLastPushTs, trumpLastPushBias
     }, null, 2));
@@ -364,20 +378,32 @@ async function classifyTrumpPost(text) {
   }
   try {
     const httpsLib = require('https');
+    // Per-instrument biases — a single tweet can be bullish for one symbol and bearish for another.
+    // Tariff posts are bearish for stocks but bullish for gold (safe haven). Iran/geopolitical posts
+    // are bearish for stocks AND BTC (risk-off) but bullish for gold. Reason about each symbol
+    // INDEPENDENTLY rather than picking one direction for the whole tweet.
     const prompt = 'Analyze this Donald Trump social media post for short-term financial market impact. Return ONLY valid JSON (no prose, no markdown):\n\n' +
       '{\n' +
       '  "market_relevant": <true/false>,\n' +
-      '  "bias": "bullish" | "bearish" | "neutral",\n' +
-      '  "topics": [<list of: "tariffs","china","fed","powell","tech","energy","crypto","gold","tax","trade","sanctions","oil">],\n' +
+      '  "biases": {\n' +
+      '    "SPY":    "bullish" | "bearish" | "neutral",\n' +
+      '    "QQQ":    "bullish" | "bearish" | "neutral",\n' +
+      '    "BTC":    "bullish" | "bearish" | "neutral",\n' +
+      '    "XAU":    "bullish" | "bearish" | "neutral",\n' +
+      '    "NAS100": "bullish" | "bearish" | "neutral"\n' +
+      '  },\n' +
+      '  "topics": [<list of: "tariffs","china","fed","powell","tech","energy","crypto","gold","tax","trade","sanctions","oil","iran","israel","russia","ukraine","geopolitical","war","economy","jobs">],\n' +
       '  "intensity": <1-5 integer; 1=mild opinion, 5=specific actionable announcement>,\n' +
-      '  "instruments_affected": [<list of: "SPY","QQQ","BTC","XAU","NAS100","ALL">],\n' +
       '  "confidence": <0-1 float>\n' +
       '}\n\n' +
+      'Each symbol bias should be reasoned INDEPENDENTLY. A single tweet often moves stocks one way and gold the opposite way. Geopolitical escalation (Iran, Middle East, war rhetoric) is bearish for stocks & BTC and bullish for gold. Tariff posts are bearish for stocks and bullish for gold. Fed-attack posts are bearish for stocks and bullish for gold. Pro-crypto posts are bullish for BTC only. Use "neutral" for symbols a tweet doesn\'t plausibly move.\n\n' +
       'Examples:\n' +
-      '"MAGA!" → {"market_relevant":false,"bias":"neutral","topics":[],"intensity":1,"instruments_affected":[],"confidence":0.9}\n' +
-      '"60% TARIFFS on China starting Monday!" → {"market_relevant":true,"bias":"bearish","topics":["tariffs","china"],"intensity":5,"instruments_affected":["SPY","QQQ","ALL"],"confidence":0.95}\n' +
-      '"Bitcoin will be the future, fantastic!" → {"market_relevant":true,"bias":"bullish","topics":["crypto"],"intensity":3,"instruments_affected":["BTC"],"confidence":0.7}\n' +
-      '"Powell is destroying the economy" → {"market_relevant":true,"bias":"bearish","topics":["fed","powell"],"intensity":3,"instruments_affected":["SPY","QQQ"],"confidence":0.7}\n\n' +
+      '"MAGA!" → {"market_relevant":false,"biases":{"SPY":"neutral","QQQ":"neutral","BTC":"neutral","XAU":"neutral","NAS100":"neutral"},"topics":[],"intensity":1,"confidence":0.9}\n' +
+      '"60% TARIFFS on China starting Monday!" → {"market_relevant":true,"biases":{"SPY":"bearish","QQQ":"bearish","BTC":"neutral","XAU":"bullish","NAS100":"bearish"},"topics":["tariffs","china"],"intensity":5,"confidence":0.95}\n' +
+      '"Bitcoin will be the future, fantastic!" → {"market_relevant":true,"biases":{"SPY":"neutral","QQQ":"neutral","BTC":"bullish","XAU":"neutral","NAS100":"neutral"},"topics":["crypto"],"intensity":3,"confidence":0.7}\n' +
+      '"Powell is destroying the economy" → {"market_relevant":true,"biases":{"SPY":"bearish","QQQ":"bearish","BTC":"neutral","XAU":"bullish","NAS100":"bearish"},"topics":["fed","powell"],"intensity":3,"confidence":0.7}\n' +
+      '"Iran\'s response is TOTALLY UNACCEPTABLE — they will pay a heavy price!" → {"market_relevant":true,"biases":{"SPY":"bearish","QQQ":"bearish","BTC":"bearish","XAU":"bullish","NAS100":"bearish"},"topics":["iran","sanctions","geopolitical"],"intensity":4,"confidence":0.8}\n' +
+      '"BIG WIN — trade deal with Japan signed today!" → {"market_relevant":true,"biases":{"SPY":"bullish","QQQ":"bullish","BTC":"neutral","XAU":"bearish","NAS100":"bullish"},"topics":["trade"],"intensity":3,"confidence":0.75}\n\n' +
       'Post:\n"' + text.replace(/"/g, '\\"').slice(0, 1000) + '"';
     const body = JSON.stringify({
       model: TRUMP_CLASSIFIER_MODEL,
@@ -405,12 +431,36 @@ async function classifyTrumpPost(text) {
     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
     if (!jsonMatch) throw new Error('No JSON in classifier response: ' + responseText.slice(0, 200));
     const parsed = JSON.parse(jsonMatch[0]);
+    // Normalize biases into the canonical { SPY, QQQ, BTC, XAU, NAS100 } shape.
+    // Accept new per-symbol format; fall back to legacy single-bias + instruments_affected.
+    const normBiases = { SPY: 'neutral', QQQ: 'neutral', BTC: 'neutral', XAU: 'neutral', NAS100: 'neutral' };
+    if (parsed.biases && typeof parsed.biases === 'object') {
+      TRUMP_VALID_SYMBOLS.forEach(s => {
+        const v = parsed.biases[s];
+        normBiases[s] = ['bullish','bearish','neutral'].includes(v) ? v : 'neutral';
+      });
+    } else if (parsed.bias && ['bullish','bearish','neutral'].includes(parsed.bias)) {
+      // Legacy fallback: project single bias onto symbols in instruments_affected (filtered to valid set)
+      const legacyInst = Array.isArray(parsed.instruments_affected) ? parsed.instruments_affected : [];
+      const isAll = legacyInst.includes('ALL');
+      TRUMP_VALID_SYMBOLS.forEach(s => {
+        normBiases[s] = (isAll || legacyInst.includes(s)) ? parsed.bias : 'neutral';
+      });
+    }
+    // Derive convenience fields for /trump/state and badges: "dominant" bias = most common
+    // non-neutral direction across symbols (ties → bullish), and instruments_affected = list
+    // of symbols that are non-neutral.
+    const nonNeutral = TRUMP_VALID_SYMBOLS.filter(s => normBiases[s] !== 'neutral');
+    const bullishCount = nonNeutral.filter(s => normBiases[s] === 'bullish').length;
+    const bearishCount = nonNeutral.filter(s => normBiases[s] === 'bearish').length;
+    const dominantBias = nonNeutral.length === 0 ? 'neutral' : (bullishCount >= bearishCount ? 'bullish' : 'bearish');
     return {
       market_relevant: !!parsed.market_relevant,
-      bias: ['bullish','bearish','neutral'].includes(parsed.bias) ? parsed.bias : 'neutral',
+      biases: normBiases,
+      bias: dominantBias,                            // legacy compat — derived
+      instruments_affected: nonNeutral,              // legacy compat — derived (validated against TRUMP_VALID_SYMBOLS)
       topics: Array.isArray(parsed.topics) ? parsed.topics : [],
       intensity: Math.max(0, Math.min(5, parseInt(parsed.intensity) || 0)),
-      instruments_affected: Array.isArray(parsed.instruments_affected) ? parsed.instruments_affected : [],
       confidence: Math.max(0, Math.min(1, parseFloat(parsed.confidence) || 0)),
       source: 'claude'
     };
@@ -421,31 +471,67 @@ async function classifyTrumpPost(text) {
 }
 
 // Lightweight keyword-based classifier — used when no API key OR Claude fails.
-// Much less accurate but keeps the pipeline alive during outages.
+// Much less accurate but keeps the pipeline alive during outages. Emits per-instrument biases.
 function classifyTrumpPostHeuristic(text) {
   const t = text.toLowerCase();
   const topics = [];
-  const instruments_affected = [];
-  let bias = 'neutral';
+  const biases = { SPY: 'neutral', QQQ: 'neutral', BTC: 'neutral', XAU: 'neutral', NAS100: 'neutral' };
   let intensity = 1;
   let market_relevant = false;
-  // Tariff / trade
-  if (/tariff|tariffs/.test(t)) { topics.push('tariffs'); market_relevant = true; intensity = Math.max(intensity, 4); instruments_affected.push('SPY','QQQ','ALL'); bias = 'bearish'; }
-  if (/trade war|trade deal/.test(t)) { topics.push('trade'); market_relevant = true; intensity = Math.max(intensity, 3); instruments_affected.push('SPY','QQQ'); }
-  if (/china/.test(t)) { topics.push('china'); if (market_relevant) instruments_affected.push('ALL'); }
-  // Fed / Powell
-  if (/fed|powell|interest rate|rate cut|rate hike/.test(t)) { topics.push('fed'); market_relevant = true; intensity = Math.max(intensity, 3); instruments_affected.push('SPY','QQQ','XAU'); }
-  if (/destroy|disaster|terrible|awful|worst/.test(t) && topics.includes('fed')) { bias = 'bearish'; }
-  // Crypto
-  if (/bitcoin|crypto|btc/.test(t)) { topics.push('crypto'); market_relevant = true; intensity = Math.max(intensity, 3); instruments_affected.push('BTC'); }
-  // Sentiment heuristics
-  if (/\b(great|fantastic|tremendous|huge win|booming)\b/.test(t)) { if (bias === 'neutral') bias = 'bullish'; }
-  if (/\b(disaster|terrible|destroy|crash|failed|incompetent)\b/.test(t)) { if (bias === 'neutral') bias = 'bearish'; }
-  if (/!{2,}|\b(URGENT|BREAKING|MUST)\b/.test(text)) { intensity = Math.max(intensity, 4); }
+  // Tariff / trade — bearish for stocks/NAS, bullish for gold (safe haven)
+  if (/tariff|tariffs/.test(t)) {
+    topics.push('tariffs'); market_relevant = true; intensity = Math.max(intensity, 4);
+    biases.SPY = 'bearish'; biases.QQQ = 'bearish'; biases.NAS100 = 'bearish'; biases.XAU = 'bullish';
+  }
+  if (/trade war/.test(t)) {
+    topics.push('trade'); market_relevant = true; intensity = Math.max(intensity, 3);
+    biases.SPY = biases.SPY === 'neutral' ? 'bearish' : biases.SPY;
+    biases.QQQ = biases.QQQ === 'neutral' ? 'bearish' : biases.QQQ;
+    biases.NAS100 = biases.NAS100 === 'neutral' ? 'bearish' : biases.NAS100;
+    biases.XAU = biases.XAU === 'neutral' ? 'bullish' : biases.XAU;
+  }
+  if (/trade deal|trade agreement/.test(t)) {
+    topics.push('trade'); market_relevant = true; intensity = Math.max(intensity, 3);
+    biases.SPY = 'bullish'; biases.QQQ = 'bullish'; biases.NAS100 = 'bullish'; biases.XAU = 'bearish';
+  }
+  if (/china/.test(t)) { topics.push('china'); }
+  // Fed / Powell attack — bearish stocks, bullish gold
+  if (/fed|powell|interest rate|rate cut|rate hike/.test(t)) {
+    topics.push('fed'); market_relevant = true; intensity = Math.max(intensity, 3);
+    if (/destroy|disaster|terrible|awful|worst|incompetent/.test(t)) {
+      biases.SPY = 'bearish'; biases.QQQ = 'bearish'; biases.NAS100 = 'bearish'; biases.XAU = 'bullish';
+    }
+  }
+  // Geopolitical — Iran, war, sanctions: risk-off → bearish for stocks & BTC, bullish for gold
+  if (/iran|israel|russia|ukraine|war|missile|strike|military|sanction|geopolitic/.test(t)) {
+    topics.push('geopolitical'); market_relevant = true; intensity = Math.max(intensity, 3);
+    if (/iran/.test(t)) topics.push('iran');
+    if (/israel/.test(t)) topics.push('israel');
+    if (/russia/.test(t)) topics.push('russia');
+    if (/ukraine/.test(t)) topics.push('ukraine');
+    if (/sanction/.test(t)) topics.push('sanctions');
+    // Escalation language bumps intensity and locks in bearish-risk / bullish-gold bias
+    if (/unacceptable|heavy price|will pay|consequences|destroy|attack/.test(t)) intensity = Math.max(intensity, 4);
+    biases.SPY = 'bearish'; biases.QQQ = 'bearish'; biases.NAS100 = 'bearish';
+    biases.BTC = 'bearish'; biases.XAU = 'bullish';
+  }
+  // Crypto-specific — only affects BTC
+  if (/bitcoin|crypto|btc/.test(t)) {
+    topics.push('crypto'); market_relevant = true; intensity = Math.max(intensity, 3);
+    if (/\b(great|fantastic|tremendous|love|future|win)\b/.test(t)) biases.BTC = 'bullish';
+    else if (/\b(scam|fraud|ban|terrible|disaster)\b/.test(t)) biases.BTC = 'bearish';
+  }
+  if (/!{2,}|\b(URGENT|BREAKING|MUST)\b/.test(text)) intensity = Math.max(intensity, 4);
+  // Derive legacy convenience fields
+  const nonNeutral = TRUMP_VALID_SYMBOLS.filter(s => biases[s] !== 'neutral');
+  const bullishCount = nonNeutral.filter(s => biases[s] === 'bullish').length;
+  const bearishCount = nonNeutral.filter(s => biases[s] === 'bearish').length;
+  const dominantBias = nonNeutral.length === 0 ? 'neutral' : (bullishCount >= bearishCount ? 'bullish' : 'bearish');
   return {
-    market_relevant, bias, topics: [...new Set(topics)],
-    intensity, instruments_affected: [...new Set(instruments_affected)],
-    confidence: market_relevant ? 0.5 : 0.3,
+    market_relevant, biases, bias: dominantBias,
+    instruments_affected: nonNeutral,
+    topics: [...new Set(topics)],
+    intensity, confidence: market_relevant ? 0.5 : 0.3,
     source: 'heuristic'
   };
 }
@@ -464,11 +550,16 @@ function applyTrumpClassification(postId, postText, classification) {
     trumpRecentIds = new Set(arr.slice(-TRUMP_RECENT_IDS_MAX));
   }
   if (classification.market_relevant && classification.intensity >= TRUMP_MIN_INTENSITY) {
-    trumpBias = classification.bias;
+    // Store the full per-symbol biases map. Each symbol gets its own direction — no more
+    // collapsing tariff/geopolitical posts into a single bullish/bearish for everything.
+    const incoming = classification.biases || {};
+    TRUMP_VALID_SYMBOLS.forEach(s => {
+      trumpBiases[s] = ['bullish','bearish','neutral'].includes(incoming[s]) ? incoming[s] : 'neutral';
+    });
     trumpBiasTs = Date.now();
     trumpIntensity = classification.intensity;
-    trumpInstruments = classification.instruments_affected;
-    log('TRUMP', '🇺🇸 ' + classification.bias.toUpperCase() + ' (intensity ' + classification.intensity + ', topics ' + classification.topics.join(',') + ', affects ' + classification.instruments_affected.join(',') + ') — "' + postText.slice(0, 120) + '"');
+    const biasSummary = TRUMP_VALID_SYMBOLS.map(s => s + ':' + trumpBiases[s][0].toUpperCase()).join(' ');
+    log('TRUMP', '🇺🇸 ' + biasSummary + ' (i' + classification.intensity + ', topics ' + classification.topics.join(',') + ') — "' + postText.slice(0, 120) + '"');
     // Notification throttle: only push when bias CHANGES from last push, OR when throttle gap
     // has elapsed. Stops every-minute notification spam from poll-loop re-classification, and
     // limits flurries of same-direction tweets to one notification per throttle window.
@@ -599,7 +690,8 @@ async function pollTrumpFeed() {
       newCount++;
     }
     if (newCount > 0) {
-      log('TRUMP', '📡 Feed poll: ' + newCount + ' new post(s) classified · current bias: ' + trumpBias + (trumpIntensity ? ' (i' + trumpIntensity + ')' : ''));
+      const summary = TRUMP_VALID_SYMBOLS.map(s => s + ':' + (trumpBiases[s] || 'n')[0].toUpperCase()).join(' ');
+      log('TRUMP', '📡 Feed poll: ' + newCount + ' new post(s) classified · ' + summary + (trumpIntensity ? ' (i' + trumpIntensity + ')' : ''));
     }
   } catch (e) {
     console.error('[' + ts() + '] Trump feed poll failed:', e.message);
@@ -1394,9 +1486,11 @@ function processPrice(sym, price, hi, lo) {
     //   • Bias direction matches signal direction
     const trumpBiasFresh = trumpBiasTs && (Date.now() - trumpBiasTs < TRUMP_BIAS_TTL_MS);
     if (trumpBiasFresh && trumpIntensity >= TRUMP_MIN_INTENSITY) {
-      const affectsThisSym = trumpInstruments.includes('ALL') || trumpInstruments.includes(sym);
-      const aligned = (isCall && trumpBias === 'bullish') || (!isCall && trumpBias === 'bearish');
-      if (affectsThisSym && aligned) {
+      // Per-symbol bias lookup — each instrument may have its own direction from the last
+      // market-relevant tweet (e.g. tariff post = bearish for SPY/QQQ, bullish for XAU).
+      const symBias = trumpBiases[sym] || 'neutral';
+      const aligned = (isCall && symBias === 'bullish') || (!isCall && symBias === 'bearish');
+      if (aligned) {
         sc++; factors.push('TRUMP');
       }
     }
@@ -4242,7 +4336,7 @@ app.post('/trump/post', async (req, res) => {
     res.json({
       ok: true,
       classification,
-      currentBias: { bias: trumpBias, intensity: trumpIntensity, instruments: trumpInstruments, ageMs: Date.now() - trumpBiasTs }
+      currentBias: { biases: { ...trumpBiases }, intensity: trumpIntensity, ageMs: Date.now() - trumpBiasTs }
     });
   } catch (e) {
     res.status(500).json({ error: 'Classify failed: ' + e.message });
@@ -4253,10 +4347,21 @@ app.post('/trump/post', async (req, res) => {
 app.get('/trump/state', (req, res) => {
   const ageMs = trumpBiasTs ? Date.now() - trumpBiasTs : null;
   const fresh = ageMs !== null && ageMs < TRUMP_BIAS_TTL_MS;
+  // Build per-symbol view that bot badges + convictionFor consumers can read directly.
+  const freshBiases = {};
+  TRUMP_VALID_SYMBOLS.forEach(s => {
+    freshBiases[s] = fresh ? (trumpBiases[s] || 'neutral') : 'neutral';
+  });
+  // Derive legacy fields so the previous /trump/state consumers keep working during rollout.
+  const nonNeutral = TRUMP_VALID_SYMBOLS.filter(s => freshBiases[s] !== 'neutral');
+  const bullishCount = nonNeutral.filter(s => freshBiases[s] === 'bullish').length;
+  const bearishCount = nonNeutral.filter(s => freshBiases[s] === 'bearish').length;
+  const derivedBias = nonNeutral.length === 0 ? 'neutral' : (bullishCount >= bearishCount ? 'bullish' : 'bearish');
   res.json({
-    bias: fresh ? trumpBias : 'neutral',
+    biases: freshBiases,                 // new — per-symbol direction map
+    bias: derivedBias,                   // legacy — dominant direction across symbols
+    instruments: nonNeutral,             // legacy — symbols with non-neutral bias
     intensity: fresh ? trumpIntensity : 0,
-    instruments: fresh ? trumpInstruments : [],
     biasAgeMin: ageMs !== null ? Math.round(ageMs / 60000) : null,
     biasTtlMin: Math.round(TRUMP_BIAS_TTL_MS / 60000),
     minIntensity: TRUMP_MIN_INTENSITY,
