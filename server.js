@@ -304,10 +304,18 @@ let trumpBias = 'neutral';            // 'bullish' | 'bearish' | 'neutral'
 let trumpBiasTs = 0;                  // when bias was last set
 let trumpIntensity = 0;               // 1-5 (only intensity >= TRUMP_MIN_INTENSITY counts)
 let trumpInstruments = [];            // ['SPY','QQQ','XAU','BTC','ALL'] — which symbols are affected
-let trumpLastPostId = '';             // dedupe — last classified post ID
+let trumpLastPostId = '';             // most-recent classified post ID (kept for /trump/state)
+let trumpRecentIds = new Set();       // dedupe — last 100 classified post IDs (proper Set-based)
 let trumpLastPostText = '';           // for /trump/state monitoring
 let trumpLastClassification = null;   // full last result for monitoring
 let trumpClassifyCount = 0;           // total classifications since startup
+// Notification throttle: push only on bias change OR after this gap. Stops every-minute spam
+// when poll loop re-classifies the same tweets, and prevents 4 beeps when Trump posts a
+// flurry of same-direction tweets. 15 min default — override via TRUMP_PUSH_THROTTLE_MIN.
+const TRUMP_PUSH_THROTTLE_MS = (parseInt(process.env.TRUMP_PUSH_THROTTLE_MIN) || 15) * 60000;
+const TRUMP_RECENT_IDS_MAX = 100;     // ring buffer size for ID dedup set
+let trumpLastPushTs = 0;              // when last push notification went out
+let trumpLastPushBias = 'neutral';    // bias of last push — used to detect changes
 
 function loadTrumpState() {
   try {
@@ -324,13 +332,20 @@ function loadTrumpState() {
     trumpLastPostText = data.trumpLastPostText || '';
     trumpLastClassification = data.trumpLastClassification || null;
     trumpClassifyCount = data.trumpClassifyCount || 0;
+    // Restore the recent-IDs dedup set + push throttle state so redeploys don't re-fire
+    // notifications for posts the previous instance already classified.
+    if (Array.isArray(data.trumpRecentIds)) trumpRecentIds = new Set(data.trumpRecentIds);
+    else if (trumpLastPostId) trumpRecentIds = new Set([trumpLastPostId]); // backfill from old state
+    trumpLastPushTs = data.trumpLastPushTs || 0;
+    trumpLastPushBias = data.trumpLastPushBias || 'neutral';
   } catch (e) { console.log('[' + ts() + '] No Trump state file — starting fresh'); }
 }
 function saveTrumpState() {
   try {
     fs.writeFileSync(TRUMP_STATE_FILE, JSON.stringify({
       trumpBias, trumpBiasTs, trumpIntensity, trumpInstruments,
-      trumpLastPostId, trumpLastPostText, trumpLastClassification, trumpClassifyCount
+      trumpLastPostId, trumpLastPostText, trumpLastClassification, trumpClassifyCount,
+      trumpRecentIds: Array.from(trumpRecentIds), trumpLastPushTs, trumpLastPushBias
     }, null, 2));
   } catch (e) {}
 }
@@ -442,14 +457,33 @@ function applyTrumpClassification(postId, postText, classification) {
   trumpLastPostText = postText.slice(0, 280);
   trumpLastClassification = classification;
   trumpClassifyCount++;
+  // Add to recent-IDs ring buffer for proper dedup. Trim to MAX size so the set doesn't grow.
+  trumpRecentIds.add(postId);
+  if (trumpRecentIds.size > TRUMP_RECENT_IDS_MAX) {
+    const arr = Array.from(trumpRecentIds);
+    trumpRecentIds = new Set(arr.slice(-TRUMP_RECENT_IDS_MAX));
+  }
   if (classification.market_relevant && classification.intensity >= TRUMP_MIN_INTENSITY) {
     trumpBias = classification.bias;
     trumpBiasTs = Date.now();
     trumpIntensity = classification.intensity;
     trumpInstruments = classification.instruments_affected;
     log('TRUMP', '🇺🇸 ' + classification.bias.toUpperCase() + ' (intensity ' + classification.intensity + ', topics ' + classification.topics.join(',') + ', affects ' + classification.instruments_affected.join(',') + ') — "' + postText.slice(0, 120) + '"');
-    sendPush('🇺🇸 Trump ' + classification.bias.toUpperCase() + ' (i' + classification.intensity + ')',
-      classification.topics.join(', ') + ' · ' + postText.slice(0, 100), 'trump');
+    // Notification throttle: only push when bias CHANGES from last push, OR when throttle gap
+    // has elapsed. Stops every-minute notification spam from poll-loop re-classification, and
+    // limits flurries of same-direction tweets to one notification per throttle window.
+    const now = Date.now();
+    const biasChanged = classification.bias !== trumpLastPushBias;
+    const throttleElapsed = now - trumpLastPushTs > TRUMP_PUSH_THROTTLE_MS;
+    if (biasChanged || throttleElapsed) {
+      sendPush('🇺🇸 Trump ' + classification.bias.toUpperCase() + ' (i' + classification.intensity + ')',
+        classification.topics.join(', ') + ' · ' + postText.slice(0, 100), 'trump');
+      trumpLastPushTs = now;
+      trumpLastPushBias = classification.bias;
+    } else {
+      const remainMin = Math.ceil((TRUMP_PUSH_THROTTLE_MS - (now - trumpLastPushTs)) / 60000);
+      log('TRUMP', '· push throttled — same bias, ' + remainMin + 'm until next allowed');
+    }
   } else {
     log('TRUMP', '· low-impact post (relevant=' + classification.market_relevant + ', intensity=' + classification.intensity + ') — no bias update');
   }
@@ -552,10 +586,13 @@ async function pollTrumpFeed() {
 
     // Process up to 5 most recent posts, oldest-first so the LATEST post wins as final state.
     // Most feeds return newest-first; we slice the first 5 then reverse.
+    // Dedup uses trumpRecentIds Set (last 100 ids) — the previous single-id check only caught
+    // the absolute-last processed post, causing older posts in the slice to be re-classified
+    // every poll (= notification spam every minute).
     const recent = items.slice(0, 5).reverse();
     let newCount = 0;
     for (const item of recent) {
-      if (item.id === trumpLastPostId) continue; // already classified — same id catches dedupe
+      if (trumpRecentIds.has(item.id)) continue; // already classified — proper Set dedup
       // Classify + apply (same code path as /trump/post webhook)
       const classification = await classifyTrumpPost(item.text);
       applyTrumpClassification(item.id, item.text, classification);
