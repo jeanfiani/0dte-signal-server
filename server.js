@@ -454,6 +454,121 @@ function applyTrumpClassification(postId, postText, classification) {
   saveTrumpState();
 }
 
+// ===== TRUMP FEED POLLER =====
+// Polls a configured feed URL on an interval, fetches new posts, dedupes by ID, and pushes
+// each through the same classifyTrumpPost() + applyTrumpClassification() pipeline used by
+// the /trump/post webhook. Set TRUMP_FEED_URL to enable. Disable by leaving it empty.
+//
+// Recommended source — RSSHub mirror of Truth Social (free, public, JSON Feed format):
+//   TRUMP_FEED_URL=https://rsshub.app/truthsocial/realDonaldTrump?format=json
+// Polling interval defaults to 5 minutes. Lower for fresher signal, higher to reduce load.
+const TRUMP_FEED_URL = process.env.TRUMP_FEED_URL || '';
+const TRUMP_POLL_INTERVAL_MS = parseInt(process.env.TRUMP_POLL_INTERVAL_MS) || 300000; // 5 min
+
+function decodeHtmlEntities(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function parseTrumpFeed(body) {
+  // Try JSON Feed (https://www.jsonfeed.org/) first — most modern format from RSSHub
+  try {
+    const json = JSON.parse(body);
+    if (Array.isArray(json.items)) {
+      return json.items.map(it => ({
+        id: it.id || it.url || it.guid || '',
+        text: decodeHtmlEntities(it.content_text || it.content_html || it.summary || it.title || '')
+      })).filter(it => it.id && it.text);
+    }
+    if (Array.isArray(json.posts)) {
+      return json.posts.map(it => ({
+        id: it.id || it.url || '',
+        text: decodeHtmlEntities(it.content || it.text || it.body || '')
+      })).filter(it => it.id && it.text);
+    }
+  } catch (e) { /* not JSON — fall through to RSS XML */ }
+
+  // RSS / Atom XML fallback — extract each <item> or <entry>
+  const itemBlocks = body.match(/<(?:item|entry)[^>]*>[\s\S]*?<\/(?:item|entry)>/g) || [];
+  return itemBlocks.map(blk => {
+    const guid = (blk.match(/<guid[^>]*>([\s\S]*?)<\/guid>/) || [])[1] || '';
+    const link = (blk.match(/<link[^>]*>([\s\S]*?)<\/link>/) || [])[1] || '';
+    const id = (blk.match(/<id[^>]*>([\s\S]*?)<\/id>/) || [])[1] || '';
+    const title = (blk.match(/<title[^>]*(?:\s\/>|>)([\s\S]*?)<\/title>/) || [])[1] || '';
+    const desc = (blk.match(/<description[^>]*>([\s\S]*?)<\/description>/) || [])[1] || '';
+    const content = (blk.match(/<content[^>]*>([\s\S]*?)<\/content>/) || [])[1] || '';
+    const summary = (blk.match(/<summary[^>]*>([\s\S]*?)<\/summary>/) || [])[1] || '';
+    return {
+      id: (guid || link || id || title).replace(/<!\[CDATA\[|\]\]>/g, '').trim(),
+      text: decodeHtmlEntities(content || desc || summary || title)
+    };
+  }).filter(it => it.id && it.text);
+}
+
+async function pollTrumpFeed() {
+  if (!TRUMP_FEED_URL) return;
+  try {
+    const u = new URL(TRUMP_FEED_URL);
+    const httpsLib = u.protocol === 'http:' ? require('http') : require('https');
+    const body = await new Promise((resolve, reject) => {
+      const req = httpsLib.get({
+        hostname: u.hostname, port: u.port || (u.protocol === 'http:' ? 80 : 443),
+        path: u.pathname + u.search,
+        headers: { 'User-Agent': '0DTE-Signal-Server/1.0', 'Accept': 'application/json, application/feed+json, application/rss+xml, application/atom+xml, */*' }
+      }, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          // Follow one redirect
+          return reject(new Error('Redirect to ' + res.headers.location + ' — point TRUMP_FEED_URL there directly'));
+        }
+        if (res.statusCode >= 400) return reject(new Error('HTTP ' + res.statusCode));
+        let chunks = '';
+        res.on('data', c => chunks += c);
+        res.on('end', () => resolve(chunks));
+      });
+      req.on('error', reject);
+      req.setTimeout(15000, () => { req.destroy(new Error('timeout')); });
+    });
+
+    const items = parseTrumpFeed(body);
+    if (items.length === 0) {
+      console.error('[' + ts() + '] Trump feed poll: no items parsed (feed format may have changed)');
+      return;
+    }
+
+    // Process up to 5 most recent posts, oldest-first so the LATEST post wins as final state.
+    // Most feeds return newest-first; we slice the first 5 then reverse.
+    const recent = items.slice(0, 5).reverse();
+    let newCount = 0;
+    for (const item of recent) {
+      if (item.id === trumpLastPostId) continue; // already classified — same id catches dedupe
+      // Classify + apply (same code path as /trump/post webhook)
+      const classification = await classifyTrumpPost(item.text);
+      applyTrumpClassification(item.id, item.text, classification);
+      newCount++;
+    }
+    if (newCount > 0) {
+      log('TRUMP', '📡 Feed poll: ' + newCount + ' new post(s) classified · current bias: ' + trumpBias + (trumpIntensity ? ' (i' + trumpIntensity + ')' : ''));
+    }
+  } catch (e) {
+    console.error('[' + ts() + '] Trump feed poll failed:', e.message);
+  }
+}
+
+if (TRUMP_FEED_URL) {
+  setTimeout(pollTrumpFeed, 10000);                       // first poll 10s after startup
+  setInterval(pollTrumpFeed, TRUMP_POLL_INTERVAL_MS);     // then on the configured interval
+}
+
 // ===== DXY STATE (for XAU inverse correlation) =====
 let dxyPrice = 0, dxyPrices = [], dxyPrevEma5 = null, dxyPrevEma13 = null;
 let dxyRoc3 = 0, dxyDir = 'neutral'; // 'up' = bearish gold, 'down' = bullish gold
@@ -4088,6 +4203,7 @@ app.listen(PORT, () => {
   loadSignalHistory();
   loadTrumpState();
   console.log('[' + ts() + '] Trump factor: ' + (ANTHROPIC_API_KEY ? 'enabled (' + TRUMP_CLASSIFIER_MODEL + ')' : 'enabled (heuristic-only — set ANTHROPIC_API_KEY for accurate classification)') + ', TTL ' + Math.round(TRUMP_BIAS_TTL_MS / 60000) + 'min, min-intensity ' + TRUMP_MIN_INTENSITY);
+  console.log('[' + ts() + '] Trump feed poller: ' + (TRUMP_FEED_URL ? 'enabled, every ' + Math.round(TRUMP_POLL_INTERVAL_MS / 60000) + 'min from ' + TRUMP_FEED_URL : 'disabled (set TRUMP_FEED_URL to enable auto-polling, or POST manually to /trump/post)'));
   connectFinnhub();
   fetchVIX();
   fetchDXY();
