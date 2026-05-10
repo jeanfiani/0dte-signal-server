@@ -116,6 +116,8 @@ SYMBOLS.forEach(sym => {
     dailyLevels: [],     // [{high, low, date}] — last 5 completed days
     rollingHigh: 0,      // current 5-day high (max of dailyLevels highs + today's sessionHigh)
     rollingLow: Infinity, // current 5-day low (min of dailyLevels lows + today's sessionLow)
+    rollingHighUpdateTs: 0, // when rollingHigh last advanced (for ATH PUT trend-protection gate)
+    rollingLowUpdateTs: 0,  // when rollingLow last advanced (for ATL CALL trend-protection gate)
     rsiAtRollingHigh: 50, // RSI when rolling high was touched
     rsiAtRollingLow: 50,  // RSI when rolling low was touched
     athApproachTs: 0,   // when price last entered ATH zone
@@ -619,6 +621,11 @@ function gET() {
   const e = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
   return e.getHours() * 60 + e.getMinutes();
 }
+function gETDow() {
+  // Day of week in ET timezone — 0 = Sunday, 6 = Saturday
+  const e = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  return e.getDay();
+}
 function ts() { return new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: 'America/New_York' }); }
 
 // ===== PUSH TO ALL SUBSCRIBERS =====
@@ -934,11 +941,15 @@ function processPrice(sym, price, hi, lo) {
     // Seed from current price if unset
     if (s.rollingHigh === 0) s.rollingHigh = price;
     if (s.rollingLow === Infinity || s.rollingLow === 0) s.rollingLow = price;
-    // Update from today's session extremes + current price (real-time, every tick)
-    if (price > s.rollingHigh) s.rollingHigh = price;
-    if (price < s.rollingLow) s.rollingLow = price;
-    if (s.sessionHigh > -Infinity && s.sessionHigh > s.rollingHigh) s.rollingHigh = s.sessionHigh;
-    if (s.sessionLow < Infinity && s.sessionLow < s.rollingLow) s.rollingLow = s.sessionLow;
+    // Update from today's session extremes + current price (real-time, every tick).
+    // Stamp rollingHighUpdateTs / rollingLowUpdateTs whenever a new extreme is set —
+    // ATL/ATH detectors use these to detect "trend in progress" (new extreme made
+    // recently = market is making new lows/highs = NOT a reversal setup).
+    const nowTs = Date.now();
+    if (price > s.rollingHigh) { s.rollingHigh = price; s.rollingHighUpdateTs = nowTs; }
+    if (price < s.rollingLow)  { s.rollingLow = price;  s.rollingLowUpdateTs = nowTs; }
+    if (s.sessionHigh > -Infinity && s.sessionHigh > s.rollingHigh) { s.rollingHigh = s.sessionHigh; s.rollingHighUpdateTs = nowTs; }
+    if (s.sessionLow < Infinity && s.sessionLow < s.rollingLow)     { s.rollingLow = s.sessionLow;   s.rollingLowUpdateTs = nowTs; }
   }
 
   s.prices.push(price); s.highs.push(hi || price); s.lows.push(lo || price);
@@ -1436,7 +1447,17 @@ function processPrice(sym, price, hi, lo) {
   if (isXAU) {
     if (etMin >= 1020 && etMin < 1080) return; // XAU closed 5-6 PM ET
   } else if (isBTC) {
-    // BTC trades 24/7 — no session block
+    // BTC trades 24/7 but weekends are ultra-thin liquidity → high chop, signal noise.
+    // 5/9 (Sat) data showed only 1 signal that ended ~flat; weekend BTC moves rarely
+    // sustain in either direction. Hard-block all signals on Sat & Sun (ET timezone).
+    const dow = gETDow();
+    if (dow === 0 || dow === 6) {
+      if (now2 - (s.weekendBlockLogTs || 0) > 600000) { // log every 10 min, not every tick
+        log(sym, '⏸ Weekend block: BTC signals disabled Sat/Sun (low-liquidity chop)');
+        s.weekendBlockLogTs = now2;
+      }
+      return;
+    }
   } else if (isNAS) {
     // NAS100 futures: Sun 6PM - Fri 5PM ET, daily break 5-6PM ET (1020-1080 min)
     if (etMin >= 1020 && etMin < 1080) return; // NAS100 closed 5-6 PM ET
@@ -2822,7 +2843,16 @@ function processPrice(sym, price, hi, lo) {
     // Minimum conviction: require at least 2 cross-asset factors (same as ATL CALL)
     const athConv = convictionFor('put');
     const athConvOk = athConv.score >= 2;
-    if (athApproachRecent && distFromATH >= athAtlPullback && s.rsiAtRollingHigh > 55 && athMacdOk && athRocStrong && !athBullBlock && athConvOk && flipCoolFor('put') && winProtectDir !== 'call') {
+    // Trend-protection gate (symmetric to ATL CALL): if rolling high advanced within 30 min,
+    // price is still making new highs — ATH PUT is fading an active uptrend. Block.
+    const athTrendBlock = s.rollingHighUpdateTs && (now2 - s.rollingHighUpdateTs < 1800000);
+    if (athTrendBlock) {
+      if (now2 - (s.athTrendBlockLogTs || 0) > 300000) {
+        log(sym, 'ATH PUT trend-block — rolling high updated ' + Math.round((now2 - s.rollingHighUpdateTs) / 60000) + 'm ago (uptrend in progress)');
+        s.athTrendBlockLogTs = now2;
+      }
+    }
+    if (!athTrendBlock && athApproachRecent && distFromATH >= athAtlPullback && s.rsiAtRollingHigh > 55 && athMacdOk && athRocStrong && !athBullBlock && athConvOk && flipCoolFor('put') && winProtectDir !== 'call') {
       if (s.lastSignalDir !== 'put' || (now2 - s.lastNTs > athAtlCooldown)) {
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
         if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
@@ -2852,7 +2882,18 @@ function processPrice(sym, price, hi, lo) {
     const atlConvOk = atlConv.score >= 2;
     const atlRocMin = roc3 > 0.01; // require real positive momentum, not just > 0
     const atlBounceFailed = s.lastAtlCallTs && (now2 - s.lastAtlCallTs < 3600000) && price <= s.lastAtlCallPrice;
-    if (atlApproachRecent && distFromATL >= athAtlPullback && s.rsiAtRollingLow < 45 && rsiV < 75 && atlMacdOk && atlRocMin && !atlBounceFailed && atlConvOk && flipCoolFor('call') && winProtectDir !== 'put') {
+    // Trend-protection gate (added 2026-05-10 after BTC 5/7 morning ATL CALL streak — 6 consecutive
+    // ATL CALLs while price kept making new 5-day lows, all losers). If the rolling low advanced
+    // (= new low set) within the last 30 min, the market is in active downtrend — ATL is trend
+    // continuation, NOT reversal. Block the CALL.
+    const atlTrendBlock = s.rollingLowUpdateTs && (now2 - s.rollingLowUpdateTs < 1800000);
+    if (atlTrendBlock) {
+      if (now2 - (s.atlTrendBlockLogTs || 0) > 300000) {
+        log(sym, 'ATL CALL trend-block — rolling low updated ' + Math.round((now2 - s.rollingLowUpdateTs) / 60000) + 'm ago (downtrend in progress)');
+        s.atlTrendBlockLogTs = now2;
+      }
+    }
+    if (!atlTrendBlock && atlApproachRecent && distFromATL >= athAtlPullback && s.rsiAtRollingLow < 45 && rsiV < 75 && atlMacdOk && atlRocMin && !atlBounceFailed && atlConvOk && flipCoolFor('call') && winProtectDir !== 'put') {
       if (s.lastSignalDir !== 'call' || (now2 - s.lastNTs > athAtlCooldown)) {
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
         if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
