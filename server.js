@@ -499,6 +499,9 @@ function parseTrumpFeed(body) {
   } catch (e) { /* not JSON — fall through to RSS XML */ }
 
   // RSS / Atom XML fallback — extract each <item> or <entry>
+  // Strip <![CDATA[ ... ]]> wrappers BEFORE decodeHtmlEntities, otherwise its tag-stripper
+  // (/<[^>]+>/g) eats `<![CDATA[<p>` but leaves an orphan `]]>` token in the text.
+  const stripCdata = s => (s || '').replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '');
   const itemBlocks = body.match(/<(?:item|entry)[^>]*>[\s\S]*?<\/(?:item|entry)>/g) || [];
   return itemBlocks.map(blk => {
     const guid = (blk.match(/<guid[^>]*>([\s\S]*?)<\/guid>/) || [])[1] || '';
@@ -509,8 +512,8 @@ function parseTrumpFeed(body) {
     const content = (blk.match(/<content[^>]*>([\s\S]*?)<\/content>/) || [])[1] || '';
     const summary = (blk.match(/<summary[^>]*>([\s\S]*?)<\/summary>/) || [])[1] || '';
     return {
-      id: (guid || link || id || title).replace(/<!\[CDATA\[|\]\]>/g, '').trim(),
-      text: decodeHtmlEntities(content || desc || summary || title)
+      id: stripCdata(guid || link || id || title).trim(),
+      text: decodeHtmlEntities(stripCdata(content || desc || summary || title))
     };
   }).filter(it => it.id && it.text);
 }
