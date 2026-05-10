@@ -285,6 +285,175 @@ function saveTrv2State() {
 // Save TRv2 state every 60 seconds
 setInterval(saveTrv2State, 60000);
 
+// ===== TRUMP TWEET SENTIMENT (cross-asset conviction factor) =====
+// Pipeline: external poller (Pipedream/RSS/custom) POSTs new posts to /trump/post.
+// Each post is classified via Claude Haiku (if ANTHROPIC_API_KEY set) into a market-impact
+// signal. Result is stored as state.trumpBias with a 60-min TTL. The convictionFor()
+// function adds a TRUMP factor when a signal aligns with the active bias.
+//
+// State persisted to /data/trump_state.json so Railway redeploys don't lose recent context.
+const TRUMP_STATE_FILE = path.join(DATA_DIR, 'trump_state.json');
+const TRUMP_BIAS_TTL_MS = parseInt(process.env.TRUMP_BIAS_TTL_MS) || 3600000; // 60 min default
+const TRUMP_MIN_INTENSITY = parseInt(process.env.TRUMP_MIN_INTENSITY) || 3;   // skip weak tweets
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
+const TRUMP_CLASSIFIER_MODEL = process.env.TRUMP_CLASSIFIER_MODEL || 'claude-haiku-4-5-20251001';
+
+let trumpBias = 'neutral';            // 'bullish' | 'bearish' | 'neutral'
+let trumpBiasTs = 0;                  // when bias was last set
+let trumpIntensity = 0;               // 1-5 (only intensity >= TRUMP_MIN_INTENSITY counts)
+let trumpInstruments = [];            // ['SPY','QQQ','XAU','BTC','ALL'] — which symbols are affected
+let trumpLastPostId = '';             // dedupe — last classified post ID
+let trumpLastPostText = '';           // for /trump/state monitoring
+let trumpLastClassification = null;   // full last result for monitoring
+let trumpClassifyCount = 0;           // total classifications since startup
+
+function loadTrumpState() {
+  try {
+    const data = JSON.parse(fs.readFileSync(TRUMP_STATE_FILE, 'utf8'));
+    // Only restore bias if still within TTL — stale bias is worse than no bias
+    if (data.trumpBiasTs && Date.now() - data.trumpBiasTs < TRUMP_BIAS_TTL_MS) {
+      trumpBias = data.trumpBias || 'neutral';
+      trumpBiasTs = data.trumpBiasTs || 0;
+      trumpIntensity = data.trumpIntensity || 0;
+      trumpInstruments = data.trumpInstruments || [];
+      console.log('[' + ts() + '] Trump state restored — ' + trumpBias + ' (intensity ' + trumpIntensity + ', age ' + Math.round((Date.now() - trumpBiasTs) / 60000) + 'min)');
+    }
+    trumpLastPostId = data.trumpLastPostId || '';
+    trumpLastPostText = data.trumpLastPostText || '';
+    trumpLastClassification = data.trumpLastClassification || null;
+    trumpClassifyCount = data.trumpClassifyCount || 0;
+  } catch (e) { console.log('[' + ts() + '] No Trump state file — starting fresh'); }
+}
+function saveTrumpState() {
+  try {
+    fs.writeFileSync(TRUMP_STATE_FILE, JSON.stringify({
+      trumpBias, trumpBiasTs, trumpIntensity, trumpInstruments,
+      trumpLastPostId, trumpLastPostText, trumpLastClassification, trumpClassifyCount
+    }, null, 2));
+  } catch (e) {}
+}
+setInterval(saveTrumpState, 60000); // save every minute
+
+// Classifier — uses Claude Haiku via Anthropic Messages API.
+// Returns { market_relevant, bias, topics, intensity, instruments_affected, confidence }
+// Falls back to a quick keyword-based heuristic if no API key is configured.
+async function classifyTrumpPost(text) {
+  if (!text || text.trim().length < 10) {
+    return { market_relevant: false, bias: 'neutral', topics: [], intensity: 0, instruments_affected: [], confidence: 0, source: 'too-short' };
+  }
+  // No API key — use simple keyword heuristic so the pipeline still works
+  if (!ANTHROPIC_API_KEY) {
+    return classifyTrumpPostHeuristic(text);
+  }
+  try {
+    const httpsLib = require('https');
+    const prompt = 'Analyze this Donald Trump social media post for short-term financial market impact. Return ONLY valid JSON (no prose, no markdown):\n\n' +
+      '{\n' +
+      '  "market_relevant": <true/false>,\n' +
+      '  "bias": "bullish" | "bearish" | "neutral",\n' +
+      '  "topics": [<list of: "tariffs","china","fed","powell","tech","energy","crypto","gold","tax","trade","sanctions","oil">],\n' +
+      '  "intensity": <1-5 integer; 1=mild opinion, 5=specific actionable announcement>,\n' +
+      '  "instruments_affected": [<list of: "SPY","QQQ","BTC","XAU","NAS100","ALL">],\n' +
+      '  "confidence": <0-1 float>\n' +
+      '}\n\n' +
+      'Examples:\n' +
+      '"MAGA!" → {"market_relevant":false,"bias":"neutral","topics":[],"intensity":1,"instruments_affected":[],"confidence":0.9}\n' +
+      '"60% TARIFFS on China starting Monday!" → {"market_relevant":true,"bias":"bearish","topics":["tariffs","china"],"intensity":5,"instruments_affected":["SPY","QQQ","ALL"],"confidence":0.95}\n' +
+      '"Bitcoin will be the future, fantastic!" → {"market_relevant":true,"bias":"bullish","topics":["crypto"],"intensity":3,"instruments_affected":["BTC"],"confidence":0.7}\n' +
+      '"Powell is destroying the economy" → {"market_relevant":true,"bias":"bearish","topics":["fed","powell"],"intensity":3,"instruments_affected":["SPY","QQQ"],"confidence":0.7}\n\n' +
+      'Post:\n"' + text.replace(/"/g, '\\"').slice(0, 1000) + '"';
+    const body = JSON.stringify({
+      model: TRUMP_CLASSIFIER_MODEL,
+      max_tokens: 300,
+      messages: [{ role: 'user', content: prompt }]
+    });
+    const res = await new Promise((resolve, reject) => {
+      const req = httpsLib.request({
+        hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
+        headers: {
+          'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body),
+          'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01'
+        }
+      }, (resp) => {
+        let chunks = '';
+        resp.on('data', (c) => chunks += c);
+        resp.on('end', () => resp.statusCode < 300 ? resolve(chunks) : reject(new Error('HTTP ' + resp.statusCode + ': ' + chunks.slice(0, 200))));
+      });
+      req.on('error', reject);
+      req.write(body); req.end();
+    });
+    const data = JSON.parse(res);
+    const responseText = data.content && data.content[0] && data.content[0].text ? data.content[0].text : '';
+    // Extract JSON from response (handle cases where model adds extra prose)
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('No JSON in classifier response: ' + responseText.slice(0, 200));
+    const parsed = JSON.parse(jsonMatch[0]);
+    return {
+      market_relevant: !!parsed.market_relevant,
+      bias: ['bullish','bearish','neutral'].includes(parsed.bias) ? parsed.bias : 'neutral',
+      topics: Array.isArray(parsed.topics) ? parsed.topics : [],
+      intensity: Math.max(0, Math.min(5, parseInt(parsed.intensity) || 0)),
+      instruments_affected: Array.isArray(parsed.instruments_affected) ? parsed.instruments_affected : [],
+      confidence: Math.max(0, Math.min(1, parseFloat(parsed.confidence) || 0)),
+      source: 'claude'
+    };
+  } catch (e) {
+    console.error('[' + ts() + '] Trump classifier error:', e.message, '— falling back to heuristic');
+    return classifyTrumpPostHeuristic(text);
+  }
+}
+
+// Lightweight keyword-based classifier — used when no API key OR Claude fails.
+// Much less accurate but keeps the pipeline alive during outages.
+function classifyTrumpPostHeuristic(text) {
+  const t = text.toLowerCase();
+  const topics = [];
+  const instruments_affected = [];
+  let bias = 'neutral';
+  let intensity = 1;
+  let market_relevant = false;
+  // Tariff / trade
+  if (/tariff|tariffs/.test(t)) { topics.push('tariffs'); market_relevant = true; intensity = Math.max(intensity, 4); instruments_affected.push('SPY','QQQ','ALL'); bias = 'bearish'; }
+  if (/trade war|trade deal/.test(t)) { topics.push('trade'); market_relevant = true; intensity = Math.max(intensity, 3); instruments_affected.push('SPY','QQQ'); }
+  if (/china/.test(t)) { topics.push('china'); if (market_relevant) instruments_affected.push('ALL'); }
+  // Fed / Powell
+  if (/fed|powell|interest rate|rate cut|rate hike/.test(t)) { topics.push('fed'); market_relevant = true; intensity = Math.max(intensity, 3); instruments_affected.push('SPY','QQQ','XAU'); }
+  if (/destroy|disaster|terrible|awful|worst/.test(t) && topics.includes('fed')) { bias = 'bearish'; }
+  // Crypto
+  if (/bitcoin|crypto|btc/.test(t)) { topics.push('crypto'); market_relevant = true; intensity = Math.max(intensity, 3); instruments_affected.push('BTC'); }
+  // Sentiment heuristics
+  if (/\b(great|fantastic|tremendous|huge win|booming)\b/.test(t)) { if (bias === 'neutral') bias = 'bullish'; }
+  if (/\b(disaster|terrible|destroy|crash|failed|incompetent)\b/.test(t)) { if (bias === 'neutral') bias = 'bearish'; }
+  if (/!{2,}|\b(URGENT|BREAKING|MUST)\b/.test(text)) { intensity = Math.max(intensity, 4); }
+  return {
+    market_relevant, bias, topics: [...new Set(topics)],
+    intensity, instruments_affected: [...new Set(instruments_affected)],
+    confidence: market_relevant ? 0.5 : 0.3,
+    source: 'heuristic'
+  };
+}
+
+// Apply a classification result to the global trumpBias state.
+// Only updates if the post is market_relevant AND intensity >= TRUMP_MIN_INTENSITY.
+function applyTrumpClassification(postId, postText, classification) {
+  trumpLastPostId = postId;
+  trumpLastPostText = postText.slice(0, 280);
+  trumpLastClassification = classification;
+  trumpClassifyCount++;
+  if (classification.market_relevant && classification.intensity >= TRUMP_MIN_INTENSITY) {
+    trumpBias = classification.bias;
+    trumpBiasTs = Date.now();
+    trumpIntensity = classification.intensity;
+    trumpInstruments = classification.instruments_affected;
+    log('TRUMP', '🇺🇸 ' + classification.bias.toUpperCase() + ' (intensity ' + classification.intensity + ', topics ' + classification.topics.join(',') + ', affects ' + classification.instruments_affected.join(',') + ') — "' + postText.slice(0, 120) + '"');
+    sendPush('🇺🇸 Trump ' + classification.bias.toUpperCase() + ' (i' + classification.intensity + ')',
+      classification.topics.join(', ') + ' · ' + postText.slice(0, 100), 'trump');
+  } else {
+    log('TRUMP', '· low-impact post (relevant=' + classification.market_relevant + ', intensity=' + classification.intensity + ') — no bias update');
+  }
+  saveTrumpState();
+}
+
 // ===== DXY STATE (for XAU inverse correlation) =====
 let dxyPrice = 0, dxyPrices = [], dxyPrevEma5 = null, dxyPrevEma13 = null;
 let dxyRoc3 = 0, dxyDir = 'neutral'; // 'up' = bearish gold, 'down' = bullish gold
@@ -1047,6 +1216,22 @@ function processPrice(sym, price, hi, lo) {
         const btcS = S['BTC'];
         const btcDir2 = btcS && btcS.pE5 && btcS.pE13 ? (btcS.pE5 > btcS.pE13 ? 'up' : 'down') : null;
         if ((isCall && btcDir2 === 'up') || (!isCall && btcDir2 === 'down')) { sc++; factors.push('BTC'); }
+      }
+    }
+
+    // TRUMP factor (added 2026-05-09) — political-risk signal that boosts conviction
+    // when a recent Trump tweet's market bias aligns with the signal direction.
+    // Only counts when:
+    //   • Bias is fresh (within TRUMP_BIAS_TTL_MS, default 60min)
+    //   • Tweet was high-intensity (>= TRUMP_MIN_INTENSITY, default 3)
+    //   • Tweet's instruments_affected list includes this symbol OR contains 'ALL'
+    //   • Bias direction matches signal direction
+    const trumpBiasFresh = trumpBiasTs && (Date.now() - trumpBiasTs < TRUMP_BIAS_TTL_MS);
+    if (trumpBiasFresh && trumpIntensity >= TRUMP_MIN_INTENSITY) {
+      const affectsThisSym = trumpInstruments.includes('ALL') || trumpInstruments.includes(sym);
+      const aligned = (isCall && trumpBias === 'bullish') || (!isCall && trumpBias === 'bearish');
+      if (affectsThisSym && aligned) {
+        sc++; factors.push('TRUMP');
       }
     }
 
@@ -3837,6 +4022,57 @@ app.get('/debug', (req, res) => {
   res.json({ events: wsEvents, apiKey: API ? API.substring(0, 4) + '***' : 'NOT SET', nodeVersion: process.version });
 });
 
+// ===== TRUMP TWEET INGESTION =====
+// POST /trump/post — feed in new tweets. Token-protected via ADMIN_TOKEN env var.
+// Body: { id: "post-id", text: "tweet body", ts?: timestamp_ms }
+// The id is used for deduplication — if you POST the same id twice, the second is ignored.
+//
+// Recommended setup: Pipedream/Zapier/your-own-poller subscribes to a Truth Social or X
+// feed, then POSTs each new post to this endpoint. Server runs sentiment analysis and
+// updates the global trumpBias state, which feeds into convictionFor() as the TRUMP factor.
+app.post('/trump/post', async (req, res) => {
+  const adminToken = process.env.ADMIN_TOKEN;
+  if (!adminToken) return res.status(503).json({ error: 'ADMIN_TOKEN not configured — endpoint disabled' });
+  if (req.query.token !== adminToken) return res.status(401).json({ error: 'Invalid or missing token' });
+  const { id, text, ts: postTs } = req.body || {};
+  if (!id || !text) return res.status(400).json({ error: 'Missing id or text' });
+  // Dedupe — same post arriving twice is a no-op
+  if (id === trumpLastPostId) {
+    return res.json({ ok: true, deduped: true, lastClassification: trumpLastClassification });
+  }
+  try {
+    const classification = await classifyTrumpPost(text);
+    applyTrumpClassification(id, text, classification);
+    res.json({
+      ok: true,
+      classification,
+      currentBias: { bias: trumpBias, intensity: trumpIntensity, instruments: trumpInstruments, ageMs: Date.now() - trumpBiasTs }
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Classify failed: ' + e.message });
+  }
+});
+
+// GET /trump/state — monitor what bias is currently active and last classified post
+app.get('/trump/state', (req, res) => {
+  const ageMs = trumpBiasTs ? Date.now() - trumpBiasTs : null;
+  const fresh = ageMs !== null && ageMs < TRUMP_BIAS_TTL_MS;
+  res.json({
+    bias: fresh ? trumpBias : 'neutral',
+    intensity: fresh ? trumpIntensity : 0,
+    instruments: fresh ? trumpInstruments : [],
+    biasAgeMin: ageMs !== null ? Math.round(ageMs / 60000) : null,
+    biasTtlMin: Math.round(TRUMP_BIAS_TTL_MS / 60000),
+    minIntensity: TRUMP_MIN_INTENSITY,
+    classifierEnabled: !!ANTHROPIC_API_KEY,
+    classifierModel: ANTHROPIC_API_KEY ? TRUMP_CLASSIFIER_MODEL : 'heuristic-fallback',
+    classifyCount: trumpClassifyCount,
+    lastPostId: trumpLastPostId,
+    lastPostText: trumpLastPostText,
+    lastClassification: trumpLastClassification
+  });
+});
+
 // Health check
 app.get('/', (req, res) => {
   res.send('0DTE Signal Server running. ' + subscriptions.length + ' subscribers. WS: ' + (ws && ws.readyState === 1 ? 'connected' : 'disconnected'));
@@ -3850,6 +4086,8 @@ app.listen(PORT, () => {
   loadRollingLevels();
   loadTrv2State();
   loadSignalHistory();
+  loadTrumpState();
+  console.log('[' + ts() + '] Trump factor: ' + (ANTHROPIC_API_KEY ? 'enabled (' + TRUMP_CLASSIFIER_MODEL + ')' : 'enabled (heuristic-only — set ANTHROPIC_API_KEY for accurate classification)') + ', TTL ' + Math.round(TRUMP_BIAS_TTL_MS / 60000) + 'min, min-intensity ' + TRUMP_MIN_INTENSITY);
   connectFinnhub();
   fetchVIX();
   fetchDXY();
