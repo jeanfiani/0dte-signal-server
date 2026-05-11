@@ -2402,11 +2402,13 @@ function processPrice(sym, price, hi, lo) {
                                    : 'beyond ±' + fmMacdExtreme + ' (exhausted)';
           log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — MACD ' + reason);
         }
-        // Same-direction price-gap guard (added 2026-05-11): after a FAST signal fires in
+        // Same-direction price-gap guard (added 2026-05-11, raised 2026-05-11 b after another
+        // falling-knife cluster slipped through by $0.06). After a FAST signal fires in
         // direction D at price P, block the next same-direction FAST until price has moved
-        // a meaningful gap away from P. Prevents the "4 PUTs at $4665-4674" cluster on XAU 5/11
-        // where the bot kept piling shorts at the same level instead of waiting for the next leg.
-        const fmGap = isXAU ? 5 : isBTC ? 300 : isNAS ? 40 : 5;
+        // a meaningful gap away from P. Was $5/$300/$40 — raised to $7/$450/$60 because the
+        // earlier setting was just one "FAST move" worth of distance, allowing stacking at
+        // virtually the same level.
+        const fmGap = isXAU ? 7 : isBTC ? 450 : isNAS ? 60 : 7;
         let fmGapOk = true;
         if (s.lastSameDir === fmDir && s.lastSameDirPrice > 0) {
           if (fmDir === 'put' && price > s.lastSameDirPrice - fmGap) fmGapOk = false;
@@ -2824,7 +2826,9 @@ function processPrice(sym, price, hi, lo) {
   // NOTE: V-REV does NOT have a chop block. It's a reversal detector — designed exactly for the
   // sharp drop+bounce pattern that often happens during ranging/chop sessions. Sits with HI/LO Rev
   // and ATH/ATL as a "fade in chop" detector. (Earlier audit lumped it with TREND/BREAKOUT — wrong.)
-  if (isXAU && s.vrevSnaps.length >= 60 && cool && (now2 - s.vrevLastTs > 600000)) {
+  // Cooldown raised 2026-05-11 b: 10 → 15 min. Earlier 10-min was too short — two VREVs
+  // fired 10 min apart at $4726.51 and $4726.97 (same direction, virtually same price).
+  if (isXAU && s.vrevSnaps.length >= 60 && cool && (now2 - s.vrevLastTs > 900000)) {
     // Find the high and low in the last 15 min of snapshots
     const lookback = s.vrevSnaps.filter(sn => sn.ts > now2 - 900000); // 15 min
     if (lookback.length >= 30) {
@@ -2840,7 +2844,14 @@ function processPrice(sym, price, hi, lo) {
       // V-REVERSAL PUT: price rallied to a high, then dropped back down
       const rallyThenDrop = range >= 8.0 && lbHighTs < now2 - 60000 && (lbHigh - price) >= range * 0.4 && lbHighTs > lbLowTs;
 
-      if (dropThenBounce && roc3 > symRocThr * 2 && rsiV > 35 && rsiV < 65 && flipCoolFor('call') && winProtectDir !== 'put') {
+      // Same-direction price-gap guard (added 2026-05-11 b): block VREV signals that fire
+      // in the same direction as the last signal without meaningful price separation. Stops
+      // the "two VREVs 10 min apart at the same price" pattern.
+      const vrevGap = 5; // XAU only — VREV is XAU-only
+      const vrevGapOkCall = !(s.lastSameDir === 'call' && s.lastSameDirPrice > 0 && price < s.lastSameDirPrice + vrevGap);
+      const vrevGapOkPut  = !(s.lastSameDir === 'put'  && s.lastSameDirPrice > 0 && price > s.lastSameDirPrice - vrevGap);
+
+      if (dropThenBounce && roc3 > symRocThr * 2 && rsiV > 35 && rsiV < 65 && vrevGapOkCall && flipCoolFor('call') && winProtectDir !== 'put') {
         // CALL reversal: was dropping, now bouncing with strong upward ROC
         s.vrevLastTs = now2;
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
@@ -2856,7 +2867,7 @@ function processPrice(sym, price, hi, lo) {
         return;
       }
 
-      if (rallyThenDrop && roc3 < -symRocThr * 2 && rsiV > 35 && rsiV < 65 && flipCoolFor('put') && winProtectDir !== 'call') {
+      if (rallyThenDrop && roc3 < -symRocThr * 2 && rsiV > 35 && rsiV < 65 && vrevGapOkPut && flipCoolFor('put') && winProtectDir !== 'call') {
         // PUT reversal: was rallying, now dropping with strong downward ROC
         s.vrevLastTs = now2;
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
