@@ -177,6 +177,13 @@ SYMBOLS.forEach(sym => {
     sweepWatchDownLow: 0,    // running trough during the down-sweep wick
     sweepWatchDownAnchor: 0, // the range-low level that was swept
     sweepLastFireTs: 0,      // when last sweep signal fired (cooldown)
+    // ===== SQUEEZE RELEASE DETECTOR (added 2026-05-11) =====
+    // Anticipatory volatility-compression detector. Fires when price has been confined to an
+    // unusually tight range (15-min range ≤ instrument threshold) AND breaks out of that
+    // compression by a meaningful amount. Catches "coiled spring" patterns where stored
+    // energy releases into a fast directional move — exactly the case where FAST/BREAK/DIV/
+    // SWEEP all miss because the range is too tight for their normal thresholds.
+    sqzLastFireTs: 0,        // when last squeeze signal fired (cooldown)
     macroSnaps: [],        // [{ts, p}] — every 5 min, max 72 entries = 6 hours
     macroLastSnapTs: 0,    // when last snapshot was taken
     macroEma: null,        // slow EMA on 5-min snapshots (period 36 = ~3 hours)
@@ -1060,6 +1067,7 @@ function processPrice(sym, price, hi, lo) {
     sweepLastFireTs: s.sweepLastFireTs,
     sweepWatchUpStart: s.sweepWatchUpStart,
     sweepWatchDownStart: s.sweepWatchDownStart,
+    sqzLastFireTs: s.sqzLastFireTs,
     breakLastTs: s.breakLastTs,
     breakLastDir: s.breakLastDir,
     breakLastPrice: s.breakLastPrice,
@@ -2641,6 +2649,111 @@ function processPrice(sym, price, hi, lo) {
             s.trade = buildCfdTrade('call', price, atrVal, sym);
             s.sweepWatchDownStart = 0;
             return;
+          }
+        }
+      }
+    }
+  }
+
+  // ===== SQUEEZE RELEASE DETECTOR (MT5: XAU + BTC + NAS100) =====
+  // Anticipatory compression-break detector. When price has been confined to an unusually
+  // tight 15-min range (volatility compression / "coiled spring") and price breaks out of
+  // that range by a meaningful amount, fire a directional signal at the BREAK — before
+  // FAST/BREAK/etc. confirm the move via their wider-range thresholds.
+  //
+  // Real-world case (XAU 2026-05-11 15:07-15:19): price compressed in $4667-$4670 range
+  // for 8 min ($3.60 range — well below $5 compression threshold for XAU), then exploded
+  // $14 in 4 min. Existing detectors missed it — FAST required $5 move that took too long
+  // to develop, BREAK was blocked by its 1-hour-range gate (range was too tight), V-REV
+  // needed $8 range, DIV/SWEEP patterns never formed. SQZ would fire ⬆SQZ CALL the moment
+  // price exceeded $4670 + $1 = $4671, capturing ~$12 of the move.
+  if (isMT5 && s.vrevSnaps.length >= 100) {
+    // Per-instrument compression thresholds — max range that qualifies as "tight enough"
+    const sqzMaxRange = isXAU ? 5 : isBTC ? 250 : isNAS ? 50 : 5;
+    // Break trigger — price must exceed compression edge by this much to count as a break
+    const sqzBreakTrigger = isXAU ? 1.0 : isBTC ? 50 : isNAS ? 10 : 1.0;
+    const sqzLookbackMs = 900000;   // 15-min compression window
+    const sqzCooldownMs = 1200000;  // 20-min cooldown between SQZ signals
+
+    if (now2 - s.sqzLastFireTs > sqzCooldownMs) {
+      const sqzLookbackStart = now2 - sqzLookbackMs;
+      const sqzSnaps = s.vrevSnaps.filter(sn => sn.ts >= sqzLookbackStart);
+      // Need at least 30 samples (~1.5 min of 3s snapshots) for meaningful compression measurement
+      if (sqzSnaps.length >= 30) {
+        const sqzHigh = Math.max(...sqzSnaps.map(sn => sn.p));
+        const sqzLow = Math.min(...sqzSnaps.map(sn => sn.p));
+        const sqzRange = sqzHigh - sqzLow;
+
+        // Only proceed if the 15-min window IS compressed
+        if (sqzRange <= sqzMaxRange) {
+          // === UP-BREAK from compression ===
+          if (price > sqzHigh + sqzBreakTrigger) {
+            // Quality gates:
+            //   - RSI in 35-65 (anticipatory zone — not entering at exhaustion)
+            //   - ROC confirms direction (real acceleration, not noise)
+            //   - macdHist agrees with direction (histogram leads line for early reversals)
+            const sqzRsiOk = rsiV >= 35 && rsiV <= 65;
+            const sqzRocOk = roc3 > 0.02;
+            const sqzMacdOk = macdHist > 0;
+            if (sqzRsiOk && sqzRocOk && sqzMacdOk && flipCoolFor('call') && (winProtectDir === null || winProtectDir === 'call')) {
+              s.sqzLastFireTs = now2;
+              s.dailySignalCount++;
+              if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
+              s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
+              s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+              s.nC++; s.lastAT = 'call';
+              const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆SQZ', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+              if (enrichSig(sig)) {
+                s.signals.push(sig); logSignal(sym, sig);
+                attachTpSl(sig, 'call', price, atrVal, sym);
+                log(sym, '🎯 SQUEEZE BREAKOUT CALL — 15-min range $' + sqzRange.toFixed(2) + ' (≤ $' + sqzMaxRange + ') · broke above $' + sqzHigh.toFixed(2) + ' to $' + price.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+                sendPush('🎯 ' + sym + ' SQUEEZE CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · broke $' + sqzHigh.toFixed(2) + ' from $' + sqzRange.toFixed(2) + ' range', 'signal');
+                s.trade = buildCfdTrade('call', price, atrVal, sym);
+                return;
+              }
+            } else {
+              // Log why a candidate squeeze break didn't fire — useful for tuning
+              const reasons = [];
+              if (!sqzRsiOk) reasons.push('RSI ' + rsiV.toFixed(1) + ' outside 35-65');
+              if (!sqzRocOk) reasons.push('ROC ' + roc3.toFixed(3) + '% < 0.02%');
+              if (!sqzMacdOk) reasons.push('macdHist ' + macdHist.toFixed(3) + ' ≤ 0');
+              if (reasons.length > 0 && now2 - (s.sqzBlockLogTs || 0) > 60000) {
+                log(sym, '🎯 SQZ UP candidate blocked — ' + reasons.join(', '));
+                s.sqzBlockLogTs = now2;
+              }
+            }
+          }
+          // === DOWN-BREAK from compression ===
+          else if (price < sqzLow - sqzBreakTrigger) {
+            const sqzRsiOk = rsiV >= 35 && rsiV <= 65;
+            const sqzRocOk = roc3 < -0.02;
+            const sqzMacdOk = macdHist < 0;
+            if (sqzRsiOk && sqzRocOk && sqzMacdOk && flipCoolFor('put') && (winProtectDir === null || winProtectDir === 'put')) {
+              s.sqzLastFireTs = now2;
+              s.dailySignalCount++;
+              if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
+              s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
+              s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+              s.nP++; s.lastAT = 'put';
+              const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇SQZ', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+              if (enrichSig(sig)) {
+                s.signals.push(sig); logSignal(sym, sig);
+                attachTpSl(sig, 'put', price, atrVal, sym);
+                log(sym, '🎯 SQUEEZE BREAKDOWN PUT — 15-min range $' + sqzRange.toFixed(2) + ' (≤ $' + sqzMaxRange + ') · broke below $' + sqzLow.toFixed(2) + ' to $' + price.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+                sendPush('🎯 ' + sym + ' SQUEEZE PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · broke $' + sqzLow.toFixed(2) + ' from $' + sqzRange.toFixed(2) + ' range', 'signal');
+                s.trade = buildCfdTrade('put', price, atrVal, sym);
+                return;
+              }
+            } else {
+              const reasons = [];
+              if (!sqzRsiOk) reasons.push('RSI ' + rsiV.toFixed(1) + ' outside 35-65');
+              if (!sqzRocOk) reasons.push('ROC ' + roc3.toFixed(3) + '% > -0.02%');
+              if (!sqzMacdOk) reasons.push('macdHist ' + macdHist.toFixed(3) + ' ≥ 0');
+              if (reasons.length > 0 && now2 - (s.sqzBlockLogTs || 0) > 60000) {
+                log(sym, '🎯 SQZ DOWN candidate blocked — ' + reasons.join(', '));
+                s.sqzBlockLogTs = now2;
+              }
+            }
           }
         }
       }
