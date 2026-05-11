@@ -163,6 +163,20 @@ SYMBOLS.forEach(sym => {
     divPeaks: [],            // last 4 confirmed swing highs: [{ts, price, rsi}]
     divTroughs: [],          // last 4 confirmed swing lows
     divLastFireTs: 0,        // when last divergence signal fired (cooldown)
+    // ===== LIQUIDITY SWEEP / STOP-HUNT DETECTOR (added 2026-05-11) =====
+    // Anti-manipulation detector. Tracks the recent range high/low and watches for the classic
+    // stop-hunt footprint: price wicks just above the range high (sweeping stop-loss clusters),
+    // then immediately returns below within a short window. Fires a COUNTER-direction signal
+    // at the return — catching the reversal at the wick rather than after the dump.
+    // Example today on XAU: range $4672-$4676, spike to $4681 (sweep), reversal to $4650.
+    // Bot would fire ⬇SWEEP PUT around $4675 (just as price returned below the swept high).
+    sweepWatchUpStart: 0,    // when an up-sweep watcher started (0 = no active watcher)
+    sweepWatchUpHigh: 0,     // running peak during the up-sweep wick
+    sweepWatchUpAnchor: 0,   // the range-high level that was swept (locked when watcher starts)
+    sweepWatchDownStart: 0,  // when a down-sweep watcher started
+    sweepWatchDownLow: 0,    // running trough during the down-sweep wick
+    sweepWatchDownAnchor: 0, // the range-low level that was swept
+    sweepLastFireTs: 0,      // when last sweep signal fired (cooldown)
     macroSnaps: [],        // [{ts, p}] — every 5 min, max 72 entries = 6 hours
     macroLastSnapTs: 0,    // when last snapshot was taken
     macroEma: null,        // slow EMA on 5-min snapshots (period 36 = ~3 hours)
@@ -1043,6 +1057,9 @@ function processPrice(sym, price, hi, lo) {
     sustainedMoveLastTs: s.sustainedMoveLastTs,
     vrevLastTs: s.vrevLastTs,
     divLastFireTs: s.divLastFireTs,
+    sweepLastFireTs: s.sweepLastFireTs,
+    sweepWatchUpStart: s.sweepWatchUpStart,
+    sweepWatchDownStart: s.sweepWatchDownStart,
     breakLastTs: s.breakLastTs,
     breakLastDir: s.breakLastDir,
     breakLastPrice: s.breakLastPrice,
@@ -2516,6 +2533,107 @@ function processPrice(sym, price, hi, lo) {
         s.divSwingPrice = price;
         s.divSwingRsi = rsiV;
         s.divSwingTs = now2;
+      }
+    }
+  }
+
+  // ===== LIQUIDITY SWEEP / STOP-HUNT DETECTOR (MT5: XAU + BTC + NAS100) =====
+  // Anti-manipulation detector — catches the classic stop-hunt footprint where a whale
+  // pushes price just above (or below) a known stop cluster (recent range high/low), then
+  // immediately reverses. Fires a COUNTER-direction signal the moment price returns through
+  // the swept level. By design, fires EARLIER than ATH/ATL — at the wick, not after the dump.
+  //
+  // State machine:
+  //   1. Track rangeHigh / rangeLow from vrevSnaps over the last 20 min (the stop-cluster zones)
+  //   2. If price exceeds rangeHigh by ≥ sweepThreshold → start 5-min "watcher" with anchor locked
+  //   3. While watcher active:
+  //      a. price returns BELOW anchor → SWEEP CONFIRMED, fire PUT (counter the wick)
+  //      b. 5 min elapse with price still above anchor → real breakout, clear watcher silently
+  //   4. Symmetric for sweep-low → CALL
+  if (isMT5 && s.vrevSnaps.length >= 50) {
+    const sweepThreshold = isXAU ? 1.5 : isBTC ? 80 : isNAS ? 15 : 1.5;
+    const sweepLookbackMs = 1200000;  // 20 min — vrevSnaps' full window
+    const sweepWatchMs = 300000;       // 5 min — sweep must fail fast (real reversals are quick)
+    const sweepCooldownMs = 1800000;   // 30 min between sweep signals
+
+    const sweepLookbackStart = now2 - sweepLookbackMs;
+    const sweepRelevantSnaps = s.vrevSnaps.filter(sn => sn.ts >= sweepLookbackStart);
+    if (sweepRelevantSnaps.length >= 20) {
+      const sweepRangeHigh = Math.max(...sweepRelevantSnaps.map(sn => sn.p));
+      const sweepRangeLow = Math.min(...sweepRelevantSnaps.map(sn => sn.p));
+
+      // === UP-SWEEP DETECTION (wicked above range high → expect dump) ===
+      if (s.sweepWatchUpStart === 0) {
+        // No active watcher — check for new sweep candidate
+        if (price > sweepRangeHigh + sweepThreshold && now2 - s.sweepLastFireTs > sweepCooldownMs) {
+          s.sweepWatchUpStart = now2;
+          s.sweepWatchUpHigh = price;
+          s.sweepWatchUpAnchor = sweepRangeHigh; // LOCK the anchor — don't track it after this
+          log(sym, '👀 SWEEP UP candidate — price $' + price.toFixed(2) + ' exceeded recent high $' + sweepRangeHigh.toFixed(2) + ' by $' + (price - sweepRangeHigh).toFixed(2) + ', watching 5min for return below');
+        }
+      } else {
+        // Active up-watcher
+        if (price > s.sweepWatchUpHigh) s.sweepWatchUpHigh = price;
+        if (now2 - s.sweepWatchUpStart > sweepWatchMs) {
+          // Window expired — real breakout, clear watcher silently
+          log(sym, '🟢 SWEEP UP failed — price held above swept level $' + s.sweepWatchUpAnchor.toFixed(2) + ' for 5min, treating as real breakout');
+          s.sweepWatchUpStart = 0;
+        } else if (price < s.sweepWatchUpAnchor && flipCoolFor('put') && (winProtectDir === null || winProtectDir === 'put')) {
+          // SWEEP CONFIRMED — price wicked above and is now back below the swept level
+          s.sweepLastFireTs = now2;
+          s.dailySignalCount++;
+          if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
+          s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
+          s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+          s.nP++; s.lastAT = 'put';
+          const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇SWEEP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+          if (!enrichSig(sig)) {
+            s.sweepWatchUpStart = 0;
+          } else {
+            s.signals.push(sig); logSignal(sym, sig);
+            attachTpSl(sig, 'put', price, atrVal, sym);
+            log(sym, '🪤 LIQUIDITY SWEEP UP CONFIRMED — wick to $' + s.sweepWatchUpHigh.toFixed(2) + ' then back to $' + price.toFixed(2) + ' (below swept $' + s.sweepWatchUpAnchor.toFixed(2) + ') — PUT [#' + s.dailySignalCount + ']');
+            sendPush('🪤 ' + sym + ' SWEEP PUT #' + s.dailySignalCount, 'Wicked $' + s.sweepWatchUpHigh.toFixed(2) + ', back to $' + price.toFixed(2), 'signal');
+            s.trade = buildCfdTrade('put', price, atrVal, sym);
+            s.sweepWatchUpStart = 0;
+            return;
+          }
+        }
+      }
+
+      // === DOWN-SWEEP DETECTION (wicked below range low → expect rally) ===
+      if (s.sweepWatchDownStart === 0) {
+        if (price < sweepRangeLow - sweepThreshold && now2 - s.sweepLastFireTs > sweepCooldownMs) {
+          s.sweepWatchDownStart = now2;
+          s.sweepWatchDownLow = price;
+          s.sweepWatchDownAnchor = sweepRangeLow;
+          log(sym, '👀 SWEEP DOWN candidate — price $' + price.toFixed(2) + ' broke recent low $' + sweepRangeLow.toFixed(2) + ' by $' + (sweepRangeLow - price).toFixed(2) + ', watching 5min for return above');
+        }
+      } else {
+        if (price < s.sweepWatchDownLow) s.sweepWatchDownLow = price;
+        if (now2 - s.sweepWatchDownStart > sweepWatchMs) {
+          log(sym, '🔴 SWEEP DOWN failed — price held below swept level $' + s.sweepWatchDownAnchor.toFixed(2) + ' for 5min, treating as real breakdown');
+          s.sweepWatchDownStart = 0;
+        } else if (price > s.sweepWatchDownAnchor && flipCoolFor('call') && (winProtectDir === null || winProtectDir === 'call')) {
+          s.sweepLastFireTs = now2;
+          s.dailySignalCount++;
+          if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
+          s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
+          s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+          s.nC++; s.lastAT = 'call';
+          const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆SWEEP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+          if (!enrichSig(sig)) {
+            s.sweepWatchDownStart = 0;
+          } else {
+            s.signals.push(sig); logSignal(sym, sig);
+            attachTpSl(sig, 'call', price, atrVal, sym);
+            log(sym, '🪤 LIQUIDITY SWEEP DOWN CONFIRMED — wick to $' + s.sweepWatchDownLow.toFixed(2) + ' then back to $' + price.toFixed(2) + ' (above swept $' + s.sweepWatchDownAnchor.toFixed(2) + ') — CALL [#' + s.dailySignalCount + ']');
+            sendPush('🪤 ' + sym + ' SWEEP CALL #' + s.dailySignalCount, 'Wicked $' + s.sweepWatchDownLow.toFixed(2) + ', back to $' + price.toFixed(2), 'signal');
+            s.trade = buildCfdTrade('call', price, atrVal, sym);
+            s.sweepWatchDownStart = 0;
+            return;
+          }
+        }
       }
     }
   }
