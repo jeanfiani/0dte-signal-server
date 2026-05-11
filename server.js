@@ -2495,6 +2495,9 @@ function processPrice(sym, price, hi, lo) {
         // only $1+ between peaks (confirmGap * 0.5) — too lenient, fires on RSI noise.
         // Now requires full divConfirmGap ($2 for XAU) between peaks PLUS macdHist confirmation
         // (histogram must be negative, meaning momentum is actually weakening, not just RSI).
+        // Added 2026-05-11 e: current-RSI floor (>= 35) AND same-direction price gap. Today's
+        // failed DIV PUT fired at RSI 32.5 — already oversold — only $1.80 below a previous
+        // PUT entry. Both gates would have caught it independently.
         if (s.divPeaks.length >= 2 && now2 - s.divLastFireTs > divCooldownMs) {
           const cur = s.divPeaks[s.divPeaks.length - 1];
           const prev = s.divPeaks[s.divPeaks.length - 2];
@@ -2502,7 +2505,12 @@ function processPrice(sym, price, hi, lo) {
           const rsiLowerHigh = cur.rsi < prev.rsi - divRsiGap;                  // RSI failing to confirm
           const peakFresh = now2 - prev.ts < divMaxExtremesAge;
           const macdConfirms = macdHist < 0;                                    // momentum already turning bearish
-          if (priceHigherHigh && rsiLowerHigh && peakFresh && macdConfirms && flipCoolFor('put') && (winProtectDir === null || winProtectDir === 'put')) {
+          const divRsiFloor = rsiV >= 35;                                       // not already oversold at entry
+          // Same-direction gap: block if previous PUT (any detector) within divSameDirGap of current price.
+          // Per-instrument: $5 XAU, $250 BTC, $25 NAS — proportional to instrument's typical move size.
+          const divSameDirGap = isXAU ? 5 : isBTC ? 250 : isNAS ? 25 : 5;
+          const divGapOk = !(s.lastSameDir === 'put' && s.lastSameDirPrice > 0 && Math.abs(price - s.lastSameDirPrice) < divSameDirGap);
+          if (priceHigherHigh && rsiLowerHigh && peakFresh && macdConfirms && divRsiFloor && divGapOk && flipCoolFor('put') && (winProtectDir === null || winProtectDir === 'put')) {
             s.divLastFireTs = now2;
             s.dailySignalCount++;
             if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
@@ -2558,6 +2566,9 @@ function processPrice(sym, price, hi, lo) {
         if (s.divTroughs.length > 4) s.divTroughs.shift();
         // Bullish divergence check: new trough LOWER price + HIGHER RSI than previous trough.
         // Same tightening as bearish — full divConfirmGap between troughs + macdHist confirmation.
+        // Added 2026-05-11 e: current-RSI ceiling (<= 65) AND same-direction price gap (symmetric
+        // to bearish DIV — same protection against overbought entries and stacking same-direction
+        // signals at near-identical prices).
         if (s.divTroughs.length >= 2 && now2 - s.divLastFireTs > divCooldownMs) {
           const cur = s.divTroughs[s.divTroughs.length - 1];
           const prev = s.divTroughs[s.divTroughs.length - 2];
@@ -2565,7 +2576,10 @@ function processPrice(sym, price, hi, lo) {
           const rsiHigherLow = cur.rsi > prev.rsi + divRsiGap;                // RSI refusing to confirm
           const troughFresh = now2 - prev.ts < divMaxExtremesAge;
           const macdConfirms = macdHist > 0;                                  // momentum already turning bullish
-          if (priceLowerLow && rsiHigherLow && troughFresh && macdConfirms && flipCoolFor('call') && (winProtectDir === null || winProtectDir === 'call')) {
+          const divRsiCeiling = rsiV <= 65;                                   // not already overbought at entry
+          const divSameDirGap = isXAU ? 5 : isBTC ? 250 : isNAS ? 25 : 5;
+          const divGapOk = !(s.lastSameDir === 'call' && s.lastSameDirPrice > 0 && Math.abs(price - s.lastSameDirPrice) < divSameDirGap);
+          if (priceLowerLow && rsiHigherLow && troughFresh && macdConfirms && divRsiCeiling && divGapOk && flipCoolFor('call') && (winProtectDir === null || winProtectDir === 'call')) {
             s.divLastFireTs = now2;
             s.dailySignalCount++;
             if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
