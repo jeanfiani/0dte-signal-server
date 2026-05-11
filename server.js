@@ -2724,7 +2724,10 @@ function processPrice(sym, price, hi, lo) {
   // to develop, BREAK was blocked by its 1-hour-range gate (range was too tight), V-REV
   // needed $8 range, DIV/SWEEP patterns never formed. SQZ would fire ⬆SQZ CALL the moment
   // price exceeded $4670 + $1 = $4671, capturing ~$12 of the move.
-  if (isMT5 && s.vrevSnaps.length >= 100) {
+  // Indicator-readiness guard added 2026-05-11 f after Railway logged
+  // "processTicks BTC error: Cannot read properties of undefined (reading 'toFixed')" —
+  // SQZ block-log tried to format macdHist/rsiV/roc3 before they were computed for early ticks.
+  if (isMT5 && s.vrevSnaps.length >= 100 && typeof rsiV === 'number' && typeof roc3 === 'number' && typeof macdHist === 'number') {
     // Per-instrument compression thresholds — max range that qualifies as "tight enough"
     const sqzMaxRange = isXAU ? 5 : isBTC ? 250 : isNAS ? 50 : 5;
     // Break trigger — price must exceed compression edge by this much to count as a break
@@ -3175,6 +3178,15 @@ function processPrice(sym, price, hi, lo) {
         const sigType = dir === 'long' ? 'call' : 'put';
         s.lastAT = sigType; if (sigType === 'call') s.nC++; else s.nP++;
         s.lastSignalDir = sigType; s.lastSignalTs = now3; s.lastNTs = now3;
+        // Fix 2026-05-11 f: `withMacro` was referenced but never declared, causing a
+        // ReferenceError every time TRv2 tried to fire (Railway logs:
+        // "processTicks NAS100 error: withMacro is not defined"). Was a leftover from an
+        // older macro-alignment feature that got partially removed. Compute it now: macro
+        // is "aligned" when DXY direction matches the inverse-correlation expectation
+        // (DXY down + LONG = aligned; DXY up + SHORT = aligned). Used for label only.
+        const withMacro = (s._dxy && s._dxy.dir)
+          ? ((dir === 'long' && s._dxy.dir === 'down') || (dir === 'short' && s._dxy.dir === 'up'))
+          : false;
         const macroTag = withMacro ? '+MACRO' : '';
         const sig = { type: sigType, time: ts(), price: price.toFixed(2), score: (dir === 'long' ? '⬆' : '⬇') + 'RIDE' + macroTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount, tp1: tp1.toFixed(2), tp2: tp2.toFixed(2), tp3: tp3.toFixed(2), sl: sl.toFixed(2) };
         if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
