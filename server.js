@@ -149,6 +149,20 @@ SYMBOLS.forEach(sym => {
     // V-Reversal detector (XAU only) — tracks recent price extremes for momentum reversal detection
     vrevSnaps: [],         // [{ts, p}] — price snapshots every 3s, last 20 min (max 400)
     vrevLastTs: 0,         // when last V-Rev signal fired (cooldown)
+    // ===== RSI DIVERGENCE DETECTOR (added 2026-05-11) =====
+    // Anticipatory reversal detector: tracks the last 4 confirmed swing extremes (alternating
+    // peaks + troughs) with their RSI value at the time. Fires PUT when price makes a NEW
+    // higher high but RSI prints a LOWER high (bearish divergence — momentum failing). Fires
+    // CALL when price makes a NEW lower low but RSI prints a HIGHER low (bullish divergence —
+    // selling pressure exhausting). This catches reversals 5-15 min BEFORE the actual flip,
+    // unlike ATH/ATL which fires only after price has already pulled back from the extreme.
+    divSwingDir: null,       // 'up' (tracking a potential peak) or 'down' (tracking a trough)
+    divSwingPrice: 0,        // running extreme price of the current swing
+    divSwingRsi: 50,         // RSI at the time of the running extreme
+    divSwingTs: 0,           // when current swing extreme was set
+    divPeaks: [],            // last 4 confirmed swing highs: [{ts, price, rsi}]
+    divTroughs: [],          // last 4 confirmed swing lows
+    divLastFireTs: 0,        // when last divergence signal fired (cooldown)
     macroSnaps: [],        // [{ts, p}] — every 5 min, max 72 entries = 6 hours
     macroLastSnapTs: 0,    // when last snapshot was taken
     macroEma: null,        // slow EMA on 5-min snapshots (period 36 = ~3 hours)
@@ -1028,6 +1042,7 @@ function processPrice(sym, price, hi, lo) {
     fastMoveLastTs: s.fastMoveLastTs,
     sustainedMoveLastTs: s.sustainedMoveLastTs,
     vrevLastTs: s.vrevLastTs,
+    divLastFireTs: s.divLastFireTs,
     breakLastTs: s.breakLastTs,
     breakLastDir: s.breakLastDir,
     breakLastPrice: s.breakLastPrice,
@@ -2382,6 +2397,125 @@ function processPrice(sym, price, hi, lo) {
           s.trade = isMT5 ? buildCfdTrade(fmDir, price, atrVal, sym) : { active: true, type: fmDir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
           return;
         }
+      }
+    }
+  }
+
+  // ===== RSI DIVERGENCE DETECTOR (MT5 instruments: XAU + BTC + NAS100) =====
+  // Anticipatory reversal — fires BEFORE price has fully reversed. Maintains a state machine
+  // that tracks each price swing (up-leg or down-leg) and confirms a swing extreme when price
+  // reverses by ≥ divConfirmGap from the running extreme. On each confirmed extreme, checks
+  // against the previous same-type extreme:
+  //   Bearish divergence  →  PUT  →  price_new > price_old  AND  rsi_new < rsi_old − divRsiGap
+  //   Bullish divergence  →  CALL →  price_new < price_old  AND  rsi_new > rsi_old + divRsiGap
+  // Divergence signals require ≥ 2 confirmed extremes of the same type to compare.
+  if (isMT5 && rsiV > 0 && rsiV < 100) {
+    // Per-instrument swing-confirmation gap — the minimum price reversal required to call a
+    // swing "done". Smaller values fire too often on noise; larger values miss real reversals.
+    const divConfirmGap = isXAU ? 2 : isBTC ? 100 : isNAS ? 20 : 2;
+    const divRsiGap = 4;            // min RSI delta between extremes to call it divergence (filters noise)
+    const divMinDuration = 60000;   // swing must last ≥ 60s to count (no tick-spike triggers)
+    const divCooldownMs = 1800000;  // 30 min between divergence signals (don't spam)
+    const divMaxExtremesAge = 1800000; // peaks/troughs older than 30 min are stale — drop them
+
+    // Initialize swing state if first valid tick
+    if (s.divSwingDir === null) {
+      s.divSwingDir = 'up';
+      s.divSwingPrice = price;
+      s.divSwingRsi = rsiV;
+      s.divSwingTs = now2;
+    }
+    // === Swing state machine ===
+    if (s.divSwingDir === 'up') {
+      // Tracking a potential peak — update running extreme as price rises
+      if (price > s.divSwingPrice) {
+        s.divSwingPrice = price;
+        s.divSwingRsi = rsiV;
+        s.divSwingTs = now2;
+      }
+      // Confirm peak when price has reversed ≥ confirmGap from the high AND swing lasted ≥ minDuration
+      else if (s.divSwingPrice - price >= divConfirmGap && now2 - s.divSwingTs >= divMinDuration) {
+        // Push the confirmed peak — keep last 4 for divergence comparison
+        s.divPeaks.push({ ts: s.divSwingTs, price: s.divSwingPrice, rsi: s.divSwingRsi });
+        if (s.divPeaks.length > 4) s.divPeaks.shift();
+        // Bearish divergence check: new peak HIGHER price + LOWER RSI than previous peak
+        if (s.divPeaks.length >= 2 && now2 - s.divLastFireTs > divCooldownMs) {
+          const cur = s.divPeaks[s.divPeaks.length - 1];
+          const prev = s.divPeaks[s.divPeaks.length - 2];
+          const priceHigherHigh = cur.price > prev.price + divConfirmGap * 0.5; // meaningfully higher
+          const rsiLowerHigh = cur.rsi < prev.rsi - divRsiGap;                   // RSI failing to confirm
+          const peakFresh = now2 - prev.ts < divMaxExtremesAge;
+          if (priceHigherHigh && rsiLowerHigh && peakFresh && flipCoolFor('put') && (winProtectDir === null || winProtectDir === 'put')) {
+            s.divLastFireTs = now2;
+            s.dailySignalCount++;
+            if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
+            s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
+            s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+            s.nP++; s.lastAT = 'put';
+            const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇DIV', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+            if (!enrichSig(sig)) {
+              // Conviction blocked — keep peak in history but reset signal counters
+            } else {
+              s.signals.push(sig); logSignal(sym, sig);
+              if (isMT5) attachTpSl(sig, 'put', price, atrVal, sym);
+              log(sym, '🔻 RSI BEARISH DIVERGENCE — price $' + cur.price.toFixed(2) + ' > $' + prev.price.toFixed(2) + ' but RSI ' + cur.rsi.toFixed(1) + ' < ' + prev.rsi.toFixed(1) + ' [#' + s.dailySignalCount + ']');
+              sendPush('🔻 ' + sym + ' BEARISH DIV PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · RSI ' + cur.rsi.toFixed(1) + ' (prev peak ' + prev.rsi.toFixed(1) + ')', 'signal');
+              s.trade = buildCfdTrade('put', price, atrVal, sym);
+              // Flip swing direction; let the next leg track the next trough
+              s.divSwingDir = 'down'; s.divSwingPrice = price; s.divSwingRsi = rsiV; s.divSwingTs = now2;
+              return;
+            }
+          }
+        }
+        // No divergence (or already-cooled-down) — just flip swing direction and continue tracking
+        s.divSwingDir = 'down';
+        s.divSwingPrice = price;
+        s.divSwingRsi = rsiV;
+        s.divSwingTs = now2;
+      }
+    } else { // divSwingDir === 'down'
+      // Tracking a potential trough — update running extreme as price falls
+      if (price < s.divSwingPrice) {
+        s.divSwingPrice = price;
+        s.divSwingRsi = rsiV;
+        s.divSwingTs = now2;
+      }
+      // Confirm trough when price has reversed ≥ confirmGap from the low AND swing lasted ≥ minDuration
+      else if (price - s.divSwingPrice >= divConfirmGap && now2 - s.divSwingTs >= divMinDuration) {
+        s.divTroughs.push({ ts: s.divSwingTs, price: s.divSwingPrice, rsi: s.divSwingRsi });
+        if (s.divTroughs.length > 4) s.divTroughs.shift();
+        // Bullish divergence check: new trough LOWER price + HIGHER RSI than previous trough
+        if (s.divTroughs.length >= 2 && now2 - s.divLastFireTs > divCooldownMs) {
+          const cur = s.divTroughs[s.divTroughs.length - 1];
+          const prev = s.divTroughs[s.divTroughs.length - 2];
+          const priceLowerLow = cur.price < prev.price - divConfirmGap * 0.5; // meaningfully lower
+          const rsiHigherLow = cur.rsi > prev.rsi + divRsiGap;                 // RSI refusing to confirm
+          const troughFresh = now2 - prev.ts < divMaxExtremesAge;
+          if (priceLowerLow && rsiHigherLow && troughFresh && flipCoolFor('call') && (winProtectDir === null || winProtectDir === 'call')) {
+            s.divLastFireTs = now2;
+            s.dailySignalCount++;
+            if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
+            s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
+            s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+            s.nC++; s.lastAT = 'call';
+            const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆DIV', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+            if (!enrichSig(sig)) {
+              // Conviction blocked — keep trough in history but reset signal counters
+            } else {
+              s.signals.push(sig); logSignal(sym, sig);
+              if (isMT5) attachTpSl(sig, 'call', price, atrVal, sym);
+              log(sym, '🚀 RSI BULLISH DIVERGENCE — price $' + cur.price.toFixed(2) + ' < $' + prev.price.toFixed(2) + ' but RSI ' + cur.rsi.toFixed(1) + ' > ' + prev.rsi.toFixed(1) + ' [#' + s.dailySignalCount + ']');
+              sendPush('🚀 ' + sym + ' BULLISH DIV CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · RSI ' + cur.rsi.toFixed(1) + ' (prev trough ' + prev.rsi.toFixed(1) + ')', 'signal');
+              s.trade = buildCfdTrade('call', price, atrVal, sym);
+              s.divSwingDir = 'up'; s.divSwingPrice = price; s.divSwingRsi = rsiV; s.divSwingTs = now2;
+              return;
+            }
+          }
+        }
+        s.divSwingDir = 'up';
+        s.divSwingPrice = price;
+        s.divSwingRsi = rsiV;
+        s.divSwingTs = now2;
       }
     }
   }
