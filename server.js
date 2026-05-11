@@ -2172,7 +2172,10 @@ function processPrice(sym, price, hi, lo) {
         s._pendingBreakout = null;
         return;
       }
-      const brkCallRsiMax = isBTC ? 75 : 65; // BTC keeps wider ceiling for sustained-trend reasons
+      // BTC ceiling lowered 2026-05-11 c: was 75 (permissive, "crypto trends sustain longer"),
+      // but BTC 5/11 data falsified that — CALL BREAK at RSI 73.6 lost -0.81%, RSI 73.4 lost
+      // -0.03%. RSI 73+ is reliable top-buying zone even for BTC. Aligning with XAU/NAS at 70.
+      const brkCallRsiMax = 70;
       if (bo.dir === 'call' && rsiV > brkCallRsiMax) {
         log(sym, '💥 BREAKOUT blocked: ⬆BREAK RSI ' + rsiV.toFixed(1) + ' > ' + brkCallRsiMax + ' — overbought, entering at exhaustion');
         s._pendingBreakout = null;
@@ -2463,6 +2466,19 @@ function processPrice(sym, price, hi, lo) {
     }
     // === Swing state machine ===
     if (s.divSwingDir === 'up') {
+      // Trough-invalidation guard (added 2026-05-11 d): if we recently confirmed a trough
+      // but price has now broken BELOW it by confirmGap, the trough was fake — pop it from
+      // history and flip back to down-tracking. Prevents the state machine from being stuck
+      // when a "trough" was actually mid-descent.
+      if (s.divTroughs.length > 0 && price < s.divTroughs[s.divTroughs.length - 1].price - divConfirmGap) {
+        const fakeTrough = s.divTroughs.pop();
+        log(sym, '🔄 DIV trough invalidated — price $' + price.toFixed(2) + ' broke below confirmed trough $' + fakeTrough.price.toFixed(2) + ' by $' + divConfirmGap + ', re-tracking');
+        s.divSwingDir = 'down';
+        s.divSwingPrice = price;
+        s.divSwingRsi = rsiV;
+        s.divSwingTs = now2;
+        return;
+      }
       // Tracking a potential peak — update running extreme as price rises
       if (price > s.divSwingPrice) {
         s.divSwingPrice = price;
@@ -2474,14 +2490,19 @@ function processPrice(sym, price, hi, lo) {
         // Push the confirmed peak — keep last 4 for divergence comparison
         s.divPeaks.push({ ts: s.divSwingTs, price: s.divSwingPrice, rsi: s.divSwingRsi });
         if (s.divPeaks.length > 4) s.divPeaks.shift();
-        // Bearish divergence check: new peak HIGHER price + LOWER RSI than previous peak
+        // Bearish divergence check: new peak HIGHER price + LOWER RSI than previous peak.
+        // Tightened 2026-05-11 d after first live DIV PUT failed: previous threshold required
+        // only $1+ between peaks (confirmGap * 0.5) — too lenient, fires on RSI noise.
+        // Now requires full divConfirmGap ($2 for XAU) between peaks PLUS macdHist confirmation
+        // (histogram must be negative, meaning momentum is actually weakening, not just RSI).
         if (s.divPeaks.length >= 2 && now2 - s.divLastFireTs > divCooldownMs) {
           const cur = s.divPeaks[s.divPeaks.length - 1];
           const prev = s.divPeaks[s.divPeaks.length - 2];
-          const priceHigherHigh = cur.price > prev.price + divConfirmGap * 0.5; // meaningfully higher
-          const rsiLowerHigh = cur.rsi < prev.rsi - divRsiGap;                   // RSI failing to confirm
+          const priceHigherHigh = cur.price > prev.price + divConfirmGap;       // meaningfully higher (was * 0.5)
+          const rsiLowerHigh = cur.rsi < prev.rsi - divRsiGap;                  // RSI failing to confirm
           const peakFresh = now2 - prev.ts < divMaxExtremesAge;
-          if (priceHigherHigh && rsiLowerHigh && peakFresh && flipCoolFor('put') && (winProtectDir === null || winProtectDir === 'put')) {
+          const macdConfirms = macdHist < 0;                                    // momentum already turning bearish
+          if (priceHigherHigh && rsiLowerHigh && peakFresh && macdConfirms && flipCoolFor('put') && (winProtectDir === null || winProtectDir === 'put')) {
             s.divLastFireTs = now2;
             s.dailySignalCount++;
             if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
@@ -2510,6 +2531,21 @@ function processPrice(sym, price, hi, lo) {
         s.divSwingTs = now2;
       }
     } else { // divSwingDir === 'down'
+      // Peak-invalidation guard (added 2026-05-11 d): if we recently confirmed a peak but
+      // price has now broken ABOVE it by confirmGap, the peak was fake (premature reversal
+      // detection). Pop it from history and flip back to up-tracking to find the real peak.
+      // CRITICAL for cases like today's failed DIV PUT — if the bot "confirms" a peak
+      // and fires PUT, but price keeps rallying, this prevents firing more PUTs into the
+      // continued rally AND lets the state machine find the real top.
+      if (s.divPeaks.length > 0 && price > s.divPeaks[s.divPeaks.length - 1].price + divConfirmGap) {
+        const fakePeak = s.divPeaks.pop();
+        log(sym, '🔄 DIV peak invalidated — price $' + price.toFixed(2) + ' broke above confirmed peak $' + fakePeak.price.toFixed(2) + ' by $' + divConfirmGap + ', re-tracking');
+        s.divSwingDir = 'up';
+        s.divSwingPrice = price;
+        s.divSwingRsi = rsiV;
+        s.divSwingTs = now2;
+        return;
+      }
       // Tracking a potential trough — update running extreme as price falls
       if (price < s.divSwingPrice) {
         s.divSwingPrice = price;
@@ -2520,14 +2556,16 @@ function processPrice(sym, price, hi, lo) {
       else if (price - s.divSwingPrice >= divConfirmGap && now2 - s.divSwingTs >= divMinDuration) {
         s.divTroughs.push({ ts: s.divSwingTs, price: s.divSwingPrice, rsi: s.divSwingRsi });
         if (s.divTroughs.length > 4) s.divTroughs.shift();
-        // Bullish divergence check: new trough LOWER price + HIGHER RSI than previous trough
+        // Bullish divergence check: new trough LOWER price + HIGHER RSI than previous trough.
+        // Same tightening as bearish — full divConfirmGap between troughs + macdHist confirmation.
         if (s.divTroughs.length >= 2 && now2 - s.divLastFireTs > divCooldownMs) {
           const cur = s.divTroughs[s.divTroughs.length - 1];
           const prev = s.divTroughs[s.divTroughs.length - 2];
-          const priceLowerLow = cur.price < prev.price - divConfirmGap * 0.5; // meaningfully lower
-          const rsiHigherLow = cur.rsi > prev.rsi + divRsiGap;                 // RSI refusing to confirm
+          const priceLowerLow = cur.price < prev.price - divConfirmGap;       // meaningfully lower (was * 0.5)
+          const rsiHigherLow = cur.rsi > prev.rsi + divRsiGap;                // RSI refusing to confirm
           const troughFresh = now2 - prev.ts < divMaxExtremesAge;
-          if (priceLowerLow && rsiHigherLow && troughFresh && flipCoolFor('call') && (winProtectDir === null || winProtectDir === 'call')) {
+          const macdConfirms = macdHist > 0;                                  // momentum already turning bullish
+          if (priceLowerLow && rsiHigherLow && troughFresh && macdConfirms && flipCoolFor('call') && (winProtectDir === null || winProtectDir === 'call')) {
             s.divLastFireTs = now2;
             s.dailySignalCount++;
             if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
