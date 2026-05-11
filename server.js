@@ -2270,7 +2270,8 @@ function processPrice(sym, price, hi, lo) {
       const rangeStr = '$' + bo.coilLo.toFixed(2) + '-$' + bo.coilHi.toFixed(2);
       log(sym, '💥 BREAKOUT ' + dir.toUpperCase() + ' — coiled ' + coilMin + 'min in ' + rangeStr + ' · escaped $' + bo.escape.toFixed(2) + ' · accel ' + bo.accel.toFixed(1) + 'x [#' + s.dailySignalCount + ']');
       sendPush('💥 ' + sym + ' BREAKOUT ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · broke ' + (dir === 'call' ? 'above' : 'below') + ' ' + rangeStr + ' (' + coilMin + 'min coil)', 'signal');
-      s.trade = isMT5 ? buildCfdTrade(dir, price, atrVal, sym) : { active: true, type: dir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
+      s.trade = isMT5 ? attachOTE(buildCfdTrade(dir, price, atrVal, sym), s, sym, dir) : { active: true, type: dir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
+      if (isMT5 && s.trade.oteLimit) log(sym, '🎯 OTE ' + dir.toUpperCase() + ' limit set @ $' + s.trade.oteLimit.toFixed(2) + ' (BREAK retracement entry, expires in 3min)');
       return;
     } else {
       // Cooldown blocked — clear pending
@@ -2525,7 +2526,8 @@ function processPrice(sym, price, hi, lo) {
               if (isMT5) attachTpSl(sig, 'put', price, atrVal, sym);
               log(sym, '🔻 RSI BEARISH DIVERGENCE — price $' + cur.price.toFixed(2) + ' > $' + prev.price.toFixed(2) + ' but RSI ' + cur.rsi.toFixed(1) + ' < ' + prev.rsi.toFixed(1) + ' [#' + s.dailySignalCount + ']');
               sendPush('🔻 ' + sym + ' BEARISH DIV PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · RSI ' + cur.rsi.toFixed(1) + ' (prev peak ' + prev.rsi.toFixed(1) + ')', 'signal');
-              s.trade = buildCfdTrade('put', price, atrVal, sym);
+              s.trade = attachOTE(buildCfdTrade('put', price, atrVal, sym), s, sym, 'put');
+              if (s.trade.oteLimit) log(sym, '🎯 OTE PUT limit set @ $' + s.trade.oteLimit.toFixed(2) + ' (impulse $' + s.trade.oteImpulseLo.toFixed(2) + '→$' + s.trade.oteImpulseHi.toFixed(2) + ', expires in 3min)');
               // Flip swing direction; let the next leg track the next trough
               s.divSwingDir = 'down'; s.divSwingPrice = price; s.divSwingRsi = rsiV; s.divSwingTs = now2;
               return;
@@ -2594,7 +2596,8 @@ function processPrice(sym, price, hi, lo) {
               if (isMT5) attachTpSl(sig, 'call', price, atrVal, sym);
               log(sym, '🚀 RSI BULLISH DIVERGENCE — price $' + cur.price.toFixed(2) + ' < $' + prev.price.toFixed(2) + ' but RSI ' + cur.rsi.toFixed(1) + ' > ' + prev.rsi.toFixed(1) + ' [#' + s.dailySignalCount + ']');
               sendPush('🚀 ' + sym + ' BULLISH DIV CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · RSI ' + cur.rsi.toFixed(1) + ' (prev trough ' + prev.rsi.toFixed(1) + ')', 'signal');
-              s.trade = buildCfdTrade('call', price, atrVal, sym);
+              s.trade = attachOTE(buildCfdTrade('call', price, atrVal, sym), s, sym, 'call');
+              if (s.trade.oteLimit) log(sym, '🎯 OTE CALL limit set @ $' + s.trade.oteLimit.toFixed(2) + ' (impulse $' + s.trade.oteImpulseHi.toFixed(2) + '→$' + s.trade.oteImpulseLo.toFixed(2) + ', expires in 3min)');
               s.divSwingDir = 'up'; s.divSwingPrice = price; s.divSwingRsi = rsiV; s.divSwingTs = now2;
               return;
             }
@@ -3471,7 +3474,8 @@ function processPrice(sym, price, hi, lo) {
         if (isMT5) attachTpSl(sig, 'put', price, atrVal, sym);
         log(sym, '🔻 ATH REVERSAL PUT — $' + distFromATH.toFixed(2) + ' off 5-day high $' + s.rollingHigh.toFixed(2) + ' RSI@ATH:' + s.rsiAtRollingHigh.toFixed(1) + ' [#' + s.dailySignalCount + ']');
         sendPush('🔻 ' + sym + ' ATH REVERSAL PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromATH.toFixed(2) + ' off ATH $' + s.rollingHigh.toFixed(2), 'signal');
-        s.trade = isMT5 ? buildCfdTrade('put', price, atrVal, sym) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
+        s.trade = isMT5 ? attachOTE(buildCfdTrade('put', price, atrVal, sym), s, sym, 'put') : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
+        if (isMT5 && s.trade.oteLimit) log(sym, '🎯 OTE PUT limit set @ $' + s.trade.oteLimit.toFixed(2) + ' (ATH retracement entry, expires in 3min)');
         s.athApproachTs = 0; // clear so it won't re-fire until price re-touches ATH
         s.lastAthPutTs = now2; s.lastAthPutPrice = price; // track for failed pullback guard
         return;
@@ -3522,7 +3526,8 @@ function processPrice(sym, price, hi, lo) {
         if (isMT5) attachTpSl(sig, 'call', price, atrVal, sym);
         log(sym, '🚀 ATL REVERSAL CALL — $' + distFromATL.toFixed(2) + ' off 5-day low $' + s.rollingLow.toFixed(2) + ' RSI@ATL:' + s.rsiAtRollingLow.toFixed(1) + ' [#' + s.dailySignalCount + ']');
         sendPush('🚀 ' + sym + ' ATL REVERSAL CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromATL.toFixed(2) + ' off ATL $' + s.rollingLow.toFixed(2), 'signal');
-        s.trade = isMT5 ? buildCfdTrade('call', price, atrVal, sym) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
+        s.trade = isMT5 ? attachOTE(buildCfdTrade('call', price, atrVal, sym), s, sym, 'call') : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
+        if (isMT5 && s.trade.oteLimit) log(sym, '🎯 OTE CALL limit set @ $' + s.trade.oteLimit.toFixed(2) + ' (ATL retracement entry, expires in 3min)');
         s.atlApproachTs = 0; // clear so it won't re-fire until price re-touches ATL
         s.lastAtlCallTs = now2; s.lastAtlCallPrice = price; // track for failed bounce guard
         return;
@@ -3702,6 +3707,64 @@ function processPrice(sym, price, hi, lo) {
 // ===== ATR-BASED TRADE BUILDER (XAU/BTC/NAS100 — CFD signals) =====
 // Creates trade object with price-based TP/SL levels from ATR
 // TP1=1x ATR, TP2=2x ATR, TP3=3x ATR, SL=1.5x ATR
+// ===== OTE (OPTIMAL TRADE ENTRY) COMPUTATION =====
+// Added 2026-05-11 f. For supported detectors (DIV/ATH/ATL/BREAK), compute the 70.5%
+// Fibonacci retracement level of the most recent 15-min impulse leg. EA uses this as a
+// LIMIT entry price (better fill than market) with fallback to Option A delayed-market entry
+// if price doesn't retrace to the OTE level within 3 minutes.
+//
+// Returns null when:
+//   - Insufficient price history
+//   - Impulse range too small to be meaningful (XAU < $3, BTC < $150, NAS < $15)
+//   - Impulse direction doesn't match the signal direction
+//     (PUT needs UP-impulse to fade — high more recent than low)
+//     (CALL needs DOWN-impulse — low more recent than high)
+function computeOTE(s, sym, dir) {
+  if (!s.vrevSnaps || s.vrevSnaps.length < 30) return null;
+  const lookbackMs = 900000; // 15 min
+  const lookbackStart = Date.now() - lookbackMs;
+  const snaps = s.vrevSnaps.filter(sn => sn.ts >= lookbackStart);
+  if (snaps.length < 30) return null;
+  let hiP = -Infinity, hiTs = 0;
+  let loP = Infinity, loTs = 0;
+  snaps.forEach(sn => {
+    if (sn.p > hiP) { hiP = sn.p; hiTs = sn.ts; }
+    if (sn.p < loP) { loP = sn.p; loTs = sn.ts; }
+  });
+  const range = hiP - loP;
+  const minRange = sym === 'XAU' ? 3 : sym === 'BTC' ? 150 : sym === 'NAS100' ? 15 : 3;
+  if (range < minRange) return null;
+  // 70.5% retracement (golden mean of OTE zone)
+  let oteLimit;
+  if (dir === 'put') {
+    // Need UP-impulse to fade — high must be more recent than low
+    if (hiTs <= loTs) return null;
+    oteLimit = hiP - range * 0.705;
+  } else {
+    // CALL — need DOWN-impulse to ride from — low must be more recent than high
+    if (loTs <= hiTs) return null;
+    oteLimit = loP + range * 0.705;
+  }
+  return {
+    limit: +oteLimit.toFixed(2),
+    expiry: Date.now() + 180000, // 3-min EA wait window
+    impulseHi: +hiP.toFixed(2),
+    impulseLo: +loP.toFixed(2)
+  };
+}
+
+// Helper to attach OTE to a built CFD trade. No-op if computeOTE returns null.
+function attachOTE(trade, s, sym, dir) {
+  const ote = computeOTE(s, sym, dir);
+  if (ote) {
+    trade.oteLimit = ote.limit;
+    trade.oteExpiry = ote.expiry;
+    trade.oteImpulseHi = ote.impulseHi;
+    trade.oteImpulseLo = ote.impulseLo;
+  }
+  return trade;
+}
+
 function buildCfdTrade(type, price, atr, sym) {
   const iC = type === 'call';
   // Unified TP/SL policy: SL=2×ATR, TP1=1.5×, TP2=2.5×, TP3=4×
@@ -4613,6 +4676,14 @@ app.get('/prices', (req, res) => {
         trailSl: s.trade.trailSl || null,
         atr: s.trade.atr || null,
         bestPrice: s.trade.bestPrice || null,
+        // OTE (Optimal Trade Entry) fields — EA uses oteLimit as limit-order price with
+        // fallback to delayed-market entry if oteExpiry passes without fill. Only set for
+        // DIV/ATH/ATL/BREAK signals (the "patient" detectors where waiting for retracement
+        // gives meaningfully better fills). Null on FAST/SQZ/SWEEP/VREV/TREND/MFLIP.
+        oteLimit: s.trade.oteLimit || null,
+        oteExpiry: s.trade.oteExpiry || null,
+        oteImpulseHi: s.trade.oteImpulseHi || null,
+        oteImpulseLo: s.trade.oteImpulseLo || null,
         pnl: s.trade.isCfd && s.lastPrice > 0 ? +(((s.trade.type === 'call' ? s.lastPrice - s.trade.ep : s.trade.ep - s.lastPrice) / s.trade.ep) * 100).toFixed(3) : null
       } : { active: false },
       dxy: s._dxy || null,
