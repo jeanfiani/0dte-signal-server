@@ -2323,22 +2323,51 @@ function processPrice(sym, price, hi, lo) {
 
       if (fmAbsDelta >= fmThreshold && accelerating) {
         const fmDir = fmDelta < 0 ? 'put' : 'call';
-        // Require RSI to not be extreme against us (don't short at RSI 10, don't buy at RSI 95)
-        const fmRsiOk = (fmDir === 'put' && rsiV < 85) || (fmDir === 'call' && rsiV > 15);
-        // Require ROC to confirm direction (even slightly)
-        const fmRocOk = (fmDir === 'put' && roc3 < 0) || (fmDir === 'call' && roc3 > 0);
-        // MACD-extremity gate (added 2026-05-07) — don't fire FAST when MACD line is already
-        // at exhaustion in the move's direction. Empirical from 5/7 XAU: a FAST PUT at MACD
-        // -1.225 (way past XAU's typical ±1.0 range) lost -0.20% as the move had already
-        // played out. The winning FAST CALL the same day had MACD +0.422, well inside range.
+        // RSI gate (tightened 2026-05-11 after XAU amateur signals): block FAST PUTs at oversold
+        // RSI and FAST CALLs at overbought RSI. Previous gate (RSI < 85 for PUT, > 15 for CALL)
+        // allowed PUT entries at RSI 20-23 (selling the bottom — knife-catch) and CALL entries
+        // at RSI 74+ (buying the top — chase). The new gate keeps PUTs to RSI 35-85 and CALLs
+        // to RSI 15-65, giving real room for the move to develop in the signal's direction.
+        const fmRsiOk = (fmDir === 'put' && rsiV > 35 && rsiV < 85)
+                     || (fmDir === 'call' && rsiV < 65 && rsiV > 15);
+        if (!fmRsiOk) {
+          log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — RSI ' + rsiV.toFixed(1) + (fmDir === 'put' ? ' too oversold (need 35-85)' : ' too overbought (need 15-65)'));
+        }
+        // ROC gate (tightened 2026-05-11): require meaningful directional momentum, not just
+        // any non-zero tick. Previous threshold of 0 let -0.001% ROC pass. New: ±0.02% minimum.
+        const fmRocOk = (fmDir === 'put' && roc3 < -0.02) || (fmDir === 'call' && roc3 > 0.02);
+        if (!fmRocOk) {
+          log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — ROC ' + roc3.toFixed(3) + '% weak (need |ROC| ≥ 0.02%)');
+        }
+        // MACD gate now enforces DIRECTION (was only extremity). XAU 5/11 signal #6 fired a PUT
+        // with macdL = +0.208 (positive, bullish momentum) — direction mismatch. Now PUTs
+        // require macdL < 0 (bearish line) and CALLs require macdL > 0 (bullish line).
+        // Extremity check is still active to prevent firing at exhaustion.
         // Per-instrument because MACD scale differs by ~100x across XAU/BTC/NAS100.
         const fmMacdExtreme = isXAU ? 1.0 : isBTC ? 100 : isNAS ? 25 : 1.0;
-        const fmMacdOk = (fmDir === 'put' && macdL > -fmMacdExtreme) || (fmDir === 'call' && macdL < fmMacdExtreme);
+        const fmMacdDir = (fmDir === 'put' && macdL < 0) || (fmDir === 'call' && macdL > 0);
+        const fmMacdNotExhausted = Math.abs(macdL) < fmMacdExtreme;
+        const fmMacdOk = fmMacdDir && fmMacdNotExhausted;
         if (!fmMacdOk) {
-          log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — MACD ' + macdL.toFixed(3) + ' beyond ±' + fmMacdExtreme + ' (move exhausted)');
+          const reason = !fmMacdDir ? 'wrong direction (MACD ' + macdL.toFixed(3) + ' opposite of ' + fmDir + ')'
+                                   : 'beyond ±' + fmMacdExtreme + ' (exhausted)';
+          log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — MACD ' + reason);
+        }
+        // Same-direction price-gap guard (added 2026-05-11): after a FAST signal fires in
+        // direction D at price P, block the next same-direction FAST until price has moved
+        // a meaningful gap away from P. Prevents the "4 PUTs at $4665-4674" cluster on XAU 5/11
+        // where the bot kept piling shorts at the same level instead of waiting for the next leg.
+        const fmGap = isXAU ? 5 : isBTC ? 300 : isNAS ? 40 : 5;
+        let fmGapOk = true;
+        if (s.lastSameDir === fmDir && s.lastSameDirPrice > 0) {
+          if (fmDir === 'put' && price > s.lastSameDirPrice - fmGap) fmGapOk = false;
+          if (fmDir === 'call' && price < s.lastSameDirPrice + fmGap) fmGapOk = false;
+          if (!fmGapOk) {
+            log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — same-dir price gap not met ($' + price.toFixed(2) + ' vs last $' + s.lastSameDirPrice.toFixed(2) + ', need $' + fmGap + ' move)');
+          }
         }
 
-        if (fmRsiOk && fmRocOk && fmMacdOk && flipCoolFor(fmDir) && (winProtectDir === null || winProtectDir === fmDir)) {
+        if (fmRsiOk && fmRocOk && fmMacdOk && fmGapOk && flipCoolFor(fmDir) && (winProtectDir === null || winProtectDir === fmDir)) {
           s.fastMoveLastTs = now2;
           s.lastAT = fmDir; if (fmDir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
           if (s.lastSignalDir && s.lastSignalDir !== fmDir) s.lastReversalTs = now2;
