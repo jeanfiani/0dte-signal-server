@@ -52,8 +52,8 @@ const API = process.env.FINNHUB_API_KEY;
 const PORT = process.env.PORT || 3000;
 const SYMBOLS = ['QQQ', 'SPY', 'XAU', 'BTC', 'NAS100'];
 const RSI_CALL_LO = { QQQ: 45, SPY: 45, XAU: 40, BTC: 42, NAS100: 42 };
-const RSI_CALL_HI = { QQQ: 65, SPY: 65, XAU: 68, BTC: 66, NAS100: 66 }; // Gate range (rsiSweetCall) — tighter
-const RSI_PUT_LO  = { QQQ: 30, SPY: 30, XAU: 28, BTC: 30, NAS100: 30 };
+const RSI_CALL_HI = { QQQ: 65, SPY: 65, XAU: 60, BTC: 60, NAS100: 60 }; // Tightened 2026-05-11 for MT5: 68/66 → 60 — block top-buying late in moves
+const RSI_PUT_LO  = { QQQ: 30, SPY: 30, XAU: 35, BTC: 35, NAS100: 35 }; // Tightened 2026-05-11 for MT5: 28/30 → 35 — block bottom-fishing late in moves
 const RSI_PUT_HI  = { QQQ: 55, SPY: 55, XAU: 58, BTC: 56, NAS100: 56 };
 const ROC_BLOWOFF = { QQQ: 0.15, SPY: 0.15, XAU: 0.35, BTC: 0.25, NAS100: 0.20 }; // XAU raised from 0.20 — was catching real trends as blowoffs
 const MAX_IND = { QQQ: 6, SPY: 6, XAU: 6, BTC: 6, NAS100: 6 };
@@ -2154,10 +2154,19 @@ function processPrice(sym, price, hi, lo) {
         return;
       }
 
-      // Filter 3: RSI exhaustion on CALL breakouts — XAU only (4/7 ⬆BREAK with RSI>75 lost)
-      // BTC excluded: Row 30 RSI 93.6 was a +0.38% winner — BTC momentum sustains longer runs
-      if (isXAU && bo.dir === 'call' && rsiV > 75) {
-        log(sym, '💥 BREAKOUT blocked: ⬆BREAK RSI ' + rsiV.toFixed(1) + ' > 75 — overbought, entering at exhaustion');
+      // Filter 3: RSI exhaustion gates — tightened 2026-05-11 to match new anti-late-fire
+      // stance across detectors. Was XAU-CALL-only with > 75 threshold; now applied to both
+      // directions on all MT5 instruments at 35/65 floor/ceiling. Prevents BREAK PUTs from
+      // firing at RSI 32 (signal #5 today, late-stage entry) and BREAK CALLs at RSI 65+.
+      // BTC kept its more permissive ceiling for CALLs (75) because BTC trends sustain longer.
+      if (bo.dir === 'put' && rsiV < 35) {
+        log(sym, '💥 BREAKOUT blocked: ⬇BREAK RSI ' + rsiV.toFixed(1) + ' < 35 — oversold, entering at exhaustion');
+        s._pendingBreakout = null;
+        return;
+      }
+      const brkCallRsiMax = isBTC ? 75 : 65; // BTC keeps wider ceiling for sustained-trend reasons
+      if (bo.dir === 'call' && rsiV > brkCallRsiMax) {
+        log(sym, '💥 BREAKOUT blocked: ⬆BREAK RSI ' + rsiV.toFixed(1) + ' > ' + brkCallRsiMax + ' — overbought, entering at exhaustion');
         s._pendingBreakout = null;
         return;
       }
@@ -3264,7 +3273,18 @@ function processPrice(sym, price, hi, lo) {
         s.athTrendBlockLogTs = now2;
       }
     }
-    if (!athTrendBlock && athApproachRecent && distFromATH >= athAtlPullback && s.rsiAtRollingHigh > 55 && athMacdOk && athRocStrong && !athBullBlock && athConvOk && flipCoolFor('put') && winProtectDir !== 'call') {
+    // Current-RSI oversold guard (added 2026-05-11 after XAU signal #4 fired ATH PUT at RSI 23.2
+    // — selling at the bottom of an already-completed move). The detector previously only checked
+    // rsiAtRollingHigh > 55 (RSI at the prior peak) without verifying CURRENT RSI is in a sane
+    // PUT zone. Now require current RSI ≥ 35 to avoid bottom-fishing.
+    const athOversoldBlock = rsiV < 35;
+    if (athOversoldBlock && athApproachRecent) {
+      if (now2 - (s.athOversoldLogTs || 0) > 300000) {
+        log(sym, 'ATH PUT oversold-block — current RSI ' + rsiV.toFixed(1) + ' < 35 (already oversold, no room to fall)');
+        s.athOversoldLogTs = now2;
+      }
+    }
+    if (!athTrendBlock && !athOversoldBlock && athApproachRecent && distFromATH >= athAtlPullback && s.rsiAtRollingHigh > 55 && athMacdOk && athRocStrong && !athBullBlock && athConvOk && flipCoolFor('put') && winProtectDir !== 'call') {
       if (s.lastSignalDir !== 'put' || (now2 - s.lastNTs > athAtlCooldown)) {
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
         if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
@@ -3305,7 +3325,17 @@ function processPrice(sym, price, hi, lo) {
         s.atlTrendBlockLogTs = now2;
       }
     }
-    if (!atlTrendBlock && atlApproachRecent && distFromATL >= athAtlPullback && s.rsiAtRollingLow < 45 && rsiV < 75 && atlMacdOk && atlRocMin && !atlBounceFailed && atlConvOk && flipCoolFor('call') && winProtectDir !== 'put') {
+    // Current-RSI overbought guard (added 2026-05-11, symmetric to ATH PUT oversold guard).
+    // Existing logic already had rsiV < 75 ceiling; tightening to 65 to match the new
+    // anti-late-fire stance — buying at RSI 65+ on a bounce is chasing the top.
+    const atlOverboughtBlock = rsiV > 65;
+    if (atlOverboughtBlock && atlApproachRecent) {
+      if (now2 - (s.atlOverboughtLogTs || 0) > 300000) {
+        log(sym, 'ATL CALL overbought-block — current RSI ' + rsiV.toFixed(1) + ' > 65 (already overbought, no room to rise)');
+        s.atlOverboughtLogTs = now2;
+      }
+    }
+    if (!atlTrendBlock && !atlOverboughtBlock && atlApproachRecent && distFromATL >= athAtlPullback && s.rsiAtRollingLow < 45 && rsiV < 75 && atlMacdOk && atlRocMin && !atlBounceFailed && atlConvOk && flipCoolFor('call') && winProtectDir !== 'put') {
       if (s.lastSignalDir !== 'call' || (now2 - s.lastNTs > athAtlCooldown)) {
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
         if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
