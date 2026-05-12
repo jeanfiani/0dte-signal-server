@@ -3023,6 +3023,14 @@ function processPrice(sym, price, hi, lo) {
   // and ATH/ATL as a "fade in chop" detector. (Earlier audit lumped it with TREND/BREAKOUT — wrong.)
   // Cooldown raised 2026-05-11 b: 10 → 15 min. Earlier 10-min was too short — two VREVs
   // fired 10 min apart at $4726.51 and $4726.97 (same direction, virtually same price).
+  // VREV-specific opposite-direction cooldown — stricter than the global 10-min flipCool.
+  // Added 2026-05-13 after CSV 5/12 row 6: VREV PUT @ $4691.85 fired exactly 13 min after a
+  // BREAK CALL @ $4689.53 that had already hit TP1 (trend was clearly UP). VREV PUT went to SL.
+  // VREV is a counter-trend fade — needs much more room than 10 min from a fresh opposite-side
+  // signal. 25 min lets the prior signal's TP/SL fully resolve before VREV is allowed to fade it.
+  const VREV_FLIP_COOLDOWN_MS = 1500000; // 25 minutes
+  const vrevFlipOk = (dir) => !s.lastSignalDir || s.lastSignalDir === dir || (now2 - s.lastNTs > VREV_FLIP_COOLDOWN_MS);
+
   if (isXAU && s.vrevSnaps.length >= 60 && cool && (now2 - s.vrevLastTs > 900000)) {
     // Find the high and low in the last 15 min of snapshots
     const lookback = s.vrevSnaps.filter(sn => sn.ts > now2 - 900000); // 15 min
@@ -3085,7 +3093,7 @@ function processPrice(sym, price, hi, lo) {
       // RSI is still oversold at the turn. Asymmetric: keep the *opposite* side tight (CALL
       // still capped at 65 because if RSI is >65 you're catching the bounce too late and the
       // setup is more BREAK than VREV; same logic reversed for PUT).
-      if (dropThenBounce && roc3 > symRocThr * 2 && rsiV > 28 && rsiV < 65 && vrevGapOkCall && vrevRoundOkCall && vrevRoomOkCall && flipCoolFor('call') && winProtectDir !== 'put') {
+      if (dropThenBounce && roc3 > symRocThr * 2 && rsiV > 28 && rsiV < 65 && vrevGapOkCall && vrevRoundOkCall && vrevRoomOkCall && flipCoolFor('call') && vrevFlipOk('call') && winProtectDir !== 'put') {
         // CALL reversal: was dropping, now bouncing with strong upward ROC
         s.vrevLastTs = now2;
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
@@ -3101,7 +3109,7 @@ function processPrice(sym, price, hi, lo) {
         return;
       }
 
-      if (rallyThenDrop && roc3 < -symRocThr * 2 && rsiV > 35 && rsiV < 72 && vrevGapOkPut && vrevRoundOkPut && vrevRoomOkPut && flipCoolFor('put') && winProtectDir !== 'call') {
+      if (rallyThenDrop && roc3 < -symRocThr * 2 && rsiV > 35 && rsiV < 72 && vrevGapOkPut && vrevRoundOkPut && vrevRoomOkPut && flipCoolFor('put') && vrevFlipOk('put') && winProtectDir !== 'call') {
         // PUT reversal: was rallying, now dropping with strong downward ROC
         s.vrevLastTs = now2;
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
