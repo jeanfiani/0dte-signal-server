@@ -3630,11 +3630,20 @@ function processPrice(sym, price, hi, lo) {
     //   ROC3 < -0.02: kills weak pullbacks (false reversal noise). Blocked 3 marginal "wins" (+0.06%), caught 2 big losers.
     //   RSI > 60 AND MACD > 0: price still in bullish territory, "pullback" is just a dip in an uptrend.
     //   Combined: 25W/10L=71% → 21W/7L=75%, and the 3 blocked losers were the biggest (-0.66%, -0.45%, -0.33%).
-    const athMacdOk = macdL < macdS || distFromATH >= athAtlMacdSkip;
+    // MACD skip — was an unconditional bypass once distFromATH >= athAtlMacdSkip ($3 XAU).
+    // Problem (caught 5/12 row 4): on 5/12 at 13:59 the rolling high was $4707 but current price
+    // was $4678 — distFromATH = $28, way past the $3 skip threshold, so the MACD bullish check
+    // was bypassed even though MACD line was +0.059 (clearly bullish, still in uptrend). Signal
+    // fired PUT and SL'd. Cap the skip to a tight "fresh rejection" zone: skip only if pullback
+    // is $3-12 (XAU), $40-150 (BTC), $15-60 (NAS). Beyond that, the price is no longer rejecting
+    // the high — it's just trading below it, and MACD lag isn't a valid excuse anymore.
+    const athMacdSkipMax = isBTC ? 150 : isNAS ? 60 : 12;
+    const athMacdOk = macdL < macdS || (distFromATH >= athAtlMacdSkip && distFromATH <= athMacdSkipMax);
     const athRocStrong = roc3 < -0.02; // minimum selling pressure — kills -0.009, -0.011 noise signals
-    // NAS100: lower RSI threshold from 60→55. On 5/6, ATH PUT went 0/4 — signals #8 and #12 had RSI 56-57
-    // with MACD>0, clearly still in uptrend. XAU/BTC keep 60 (backtested on XAU).
-    const athBullRsiThr = isNAS ? 55 : 60;
+    // RSI threshold (lowered 2026-05-13 for XAU 60→55 after CSV 5/12 row 4: PUT ATH fired
+    // at RSI 58.6 with MACD +0.059, just $1.4 under the old 60 floor). NAS was already 55.
+    // BTC kept at 60 — no losing signal observed yet, don't over-tighten.
+    const athBullRsiThr = isBTC ? 60 : 55;
     const athBullBlock = rsiV > athBullRsiThr && macdHist > 0; // RSI high + MACD bullish = still in uptrend, not a real reversal
     // Minimum conviction: require at least 2 cross-asset factors (same as ATL CALL)
     const athConv = convictionFor('put');
@@ -3685,7 +3694,11 @@ function processPrice(sym, price, hi, lo) {
     // Minimum ROC > 0.01: kills ROC 0.000% falling-knife signals (XAU 5/7: ATL CALL at ROC +0.000% in downtrend).
     // Failed bounce guard: if last ATL CALL was within 60 min and price is at/below that entry, the bounce
     // failed — don't fire another one into the same falling knife (XAU 5/7: two ATL CALLs $1 apart in 20 min).
-    const atlMacdOk = macdL > macdS || distFromATL >= athAtlMacdSkip;
+    // Mirror of ATH MACD-skip cap (see comment at line ~3633): only skip MACD check when the
+    // bounce is "fresh-rejection sized" ($3-12 XAU / $40-150 BTC / $15-60 NAS). Beyond that,
+    // price is just trading above the rolling low — not a rejection — and MACD-lag isn't a
+    // valid reason to skip the bullish-cross requirement.
+    const atlMacdOk = macdL > macdS || (distFromATL >= athAtlMacdSkip && distFromATL <= athMacdSkipMax);
     const atlConv = convictionFor('call');
     const atlConvOk = atlConv.score >= 2;
     const atlRocMin = roc3 > 0.01; // require real positive momentum, not just > 0
