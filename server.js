@@ -1034,7 +1034,11 @@ function logSignal(sym, sig) {
     vix: vixV.toFixed(1),
     chop: S[sym].chopActive ? 1 : 0,
     num: sig.num,
-    conv: sig.conv || null
+    conv: sig.conv || null,
+    // Outcome tracking (added 2026-05-12) — updated by checkExit() when trade flags flip.
+    // Boolean fields stay false until TP1/TP2/TP3/SL price is touched. Used by CSV export
+    // to surface trade outcome per signal.
+    outcomes: {}
   };
   // Add TRv2 trade context if active (BTC/NAS100)
   if (S[sym].trv2Trade) {
@@ -1049,6 +1053,9 @@ function logSignal(sym, sig) {
     };
   }
   signalHistory.push(histEntry);
+  // Track which signalHistory index represents the active trade for this symbol.
+  // checkExit() uses this to update outcomes when t.t1/t.t2/t.sl flags flip.
+  S[sym].lastHistIdx = signalHistory.length - 1;
 }
 
 // ===== PROCESS PRICE (same engine as mobile/desktop) =====
@@ -3039,7 +3046,32 @@ function processPrice(sym, price, hi, lo) {
       const vrevGapOkCall = !(s.lastSameDir === 'call' && s.lastSameDirPrice > 0 && price < s.lastSameDirPrice + vrevGap);
       const vrevGapOkPut  = !(s.lastSameDir === 'put'  && s.lastSameDirPrice > 0 && price > s.lastSameDirPrice - vrevGap);
 
-      if (dropThenBounce && roc3 > symRocThr * 2 && rsiV > 35 && rsiV < 65 && vrevGapOkCall && flipCoolFor('call') && winProtectDir !== 'put') {
+      // Round-number gate (added 2026-05-12 b, ports the BREAK/FAST pattern). XAU $50 levels
+      // are psychological walls. Block VREV CALL if price is approaching a round number from
+      // below — bounce-into-resistance is exactly when VREV reads "bounce" but $4700 caps it.
+      // Block VREV PUT if approaching from above. Require $0.50 break confirmation.
+      // Caught XAU 5/12 signal #6: VREV CALL at $4699.68 (just $0.32 below $4700).
+      const vrevBreakBuffer = 0.50;
+      const vrevRoundOkCall = !(roundNumZone && price < nearestRound + vrevBreakBuffer);
+      const vrevRoundOkPut  = !(roundNumZone && price > nearestRound - vrevBreakBuffer);
+
+      // Room-to-grow / room-to-sell gate (added 2026-05-12 b, ports the FAST pattern).
+      // Block VREV CALL if price is within $2 of the 1-hour high (no upside left).
+      // Block VREV PUT if price is within $2 of the 1-hour low (no downside left).
+      // Catches XAU 5/12 signal #7: VREV CALL at $4706.42, $1.17 below day's $4707.59 high
+      // (then -$22 reversal).
+      let vrevRoomOkCall = true;
+      let vrevRoomOkPut = true;
+      const vrevRoomBuffer = 2.0; // XAU
+      if (s.atrCandles && s.atrCandles.length >= 12) {
+        const last12 = s.atrCandles.slice(-12);
+        const hi1h = Math.max(...last12.map(c => c.h));
+        const lo1h = Math.min(...last12.map(c => c.l));
+        if (price > hi1h - vrevRoomBuffer) vrevRoomOkCall = false;
+        if (price < lo1h + vrevRoomBuffer) vrevRoomOkPut = false;
+      }
+
+      if (dropThenBounce && roc3 > symRocThr * 2 && rsiV > 35 && rsiV < 65 && vrevGapOkCall && vrevRoundOkCall && vrevRoomOkCall && flipCoolFor('call') && winProtectDir !== 'put') {
         // CALL reversal: was dropping, now bouncing with strong upward ROC
         s.vrevLastTs = now2;
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
@@ -3055,7 +3087,7 @@ function processPrice(sym, price, hi, lo) {
         return;
       }
 
-      if (rallyThenDrop && roc3 < -symRocThr * 2 && rsiV > 35 && rsiV < 65 && vrevGapOkPut && flipCoolFor('put') && winProtectDir !== 'call') {
+      if (rallyThenDrop && roc3 < -symRocThr * 2 && rsiV > 35 && rsiV < 65 && vrevGapOkPut && vrevRoundOkPut && vrevRoomOkPut && flipCoolFor('put') && winProtectDir !== 'call') {
         // PUT reversal: was rallying, now dropping with strong downward ROC
         s.vrevLastTs = now2;
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
@@ -3950,6 +3982,38 @@ function attachTpSl(sig, type, price, atr, sym) {
 }
 
 // ===== EXIT MONITOR =====
+// Update outcome tracking on signalHistory entry corresponding to the active trade.
+// Called by checkExit() after flag transitions. Stores tp1Hit/tp2Hit/tp3Hit/slHit + timestamps.
+// TP3 is distinguished from real SL by checking whether t.t2 was already true at trigger time
+// (TP3 path: TP1 hit → TP2 hit → TP3 hit sets t.sl=true; real SL: just t.sl=true with no prior TP2).
+function updateSignalOutcome(sym, finalPrice) {
+  const s = S[sym];
+  if (s.lastHistIdx == null) return;
+  const entry = signalHistory[s.lastHistIdx];
+  if (!entry || entry.symbol !== sym) return;
+  if (!entry.outcomes) entry.outcomes = {};
+  const t = s.trade;
+  if (!t) return;
+  const now = Date.now();
+  if (t.t1 && !entry.outcomes.tp1Hit) {
+    entry.outcomes.tp1Hit = true; entry.outcomes.tp1HitTs = now;
+  }
+  if (t.t2 && !entry.outcomes.tp2Hit) {
+    entry.outcomes.tp2Hit = true; entry.outcomes.tp2HitTs = now;
+  }
+  if (t.sl && !entry.outcomes.slHit && !entry.outcomes.tp3Hit) {
+    if (t.t2) {
+      // t.sl was set via the TP3 path (line ~4005) — TP2 already hit, then TP3
+      entry.outcomes.tp3Hit = true; entry.outcomes.tp3HitTs = now;
+      entry.outcomes.closePrice = finalPrice;
+    } else {
+      // Real stop loss (before TP2)
+      entry.outcomes.slHit = true; entry.outcomes.slHitTs = now;
+      entry.outcomes.closePrice = finalPrice;
+    }
+  }
+}
+
 function checkExit(sym, price) {
   const s = S[sym], t = s.trade;
   if (!t.active || !t.ep || price <= 0) return;
@@ -3968,18 +4032,21 @@ function checkExit(sym, price) {
       t.t1 = true; t.trailSl = t.ep; t.lastETs = now;
       log(sym, '🎯 TP1 HIT — $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2) + ' · SL → breakeven $' + t.ep.toFixed(2));
       sendPush('🎯 ' + sym + ' TP1 HIT', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · SL → breakeven', 'signal');
+      updateSignalOutcome(sym, price);
     }
     // TP2 hit → trail SL to TP1
     if (!t.t2 && ((iC && price >= t.tp2Price) || (!iC && price <= t.tp2Price))) {
       t.t2 = true; t.trailSl = t.tp1Price; t.lastETs = now;
       log(sym, '🎯 TP2 HIT — $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2) + ' · SL → TP1 $' + t.tp1Price.toFixed(2));
       sendPush('🎯 ' + sym + ' TP2 HIT', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · SL → TP1', 'signal');
+      updateSignalOutcome(sym, price);
     }
     // TP3 hit → full exit
     if (!t.sl && ((iC && price >= t.tp3Price) || (!iC && price <= t.tp3Price))) {
       t.sl = true; t.lastETs = now;
       log(sym, '🏆 TP3 FULL TARGET — $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2));
       sendPush('🏆 ' + sym + ' TP3 — FULL TARGET', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · close trade', 'signal');
+      updateSignalOutcome(sym, price); // capture TP3 outcome BEFORE clearing trade
       s.trade = { active: false };
       return;
     }
@@ -3991,6 +4058,7 @@ function checkExit(sym, price) {
         t.sl = true; t.lastETs = now;
         log(sym, '🛑 TRAIL SL — $' + price.toFixed(2) + ' · SL was $' + t.trailSl.toFixed(2) + ' · P&L $' + tsPnl.toFixed(2));
         sendPush('🛑 ' + sym + ' TRAIL SL', '$' + price.toFixed(2) + ' · P&L $' + tsPnl.toFixed(2), 'exit');
+        updateSignalOutcome(sym, price);
         s.trade = { active: false };
         return;
       }
@@ -4004,6 +4072,7 @@ function checkExit(sym, price) {
         const slPnl = iC ? t.slPrice - t.ep : t.ep - t.slPrice;
         log(sym, '🛑 SL HIT — ' + t.type.toUpperCase() + ' $' + price.toFixed(2) + ' · SL $' + t.slPrice.toFixed(2) + ' · P&L $' + slPnl.toFixed(2));
         sendPush('🛑 ' + sym + ' SL HIT', t.type.toUpperCase() + ' · loss $' + slPnl.toFixed(2) + ' — exit now', 'exit');
+        updateSignalOutcome(sym, price);
         s.trade = { active: false };
         return;
       }
@@ -4931,8 +5000,48 @@ app.get('/signals/csv/:date', (req, res) => {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return res.status(400).json({ error: 'Use YYYY-MM-DD format' });
   const file = path.join(SIGNALS_DIR, dateStr + '.csv');
   if (!fs.existsSync(file)) return res.status(404).json({ error: 'No CSV for ' + dateStr });
-  res.header('Content-Type', 'text/csv');
-  res.sendFile(file);
+  // Enrich CSV with outcome columns (added 2026-05-12) by merging in outcomes from
+  // signalHistory. The base file is write-once (header + per-fire rows); outcomes are
+  // tracked separately in signalHistory and joined here at export time. Columns added:
+  //   tp1Hit, tp2Hit, tp3Hit, slHit  — Y/blank
+  //   finalOutcome — TP3 / TP2 / TP1-only / SL-after-TP1 / SL / Open
+  try {
+    const raw = fs.readFileSync(file, 'utf8');
+    const lines = raw.split('\n');
+    if (lines.length < 2) {
+      res.header('Content-Type', 'text/csv');
+      return res.send(raw);
+    }
+    const enrichedHeader = lines[0].trim() + ',tp1Hit,tp2Hit,tp3Hit,slHit,finalOutcome';
+    const enrichedRows = [];
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      const cols = line.split(',');
+      const date = cols[0], time = cols[1], symbol = cols[2], type = cols[3], price = cols[4];
+      // Match by (date,time,symbol,type,price) — unique per signal
+      const entry = signalHistory.find(h =>
+        h.date === date && h.time === time && h.symbol === symbol && h.type === type && String(h.price) === price
+      );
+      const o = entry && entry.outcomes ? entry.outcomes : {};
+      const tp1 = o.tp1Hit ? 'Y' : '';
+      const tp2 = o.tp2Hit ? 'Y' : '';
+      const tp3 = o.tp3Hit ? 'Y' : '';
+      const sl  = o.slHit  ? 'Y' : '';
+      let final;
+      if (o.tp3Hit)      final = 'TP3';
+      else if (o.slHit)  final = o.tp1Hit ? 'SL-after-TP1' : 'SL';
+      else if (o.tp2Hit) final = 'TP2';
+      else if (o.tp1Hit) final = 'TP1-only';
+      else               final = 'Open';
+      enrichedRows.push(line + ',' + tp1 + ',' + tp2 + ',' + tp3 + ',' + sl + ',' + final);
+    }
+    res.header('Content-Type', 'text/csv');
+    res.send(enrichedHeader + '\n' + enrichedRows.join('\n') + (enrichedRows.length ? '\n' : ''));
+  } catch (e) {
+    console.error('[' + ts() + '] CSV export error for ' + dateStr + ': ' + e.message);
+    res.status(500).json({ error: 'Failed to read/enrich CSV: ' + e.message });
+  }
 });
 
 // Manual CSV backup trigger — POST yesterday's (or any date's) CSV to BACKUP_WEBHOOK_URL on demand
