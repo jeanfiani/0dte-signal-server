@@ -208,6 +208,7 @@ SYMBOLS.forEach(sym => {
     breakLegStartTs: 0,      // when current same-direction leg started (resets on direction flip OR after 2h gap)
     // Fast-move detector — catches strong directional moves when MACD lags
     fastMoveLastTs: 0,       // when last fast-move signal fired (cooldown)
+    fastLastDir: null,       // direction of last FAST fire ('call'|'put'). Used by 30-min opposite-direction flip-cool — reversals belong to SQZ/ATH/ATL, NOT FAST.
     sustainedMoveLastTs: 0,  // when last sustained-move signal fired (cooldown)
     trendRideLastTs: 0,      // when last trend-ride signal fired (cooldown)
     trendRideLastDir: null,   // last trend-ride direction ('call'/'put')
@@ -1080,6 +1081,7 @@ function processPrice(sym, price, hi, lo) {
     lastSameDirPrice: s.lastSameDirPrice,
     lastReversalTs: s.lastReversalTs,
     fastMoveLastTs: s.fastMoveLastTs,
+    fastLastDir: s.fastLastDir,
     sustainedMoveLastTs: s.sustainedMoveLastTs,
     vrevLastTs: s.vrevLastTs,
     divLastFireTs: s.divLastFireTs,
@@ -2430,15 +2432,42 @@ function processPrice(sym, price, hi, lo) {
 
       if (fmAbsDelta >= fmThreshold && accelerating) {
         const fmDir = fmDelta < 0 ? 'put' : 'call';
+        // Opposite-direction flip cooldown (added 2026-05-12): after FAST fires direction X,
+        // block opposite-direction FAST for 30 min. Reversals are SQZ/ATH/ATL's job — FAST is
+        // continuation-only. Without this, the bot flip-flopped (XAU 5/12: CALL→PUT→PUT→CALL→PUT
+        // in 50 min during chop, losing on multiple direction flips). FAST same-direction
+        // cooldown stays at 10min via the outer `s.fastMoveLastTs > 600000` check.
+        const fmFlipCoolMs = 1800000; // 30 min
+        if (s.fastLastDir && s.fastLastDir !== fmDir && (now2 - s.fastMoveLastTs < fmFlipCoolMs)) {
+          const remainMin = Math.ceil((fmFlipCoolMs - (now2 - s.fastMoveLastTs)) / 60000);
+          log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — flip-cool: last FAST was ' + s.fastLastDir.toUpperCase() + ' ' + ((now2 - s.fastMoveLastTs) / 60000).toFixed(1) + 'min ago (need ' + remainMin + 'min more — opposite FAST is chop, let SQZ/ATH/ATL handle reversals)');
+          return; // exit FAST detector entirely
+        }
         // RSI gate (tightened 2026-05-11 after XAU amateur signals): block FAST PUTs at oversold
         // RSI and FAST CALLs at overbought RSI. Previous gate (RSI < 85 for PUT, > 15 for CALL)
         // allowed PUT entries at RSI 20-23 (selling the bottom — knife-catch) and CALL entries
         // at RSI 74+ (buying the top — chase). The new gate keeps PUTs to RSI 35-85 and CALLs
         // to RSI 15-65, giving real room for the move to develop in the signal's direction.
-        const fmRsiOk = (fmDir === 'put' && rsiV > 35 && rsiV < 85)
-                     || (fmDir === 'call' && rsiV < 65 && rsiV > 15);
+        // RSI gate: standard 35-85 PUT / 15-65 CALL.
+        // Relaxation 2026-05-12 b: when a confirmed round-number break is in play (price has
+        // already moved past the round + buffer), allow lower RSI floor for PUT / higher
+        // ceiling for CALL — the break itself is the high-conviction signal, RSI naturally
+        // lags into "oversold" territory during sharp moves through $50 levels.
+        // Floor 35 → 25 for PUT (still blocks data-corruption-tier RSI < 25).
+        // Ceiling 65 → 75 for CALL.
+        const fmBreakConfirmed = isXAU && roundNumZone && (
+          (fmDir === 'put' && price <= nearestRound - 0.50) ||
+          (fmDir === 'call' && price >= nearestRound + 0.50)
+        );
+        const fmRsiFloorPut = fmBreakConfirmed ? 25 : 35;
+        const fmRsiCeilCall = fmBreakConfirmed ? 75 : 65;
+        const fmRsiOk = (fmDir === 'put' && rsiV > fmRsiFloorPut && rsiV < 85)
+                     || (fmDir === 'call' && rsiV < fmRsiCeilCall && rsiV > 15);
         if (!fmRsiOk) {
-          log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — RSI ' + rsiV.toFixed(1) + (fmDir === 'put' ? ' too oversold (need 35-85)' : ' too overbought (need 15-65)'));
+          const need = (fmDir === 'put')
+                      ? fmRsiFloorPut + '-85' + (fmBreakConfirmed ? ' (round-break relaxed)' : '')
+                      : '15-' + fmRsiCeilCall + (fmBreakConfirmed ? ' (round-break relaxed)' : '');
+          log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — RSI ' + rsiV.toFixed(1) + ' outside ' + need);
         }
         // ROC gate (tightened 2026-05-11): require meaningful directional momentum, not just
         // any non-zero tick. Previous threshold of 0 let -0.001% ROC pass. New: ±0.02% minimum.
@@ -2454,10 +2483,21 @@ function processPrice(sym, price, hi, lo) {
         const fmMacdExtreme = isXAU ? 1.0 : isBTC ? 100 : isNAS ? 25 : 1.0;
         const fmMacdDir = (fmDir === 'put' && macdL < 0) || (fmDir === 'call' && macdL > 0);
         const fmMacdNotExhausted = Math.abs(macdL) < fmMacdExtreme;
-        const fmMacdOk = fmMacdDir && fmMacdNotExhausted;
+        // MACD-histogram FADING check (added 2026-05-12, ported from BREAK Filter 4).
+        // Catches the "end-of-move exhaustion" pattern that has been FAST's worst failure mode.
+        // Histogram = macdL − macdSignal. If histogram is shrinking in the signal direction
+        // (macdAccel opposes direction with histogram still on the signal side), the move is
+        // running out of steam — block the entry even if line direction is technically correct.
+        // XAU 5/12 #11 (FAST PUT at $4681 → price rallied $13) and #9/#12 (FAST CALLs into
+        // intraday tops → reversed) all had fading histograms by the time FAST fired.
+        const fmMacdFading = (fmDir === 'call' && macdAccel < 0 && macdHist > 0)
+                          || (fmDir === 'put'  && macdAccel > 0 && macdHist < 0);
+        const fmMacdOk = fmMacdDir && fmMacdNotExhausted && !fmMacdFading;
         if (!fmMacdOk) {
-          const reason = !fmMacdDir ? 'wrong direction (MACD ' + macdL.toFixed(3) + ' opposite of ' + fmDir + ')'
-                                   : 'beyond ±' + fmMacdExtreme + ' (exhausted)';
+          let reason;
+          if (!fmMacdDir) reason = 'wrong direction (MACD ' + macdL.toFixed(3) + ' opposite of ' + fmDir + ')';
+          else if (!fmMacdNotExhausted) reason = 'beyond ±' + fmMacdExtreme + ' (exhausted)';
+          else reason = 'histogram fading (hist=' + macdHist.toFixed(3) + ' accel=' + macdAccel.toFixed(3) + ', momentum running out)';
           log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — MACD ' + reason);
         }
         // Same-direction price-gap guard (added 2026-05-11, raised 2026-05-11 b after another
@@ -2513,6 +2553,7 @@ function processPrice(sym, price, hi, lo) {
 
         if (fmRsiOk && fmRocOk && fmMacdOk && fmGapOk && fmRoomOk && fmRoundOk && flipCoolFor(fmDir) && (winProtectDir === null || winProtectDir === fmDir)) {
           s.fastMoveLastTs = now2;
+          s.fastLastDir = fmDir; // for 30-min opposite-direction flip-cool
           s.lastAT = fmDir; if (fmDir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
           if (s.lastSignalDir && s.lastSignalDir !== fmDir) s.lastReversalTs = now2;
           s.lastSignalDir = fmDir; s.lastSignalTs = now2; s.lastNTs = now2;
