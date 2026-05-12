@@ -2258,6 +2258,41 @@ function processPrice(sym, price, hi, lo) {
         s._pendingBreakout = null;
         return;
       }
+      // Filter 8: Round-number resistance/support gate (added 2026-05-12, deferred-fire 2026-05-12 b)
+      // XAU $50 levels ($4700, $4750, etc.) are well-known psychological resistance.
+      // When BREAK fires while price is in zone AND approaching from "wrong" side, instead
+      // of dropping the breakout entirely, RE-ARM s._pendingBreakout so the filter chain
+      // re-runs each subsequent tick. As price ticks up through $4700.50+, the filter passes
+      // and the breakout fires at the confirmed-break price.
+      // Expiry: 5 minutes of waiting → give up (coil context has moved on).
+      if (isXAU && roundNumZone) {
+        const breakBuffer = 0.50;
+        const isCallStillBelow = bo.dir === 'call' && price < nearestRound + breakBuffer;
+        const isPutStillAbove  = bo.dir === 'put'  && price > nearestRound - breakBuffer;
+        if (isCallStillBelow || isPutStillAbove) {
+          // First time we deferred? Stamp the start time so we can expire after 5 min.
+          if (!bo.roundPendingTs) bo.roundPendingTs = now2;
+          if (now2 - bo.roundPendingTs > 300000) {
+            log(sym, '💥 BREAK ' + bo.dir.toUpperCase() + ' deferred-expired — round-number break not confirmed in 5min, dropping setup');
+            s._pendingBreakout = null;
+            return;
+          }
+          // Re-arm pendingBreakout so the filter chain runs again next tick.
+          // Throttle the "waiting" log to once every 30s so it doesn't spam.
+          if (!bo.roundLastLogTs || now2 - bo.roundLastLogTs > 30000) {
+            const targetStr = bo.dir === 'call' ? '$' + (nearestRound + breakBuffer).toFixed(2) + '+' : '$' + (nearestRound - breakBuffer).toFixed(2) + '-';
+            log(sym, '💥 BREAK ' + bo.dir.toUpperCase() + ' deferred — $' + price.toFixed(2) + ' near $' + nearestRound + ', waiting for confirmed break (' + targetStr + ') · ' + Math.round((300000 - (now2 - bo.roundPendingTs)) / 1000) + 's left');
+            bo.roundLastLogTs = now2;
+          }
+          s._pendingBreakout = bo; // keep waiting — re-runs next tick
+          return;
+        }
+        // Price has cleared the round number — confirmed break, let the signal fire.
+        // (bo.roundPendingTs may be set from earlier waiting ticks; that's harmless.)
+        if (bo.roundPendingTs) {
+          log(sym, '💥 BREAK ' + bo.dir.toUpperCase() + ' confirmed-break — $' + price.toFixed(2) + ' cleared $' + nearestRound + ' after ' + Math.round((now2 - bo.roundPendingTs) / 1000) + 's wait');
+        }
+      }
       s.breakSameDirCount++;
 
       s.breakLastTs = now2;
@@ -2460,8 +2495,23 @@ function processPrice(sym, price, hi, lo) {
             log(sym, '⚡ FAST PUT BLOCKED — no room to sell: $' + price.toFixed(2) + ' within $' + fmRoomBuffer + ' of 1h low $' + lo1h.toFixed(2) + ' (move exhausted)');
           }
         }
+        // Round-number resistance/support gate (added 2026-05-12, mirrors BREAK filter 8).
+        // XAU $50 levels are well-known psychological walls. Block FAST CALL approaching round
+        // from below, FAST PUT approaching round from above. Wait for break confirmation.
+        let fmRoundOk = true;
+        if (isXAU && roundNumZone) {
+          const fmBreakBuffer = 0.50;
+          if (fmDir === 'call' && price < nearestRound + fmBreakBuffer) {
+            fmRoundOk = false;
+            log(sym, '⚡ FAST CALL BLOCKED — $' + price.toFixed(2) + ' approaching $' + nearestRound + ' resistance from below (need confirmed break above $' + (nearestRound + fmBreakBuffer).toFixed(2) + ')');
+          }
+          if (fmDir === 'put' && price > nearestRound - fmBreakBuffer) {
+            fmRoundOk = false;
+            log(sym, '⚡ FAST PUT BLOCKED — $' + price.toFixed(2) + ' approaching $' + nearestRound + ' support from above (need confirmed break below $' + (nearestRound - fmBreakBuffer).toFixed(2) + ')');
+          }
+        }
 
-        if (fmRsiOk && fmRocOk && fmMacdOk && fmGapOk && fmRoomOk && flipCoolFor(fmDir) && (winProtectDir === null || winProtectDir === fmDir)) {
+        if (fmRsiOk && fmRocOk && fmMacdOk && fmGapOk && fmRoomOk && fmRoundOk && flipCoolFor(fmDir) && (winProtectDir === null || winProtectDir === fmDir)) {
           s.fastMoveLastTs = now2;
           s.lastAT = fmDir; if (fmDir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
           if (s.lastSignalDir && s.lastSignalDir !== fmDir) s.lastReversalTs = now2;
