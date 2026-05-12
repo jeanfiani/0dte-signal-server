@@ -4090,16 +4090,32 @@ function checkExit(sym, price) {
     // (lock in the win). Losing trades stay open — let them work toward the ATR-based SL or recover.
     const heldLongEnough = t.ts && (now - t.ts > REV_MIN_HOLD_MS);
     if (fl >= 3 && !t.rev && now - t.lastETs > 120000 && heldLongEnough) {
-      if (pnl > 0) {
-        // Profitable + indicators flipped → set t.rev=true and log only.
+      // Compute pullback from peak favorable price. Trade is "reversing meaningfully"
+      // only when price has given back ≥ threshold from the best level reached.
+      // Tightened 2026-05-12: previous check was just pnl > 0 (any positive P&L),
+      // which fired on $0.50 noise. Now require both:
+      //   1. pnl > 0 (still profitable — don't close at a loss)
+      //   2. pullback ≥ instrument-specific threshold (real reversal, not noise)
+      // Thresholds proportional to instrument move size: XAU $5, BTC $250, NAS $25.
+      const bestPnl = iC ? t.bestPrice - t.ep : t.ep - t.bestPrice;
+      const pullback = bestPnl - pnl; // how much we've given back from peak
+      const revMinPullback = (sym === 'XAU') ? 5 : (sym === 'BTC') ? 250 : (sym === 'NAS100') ? 25 : 5;
+      if (pnl > 0 && pullback >= revMinPullback) {
+        // Meaningful reversal + still profitable → set t.rev=true and log only.
         // Push notification removed (2026-05-08, by user request) — reversal warnings used
         // to ping the phone, but only the user should close trades (via ✕ Clear button,
         // popup accept, or new signal). Log stays so we can correlate post-hoc.
         t.rev = true; t.lastETs = now;
-        log(sym, '🎯 REVERSAL EXIT (log-only) — +$' + pnl.toFixed(2) + ' · ' + fl + '/3 indicators flipped · age ' + Math.round((now - t.ts) / 60000) + 'min');
+        log(sym, '🎯 REVERSAL EXIT (log-only) — pulled back $' + pullback.toFixed(2) + ' from peak $' + bestPnl.toFixed(2) + ' · current +$' + pnl.toFixed(2) + ' · ' + fl + '/3 indicators flipped · age ' + Math.round((now - t.ts) / 60000) + 'min');
+      } else if (pnl > 0 && pullback < revMinPullback) {
+        // Indicators flipped + profitable BUT pullback too small — noise, not a real reversal.
+        // Wait for either more pullback (real reversal) or recovery (trade continues).
+        if (now - (t.lastRevHoldLog || 0) > 60000) {
+          log(sym, '⏸ Reversal indicators flipped but pullback $' + pullback.toFixed(2) + ' < $' + revMinPullback + ' (noise — holding) · peak +$' + bestPnl.toFixed(2) + ' · current +$' + pnl.toFixed(2));
+          t.lastRevHoldLog = now;
+        }
       } else {
         // Not profitable yet — don't auto-close. Trade either recovers or hits SL.
-        // Log once per minute (no push) so the user can see in logs without notification spam.
         if (now - (t.lastRevHoldLog || 0) > 60000) {
           log(sym, '⏸ Reversal detected but trade negative ($' + pnl.toFixed(2) + ') — holding for recovery or SL');
           t.lastRevHoldLog = now;
