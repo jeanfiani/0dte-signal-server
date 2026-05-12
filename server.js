@@ -1657,10 +1657,15 @@ function processPrice(sym, price, hi, lo) {
     // Added 2026-05-08 after 5/8 morning bounce ($4711→$4733) was missed: V-REV had the right
     // pattern but conv stayed low because cross-asset hadn't flipped yet.
     const isMomentumCatch = /VREV|FAST/.test(tag);
-    const minConv = isMomentumCatch
+    let minConv = isMomentumCatch
       ? 3                                        // V-REV / FAST: pattern is evidence, no counter-trend bump
       : ((isCounterTrend || isFadeSignal) ? 4    // ATH / ATL / HI / LO / counter-trend MFLIP·TREND: need 4
                                           : 3);  // trend-aligned: 3 is enough
+    // Post-reopen settling period (added 2026-05-13): for 15 min after the 15-min hard
+    // opening-bell block expires (18:15-18:30 ET on XAU/NAS), bump conv requirement to 4.
+    // Liquidity is still rebuilding; marginal MOD signals in this window have historically
+    // been thin-tape noise. Caught 5/12 row 1 BREAK CALL @ 18:05:00 ET (MOD/3) which SL'd.
+    if (s._postReopenSettle && minConv < 4) minConv = 4;
     if (conv.score < minConv) {
       // Rollback emit-related state to start-of-tick snapshot. Without this, the emit
       // code's pre-gate mutations (dailySignalCount++, lastNTs = now2, fastMoveLastTs = now2,
@@ -1722,17 +1727,26 @@ function processPrice(sym, price, hi, lo) {
   // BTC: 24/7, no block window (crypto never sleeps)
   // Equities: 9:30 AM - 3:55 PM ET (570-955 min)
   //
-  // Opening-bell noise filter (added 2026-05-07): for XAU and NAS100, block all signals in
-  // the first 5 minutes of the futures session reopen (6:00-6:05 PM ET = 1080-1085 min).
-  // Right after the 5-6 PM daily break, liquidity is thin and the first prints can produce
-  // false directional reads before the session settles.
-  if ((isXAU || isNAS) && etMin >= 1080 && etMin < 1085) {
+  // Opening-bell noise filter (added 2026-05-07, extended 2026-05-13).
+  // For XAU and NAS100, block all signals in the first 15 minutes of the futures session
+  // reopen (6:00-6:15 PM ET = 1080-1095 min). Right after the 5-6 PM daily break, liquidity
+  // is thin and the first prints can produce false directional reads before the session settles.
+  //
+  // Extended from 5 → 15 min after 5/12 row 1 caught: BREAK CALL at 18:05:00 ET — fired at
+  // the EXACT second the old 5-min block expired. RSI 51.7 (neutral), conv 3 MOD (just barely
+  // met), ROC +0.091% (modest). Classic post-reopen thin-liquidity false breakout. Hit SL.
+  // 15 min gives the order book time to rebuild before the bot acts on early prints.
+  if ((isXAU || isNAS) && etMin >= 1080 && etMin < 1095) {
     if (now2 - (s.openBlockLogTs || 0) > 60000) {
-      log(sym, '⏸ Opening-bell block: first 5 min of 6:00 PM futures reopen — too noisy for entries');
+      log(sym, '⏸ Opening-bell block: first 15 min of 6:00 PM futures reopen — too noisy for entries');
       s.openBlockLogTs = now2;
     }
     return;
   }
+  // Soft post-reopen settling period: from 18:15-18:30 ET, ONLY HIGH conviction signals fire.
+  // Prevents marginal MOD signals from firing while session is still re-pricing but past the
+  // hard block. Implemented via state flag checked downstream by enrichSig (conviction gate).
+  s._postReopenSettle = (isXAU || isNAS) && etMin >= 1095 && etMin < 1110;
   if (isXAU) {
     if (etMin >= 1020 && etMin < 1080) return; // XAU closed 5-6 PM ET
   } else if (isBTC) {
