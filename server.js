@@ -3035,9 +3035,18 @@ function processPrice(sym, price, hi, lo) {
 
       // V-REVERSAL CALL: price dropped to a low, then bounced back up
       // Low happened BEFORE current time, price has recovered significantly, ROC confirms upward
-      const dropThenBounce = range >= 8.0 && lbLowTs < now2 - 60000 && (price - lbLow) >= range * 0.4 && lbLowTs > lbHighTs;
+      //
+      // Bounce-magnitude gate: was `range * 0.4` (40% of full range) — that worked for $10-15
+      // V's but missed deep washouts. Example: 5/12 chart, ~17:45 broker time, range $4700→$4630
+      // ≈ $70. 40% = $28 required before VREV could fire, by which point the move was 60% spent
+      // AND RSI was back near 40 (also gating it elsewhere). Now: 30% bounce OR $10 absolute,
+      // whichever is SMALLER — so a deep $70 V fires after $10 recovery, while a shallow $10 V
+      // still needs 30% = $3. Asymmetric in the right direction (catches more deep V's, doesn't
+      // make shallow V's noisier than they already were).
+      const minBounce = Math.min(range * 0.30, 10.0);
+      const dropThenBounce = range >= 8.0 && lbLowTs < now2 - 60000 && (price - lbLow) >= minBounce && lbLowTs > lbHighTs;
       // V-REVERSAL PUT: price rallied to a high, then dropped back down
-      const rallyThenDrop = range >= 8.0 && lbHighTs < now2 - 60000 && (lbHigh - price) >= range * 0.4 && lbHighTs > lbLowTs;
+      const rallyThenDrop = range >= 8.0 && lbHighTs < now2 - 60000 && (lbHigh - price) >= minBounce && lbHighTs > lbLowTs;
 
       // Same-direction price-gap guard (added 2026-05-11 b): block VREV signals that fire
       // in the same direction as the last signal without meaningful price separation. Stops
@@ -3071,7 +3080,12 @@ function processPrice(sym, price, hi, lo) {
         if (price < lo1h + vrevRoomBuffer) vrevRoomOkPut = false;
       }
 
-      if (dropThenBounce && roc3 > symRocThr * 2 && rsiV > 35 && rsiV < 65 && vrevGapOkCall && vrevRoundOkCall && vrevRoomOkCall && flipCoolFor('call') && winProtectDir !== 'put') {
+      // RSI band widened 2026-05-13: CALL lower bound 35 → 28, PUT upper bound 65 → 72.
+      // The 35-65 band rejected exactly the trades VREV exists to catch — deep washouts where
+      // RSI is still oversold at the turn. Asymmetric: keep the *opposite* side tight (CALL
+      // still capped at 65 because if RSI is >65 you're catching the bounce too late and the
+      // setup is more BREAK than VREV; same logic reversed for PUT).
+      if (dropThenBounce && roc3 > symRocThr * 2 && rsiV > 28 && rsiV < 65 && vrevGapOkCall && vrevRoundOkCall && vrevRoomOkCall && flipCoolFor('call') && winProtectDir !== 'put') {
         // CALL reversal: was dropping, now bouncing with strong upward ROC
         s.vrevLastTs = now2;
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
@@ -3087,7 +3101,7 @@ function processPrice(sym, price, hi, lo) {
         return;
       }
 
-      if (rallyThenDrop && roc3 < -symRocThr * 2 && rsiV > 35 && rsiV < 65 && vrevGapOkPut && vrevRoundOkPut && vrevRoomOkPut && flipCoolFor('put') && winProtectDir !== 'call') {
+      if (rallyThenDrop && roc3 < -symRocThr * 2 && rsiV > 35 && rsiV < 72 && vrevGapOkPut && vrevRoundOkPut && vrevRoomOkPut && flipCoolFor('put') && winProtectDir !== 'call') {
         // PUT reversal: was rallying, now dropping with strong downward ROC
         s.vrevLastTs = now2;
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
