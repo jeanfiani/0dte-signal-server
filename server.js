@@ -1075,6 +1075,43 @@ function logSignal(sym, sig) {
     };
   }
   signalHistory.push(histEntry);
+
+  // Fast-forward previous signal's outcomes before reassigning lastHistIdx (added 2026-05-13).
+  // BUG it fixes: when a same-direction signal fires while a previous trade is still active,
+  // the detector overwrites s.trade with buildCfdTrade() right after logSignal. Any subsequent
+  // TP2/TP3 hits are then tracked against the NEW signal's levels, leaving the previous signal
+  // frozen at whatever level it had reached at handoff time. Caught 5/12 BTC row 1: PUT @ $80,786
+  // marked TP1-only even though price went to $79,800 (which would have hit signal #1's TP2 and
+  // TP3 levels by a wide margin). Here we check the OLD trade's bestPrice against its OWN
+  // tp2/tp3 levels and mark the previous signal's outcomes accordingly.
+  try {
+    const sOld = S[sym];
+    const oldIdx = sOld.lastHistIdx;
+    const t = sOld.trade;
+    if (oldIdx != null && t && t.active && t.isCfd && typeof t.bestPrice === 'number') {
+      const oldEntry = signalHistory[oldIdx];
+      if (oldEntry && oldEntry.symbol === sym) {
+        if (!oldEntry.outcomes) oldEntry.outcomes = {};
+        const iC = t.type === 'call';
+        const now = Date.now();
+        // TP1
+        if (!oldEntry.outcomes.tp1Hit && ((iC && t.bestPrice >= t.tp1Price) || (!iC && t.bestPrice <= t.tp1Price))) {
+          oldEntry.outcomes.tp1Hit = true; oldEntry.outcomes.tp1HitTs = now;
+        }
+        // TP2
+        if (!oldEntry.outcomes.tp2Hit && ((iC && t.bestPrice >= t.tp2Price) || (!iC && t.bestPrice <= t.tp2Price))) {
+          oldEntry.outcomes.tp2Hit = true; oldEntry.outcomes.tp2HitTs = now;
+        }
+        // TP3 (only mark if reached and SL hasn't been hit on this trade)
+        if (!oldEntry.outcomes.tp3Hit && !oldEntry.outcomes.slHit
+            && ((iC && t.bestPrice >= t.tp3Price) || (!iC && t.bestPrice <= t.tp3Price))) {
+          oldEntry.outcomes.tp3Hit = true; oldEntry.outcomes.tp3HitTs = now;
+          oldEntry.outcomes.closePrice = t.bestPrice;
+        }
+      }
+    }
+  } catch (e) { /* never let outcome fast-forward crash signal emission */ }
+
   // Track which signalHistory index represents the active trade for this symbol.
   // checkExit() uses this to update outcomes when t.t1/t.t2/t.sl flags flip.
   S[sym].lastHistIdx = signalHistory.length - 1;
@@ -1165,10 +1202,14 @@ function processPrice(sym, price, hi, lo) {
     // ATL/ATH detectors use these to detect "trend in progress" (new extreme made
     // recently = market is making new lows/highs = NOT a reversal setup).
     const nowTs = Date.now();
-    if (price > s.rollingHigh) { s.rollingHigh = price; s.rollingHighUpdateTs = nowTs; }
-    if (price < s.rollingLow)  { s.rollingLow = price;  s.rollingLowUpdateTs = nowTs; }
-    if (s.sessionHigh > -Infinity && s.sessionHigh > s.rollingHigh) { s.rollingHigh = s.sessionHigh; s.rollingHighUpdateTs = nowTs; }
-    if (s.sessionLow < Infinity && s.sessionLow < s.rollingLow)     { s.rollingLow = s.sessionLow;   s.rollingLowUpdateTs = nowTs; }
+    // priorRangeHigh / priorRangeLow snapshot the previous rolling level BEFORE the breakout
+    // (added 2026-05-13 for big-washout override on ATL/ATH trend-block — see ATL section).
+    // Only captured at the moment a new extreme is set, so it represents what the prior range
+    // was right before this breakout/breakdown.
+    if (price > s.rollingHigh) { s.priorRangeHigh = s.rollingHigh; s.rollingHigh = price; s.rollingHighUpdateTs = nowTs; }
+    if (price < s.rollingLow)  { s.priorRangeLow  = s.rollingLow;  s.rollingLow  = price; s.rollingLowUpdateTs  = nowTs; }
+    if (s.sessionHigh > -Infinity && s.sessionHigh > s.rollingHigh) { s.priorRangeHigh = s.rollingHigh; s.rollingHigh = s.sessionHigh; s.rollingHighUpdateTs = nowTs; }
+    if (s.sessionLow < Infinity && s.sessionLow < s.rollingLow)     { s.priorRangeLow  = s.rollingLow;  s.rollingLow  = s.sessionLow;  s.rollingLowUpdateTs  = nowTs; }
   }
 
   s.prices.push(price); s.highs.push(hi || price); s.lows.push(lo || price);
@@ -3095,7 +3136,11 @@ function processPrice(sym, price, hi, lo) {
   const VREV_FLIP_COOLDOWN_MS = 1500000; // 25 minutes
   const vrevFlipOk = (dir) => !s.lastSignalDir || s.lastSignalDir === dir || (now2 - s.lastNTs > VREV_FLIP_COOLDOWN_MS);
 
-  if (isXAU && s.vrevSnaps.length >= 60 && cool && (now2 - s.vrevLastTs > 900000)) {
+  // VREV now runs for XAU AND BTC (BTC added 2026-05-13 after 5/12 V-bottom miss at $79,800
+  // → $80,700 in 2hr — a $900 V that nothing caught because BTC had no V-REV detector).
+  // All thresholds are scaled by symbol — BTC values are ~40× XAU.
+  const vrevEnabled = isXAU || isBTC;
+  if (vrevEnabled && s.vrevSnaps.length >= 60 && cool && (now2 - s.vrevLastTs > 900000)) {
     // Find the high and low in the last 15 min of snapshots
     const lookback = s.vrevSnaps.filter(sn => sn.ts > now2 - 900000); // 15 min
     if (lookback.length >= 30) {
@@ -3105,45 +3150,43 @@ function processPrice(sym, price, hi, lo) {
       const lbLowTs = lookback.find(sn => sn.p === lbLow)?.ts || 0;
       const range = lbHigh - lbLow;
 
+      // Symbol-scaled thresholds. BTC numbers tuned to scale with BTC ATR (~$300/min vs XAU $1/min).
+      const vrevMinRange = isBTC ? 300 : 8;
+      const vrevBounceCap = isBTC ? 250 : 10;
+      const vrevGap = isBTC ? 250 : 5;
+      const vrevRoomBuffer = isBTC ? 100 : 2.0;
+      const vrevBreakBuffer = isBTC ? 50 : 0.50;
+
       // V-REVERSAL CALL: price dropped to a low, then bounced back up
       // Low happened BEFORE current time, price has recovered significantly, ROC confirms upward
       //
       // Bounce-magnitude gate: was `range * 0.4` (40% of full range) — that worked for $10-15
       // V's but missed deep washouts. Example: 5/12 chart, ~17:45 broker time, range $4700→$4630
       // ≈ $70. 40% = $28 required before VREV could fire, by which point the move was 60% spent
-      // AND RSI was back near 40 (also gating it elsewhere). Now: 30% bounce OR $10 absolute,
-      // whichever is SMALLER — so a deep $70 V fires after $10 recovery, while a shallow $10 V
-      // still needs 30% = $3. Asymmetric in the right direction (catches more deep V's, doesn't
+      // AND RSI was back near 40 (also gating it elsewhere). Now: 30% bounce OR cap absolute,
+      // whichever is SMALLER — so a deep V fires after a short recovery, while a shallow V
+      // still needs 30%. Asymmetric in the right direction (catches more deep V's, doesn't
       // make shallow V's noisier than they already were).
-      const minBounce = Math.min(range * 0.30, 10.0);
-      const dropThenBounce = range >= 8.0 && lbLowTs < now2 - 60000 && (price - lbLow) >= minBounce && lbLowTs > lbHighTs;
+      const minBounce = Math.min(range * 0.30, vrevBounceCap);
+      const dropThenBounce = range >= vrevMinRange && lbLowTs < now2 - 60000 && (price - lbLow) >= minBounce && lbLowTs > lbHighTs;
       // V-REVERSAL PUT: price rallied to a high, then dropped back down
-      const rallyThenDrop = range >= 8.0 && lbHighTs < now2 - 60000 && (lbHigh - price) >= minBounce && lbHighTs > lbLowTs;
+      const rallyThenDrop = range >= vrevMinRange && lbHighTs < now2 - 60000 && (lbHigh - price) >= minBounce && lbHighTs > lbLowTs;
 
       // Same-direction price-gap guard (added 2026-05-11 b): block VREV signals that fire
       // in the same direction as the last signal without meaningful price separation. Stops
       // the "two VREVs 10 min apart at the same price" pattern.
-      const vrevGap = 5; // XAU only — VREV is XAU-only
       const vrevGapOkCall = !(s.lastSameDir === 'call' && s.lastSameDirPrice > 0 && price < s.lastSameDirPrice + vrevGap);
       const vrevGapOkPut  = !(s.lastSameDir === 'put'  && s.lastSameDirPrice > 0 && price > s.lastSameDirPrice - vrevGap);
 
-      // Round-number gate (added 2026-05-12 b, ports the BREAK/FAST pattern). XAU $50 levels
-      // are psychological walls. Block VREV CALL if price is approaching a round number from
-      // below — bounce-into-resistance is exactly when VREV reads "bounce" but $4700 caps it.
-      // Block VREV PUT if approaching from above. Require $0.50 break confirmation.
-      // Caught XAU 5/12 signal #6: VREV CALL at $4699.68 (just $0.32 below $4700).
-      const vrevBreakBuffer = 0.50;
-      const vrevRoundOkCall = !(roundNumZone && price < nearestRound + vrevBreakBuffer);
-      const vrevRoundOkPut  = !(roundNumZone && price > nearestRound - vrevBreakBuffer);
+      // Round-number gate — XAU has $50 levels; BTC's round numbers ($1000 levels) are less
+      // structurally relevant, so the gate is XAU-only. For BTC vrevRound* defaults to true.
+      const vrevRoundOkCall = isBTC ? true : !(roundNumZone && price < nearestRound + vrevBreakBuffer);
+      const vrevRoundOkPut  = isBTC ? true : !(roundNumZone && price > nearestRound - vrevBreakBuffer);
 
-      // Room-to-grow / room-to-sell gate (added 2026-05-12 b, ports the FAST pattern).
-      // Block VREV CALL if price is within $2 of the 1-hour high (no upside left).
-      // Block VREV PUT if price is within $2 of the 1-hour low (no downside left).
-      // Catches XAU 5/12 signal #7: VREV CALL at $4706.42, $1.17 below day's $4707.59 high
-      // (then -$22 reversal).
+      // Room-to-grow / room-to-sell gate. Block VREV CALL if price is within buffer of the
+      // 1-hour high (no upside left). Block VREV PUT if within buffer of 1-hour low.
       let vrevRoomOkCall = true;
       let vrevRoomOkPut = true;
-      const vrevRoomBuffer = 2.0; // XAU
       if (s.atrCandles && s.atrCandles.length >= 12) {
         const last12 = s.atrCandles.slice(-12);
         const hi1h = Math.max(...last12.map(c => c.h));
@@ -3714,8 +3757,20 @@ function processPrice(sym, price, hi, lo) {
     const athConvOk = athConv.score >= 2;
     // Trend-protection gate (symmetric to ATL CALL): if rolling high advanced within 30 min,
     // price is still making new highs — ATH PUT is fading an active uptrend. Block.
-    const athTrendBlock = s.rollingHighUpdateTs && (now2 - s.rollingHighUpdateTs < 1800000);
-    if (athTrendBlock) {
+    //
+    // EXCEPTION (added 2026-05-13, mirror of ATL big-washout override): if the spike that
+    // set the new rolling high was unusually large (price gapped well past prior range), the
+    // spike IS the blow-off-top opportunity, not continuation. Allow ATH PUT once price has
+    // pulled back at least 30% of the spike magnitude.
+    const athSpikeSize = isBTC ? 200 : isNAS ? 30 : 5;
+    const athSpikeDepth = s.rollingHigh - (s.priorRangeHigh || s.rollingHigh);
+    const athBigSpike = athSpikeDepth >= athSpikeSize;
+    const athPostSpikePullback = distFromATH >= athSpikeSize * 0.30;
+    const athTrendBlockRaw = s.rollingHighUpdateTs && (now2 - s.rollingHighUpdateTs < 1800000);
+    const athTrendBlock = athTrendBlockRaw && !(athBigSpike && athPostSpikePullback);
+    if (athTrendBlockRaw && !athTrendBlock) {
+      log(sym, 'ATH PUT trend-block OVERRIDE — big spike ($' + athSpikeDepth.toFixed(2) + ' past prior range, pulled back $' + distFromATH.toFixed(2) + ' off new high). Allowing ATH PUT.');
+    } else if (athTrendBlock) {
       if (now2 - (s.athTrendBlockLogTs || 0) > 300000) {
         log(sym, 'ATH PUT trend-block — rolling high updated ' + Math.round((now2 - s.rollingHighUpdateTs) / 60000) + 'm ago (uptrend in progress)');
         s.athTrendBlockLogTs = now2;
@@ -3771,8 +3826,22 @@ function processPrice(sym, price, hi, lo) {
     // ATL CALLs while price kept making new 5-day lows, all losers). If the rolling low advanced
     // (= new low set) within the last 30 min, the market is in active downtrend — ATL is trend
     // continuation, NOT reversal. Block the CALL.
-    const atlTrendBlock = s.rollingLowUpdateTs && (now2 - s.rollingLowUpdateTs < 1800000);
-    if (atlTrendBlock) {
+    //
+    // EXCEPTION (added 2026-05-13 after 5/12 BTC V-bottom miss): if the washout that set the
+    // new rolling low was unusually large — meaning price fell sharply past the prior range —
+    // the washout IS the reversal opportunity, not a continuation. Allow ATL CALL despite the
+    // recent rolling-low update IF price has bounced meaningfully off the new low.
+    // Washout thresholds (% of athAtlMinRange): XAU $5/$15=33%, BTC $200/$500=40%, NAS $30/$100=30%.
+    // Bounce requirement: price has recovered at least 30% of the washout magnitude.
+    const washoutSize = isBTC ? 200 : isNAS ? 30 : 5;          // size of the "big washout" that justifies override
+    const atlWashoutDepth = (s.priorRangeLow || s.rollingLow) - s.rollingLow; // how far past prior range the new low went
+    const atlBigWashout = atlWashoutDepth >= washoutSize;
+    const atlPostWashoutBounce = distFromATL >= washoutSize * 0.30; // bounced 30% of washout off the new low
+    const atlTrendBlockRaw = s.rollingLowUpdateTs && (now2 - s.rollingLowUpdateTs < 1800000);
+    const atlTrendBlock = atlTrendBlockRaw && !(atlBigWashout && atlPostWashoutBounce);
+    if (atlTrendBlockRaw && !atlTrendBlock) {
+      log(sym, 'ATL CALL trend-block OVERRIDE — big washout ($' + atlWashoutDepth.toFixed(2) + ' past prior range, bounced $' + distFromATL.toFixed(2) + ' off new low). Allowing ATL CALL.');
+    } else if (atlTrendBlock) {
       if (now2 - (s.atlTrendBlockLogTs || 0) > 300000) {
         log(sym, 'ATL CALL trend-block — rolling low updated ' + Math.round((now2 - s.rollingLowUpdateTs) / 60000) + 'm ago (downtrend in progress)');
         s.atlTrendBlockLogTs = now2;
