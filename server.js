@@ -149,6 +149,12 @@ SYMBOLS.forEach(sym => {
     // V-Reversal detector (XAU only) — tracks recent price extremes for momentum reversal detection
     vrevSnaps: [],         // [{ts, p}] — price snapshots every 3s, last 20 min (max 400)
     vrevLastTs: 0,         // when last V-Rev signal fired (cooldown)
+    // Chop circuit breaker (added 2026-05-13) — tracks direction flips over rolling 60-min window.
+    // If 3+ flips happen in 60 min, suppress all opposite-direction signals for the next 30 min.
+    // Behavioral chop detector — catches the death-by-1000-cuts pattern when individual indicator
+    // gates each look OK in isolation but the macro behavior screams "indecisive market."
+    flipHistory: [],       // [ts] of opposite-direction signal flips, last 60 min only
+    chopBreakerUntil: 0,   // timestamp when circuit-breaker suppression expires
     // ===== RSI DIVERGENCE DETECTOR (added 2026-05-11) =====
     // Anticipatory reversal detector: tracks the last 4 confirmed swing extremes (alternating
     // peaks + troughs) with their RSI value at the time. Fires PUT when price makes a NEW
@@ -977,6 +983,22 @@ setInterval(() => {
 }, 60000); // check once a minute
 
 function logSignal(sym, sig) {
+  // Chop circuit breaker bookkeeping (added 2026-05-13): if this signal is the opposite
+  // direction of the previous one for this symbol, record the timestamp in flipHistory.
+  // The breaker logic (in the detector preamble) checks if flipHistory has >=3 entries in
+  // the last 60 min — if so, opposite-direction signals are suppressed for 30 min.
+  // Done here (vs each detector site) so we only have one source of truth.
+  try {
+    const s = S[sym];
+    if (s && Array.isArray(s.signals) && s.signals.length >= 2) {
+      const prev = s.signals[s.signals.length - 2]; // the new sig was already pushed before logSignal
+      if (prev && prev.type && sig.type && prev.type !== sig.type) {
+        if (!Array.isArray(s.flipHistory)) s.flipHistory = [];
+        s.flipHistory.push(Date.now());
+      }
+    }
+  } catch (e) { /* never let chop-breaker bookkeeping crash signal emission */ }
+
   const dateStr = todayDateET();
   // CSV log (legacy)
   const file = path.join(SIGNALS_DIR, dateStr + '.csv');
@@ -1616,15 +1638,42 @@ function processPrice(sym, price, hi, lo) {
   const cool = now2 - s.lastNTs > COOLDOWN_MS;
 
   // === OPPOSITE-DIRECTION FLIP GUARD ===
-  // Prevent PUT+CALL firing within 10 min of each other (different detectors can disagree at tops/bottoms)
-  // Same-direction signals still use normal 3-min cooldown. Opposite direction needs 10 min.
-  const FLIP_COOLDOWN_MS = 600000; // 10 minutes
+  // Prevent PUT+CALL firing within 15 min of each other (different detectors can disagree at tops/bottoms)
+  // Same-direction signals still use normal 3-min cooldown. Opposite direction needs 15 min.
+  // Bumped 10→15 min 2026-05-13: 5/12 morning had a 4-flip chain (10:13/10:26/10:38/10:49)
+  // every 11-13 min — every flip JUST past the 10-min wall. 15 min would have killed at least 4
+  // of the morning's chop flips and saved the 10:49 PUT 6/6 that sold the V-bottom.
+  const FLIP_COOLDOWN_MS = 900000; // 15 minutes
+
+  // === CHOP CIRCUIT BREAKER ===
+  // Maintain flipHistory: opposite-direction signal timestamps in last 60 min.
+  // If >=3 flips in 60 min, suppress all opposite-direction signals for next 30 min.
+  // Doesn't block same-direction signals (a real trend can keep firing in one direction).
+  if (!Array.isArray(s.flipHistory)) s.flipHistory = [];
+  const FLIP_WINDOW_MS = 3600000;   // 60 min lookback
+  const CHOP_SUPPRESS_MS = 1800000; // 30 min suppression
+  const FLIP_BREAKER_THR = 3;       // 3+ flips in window triggers breaker
+  s.flipHistory = s.flipHistory.filter(t => t > now2 - FLIP_WINDOW_MS);
+  if (s.flipHistory.length >= FLIP_BREAKER_THR && now2 > (s.chopBreakerUntil || 0)) {
+    s.chopBreakerUntil = now2 + CHOP_SUPPRESS_MS;
+    log(sym, '🚧 CHOP CIRCUIT BREAKER engaged — ' + s.flipHistory.length + ' direction flips in last 60 min. Opposite-direction signals suppressed for next 30 min.');
+  }
+  const chopBreakerActive = now2 < (s.chopBreakerUntil || 0);
+
   const flipCool = !s.lastSignalDir || (now2 - s.lastNTs > FLIP_COOLDOWN_MS);
   // flipCoolFor(dir): returns true if firing 'dir' is allowed given the last signal's direction
   function flipCoolFor(dir) {
     if (!s.lastSignalDir) return true; // no previous signal
     if (s.lastSignalDir === dir) return cool; // same direction: normal 3-min cooldown
-    return now2 - s.lastNTs > FLIP_COOLDOWN_MS; // opposite direction: 10-min cooldown
+    // Opposite direction: must clear flip cooldown AND chop circuit breaker must be inactive
+    if (chopBreakerActive) {
+      if (now2 - (s.chopBreakerLogTs || 0) > 60000) {
+        log(sym, 'Opposite-direction signal suppressed — chop circuit breaker active for ' + Math.round((s.chopBreakerUntil - now2) / 60000) + 'm more');
+        s.chopBreakerLogTs = now2;
+      }
+      return false;
+    }
+    return now2 - s.lastNTs > FLIP_COOLDOWN_MS; // opposite direction: 15-min cooldown
   }
 
   // === SIGNAL GATES ===
@@ -1849,15 +1898,30 @@ function processPrice(sym, price, hi, lo) {
   // RSI sweet-spot — sustained momentum can override (move still going despite oversold/overbought)
   // Note: rsiSweetCall and rsiSweetPut are now declared at function scope above (line ~1101)
   // so they're visible to Shakeout Recovery + 6/6 emit logic that runs below.
+  // Extreme-RSI hard floor for sustainedOverride (added 2026-05-13): even with 10+ ticks of
+  // sustained momentum, refuse PUT signals at RSI ≤ 30 and CALL signals at RSI ≥ 70. Caught
+  // 5/12 row 15: 6/6 PUT @ $4679.89 fired at RSI 31.9 — sustainedOverride bypassed the
+  // PUT_LO floor of 40, signal landed right at the V-bottom before a $40+ recovery.
+  // The asymmetry: sustained downward momentum that has driven RSI below 30 IS, by definition,
+  // an exhausted move — the bot is selling the bottom, not catching the trend.
+  const rsiHardOversold = rsiV <= 30;  // no PUT bypass below 30
+  const rsiHardOverbought = rsiV >= 70; // no CALL bypass above 70
+
   if (!rsiSweetCall && cS >= minS && cS >= pS) {
-    if (sustainedOverride && s.sustainedDir === 'call') {
+    if (sustainedOverride && s.sustainedDir === 'call' && !rsiHardOverbought) {
       log(sym, 'RSI gate override: sustained CALL momentum (' + s.sustainedCount + ' ticks) — RSI ' + rsiV.toFixed(1) + ' outside sweet zone');
-    } else return;
+    } else {
+      if (rsiHardOverbought) log(sym, 'RSI hard-overbought block: RSI ' + rsiV.toFixed(1) + ' ≥ 70 — sustainedOverride disabled (chasing the top)');
+      return;
+    }
   }
   if (!rsiSweetPut && pS >= minS && pS > cS) {
-    if (sustainedOverride && s.sustainedDir === 'put') {
+    if (sustainedOverride && s.sustainedDir === 'put' && !rsiHardOversold) {
       log(sym, 'RSI gate override: sustained PUT momentum (' + s.sustainedCount + ' ticks) — RSI ' + rsiV.toFixed(1) + ' outside sweet zone');
-    } else return;
+    } else {
+      if (rsiHardOversold) log(sym, 'RSI hard-oversold block: RSI ' + rsiV.toFixed(1) + ' ≤ 30 — sustainedOverride disabled (selling the bottom)');
+      return;
+    }
   }
 
   // FIX 3: RSI 30-45 PUT confirmation — "weak bearish" band is a trap (35% XAU, 20% BTC)
