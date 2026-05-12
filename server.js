@@ -52,8 +52,8 @@ const API = process.env.FINNHUB_API_KEY;
 const PORT = process.env.PORT || 3000;
 const SYMBOLS = ['QQQ', 'SPY', 'XAU', 'BTC', 'NAS100'];
 const RSI_CALL_LO = { QQQ: 45, SPY: 45, XAU: 40, BTC: 42, NAS100: 42 };
-const RSI_CALL_HI = { QQQ: 65, SPY: 65, XAU: 60, BTC: 60, NAS100: 60 }; // Tightened 2026-05-11 for MT5: 68/66 → 60 — block top-buying late in moves
-const RSI_PUT_LO  = { QQQ: 30, SPY: 30, XAU: 35, BTC: 35, NAS100: 35 }; // Tightened 2026-05-11 for MT5: 28/30 → 35 — block bottom-fishing late in moves
+const RSI_CALL_HI = { QQQ: 65, SPY: 65, XAU: 56, BTC: 60, NAS100: 60 }; // XAU 6/6-base tightened 2026-05-11 g: 60 → 56 (only affects 6/6 — specialists have own gates). Mirror of PUT_LO 35→40.
+const RSI_PUT_LO  = { QQQ: 30, SPY: 30, XAU: 40, BTC: 35, NAS100: 35 }; // XAU 6/6-base tightened 2026-05-11 g: 35 → 40 (only affects 6/6 — specialists have own gates). Today's 6/6 PUT at RSI 38.4 was the falling-knife — would now be blocked.
 const RSI_PUT_HI  = { QQQ: 55, SPY: 55, XAU: 58, BTC: 56, NAS100: 56 };
 const ROC_BLOWOFF = { QQQ: 0.15, SPY: 0.15, XAU: 0.35, BTC: 0.25, NAS100: 0.20 }; // XAU raised from 0.20 — was catching real trends as blowoffs
 const MAX_IND = { QQQ: 6, SPY: 6, XAU: 6, BTC: 6, NAS100: 6 };
@@ -996,8 +996,27 @@ function logSignal(sym, sig) {
     S[sym].chopActive ? 1 : 0, sig.num,
     convScore, convLabel, convFactors
   ].join(',') + '\n';
-  if (!exists) fs.writeFileSync(file, header + row);
-  else fs.appendFileSync(file, row);
+  // Wrap CSV write in try/catch (added 2026-05-12). Previously unhandled — if disk was full,
+  // permissions wrong, or DATA_DIR/signal_logs didn't exist post-restart, the signal would
+  // emit in-memory (push notif fires, mobile sees it) but the file write would silently fail
+  // OR throw and break the calling code. Now we log the failure explicitly so we can see it
+  // in Railway logs AND attempt to recreate the directory if it's missing.
+  try {
+    if (!exists) fs.writeFileSync(file, header + row);
+    else fs.appendFileSync(file, row);
+  } catch (e) {
+    console.error('[' + ts() + '] CSV WRITE FAILED for ' + sym + ' ' + sig.type + ' @ $' + sig.price + ' — ' + e.message);
+    // If directory got wiped (e.g. volume re-mounted), recreate and retry once
+    if (e.code === 'ENOENT') {
+      try {
+        fs.mkdirSync(SIGNALS_DIR, { recursive: true });
+        fs.writeFileSync(file, header + row);
+        console.log('[' + ts() + '] CSV recovered — recreated ' + SIGNALS_DIR + ' and wrote signal');
+      } catch (e2) {
+        console.error('[' + ts() + '] CSV recovery also failed: ' + e2.message);
+      }
+    }
+  }
 
   // JSON history (7-day persistent store)
   const histEntry = {
@@ -2421,8 +2440,28 @@ function processPrice(sym, price, hi, lo) {
             log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — same-dir price gap not met ($' + price.toFixed(2) + ' vs last $' + s.lastSameDirPrice.toFixed(2) + ', need $' + fmGap + ' move)');
           }
         }
+        // "Room to grow/sell" exhaustion gate (added 2026-05-12 after user analysis showed FAST
+        // consistently fires AT THE END of the directional leg, right before mean reversion).
+        // Use 1-hour candle data (12× 5-min candles) to find recent range. If price is too close
+        // to the 1h high (for CALL) or 1h low (for PUT), the move has no room left — block.
+        // Per-instrument exhaustion buffer: XAU $2, BTC $100, NAS $10.
+        let fmRoomOk = true;
+        const fmRoomBuffer = isXAU ? 2.0 : isBTC ? 100 : isNAS ? 10 : 2.0;
+        if (s.atrCandles && s.atrCandles.length >= 12) {
+          const last12 = s.atrCandles.slice(-12);
+          const hi1h = Math.max(...last12.map(c => c.h));
+          const lo1h = Math.min(...last12.map(c => c.l));
+          if (fmDir === 'call' && price > hi1h - fmRoomBuffer) {
+            fmRoomOk = false;
+            log(sym, '⚡ FAST CALL BLOCKED — no room to grow: $' + price.toFixed(2) + ' within $' + fmRoomBuffer + ' of 1h high $' + hi1h.toFixed(2) + ' (move exhausted)');
+          }
+          if (fmDir === 'put' && price < lo1h + fmRoomBuffer) {
+            fmRoomOk = false;
+            log(sym, '⚡ FAST PUT BLOCKED — no room to sell: $' + price.toFixed(2) + ' within $' + fmRoomBuffer + ' of 1h low $' + lo1h.toFixed(2) + ' (move exhausted)');
+          }
+        }
 
-        if (fmRsiOk && fmRocOk && fmMacdOk && fmGapOk && flipCoolFor(fmDir) && (winProtectDir === null || winProtectDir === fmDir)) {
+        if (fmRsiOk && fmRocOk && fmMacdOk && fmGapOk && fmRoomOk && flipCoolFor(fmDir) && (winProtectDir === null || winProtectDir === fmDir)) {
           s.fastMoveLastTs = now2;
           s.lastAT = fmDir; if (fmDir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
           if (s.lastSignalDir && s.lastSignalDir !== fmDir) s.lastReversalTs = now2;
