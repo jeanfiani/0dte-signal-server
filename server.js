@@ -149,6 +149,21 @@ SYMBOLS.forEach(sym => {
     // V-Reversal detector (XAU only) — tracks recent price extremes for momentum reversal detection
     vrevSnaps: [],         // [{ts, p}] — price snapshots every 3s, last 20 min (max 400)
     vrevLastTs: 0,         // when last V-Rev signal fired (cooldown)
+    // Macro-alignment tracking (added 2026-05-13). Records when conv.score first reached the
+    // "fully aligned" threshold (6+/7 for XAU, 6+/7-8 for BTC/NAS) for each direction. Used to
+    // LOOSEN guard gates (4h range-bound bump, post-reopen settling, chop circuit breaker) when
+    // ALL cross-asset factors agree — at that point the macro thesis is so strong that the
+    // short-term chop/timing gates become overcautious. Added after 5/13 dashboard showed
+    // 7/7 BEARISH conviction holding while price dropped $14 with no detector firing.
+    fullConvSinceCall: 0,  // when conv.score first reached 6+ for CALL direction (0 = not currently)
+    fullConvSincePut: 0,   // when conv.score first reached 6+ for PUT direction
+    // Macro-contra block (added 2026-05-13). When conv ≥6 aligned in one direction, set a
+    // sticky 20-min block on the OPPOSITE direction. While macro remains aligned, the block
+    // is refreshed every tick; when alignment breaks, the block decays over 20 min. Prevents
+    // counter-trend signals from sneaking through right after a fresh same-side trade, even
+    // when those signals look "OK" by their own detector logic.
+    macroContraBlockCallUntil: 0, // timestamp until which CALL signals are blocked (macro PUT)
+    macroContraBlockPutUntil: 0,  // timestamp until which PUT signals are blocked (macro CALL)
     // Chop circuit breaker (added 2026-05-13) — tracks direction flips over rolling 60-min window.
     // If 3+ flips happen in 60 min, suppress all opposite-direction signals for the next 30 min.
     // Behavioral chop detector — catches the death-by-1000-cuts pattern when individual indicator
@@ -1629,6 +1644,44 @@ function processPrice(sym, price, hi, lo) {
     const label = sc >= 5 ? 'HIGH' : sc >= 3 ? 'MOD' : 'LOW';
     return { score: sc, label, factors };
   }
+
+  // ===== MACRO-ALIGN TRACKING (added 2026-05-13) =====
+  // Per-tick: update fullConvSince* timestamps based on current conviction in each direction.
+  // 6+/7 for XAU is "near-max" (allowing 1 factor to lag is realistic); pure 7/7 is the absolute
+  // ceiling but rare enough to flicker. We use a 5-minute stability window to gate the loosen
+  // logic — alignment must have held for 5+ minutes before we trust it to override other gates.
+  const MACRO_ALIGN_THR = 6;  // factors aligned (out of 7 XAU / 7-8 BTC-NAS) to qualify as "aligned"
+  const MACRO_STABLE_MS = 300000; // 5 minutes of stability required
+  function macroAlignedFor(dir) {
+    // Returns true if conv has held at >= MACRO_ALIGN_THR for at least MACRO_STABLE_MS.
+    const since = dir === 'call' ? s.fullConvSinceCall : s.fullConvSincePut;
+    return since > 0 && (Date.now() - since) >= MACRO_STABLE_MS;
+  }
+  // Contra-block duration (added 2026-05-13): how long to suppress contrary-to-macro signals
+  // after a 6+ alignment is detected. Sticky — refreshed every tick while aligned, then decays
+  // for MACRO_CONTRA_BLOCK_MS after alignment breaks.
+  const MACRO_CONTRA_BLOCK_MS = 1200000; // 20 minutes
+  // Update tracker each tick — only when prices warm enough that conviction is meaningful.
+  if (isMT5 && s.prices.length >= 60) {
+    const convCallNow = convictionFor('call').score;
+    const convPutNow = convictionFor('put').score;
+    const tNow = Date.now();
+    if (convCallNow >= MACRO_ALIGN_THR) {
+      if (!s.fullConvSinceCall) s.fullConvSinceCall = tNow;
+      // Macro is calling for CALL → block contrary PUT signals for 20 min (sticky).
+      s.macroContraBlockPutUntil = tNow + MACRO_CONTRA_BLOCK_MS;
+    } else {
+      s.fullConvSinceCall = 0;
+    }
+    if (convPutNow >= MACRO_ALIGN_THR) {
+      if (!s.fullConvSincePut) s.fullConvSincePut = tNow;
+      // Macro is calling for PUT → block contrary CALL signals for 20 min (sticky).
+      s.macroContraBlockCallUntil = tNow + MACRO_CONTRA_BLOCK_MS;
+    } else {
+      s.fullConvSincePut = 0;
+    }
+  }
+
   // Enriches a signal object with conviction data and applies the conviction gate.
   // Returns true if the signal should emit, false if it must be blocked.
   // QQQ/SPY (non-MT5) skip both enrichment and gate — they don't have cross-asset factors.
@@ -1643,6 +1696,26 @@ function processPrice(sym, price, hi, lo) {
     if (!isMT5) return true; // non-MT5 instruments don't have conv — let them through
     const conv = convictionFor(sig.type);
     sig.conv = conv;
+
+    // Macro-contra block (added 2026-05-13). When cross-asset conv was ≥6 aligned against this
+    // signal's direction within the last 20 min, reject the signal outright. Hard guard — runs
+    // BEFORE other emit logic so we don't mutate state for a signal that won't fire.
+    // Exception: fade signals (ATH/ATL/HI/LO/DIV) are DESIGNED to counter-trend at extremes;
+    // letting them fire when macro is contrary still makes sense if their own detector gates
+    // are tight enough. But for trend-aligned signals (BREAK/FAST/TREND/VREV), going against
+    // a 6+/7 macro is the textbook losing setup.
+    const tagEarly = sig.score || '';
+    const isFadeEarly = /ATH|ATL|HI|LO|DIV/.test(tagEarly) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tagEarly);
+    const macroContraNow = Date.now();
+    const contraBlocked =
+      (sig.type === 'call' && macroContraNow < (s.macroContraBlockCallUntil || 0)) ||
+      (sig.type === 'put'  && macroContraNow < (s.macroContraBlockPutUntil  || 0));
+    if (contraBlocked && !isFadeEarly) {
+      Object.assign(s, _emitSnapshot);
+      const remainMin = Math.round(((sig.type === 'call' ? s.macroContraBlockCallUntil : s.macroContraBlockPutUntil) - macroContraNow) / 60000);
+      log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — macro 6+/7 aligned ' + (sig.type === 'call' ? 'PUT' : 'CALL') + '. Contra-block active ' + remainMin + 'min more.');
+      return false;
+    }
 
     const macroDir = s.macroEma ? (price > s.macroEma ? 'bull' : 'bear') : null;
     const isCall = sig.type === 'call';
@@ -1661,11 +1734,39 @@ function processPrice(sym, price, hi, lo) {
       ? 3                                        // V-REV / FAST: pattern is evidence, no counter-trend bump
       : ((isCounterTrend || isFadeSignal) ? 4    // ATH / ATL / HI / LO / counter-trend MFLIP·TREND: need 4
                                           : 3);  // trend-aligned: 3 is enough
+    // Macro-aligned override (added 2026-05-13): if cross-asset conviction has been
+    // ≥6/7 aligned in the signal's direction for ≥5 minutes, skip the soft-block bumps
+    // below. The macro thesis is strong enough that ranged/post-reopen/chop suppression
+    // becomes overcautious. The hard gates (chop circuit breaker, flipCool, RSI extremes)
+    // still apply — this only removes the conv-bump that softly suppresses MOD signals.
+    const macroOverride = macroAlignedFor(sig.type);
+
     // Post-reopen settling period (added 2026-05-13): for 15 min after the 15-min hard
     // opening-bell block expires (18:15-18:30 ET on XAU/NAS), bump conv requirement to 4.
     // Liquidity is still rebuilding; marginal MOD signals in this window have historically
     // been thin-tape noise. Caught 5/12 row 1 BREAK CALL @ 18:05:00 ET (MOD/3) which SL'd.
-    if (s._postReopenSettle && minConv < 4) minConv = 4;
+    if (s._postReopenSettle && minConv < 4 && !macroOverride) minConv = 4;
+    // 4-hour range-bound chop bump (added 2026-05-13): when the 4-hour high-low range is
+    // tight (< $30 XAU / $1500 BTC / $150 NAS), the market is in extended consolidation
+    // even if the 1-hour breakout filter and the efficiency-ratio chop detector say it's fine.
+    // Caught 5/13 morning: 8 signals fired in a $13 4-hour range (0.28% of price), at least
+    // 3 hit SL. In this regime each "breakout" just touches the other side of the range and
+    // reverses. Require HIGH conv (≥4) for trend/momentum signals to fire. Doesn't apply to
+    // fade signals (ATH/ATL/HI/LO) — those are SUPPOSED to fire at range edges.
+    // Skip for VREV — VREV is a chop-friendly detector and this would double-suppress it.
+    // Skip when macroOverride active — full cross-asset alignment trumps short-term chop.
+    if (!isFadeSignal && !/VREV/.test(tag) && !macroOverride && s.atrCandles && s.atrCandles.length >= 48) {
+      const last48 = s.atrCandles.slice(-48); // 48 × 5-min = 4 hours
+      const hi4h = Math.max(...last48.map(c => c.h));
+      const lo4h = Math.min(...last48.map(c => c.l));
+      const range4h = hi4h - lo4h;
+      const tightThr = isBTC ? 1500 : isNAS ? 150 : 30;
+      if (range4h < tightThr && minConv < 4) {
+        minConv = 4;
+        // Mark on the sig so the block log below is informative if conv falls short
+        sig._rangeBoundBump = +(range4h).toFixed(2);
+      }
+    }
     if (conv.score < minConv) {
       // Rollback emit-related state to start-of-tick snapshot. Without this, the emit
       // code's pre-gate mutations (dailySignalCount++, lastNTs = now2, fastMoveLastTs = now2,
@@ -1711,13 +1812,22 @@ function processPrice(sym, price, hi, lo) {
   function flipCoolFor(dir) {
     if (!s.lastSignalDir) return true; // no previous signal
     if (s.lastSignalDir === dir) return cool; // same direction: normal 3-min cooldown
-    // Opposite direction: must clear flip cooldown AND chop circuit breaker must be inactive
-    if (chopBreakerActive) {
+    // Opposite direction: must clear flip cooldown AND chop circuit breaker must be inactive.
+    // Macro-aligned override (added 2026-05-13): if cross-asset conviction has been ≥6 aligned
+    // with `dir` for ≥5 min, allow the flip even when the chop breaker is active. The macro
+    // thesis says the prior signals were the wrong direction and we should reverse. The
+    // 15-min flip cooldown still applies — only the chop breaker is bypassed.
+    const macroFlipOk = (s.fullConvSinceCall && dir === 'call' && (now2 - s.fullConvSinceCall) >= 300000) ||
+                         (s.fullConvSincePut && dir === 'put' && (now2 - s.fullConvSincePut) >= 300000);
+    if (chopBreakerActive && !macroFlipOk) {
       if (now2 - (s.chopBreakerLogTs || 0) > 60000) {
         log(sym, 'Opposite-direction signal suppressed — chop circuit breaker active for ' + Math.round((s.chopBreakerUntil - now2) / 60000) + 'm more');
         s.chopBreakerLogTs = now2;
       }
       return false;
+    }
+    if (chopBreakerActive && macroFlipOk) {
+      log(sym, '🔄 Chop breaker BYPASS — macro 6+/7 aligned ' + dir.toUpperCase() + ' for ' + Math.round((now2 - (dir === 'call' ? s.fullConvSinceCall : s.fullConvSincePut)) / 60000) + 'min. Allowing flip.');
     }
     return now2 - s.lastNTs > FLIP_COOLDOWN_MS; // opposite direction: 15-min cooldown
   }
@@ -4572,7 +4682,10 @@ function processTicks(symbols) {
         // Close candle after 5 minutes
         if (bNow5 - s.atrCurCandle.startTs >= 300000) {
           s.atrCandles.push({ o: s.atrCurCandle.o, h: s.atrCurCandle.h, l: s.atrCurCandle.l, c: s.atrCurCandle.c, ts: s.atrCurCandle.startTs });
-          if (s.atrCandles.length > 20) s.atrCandles.shift();
+          // Cap raised 20 → 60 candles (5 hours) on 2026-05-13 to support the 4-hour
+          // range-bound chop detector in enrichSig that needs 48 candles. 5 hours of
+          // 5-min OHLC ≈ 60 floats × 4 fields = trivial memory.
+          if (s.atrCandles.length > 60) s.atrCandles.shift();
           s.atrCurCandle = { o: price, h: price, l: price, c: price, startTs: bNow5 };
         }
       }
