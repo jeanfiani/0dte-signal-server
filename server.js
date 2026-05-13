@@ -158,12 +158,18 @@ SYMBOLS.forEach(sym => {
     fullConvSinceCall: 0,  // when conv.score first reached 6+ for CALL direction (0 = not currently)
     fullConvSincePut: 0,   // when conv.score first reached 6+ for PUT direction
     // Macro-contra block (added 2026-05-13). When conv ≥6 aligned in one direction, set a
-    // sticky 20-min block on the OPPOSITE direction. While macro remains aligned, the block
-    // is refreshed every tick; when alignment breaks, the block decays over 20 min. Prevents
+    // sticky 45-min block on the OPPOSITE direction. While macro remains aligned, the block
+    // is refreshed every tick; when alignment breaks, the block decays over 45 min. Prevents
     // counter-trend signals from sneaking through right after a fresh same-side trade, even
     // when those signals look "OK" by their own detector logic.
     macroContraBlockCallUntil: 0, // timestamp until which CALL signals are blocked (macro PUT)
     macroContraBlockPutUntil: 0,  // timestamp until which PUT signals are blocked (macro CALL)
+    // Macro-flip cooldown (added 2026-05-13 after 5/13 10:32 ATL CALL SL'd 32 min after PUT
+    // alignment ended). Records when alignment in each direction last ENDED (transitioned
+    // from ≥6 to <6). Used to block ALL signals — including fades — when macro recently
+    // flipped, on the theory that "macro is flickering" = chop, not real reversal.
+    lastFullConvCallEndTs: 0,  // when CALL alignment last ended
+    lastFullConvPutEndTs: 0,   // when PUT alignment last ended
     // Chop circuit breaker (added 2026-05-13) — tracks direction flips over rolling 60-min window.
     // If 3+ flips happen in 60 min, suppress all opposite-direction signals for the next 30 min.
     // Behavioral chop detector — catches the death-by-1000-cuts pattern when individual indicator
@@ -1657,10 +1663,9 @@ function processPrice(sym, price, hi, lo) {
     const since = dir === 'call' ? s.fullConvSinceCall : s.fullConvSincePut;
     return since > 0 && (Date.now() - since) >= MACRO_STABLE_MS;
   }
-  // Contra-block duration (added 2026-05-13): how long to suppress contrary-to-macro signals
-  // after a 6+ alignment is detected. Sticky — refreshed every tick while aligned, then decays
-  // for MACRO_CONTRA_BLOCK_MS after alignment breaks.
-  const MACRO_CONTRA_BLOCK_MS = 1200000; // 20 minutes
+  // Contra-block duration (extended 2026-05-13 second pass: 20 → 45 min). User feedback after
+  // 5/13 10:32 CALL ATL SL'd 32 min after PUT-aligned macro ended → 20 min was too short.
+  const MACRO_CONTRA_BLOCK_MS = 2700000; // 45 minutes
   // Update tracker each tick — only when prices warm enough that conviction is meaningful.
   if (isMT5 && s.prices.length >= 60) {
     const convCallNow = convictionFor('call').score;
@@ -1668,16 +1673,19 @@ function processPrice(sym, price, hi, lo) {
     const tNow = Date.now();
     if (convCallNow >= MACRO_ALIGN_THR) {
       if (!s.fullConvSinceCall) s.fullConvSinceCall = tNow;
-      // Macro is calling for CALL → block contrary PUT signals for 20 min (sticky).
+      // Macro is calling for CALL → block contrary PUT signals for 45 min (sticky).
       s.macroContraBlockPutUntil = tNow + MACRO_CONTRA_BLOCK_MS;
     } else {
+      // Record the moment alignment ENDED (only on the transition, not every tick once 0)
+      if (s.fullConvSinceCall) s.lastFullConvCallEndTs = tNow;
       s.fullConvSinceCall = 0;
     }
     if (convPutNow >= MACRO_ALIGN_THR) {
       if (!s.fullConvSincePut) s.fullConvSincePut = tNow;
-      // Macro is calling for PUT → block contrary CALL signals for 20 min (sticky).
+      // Macro is calling for PUT → block contrary CALL signals for 45 min (sticky).
       s.macroContraBlockCallUntil = tNow + MACRO_CONTRA_BLOCK_MS;
     } else {
+      if (s.fullConvSincePut) s.lastFullConvPutEndTs = tNow;
       s.fullConvSincePut = 0;
     }
   }
@@ -1697,16 +1705,35 @@ function processPrice(sym, price, hi, lo) {
     const conv = convictionFor(sig.type);
     sig.conv = conv;
 
-    // Macro-contra block (added 2026-05-13). When cross-asset conv was ≥6 aligned against this
-    // signal's direction within the last 20 min, reject the signal outright. Hard guard — runs
-    // BEFORE other emit logic so we don't mutate state for a signal that won't fire.
-    // Exception: fade signals (ATH/ATL/HI/LO/DIV) are DESIGNED to counter-trend at extremes;
-    // letting them fire when macro is contrary still makes sense if their own detector gates
-    // are tight enough. But for trend-aligned signals (BREAK/FAST/TREND/VREV), going against
-    // a 6+/7 macro is the textbook losing setup.
     const tagEarly = sig.score || '';
     const isFadeEarly = /ATH|ATL|HI|LO|DIV/.test(tagEarly) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tagEarly);
     const macroContraNow = Date.now();
+
+    // ===== MACRO-FLIP COOLDOWN (added 2026-05-13) =====
+    // Caught 5/13 10:32 ATL CALL @ conv 6 HIGH SL'd 32 min after PUT alignment ended. The
+    // 20-min contra-block had just expired AND fade exemption let ATL through anyway. When
+    // macro alignment recently ENDED in the opposite direction (within 60 min), the macro
+    // is FLICKERING — not a clean reversal. Block ALL signals including fades.
+    const MACRO_FLIP_COOLDOWN_MS = 3600000; // 60 minutes since opposite alignment ended
+    const oppositeEndTs = sig.type === 'call' ? (s.lastFullConvPutEndTs || 0) : (s.lastFullConvCallEndTs || 0);
+    const oppositeFlipRecent = oppositeEndTs > 0 && (macroContraNow - oppositeEndTs) < MACRO_FLIP_COOLDOWN_MS;
+    // Bypass: if macro has now been aligned WITH signal direction stably for ≥15 min, the
+    // flip is real — allow the trade.
+    const newDirStable = sig.type === 'call'
+      ? (s.fullConvSinceCall > 0 && (macroContraNow - s.fullConvSinceCall) >= 900000)
+      : (s.fullConvSincePut > 0 && (macroContraNow - s.fullConvSincePut) >= 900000);
+    if (oppositeFlipRecent && !newDirStable) {
+      Object.assign(s, _emitSnapshot);
+      const flipAgoMin = Math.round((macroContraNow - oppositeEndTs) / 60000);
+      log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — macro flip cooldown (opposite alignment ended ' + flipAgoMin + 'min ago, need 60min OR 15min of stable new alignment).');
+      return false;
+    }
+
+    // ===== MACRO-CONTRA BLOCK (added 2026-05-13, extended 20→45min) =====
+    // When cross-asset conv is/was ≥6 aligned against this signal's direction within the
+    // last 45 min, reject the signal. Fade signals (ATH/ATL/HI/LO/DIV) are normally exempt
+    // because they're designed to counter-trend at extremes — but the macro-flip cooldown
+    // above already catches the chop-flicker case, so fades here pass through correctly.
     const contraBlocked =
       (sig.type === 'call' && macroContraNow < (s.macroContraBlockCallUntil || 0)) ||
       (sig.type === 'put'  && macroContraNow < (s.macroContraBlockPutUntil  || 0));
