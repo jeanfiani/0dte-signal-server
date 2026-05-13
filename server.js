@@ -3961,7 +3961,15 @@ function processPrice(sym, price, hi, lo) {
         s.athOversoldLogTs = now2;
       }
     }
-    if (!athTrendBlock && !athOversoldBlock && athApproachRecent && distFromATH >= athAtlPullback && s.rsiAtRollingHigh > 55 && athMacdOk && athRocStrong && !athBullBlock && athConvOk && flipCoolFor('put') && winProtectDir !== 'call') {
+    // Big-spike-pullback override (added 2026-05-13 — same case as the trend-block override).
+    // Caught from 5/13 18:49-19:00 logs: ATH PUT trend-block OVERRIDE messages firing EVERY
+    // tick saying "Allowing ATH PUT" with $15-22 pullback off new high, but signal never
+    // actually emitting because athApproachRecent was FALSE (price had pulled back far enough
+    // that it's no longer within 0.1% of the rolling high → athApproachTs stale).
+    // When the big-spike override is active, the spike+pullback pattern IS the rejection —
+    // doesn't need a fresh price-zone touch. Bypass athApproachRecent in that case.
+    const athApproachOk = athApproachRecent || (athBigSpike && athPostSpikePullback);
+    if (!athTrendBlock && !athOversoldBlock && athApproachOk && distFromATH >= athAtlPullback && s.rsiAtRollingHigh > 55 && athMacdOk && athRocStrong && !athBullBlock && athConvOk && flipCoolFor('put') && winProtectDir !== 'call') {
       if (s.lastSignalDir !== 'put' || (now2 - s.lastNTs > athAtlCooldown)) {
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
         if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
@@ -4031,7 +4039,11 @@ function processPrice(sym, price, hi, lo) {
         s.atlOverboughtLogTs = now2;
       }
     }
-    if (!atlTrendBlock && !atlOverboughtBlock && atlApproachRecent && distFromATL >= athAtlPullback && s.rsiAtRollingLow < 45 && rsiV < 75 && atlMacdOk && atlRocMin && !atlBounceFailed && atlConvOk && flipCoolFor('call') && winProtectDir !== 'put') {
+    // Mirror of ATH PUT fix: bypass atlApproachRecent when big-washout override is active
+    // (added 2026-05-13). After a deep washout, price is no longer within 0.1% of rolling low
+    // → atlApproachTs stale → atlApproachRecent FALSE → signal silently doesn't fire.
+    const atlApproachOk = atlApproachRecent || (atlBigWashout && atlPostWashoutBounce);
+    if (!atlTrendBlock && !atlOverboughtBlock && atlApproachOk && distFromATL >= athAtlPullback && s.rsiAtRollingLow < 45 && rsiV < 75 && atlMacdOk && atlRocMin && !atlBounceFailed && atlConvOk && flipCoolFor('call') && winProtectDir !== 'put') {
       if (s.lastSignalDir !== 'call' || (now2 - s.lastNTs > athAtlCooldown)) {
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
         if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
