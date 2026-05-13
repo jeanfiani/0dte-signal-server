@@ -1784,8 +1784,13 @@ function processPrice(sym, price, hi, lo) {
     // Skip when macroOverride active — full cross-asset alignment trumps short-term chop.
     if (!isFadeSignal && !/VREV/.test(tag) && !macroOverride && s.atrCandles && s.atrCandles.length >= 48) {
       const last48 = s.atrCandles.slice(-48); // 48 × 5-min = 4 hours
-      const hi4h = Math.max(...last48.map(c => c.h));
-      const lo4h = Math.min(...last48.map(c => c.l));
+      let hi4h = Math.max(...last48.map(c => c.h));
+      let lo4h = Math.min(...last48.map(c => c.l));
+      // Include in-progress candle so live moves expand the range correctly (2026-05-13)
+      if (s.atrCurCandle) {
+        if (s.atrCurCandle.h > hi4h) hi4h = s.atrCurCandle.h;
+        if (s.atrCurCandle.l < lo4h) lo4h = s.atrCurCandle.l;
+      }
       const range4h = hi4h - lo4h;
       const tightThr = isBTC ? 1500 : isNAS ? 150 : 30;
       if (range4h < tightThr && minConv < 4) {
@@ -2494,8 +2499,14 @@ function processPrice(sym, price, hi, lo) {
       // Per-instrument min range as % of price: BTC 0.30, XAU 0.20, NAS 0.25.
       if (s.atrCandles && s.atrCandles.length >= 12) {
         const last12 = s.atrCandles.slice(-12);
-        const hi1h = Math.max(...last12.map(c => c.h));
-        const lo1h = Math.min(...last12.map(c => c.l));
+        let hi1h = Math.max(...last12.map(c => c.h));
+        let lo1h = Math.min(...last12.map(c => c.l));
+        // Include in-progress candle so an in-flight breakout that's expanding the range
+        // isn't blocked by the prior tight closed-candle range (2026-05-13).
+        if (s.atrCurCandle) {
+          if (s.atrCurCandle.h > hi1h) hi1h = s.atrCurCandle.h;
+          if (s.atrCurCandle.l < lo1h) lo1h = s.atrCurCandle.l;
+        }
         const range1h = hi1h - lo1h;
         const rangePct = (range1h / price) * 100;
         const minRangePct = isBTC ? 0.30 : isNAS ? 0.25 : isXAU ? 0.20 : 0.20;
@@ -2780,20 +2791,30 @@ function processPrice(sym, price, hi, lo) {
         }
         // "Room to grow/sell" exhaustion gate (added 2026-05-12 after user analysis showed FAST
         // consistently fires AT THE END of the directional leg, right before mean reversion).
-        // Use 1-hour candle data (12× 5-min candles) to find recent range. If price is too close
-        // to the 1h high (for CALL) or 1h low (for PUT), the move has no room left — block.
+        // Use 1-hour candle data (12× 5-min closed candles) to find recent range. If price is
+        // approaching the 1h high (for CALL) or 1h low (for PUT) FROM THE INTERIOR — i.e., it
+        // hasn't broken through yet — the move is likely exhausted at support/resistance. Block.
         // Per-instrument exhaustion buffer: XAU $2, BTC $100, NAS $10.
+        //
+        // FIX 2026-05-13: caught 5/13 ~19:30-20:30 broker time, $10 downtrend with NO PUT
+        // signals because the gate blocked every tick. Original check `price < lo1h + buffer`
+        // fired even when price had broken WELL BELOW the prior closed-candle low (i.e., a
+        // fresh new-low continuation, not an approach to support). New check: only block PUT
+        // when price is ABOVE the closed lo1h (approaching it from above). If price < lo1h,
+        // we've already broken the support → continuation trade, allow. Symmetric for CALL.
+        // Use closed candles only (NOT in-progress) so a fresh breakdown lifts the gate
+        // correctly — adding in-progress would re-fire the gate with the live low.
         let fmRoomOk = true;
         const fmRoomBuffer = isXAU ? 2.0 : isBTC ? 100 : isNAS ? 10 : 2.0;
         if (s.atrCandles && s.atrCandles.length >= 12) {
           const last12 = s.atrCandles.slice(-12);
           const hi1h = Math.max(...last12.map(c => c.h));
           const lo1h = Math.min(...last12.map(c => c.l));
-          if (fmDir === 'call' && price > hi1h - fmRoomBuffer) {
+          if (fmDir === 'call' && price < hi1h && price > hi1h - fmRoomBuffer) {
             fmRoomOk = false;
             log(sym, '⚡ FAST CALL BLOCKED — no room to grow: $' + price.toFixed(2) + ' within $' + fmRoomBuffer + ' of 1h high $' + hi1h.toFixed(2) + ' (move exhausted)');
           }
-          if (fmDir === 'put' && price < lo1h + fmRoomBuffer) {
+          if (fmDir === 'put' && price > lo1h && price < lo1h + fmRoomBuffer) {
             fmRoomOk = false;
             log(sym, '⚡ FAST PUT BLOCKED — no room to sell: $' + price.toFixed(2) + ' within $' + fmRoomBuffer + ' of 1h low $' + lo1h.toFixed(2) + ' (move exhausted)');
           }
@@ -3334,16 +3355,18 @@ function processPrice(sym, price, hi, lo) {
       const vrevRoundOkCall = isBTC ? true : !(roundNumZone && price < nearestRound + vrevBreakBuffer);
       const vrevRoundOkPut  = isBTC ? true : !(roundNumZone && price > nearestRound - vrevBreakBuffer);
 
-      // Room-to-grow / room-to-sell gate. Block VREV CALL if price is within buffer of the
-      // 1-hour high (no upside left). Block VREV PUT if within buffer of 1-hour low.
+      // Room-to-grow / room-to-sell gate. Block VREV CALL if price is approaching the 1h high
+      // FROM BELOW (within buffer, no upside left). Block VREV PUT if approaching 1h low from
+      // above. Same fix as FAST 2026-05-13: only block when price hasn't broken through —
+      // if price > hi1h or < lo1h the breakout already happened, allow the trade.
       let vrevRoomOkCall = true;
       let vrevRoomOkPut = true;
       if (s.atrCandles && s.atrCandles.length >= 12) {
         const last12 = s.atrCandles.slice(-12);
         const hi1h = Math.max(...last12.map(c => c.h));
         const lo1h = Math.min(...last12.map(c => c.l));
-        if (price > hi1h - vrevRoomBuffer) vrevRoomOkCall = false;
-        if (price < lo1h + vrevRoomBuffer) vrevRoomOkPut = false;
+        if (price < hi1h && price > hi1h - vrevRoomBuffer) vrevRoomOkCall = false;
+        if (price > lo1h && price < lo1h + vrevRoomBuffer) vrevRoomOkPut = false;
       }
 
       // RSI band widened 2026-05-13: CALL lower bound 35 → 28, PUT upper bound 65 → 72.
