@@ -108,7 +108,7 @@ SYMBOLS.forEach(sym => {
     chopShort: [], chopLong: [], chopCount: 0, trendCount: 0, chopActive: false,
     signals: [], tickBuf: [], lastPrice: 0,
     crossAssetDir: null, crossAssetTs: 0,
-    sessionHigh: -Infinity, sessionLow: Infinity, rsiAtSessionHigh: 50,
+    sessionHigh: -Infinity, sessionLow: Infinity, rsiAtSessionHigh: 50, rsiAtSessionLow: 50,
     gapDayMode: false, gapDirection: null, prevClose: null,
     lastSameDir: null, lastSameDirMacd: 0, lastSameDirTs: 0, lastSameDirPrice: 0,
     // Rolling multi-day high/low for ATH/ATL reversal detection
@@ -1390,6 +1390,8 @@ function processPrice(sym, price, hi, lo) {
 
   // Track RSI at session high — used by Session High Reversal Detector
   if (price >= s.sessionHigh) s.rsiAtSessionHigh = rsiV;
+  // Track RSI at session low — used by Session Low Reversal Detector (added 2026-05-13)
+  if (price <= s.sessionLow) s.rsiAtSessionLow = rsiV;
   // Track RSI at rolling ATH/ATL — used by ATH/ATL Reversal Detector
   if (isMT5) {
     if (s.rollingHigh > 0 && price >= s.rollingHigh * 0.999) { s.rsiAtRollingHigh = rsiV; s.athApproachTs = Date.now(); s.athApproachPrice = price; }
@@ -1737,11 +1739,19 @@ function processPrice(sym, price, hi, lo) {
     const contraBlocked =
       (sig.type === 'call' && macroContraNow < (s.macroContraBlockCallUntil || 0)) ||
       (sig.type === 'put'  && macroContraNow < (s.macroContraBlockPutUntil  || 0));
-    if (contraBlocked && !isFadeEarly) {
-      Object.assign(s, _emitSnapshot);
-      const remainMin = Math.round(((sig.type === 'call' ? s.macroContraBlockCallUntil : s.macroContraBlockPutUntil) - macroContraNow) / 60000);
-      log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — macro 6+/7 aligned ' + (sig.type === 'call' ? 'PUT' : 'CALL') + '. Contra-block active ' + remainMin + 'min more.');
-      return false;
+    if (contraBlocked) {
+      if (isFadeEarly) {
+        // Audit finding LOW-4 (added 2026-05-13): log when a fade signal proceeds despite
+        // the contra-block — previously this was a silent pass-through making it confusing
+        // to debug why fade signals fire when macro is strongly aligned against them.
+        const remainMin = Math.round(((sig.type === 'call' ? s.macroContraBlockCallUntil : s.macroContraBlockPutUntil) - macroContraNow) / 60000);
+        log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' contra-block EXEMPT (fade signal) — macro aligned ' + (sig.type === 'call' ? 'PUT' : 'CALL') + ' ' + remainMin + 'min more, but fade detectors are designed to counter-trend at extremes.');
+      } else {
+        Object.assign(s, _emitSnapshot);
+        const remainMin = Math.round(((sig.type === 'call' ? s.macroContraBlockCallUntil : s.macroContraBlockPutUntil) - macroContraNow) / 60000);
+        log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — macro 6+/7 aligned ' + (sig.type === 'call' ? 'PUT' : 'CALL') + '. Contra-block active ' + remainMin + 'min more.');
+        return false;
+      }
     }
 
     const macroDir = s.macroEma ? (price > s.macroEma ? 'bull' : 'bear') : null;
@@ -2412,6 +2422,41 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
+  // Session Low Reversal Detector — fire high-confidence CALL when price reverses from session low
+  // Added 2026-05-13 (audit finding HIGH-1): mirror of HIGH REVERSAL PUT. Without this, the
+  // CALL side was missing this signal class entirely. Also writes s.lastLoRevTs which is read
+  // by TRv2 SHORT-blocking guards at lines ~3528 / 3617-3625 — those guards were dead code
+  // until this detector existed because nothing wrote the timestamp.
+  if (s.sessionLow < Infinity && s.openPrice && cool && hiLoRsiSane && flipCoolFor('call') && winProtectDir !== 'put' && (isMT5 || s.dailySignalCount < MAX_SIG) && etMin >= 570 && etMin < 955) {
+    const distFromLow = price - s.sessionLow;
+    const sessionRange = s.sessionHigh - s.sessionLow;
+    const lowWasRecent = s.prices.length >= 10 && Math.min(...s.prices.slice(-30 > -s.prices.length ? -30 : 0)) <= s.sessionLow + 0.05;
+    // Same per-instrument thresholds as HIGH reversal — symmetric setup.
+    const loRevDist  = isBTC ? 80.0 : isNAS ? 50.0 : isXAU ? 5.0 : 0.50;   // min bounce from low
+    const loRevRange = isBTC ? 150.0 : isNAS ? 100.0 : isXAU ? 10.0 : 1.0;  // min session range
+    // RSI@low must have been oversold (< 45), and ROC OR MACD confirms upside reversal.
+    const loRevRocOk  = roc3 > symRocThr;
+    const loRevMacdOk = macdL > macdS;
+    if (distFromLow >= loRevDist && s.rsiAtSessionLow < 45 && sessionRange >= loRevRange && lowWasRecent && (loRevRocOk || loRevMacdOk)) {
+      if (s.lastSignalDir !== 'call' || (now2 - s.lastNTs > COOLDOWN_MS)) {
+        s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
+        if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
+        s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
+        s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+        const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆LO', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        if (!enrichSig(sig)) return; s.signals.push(sig);
+        logSignal(sym, sig);
+        if (isMT5) attachTpSl(sig, 'call', price, atrVal, sym);
+        s.lastLoRevTs = now2; // Track for TRv2 SHORT-entry suppression
+        log(sym, '🚀 SESSION LOW REVERSAL CALL — $' + distFromLow.toFixed(2) + ' off low $' + s.sessionLow.toFixed(2) + ' RSI@low:' + s.rsiAtSessionLow.toFixed(1) + ' RSInow:' + rsiV.toFixed(1) + ' [#' + s.dailySignalCount + ']');
+        sendPush('🚀 ' + sym + ' LOW REVERSAL CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromLow.toFixed(2) + ' off low · RSI@low:' + s.rsiAtSessionLow.toFixed(1), 'signal');
+        s.trade = isMT5 ? buildCfdTrade('call', price, atrVal, sym) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
+        SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'call'; S[other].crossAssetTs = now2; } });
+        return;
+      }
+    }
+  }
+
   // ===== CONSOLIDATION BREAKOUT DETECTOR (MT5 instruments: XAU + BTC) =====
   // Fires INSTANTLY when price escapes a tight range — no lagging indicator delay.
   // This is the fastest signal: catches moves 2-3 min before EMAs/RSI/MACD confirm.
@@ -2825,13 +2870,18 @@ function processPrice(sym, price, hi, lo) {
         let fmRoundOk = true;
         if (isXAU && roundNumZone) {
           const fmBreakBuffer = 0.50;
-          if (fmDir === 'call' && price < nearestRound + fmBreakBuffer) {
+          // FIX 2026-05-13 (audit finding MEDIUM-3): same directional-inversion bug as VREV.
+          // Original `price < nearestRound + fmBreakBuffer` fired even when price had cleared
+          // the round going up (e.g. price=$4700.30 > $4700, but $4700.30 < $4700.50 still
+          // TRUE → block), AND the log message said "approaching from below" which is wrong.
+          // Fix: only block when price is on the WRONG SIDE of the round. Once cleared, allow.
+          if (fmDir === 'call' && price < nearestRound) {
             fmRoundOk = false;
-            log(sym, '⚡ FAST CALL BLOCKED — $' + price.toFixed(2) + ' approaching $' + nearestRound + ' resistance from below (need confirmed break above $' + (nearestRound + fmBreakBuffer).toFixed(2) + ')');
+            log(sym, '⚡ FAST CALL BLOCKED — $' + price.toFixed(2) + ' below $' + nearestRound + ' resistance (wait for cross)');
           }
-          if (fmDir === 'put' && price > nearestRound - fmBreakBuffer) {
+          if (fmDir === 'put' && price > nearestRound) {
             fmRoundOk = false;
-            log(sym, '⚡ FAST PUT BLOCKED — $' + price.toFixed(2) + ' approaching $' + nearestRound + ' support from above (need confirmed break below $' + (nearestRound - fmBreakBuffer).toFixed(2) + ')');
+            log(sym, '⚡ FAST PUT BLOCKED — $' + price.toFixed(2) + ' above $' + nearestRound + ' support (wait for cross)');
           }
         }
 
@@ -3352,8 +3402,15 @@ function processPrice(sym, price, hi, lo) {
 
       // Round-number gate — XAU has $50 levels; BTC's round numbers ($1000 levels) are less
       // structurally relevant, so the gate is XAU-only. For BTC vrevRound* defaults to true.
-      const vrevRoundOkCall = isBTC ? true : !(roundNumZone && price < nearestRound + vrevBreakBuffer);
-      const vrevRoundOkPut  = isBTC ? true : !(roundNumZone && price > nearestRound - vrevBreakBuffer);
+      //
+      // FIX 2026-05-13 (audit finding HIGH-2): same directional-inversion bug as the
+      // room-to-grow gate. Original check `price < nearestRound + buffer` fired even when
+      // price had cleared the round going up (e.g. price=$4700.30, round=$4700, $4700.30 <
+      // $4700.50 still TRUE → block). But once price crosses above, that's a CONFIRMED BREAK
+      // and the VREV CALL should fire. Fix: only block when price is on the WRONG SIDE of
+      // the round (below for CALL, above for PUT). Once price clears the round, allow.
+      const vrevRoundOkCall = isBTC ? true : !(roundNumZone && price < nearestRound);
+      const vrevRoundOkPut  = isBTC ? true : !(roundNumZone && price > nearestRound);
 
       // Room-to-grow / room-to-sell gate. Block VREV CALL if price is approaching the 1h high
       // FROM BELOW (within buffer, no upside left). Block VREV PUT if approaching 1h low from
@@ -5082,7 +5139,7 @@ setInterval(() => {
       s.chopShort = []; s.chopLong = []; s.chopCount = 0; s.trendCount = 0; s.chopActive = false;
       s.signals = []; s.tickBuf = []; // in-memory today array cleared — full history persisted in signalHistory[]
       s.crossAssetDir = null; s.crossAssetTs = 0;
-      s.sessionHigh = -Infinity; s.sessionLow = Infinity; s.rsiAtSessionHigh = 50;
+      s.sessionHigh = -Infinity; s.sessionLow = Infinity; s.rsiAtSessionHigh = 50; s.rsiAtSessionLow = 50;
       s.lastHiRevTs = 0; s.lastLoRevTs = 0; // reset session extreme tracking
       // Rolling ATH/ATL: save today's high/low before resetting, keep 5 days
       if (s.sessionHigh > -Infinity && s.sessionLow < Infinity) {
