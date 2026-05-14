@@ -170,6 +170,13 @@ SYMBOLS.forEach(sym => {
     // flipped, on the theory that "macro is flickering" = chop, not real reversal.
     lastFullConvCallEndTs: 0,  // when CALL alignment last ended
     lastFullConvPutEndTs: 0,   // when PUT alignment last ended
+    // Duration of the just-ended alignment (added 2026-05-14 after 5/14 missed $4710 peak PUT
+    // when macro briefly flipped CALL during a bounce, then back). If the opposite alignment
+    // was BRIEF (< 30 min), it's a flicker and cooldown shouldn't enforce. Real reversals come
+    // from sustained alignment ending (> 30 min). Records duration of the alignment that just
+    // ended in each direction so the cooldown gate can decide flicker vs real.
+    lastFullConvCallDurationMs: 0,
+    lastFullConvPutDurationMs: 0,
     // Post-signal price snapshots (added 2026-05-14). For each fired signal, capture price at
     // +5min / +15min / +30min after entry. CSV export adds price5m/delta5m/price15m/delta15m/
     // price30m/delta30m columns. Entries removed once all 3 captured. List: [{histIdx, fireTs}].
@@ -179,6 +186,12 @@ SYMBOLS.forEach(sym => {
     // signal fires near the end of an extended move (5/14 03:58 PUT FAST: 3rd PUT in 19 min,
     // SL'd despite full conv 7/7 + STRUCT). List: [{ts, type}].
     recentFires: [],
+    // Post-TP3 cooldown timestamps per direction (added 2026-05-14). When a same-direction
+    // trade hits TP3 (full target captured), block new same-direction signals for 90 min —
+    // the move is exhausted, chasing it leads to losers (5/14 signal #2 SL'd 32 min after
+    // signal #1 hit TP3 in the same direction).
+    lastTp3CallTs: 0,
+    lastTp3PutTs: 0,
     // Chop circuit breaker (added 2026-05-13) — tracks direction flips over rolling 60-min window.
     // If 3+ flips happen in 60 min, suppress all opposite-direction signals for the next 30 min.
     // Behavioral chop detector — catches the death-by-1000-cuts pattern when individual indicator
@@ -1312,12 +1325,19 @@ function processPrice(sym, price, hi, lo) {
       if (!entry) return false; // signalHistory entry gone — drop
       const ageS = (tNow - ps.fireTs) / 1000;
       if (!entry.priceSnaps) entry.priceSnaps = {};
-      if (ageS >= 5 * 60  && entry.priceSnaps.p5m  == null) entry.priceSnaps.p5m  = +price.toFixed(2);
-      if (ageS >= 15 * 60 && entry.priceSnaps.p15m == null) entry.priceSnaps.p15m = +price.toFixed(2);
+      let snapWritten = false;
+      if (ageS >= 5 * 60  && entry.priceSnaps.p5m  == null) { entry.priceSnaps.p5m  = +price.toFixed(2); snapWritten = true; }
+      if (ageS >= 15 * 60 && entry.priceSnaps.p15m == null) { entry.priceSnaps.p15m = +price.toFixed(2); snapWritten = true; }
       if (ageS >= 30 * 60 && entry.priceSnaps.p30m == null) {
         entry.priceSnaps.p30m = +price.toFixed(2);
+        // Persist immediately when this snapshot completes (added 2026-05-14). Don't rely
+        // solely on the 60-sec periodic save — if a deploy happens in the 60-sec window
+        // after the snapshot captures, we'd lose it.
+        try { saveSignalHistory(); } catch (e) { /* already logged */ }
         return false; // all 3 captured — done
       }
+      // Persist immediately when a 5m or 15m snap is freshly captured
+      if (snapWritten) { try { saveSignalHistory(); } catch (e) { /* already logged */ } }
       return true; // still pending
     });
   }
@@ -1765,8 +1785,11 @@ function processPrice(sym, price, hi, lo) {
       // Macro is calling for CALL → block contrary PUT signals for 45 min (sticky).
       s.macroContraBlockPutUntil = tNow + MACRO_CONTRA_BLOCK_MS;
     } else {
-      // Record the moment alignment ENDED (only on the transition, not every tick once 0)
-      if (s.fullConvSinceCall) s.lastFullConvCallEndTs = tNow;
+      // Record the moment alignment ENDED + its DURATION (only on the transition)
+      if (s.fullConvSinceCall) {
+        s.lastFullConvCallEndTs = tNow;
+        s.lastFullConvCallDurationMs = tNow - s.fullConvSinceCall;
+      }
       s.fullConvSinceCall = 0;
     }
     if (convPutNow >= MACRO_ALIGN_THR) {
@@ -1774,7 +1797,10 @@ function processPrice(sym, price, hi, lo) {
       // Macro is calling for PUT → block contrary CALL signals for 45 min (sticky).
       s.macroContraBlockCallUntil = tNow + MACRO_CONTRA_BLOCK_MS;
     } else {
-      if (s.fullConvSincePut) s.lastFullConvPutEndTs = tNow;
+      if (s.fullConvSincePut) {
+        s.lastFullConvPutEndTs = tNow;
+        s.lastFullConvPutDurationMs = tNow - s.fullConvSincePut;
+      }
       s.fullConvSincePut = 0;
     }
   }
@@ -1804,18 +1830,34 @@ function processPrice(sym, price, hi, lo) {
     // macro alignment recently ENDED in the opposite direction (within 60 min), the macro
     // is FLICKERING — not a clean reversal. Block ALL signals including fades.
     const MACRO_FLIP_COOLDOWN_MS = 3600000; // 60 minutes since opposite alignment ended
+    const MACRO_FLICKER_THR_MS = 1800000;   // < 30 min of opposite alignment = flicker, not real
     const oppositeEndTs = sig.type === 'call' ? (s.lastFullConvPutEndTs || 0) : (s.lastFullConvCallEndTs || 0);
+    const oppositeDur   = sig.type === 'call' ? (s.lastFullConvPutDurationMs || 0) : (s.lastFullConvCallDurationMs || 0);
     const oppositeFlipRecent = oppositeEndTs > 0 && (macroContraNow - oppositeEndTs) < MACRO_FLIP_COOLDOWN_MS;
-    // Bypass: if macro has now been aligned WITH signal direction stably for ≥15 min, the
-    // flip is real — allow the trade.
+    // Flicker exemption (added 2026-05-14 after 5/14 missed $4710 peak PUT): if the just-ended
+    // opposite alignment lasted < 30 min, it was noise/flicker (e.g. brief CALL during a peak
+    // bounce). Don't enforce the cooldown — the prior direction was the real trend and the
+    // new signal is catching the resumption. Sustained opposite alignment (>30 min) still
+    // enforces cooldown because that was a real reversal that may itself be ending falsely.
+    const oppositeWasFlicker = oppositeDur > 0 && oppositeDur < MACRO_FLICKER_THR_MS;
+    // Bypass: if macro has now been aligned WITH signal direction stably for ≥7 min, the
+    // flip is real — allow the trade. Loosened 15→7min on 2026-05-14 after spike-low VREV
+    // CALLs were blocked all afternoon following morning PUT trend. 7min catches genuine
+    // reversals within their first leg while still filtering pure noise.
+    const STABILITY_BYPASS_MS = 420000; // 7 minutes
     const newDirStable = sig.type === 'call'
-      ? (s.fullConvSinceCall > 0 && (macroContraNow - s.fullConvSinceCall) >= 900000)
-      : (s.fullConvSincePut > 0 && (macroContraNow - s.fullConvSincePut) >= 900000);
-    if (oppositeFlipRecent && !newDirStable) {
+      ? (s.fullConvSinceCall > 0 && (macroContraNow - s.fullConvSinceCall) >= STABILITY_BYPASS_MS)
+      : (s.fullConvSincePut > 0 && (macroContraNow - s.fullConvSincePut) >= STABILITY_BYPASS_MS);
+    if (oppositeFlipRecent && !newDirStable && !oppositeWasFlicker) {
       Object.assign(s, _emitSnapshot);
       const flipAgoMin = Math.round((macroContraNow - oppositeEndTs) / 60000);
-      log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — macro flip cooldown (opposite alignment ended ' + flipAgoMin + 'min ago, need 60min OR 15min of stable new alignment).');
+      const durMin = Math.round(oppositeDur / 60000);
+      log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — macro flip cooldown (opposite alignment lasted ' + durMin + 'min, ended ' + flipAgoMin + 'min ago, need 60min OR 7min stable new alignment OR opposite <30min flicker).');
       return false;
+    }
+    if (oppositeFlipRecent && oppositeWasFlicker) {
+      const durMin = Math.round(oppositeDur / 60000);
+      log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' macro-flip cooldown BYPASSED — opposite alignment was a ' + durMin + 'min flicker (< 30 min threshold). Allowing real-trend resumption.');
     }
 
     // ===== MACRO-CONTRA BLOCK (added 2026-05-13, extended 20→45min) =====
@@ -1864,6 +1906,21 @@ function processPrice(sym, price, hi, lo) {
         log(sym, '🚫 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — same-direction cap: already ' + sameDirRecent.length + ' ' + sig.type.toUpperCase() + ' fires in last ' + Math.round(SAME_DIR_CAP_MS / 60000) + 'min (oldest ' + oldestAge + 'min ago). Trend exhaustion likely — wait for retracement.');
         return false;
       }
+    }
+
+    // ===== POST-TP3 COOLDOWN (added 2026-05-14, 90 min same-direction block) =====
+    // After a TP3 hit (full move captured), block new same-direction signals for 90 min.
+    // The move is exhausted — chasing it leads to losers (5/14 signal #2 PUT FAST SL'd 32 min
+    // after signal #1 SWEEP PUT hit TP3 in the same direction). Lets the market consolidate
+    // / reverse before allowing another trend continuation entry.
+    const POST_TP3_COOLDOWN_MS = 5400000; // 90 minutes
+    const lastTp3Ts = sig.type === 'call' ? (s.lastTp3CallTs || 0) : (s.lastTp3PutTs || 0);
+    if (lastTp3Ts > 0 && (Date.now() - lastTp3Ts) < POST_TP3_COOLDOWN_MS) {
+      Object.assign(s, _emitSnapshot);
+      const tp3AgoMin = Math.round((Date.now() - lastTp3Ts) / 60000);
+      const remainMin = Math.round((POST_TP3_COOLDOWN_MS - (Date.now() - lastTp3Ts)) / 60000);
+      log(sym, '🚫 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — post-TP3 cooldown: same-direction TP3 hit ' + tp3AgoMin + 'min ago, ' + remainMin + 'min remaining of 90min lockout (move is exhausted, wait for reversal or fresh setup).');
+      return false;
     }
 
     // ===== WINNERS-ONLY MODE GATES (added 2026-05-14 from 3-day loser audit) =====
@@ -4621,6 +4678,11 @@ function updateSignalOutcome(sym, finalPrice) {
       // t.sl was set via the TP3 path (line ~4005) — TP2 already hit, then TP3
       entry.outcomes.tp3Hit = true; entry.outcomes.tp3HitTs = now;
       entry.outcomes.closePrice = finalPrice;
+      // Mark post-TP3 cooldown for this direction (added 2026-05-14). 90 min block on
+      // same-direction signals — the move is exhausted, chasing it leads to losers
+      // (5/14 signal #2 SL'd 32 min after signal #1 hit TP3 in same direction).
+      if (t.type === 'call') s.lastTp3CallTs = now;
+      else if (t.type === 'put') s.lastTp3PutTs = now;
     } else {
       // Real stop loss (before TP2)
       entry.outcomes.slHit = true; entry.outcomes.slHitTs = now;
