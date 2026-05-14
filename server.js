@@ -170,6 +170,10 @@ SYMBOLS.forEach(sym => {
     // flipped, on the theory that "macro is flickering" = chop, not real reversal.
     lastFullConvCallEndTs: 0,  // when CALL alignment last ended
     lastFullConvPutEndTs: 0,   // when PUT alignment last ended
+    // Post-signal price snapshots (added 2026-05-14). For each fired signal, capture price at
+    // +5min / +15min / +30min after entry. CSV export adds price5m/delta5m/price15m/delta15m/
+    // price30m/delta30m columns. Entries removed once all 3 captured. List: [{histIdx, fireTs}].
+    pendingSnapshots: [],
     // Chop circuit breaker (added 2026-05-13) — tracks direction flips over rolling 60-min window.
     // If 3+ flips happen in 60 min, suppress all opposite-direction signals for the next 30 min.
     // Behavioral chop detector — catches the death-by-1000-cuts pattern when individual indicator
@@ -1136,6 +1140,17 @@ function logSignal(sym, sig) {
   // Track which signalHistory index represents the active trade for this symbol.
   // checkExit() uses this to update outcomes when t.t1/t.t2/t.sl flags flip.
   S[sym].lastHistIdx = signalHistory.length - 1;
+
+  // Schedule post-signal price snapshots at +5m / +15m / +30m (added 2026-05-14).
+  // processPrice() will check pendingSnapshots each tick and populate priceSnaps on the
+  // signalHistory entry as time elapses. CSV export reads these to add price5m/delta5m/
+  // price15m/delta15m/price30m/delta30m columns.
+  try {
+    const s = S[sym];
+    if (s && Array.isArray(s.pendingSnapshots)) {
+      s.pendingSnapshots.push({ histIdx: signalHistory.length - 1, fireTs: Date.now() });
+    }
+  } catch (e) { /* never crash signal emission on snapshot scheduling */ }
 }
 
 // ===== PROCESS PRICE (same engine as mobile/desktop) =====
@@ -1234,6 +1249,26 @@ function processPrice(sym, price, hi, lo) {
   }
 
   s.prices.push(price); s.highs.push(hi || price); s.lows.push(lo || price);
+
+  // Post-signal price snapshots (added 2026-05-14). For each pending signal entry, check if
+  // we've crossed the +5min / +15min / +30min thresholds since fire and capture the price.
+  // Once all 3 captured (or histEntry missing), remove from pending list.
+  if (Array.isArray(s.pendingSnapshots) && s.pendingSnapshots.length > 0) {
+    const tNow = Date.now();
+    s.pendingSnapshots = s.pendingSnapshots.filter(ps => {
+      const entry = signalHistory[ps.histIdx];
+      if (!entry) return false; // signalHistory entry gone — drop
+      const ageS = (tNow - ps.fireTs) / 1000;
+      if (!entry.priceSnaps) entry.priceSnaps = {};
+      if (ageS >= 5 * 60  && entry.priceSnaps.p5m  == null) entry.priceSnaps.p5m  = +price.toFixed(2);
+      if (ageS >= 15 * 60 && entry.priceSnaps.p15m == null) entry.priceSnaps.p15m = +price.toFixed(2);
+      if (ageS >= 30 * 60 && entry.priceSnaps.p30m == null) {
+        entry.priceSnaps.p30m = +price.toFixed(2);
+        return false; // all 3 captured — done
+      }
+      return true; // still pending
+    });
+  }
   // MT5 needs 720+ entries for 12-min ROC (1 tick/sec), equities need 200
   const maxPrices = isMT5 ? 800 : 200;
   if (s.prices.length > maxPrices) { s.prices.shift(); s.highs.shift(); s.lows.shift(); }
@@ -1760,6 +1795,54 @@ function processPrice(sym, price, hi, lo) {
     // Specialist fade tags — by design these signals fight extremes and need extra confirmation
     const tag = sig.score || '';
     const isFadeSignal = /ATH|ATL|HI|LO/.test(tag) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tag);
+
+    // ===== WINNERS-ONLY MODE GATES (added 2026-05-14 from 3-day loser audit) =====
+    // 3 of 3 confirmed XAU winners had STRUCT in conv factors. 5/8 XAU losers were missing STRUCT.
+    // STRUCT = price structure (EMA stack) aligned with signal direction. Without STRUCT, the
+    // signal is "macro indicators think direction X" but price isn't actually doing X — high-EV
+    // setups always have BOTH. Required for trend/momentum signals (BREAK / FAST / TREND / MFLIP /
+    // 6/6 / SUST / SQZ / RIDE). NOT required for fade/reversal detectors (ATH / ATL / HI / LO /
+    // VREV / DIV / SWEEP) because those fire AGAINST price structure by design.
+    //
+    // XAU-ONLY (added 2026-05-14b): Winner #4 (BTC 5/12 15:56 PUT BREAK) hit TP1 without STRUCT —
+    // BTC's price structure is more chaotic / less directional than XAU. The STRUCT filter is
+    // less reliable on BTC and would have killed that winner. Restricting to XAU only.
+    // Once BTC has more data, we can reassess.
+    const isStructureReq = isXAU && /BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(tag) && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP/.test(tag);
+    if (isStructureReq) {
+      const hasStruct = conv.factors && conv.factors.indexOf('STRUCT') !== -1;
+      if (!hasStruct) {
+        Object.assign(s, _emitSnapshot);
+        log(sym, '🚫 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — missing STRUCT factor. Price structure not aligned with signal direction (3-day loser audit: 5/8 XAU losers missing STRUCT, 3/3 XAU winners had it).');
+        return false;
+      }
+    }
+
+    // 2-consecutive-same-direction history block. Looks at last few signals in s.signals.
+    // If last 2 signals were both same direction AND in last 60 min, block opposite direction
+    // for 60 min. Catches 5/14 01:30 CALL FAST that fired after 2 consecutive PUTs (conv 4
+    // each, just below the 6-threshold for macro contra-block). Doesn't depend on conviction
+    // hitting 6 — works off actual signal history. Fades exempt (counter-trend by design).
+    if (!isFadeSignal && Array.isArray(s.signals) && s.signals.length >= 2) {
+      const recent = s.signals.slice(-5); // look at last 5 emitted
+      const sameDirOpposite = [];
+      const oppDir = sig.type === 'call' ? 'put' : 'call';
+      for (let i = recent.length - 1; i >= 0; i--) {
+        const r = recent[i];
+        if (!r || !r.time) continue;
+        // Parse signal time in ET to ms-ago — sig.time is from ts() which is ET HH:MM:SS
+        // Use the trade timestamp if available (r.ts wasn't tracked) — fall back to assuming
+        // the signal is recent enough since we only track last 5.
+        if (r.type === oppDir) sameDirOpposite.push(r);
+        else break; // hit a same-direction or unknown — break the streak
+      }
+      // If last 2+ signals were opposite to current, block this flip
+      if (sameDirOpposite.length >= 2) {
+        Object.assign(s, _emitSnapshot);
+        log(sym, '🚫 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — direction-consistency guard: last ' + sameDirOpposite.length + ' signals were ' + oppDir.toUpperCase() + '. Need clear flip (one signal alone) before allowing opposite.');
+        return false;
+      }
+    }
     // Momentum-catch detectors (V-REV, FAST): the price pattern is itself the primary evidence
     // (sharp drop + 40% bounce, or $5 in 3 min). Cross-asset confirmation lags the move by
     // minutes — by the time MACRO/TLT/SLV/GDX flip, the move is over. So don't apply the
@@ -1827,12 +1910,12 @@ function processPrice(sym, price, hi, lo) {
   const cool = now2 - s.lastNTs > COOLDOWN_MS;
 
   // === OPPOSITE-DIRECTION FLIP GUARD ===
-  // Prevent PUT+CALL firing within 15 min of each other (different detectors can disagree at tops/bottoms)
-  // Same-direction signals still use normal 3-min cooldown. Opposite direction needs 15 min.
-  // Bumped 10→15 min 2026-05-13: 5/12 morning had a 4-flip chain (10:13/10:26/10:38/10:49)
-  // every 11-13 min — every flip JUST past the 10-min wall. 15 min would have killed at least 4
-  // of the morning's chop flips and saved the 10:49 PUT 6/6 that sold the V-bottom.
-  const FLIP_COOLDOWN_MS = 900000; // 15 minutes
+  // Prevent PUT+CALL firing within 30 min of each other (different detectors can disagree at tops/bottoms)
+  // Same-direction signals still use normal 3-min cooldown. Opposite direction needs 30 min.
+  // Progression: 10→15min 2026-05-13a, 15→30min 2026-05-14 from "winners only" 3-day loser audit
+  // — 5/14 01:30 CALL FAST fired 15 min after a PUT BREAK and SL'd (just past 15-min wall).
+  // 30 min eliminates the "barely cleared cooldown" loser pattern.
+  const FLIP_COOLDOWN_MS = 1800000; // 30 minutes
 
   // === CHOP CIRCUIT BREAKER ===
   // Maintain flipHistory: opposite-direction signal timestamps in last 60 min.
@@ -2780,12 +2863,19 @@ function processPrice(sym, price, hi, lo) {
         );
         const fmRsiFloorPut = fmBreakConfirmed ? 25 : 35;
         const fmRsiCeilCall = fmBreakConfirmed ? 75 : 65;
-        const fmRsiOk = (fmDir === 'put' && rsiV > fmRsiFloorPut && rsiV < 85)
-                     || (fmDir === 'call' && rsiV < fmRsiCeilCall && rsiV > 15);
+        // Winners-only confirmation ceilings (added 2026-05-14): FAST PUT must have RSI < 45
+        // (clearly bearish), FAST CALL must have RSI > 55 (clearly bullish). Neutral RSI on a
+        // FAST signal = "macro hopes direction" without price-action confirmation. Caught 5/14
+        // PUT FAST at RSI 52.2 which had HIGH conv but lost. The fmBreakConfirmed relaxation
+        // (round-number break in progress) bypasses these — confirmed breaks are the exception.
+        const fmRsiPutMax = fmBreakConfirmed ? 85 : 45;
+        const fmRsiCallMin = fmBreakConfirmed ? 15 : 55;
+        const fmRsiOk = (fmDir === 'put' && rsiV > fmRsiFloorPut && rsiV < fmRsiPutMax)
+                     || (fmDir === 'call' && rsiV < fmRsiCeilCall && rsiV > fmRsiCallMin);
         if (!fmRsiOk) {
           const need = (fmDir === 'put')
-                      ? fmRsiFloorPut + '-85' + (fmBreakConfirmed ? ' (round-break relaxed)' : '')
-                      : '15-' + fmRsiCeilCall + (fmBreakConfirmed ? ' (round-break relaxed)' : '');
+                      ? fmRsiFloorPut + '-' + fmRsiPutMax + (fmBreakConfirmed ? ' (round-break relaxed)' : ' (winners-only: PUT needs RSI<45)')
+                      : fmRsiCallMin + '-' + fmRsiCeilCall + (fmBreakConfirmed ? ' (round-break relaxed)' : ' (winners-only: CALL needs RSI>55)');
           log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — RSI ' + rsiV.toFixed(1) + ' outside ' + need);
         }
         // ROC gate (tightened 2026-05-11): require meaningful directional momentum, not just
@@ -3886,11 +3976,11 @@ function processPrice(sym, price, hi, lo) {
       }
 
       // TREND RIDE CALL: macro bullish, price well above EMA, short+medium ROC both up
-      // RSI cap: 70 (lowered from 75 on 2026-05-07). The MACD-extreme gate above already catches
-      // the over-extended setups (5/7 row 44 RSI 70.4, MACD +1.447 → blocked there). Capping RSI
-      // at 70 is a second line of defence: RSI 70-75 entries that slip past the MACD gate are
-      // statistically marginal — most winners had RSI < 70 with strong MACD continuation.
-      const trCallRsiMax = 70;
+      // RSI cap: 60 (lowered 70→60 on 2026-05-14 for winners-only mode). Caught 5/13 06:09
+      // TREND CALL @ RSI 63.6 which had STRUCT + good conv but still SL'd — entered too
+      // overbought. RSI 60-70 is "exhaustion entry" territory for trend continuation; the
+      // safer ride begins when RSI pulls back below 60 and re-confirms.
+      const trCallRsiMax = 60;
       if (trDir === 'bull' && rsiV > 30 && rsiV < trCallRsiMax && trCallMacdOk && flipCoolFor('call') && winProtectDir !== 'put') {
         // (Removed 2026-05-08): hard cap at 2 same-direction signals was too aggressive — it
         // could lock out the entire direction for hours when overnight signals had already
@@ -5442,7 +5532,11 @@ app.get('/signals/csv/:date', (req, res) => {
       res.header('Content-Type', 'text/csv');
       return res.send(raw);
     }
-    const enrichedHeader = lines[0].trim() + ',tp1Hit,tp2Hit,tp3Hit,slHit,finalOutcome';
+    // Header: original signal columns + outcome columns + post-signal price snapshots.
+    // Snapshot columns added 2026-05-14: price5m/delta5m/price15m/delta15m/price30m/delta30m.
+    // delta is signed by signal direction: positive = price moved IN signal direction (profit),
+    // negative = adverse. Makes win/loss obvious at a glance independent of TP/SL hits.
+    const enrichedHeader = lines[0].trim() + ',tp1Hit,tp2Hit,tp3Hit,slHit,finalOutcome,price5m,delta5m,price15m,delta15m,price30m,delta30m';
     const enrichedRows = [];
     for (let i = 1; i < lines.length; i++) {
       const line = lines[i].trim();
@@ -5464,7 +5558,17 @@ app.get('/signals/csv/:date', (req, res) => {
       else if (o.tp2Hit) final = 'TP2';
       else if (o.tp1Hit) final = 'TP1-only';
       else               final = 'Open';
-      enrichedRows.push(line + ',' + tp1 + ',' + tp2 + ',' + tp3 + ',' + sl + ',' + final);
+      // Post-signal price snapshots. Delta is positive = profitable (price moved in signal direction).
+      // For CALL: delta = priceN - entryPrice. For PUT: delta = entryPrice - priceN.
+      const snaps = entry && entry.priceSnaps ? entry.priceSnaps : {};
+      const entryPx = parseFloat(price);
+      const sign = (type === 'call') ? 1 : -1;
+      const fmtPx = (v) => (v == null ? '' : v.toFixed(2));
+      const fmtDelta = (v) => (v == null || !isFinite(entryPx) ? '' : ((v - entryPx) * sign).toFixed(2));
+      const p5  = fmtPx(snaps.p5m),  d5  = fmtDelta(snaps.p5m);
+      const p15 = fmtPx(snaps.p15m), d15 = fmtDelta(snaps.p15m);
+      const p30 = fmtPx(snaps.p30m), d30 = fmtDelta(snaps.p30m);
+      enrichedRows.push(line + ',' + tp1 + ',' + tp2 + ',' + tp3 + ',' + sl + ',' + final + ',' + p5 + ',' + d5 + ',' + p15 + ',' + d15 + ',' + p30 + ',' + d30);
     }
     res.header('Content-Type', 'text/csv');
     res.send(enrichedHeader + '\n' + enrichedRows.join('\n') + (enrichedRows.length ? '\n' : ''));
