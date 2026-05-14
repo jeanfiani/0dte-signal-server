@@ -174,6 +174,11 @@ SYMBOLS.forEach(sym => {
     // +5min / +15min / +30min after entry. CSV export adds price5m/delta5m/price15m/delta15m/
     // price30m/delta30m columns. Entries removed once all 3 captured. List: [{histIdx, fireTs}].
     pendingSnapshots: [],
+    // Same-direction fire history (added 2026-05-14). Caps same-direction signals at 2 per
+    // rolling 30-min window. Catches "trend exhaustion stacking" — when a 3rd same-direction
+    // signal fires near the end of an extended move (5/14 03:58 PUT FAST: 3rd PUT in 19 min,
+    // SL'd despite full conv 7/7 + STRUCT). List: [{ts, type}].
+    recentFires: [],
     // Chop circuit breaker (added 2026-05-13) — tracks direction flips over rolling 60-min window.
     // If 3+ flips happen in 60 min, suppress all opposite-direction signals for the next 30 min.
     // Behavioral chop detector — catches the death-by-1000-cuts pattern when individual indicator
@@ -1151,6 +1156,19 @@ function logSignal(sym, sig) {
       s.pendingSnapshots.push({ histIdx: signalHistory.length - 1, fireTs: Date.now() });
     }
   } catch (e) { /* never crash signal emission on snapshot scheduling */ }
+
+  // Record fire for same-direction cap tracking (added 2026-05-14).
+  // 30-min rolling window, max 2 same-direction signals before block.
+  try {
+    const s = S[sym];
+    if (s) {
+      if (!Array.isArray(s.recentFires)) s.recentFires = [];
+      s.recentFires.push({ ts: Date.now(), type: sig.type });
+      // Trim entries older than 60 min (window is 30 min, keep some buffer for analysis)
+      const cutoff = Date.now() - 3600000;
+      s.recentFires = s.recentFires.filter(f => f.ts > cutoff);
+    }
+  } catch (e) { /* never crash signal emission on cap tracking */ }
 }
 
 // ===== PROCESS PRICE (same engine as mobile/desktop) =====
@@ -1795,6 +1813,24 @@ function processPrice(sym, price, hi, lo) {
     // Specialist fade tags — by design these signals fight extremes and need extra confirmation
     const tag = sig.score || '';
     const isFadeSignal = /ATH|ATL|HI|LO/.test(tag) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tag);
+
+    // ===== SAME-DIRECTION CAP (added 2026-05-14, max 2 per 30 min) =====
+    // Caught 5/14 03:58 PUT FAST: 3rd PUT in 19 min after 2 winners, SL'd despite max conv 7/7.
+    // No conviction/RSI/STRUCT filter catches "trend exhaustion stacking" — by definition all
+    // those metrics scream bullish-on-trend right when the trend has the least room left.
+    // Only a time/count-based filter catches it. Cap = 2 same-direction signals in 30 min.
+    const SAME_DIR_CAP_MS = 1800000; // 30 minutes
+    const SAME_DIR_CAP = 2;
+    if (Array.isArray(s.recentFires)) {
+      const tCap = Date.now();
+      const sameDirRecent = s.recentFires.filter(f => f.type === sig.type && (tCap - f.ts) < SAME_DIR_CAP_MS);
+      if (sameDirRecent.length >= SAME_DIR_CAP) {
+        Object.assign(s, _emitSnapshot);
+        const oldestAge = Math.round((tCap - sameDirRecent[0].ts) / 60000);
+        log(sym, '🚫 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — same-direction cap: already ' + sameDirRecent.length + ' ' + sig.type.toUpperCase() + ' fires in last ' + Math.round(SAME_DIR_CAP_MS / 60000) + 'min (oldest ' + oldestAge + 'min ago). Trend exhaustion likely — wait for retracement.');
+        return false;
+      }
+    }
 
     // ===== WINNERS-ONLY MODE GATES (added 2026-05-14 from 3-day loser audit) =====
     // 3 of 3 confirmed XAU winners had STRUCT in conv factors. 5/8 XAU losers were missing STRUCT.
@@ -2861,15 +2897,24 @@ function processPrice(sym, price, hi, lo) {
           (fmDir === 'put' && price <= nearestRound - 0.50) ||
           (fmDir === 'call' && price >= nearestRound + 0.50)
         );
-        const fmRsiFloorPut = fmBreakConfirmed ? 25 : 35;
-        const fmRsiCeilCall = fmBreakConfirmed ? 75 : 65;
-        // Winners-only confirmation ceilings (added 2026-05-14): FAST PUT must have RSI < 45
-        // (clearly bearish), FAST CALL must have RSI > 55 (clearly bullish). Neutral RSI on a
-        // FAST signal = "macro hopes direction" without price-action confirmation. Caught 5/14
-        // PUT FAST at RSI 52.2 which had HIGH conv but lost. The fmBreakConfirmed relaxation
-        // (round-number break in progress) bypasses these — confirmed breaks are the exception.
+        // FAST PUT floor 35→37 + CALL ceiling 65→63 on 2026-05-14: both confirmed FAST PUT
+        // losers had RSI at the floor (35.7, 36.0). The one confirmed FAST CALL loser had
+        // RSI 55.6 — also at its floor. By symmetry, RSI close to overbought (63-65) is
+        // the equivalent danger zone for CALL. Tightened bands: PUT 37-45, CALL 57-63.
+        // VREV PUT keeps its 35 floor because VREV is designed for oversold reversals —
+        // 5/14 03:39 VREV PUT @ RSI 37.8 won +$15.88 in 30min.
+        const fmRsiFloorPut = fmBreakConfirmed ? 25 : 37;
+        const fmRsiCeilCall = fmBreakConfirmed ? 75 : 63;
+        // Winners-only confirmation ceilings. Both ends tightened on 2026-05-14:
+        //   PUT band: 35-45 → 37-45 (floor up to escape oversold trap)
+        //   CALL band: 55-65 → 57-63 (floor up + ceiling down — symmetric to PUT)
+        // Both confirmed FAST PUT losers had RSI at the floor (35.7, 36.0). The confirmed
+        // FAST CALL loser (5/14 01:30) had RSI 55.6 — also at the floor. The trap is the same
+        // on both sides: "RSI is in the band but TOO close to the danger zone where the move
+        // is exhausted." Tightening to the middle of each band keeps the sweet spot only.
+        // The fmBreakConfirmed relaxation (round-number break in progress) still bypasses these.
         const fmRsiPutMax = fmBreakConfirmed ? 85 : 45;
-        const fmRsiCallMin = fmBreakConfirmed ? 15 : 55;
+        const fmRsiCallMin = fmBreakConfirmed ? 15 : 57;
         const fmRsiOk = (fmDir === 'put' && rsiV > fmRsiFloorPut && rsiV < fmRsiPutMax)
                      || (fmDir === 'call' && rsiV < fmRsiCeilCall && rsiV > fmRsiCallMin);
         if (!fmRsiOk) {
@@ -4455,6 +4500,41 @@ function buildCfdTrade(type, price, atr, sym) {
   const tp1 = iC ? price + tp1Dist : price - tp1Dist;
   const tp2 = iC ? price + tp2Dist : price - tp2Dist;
   const tp3 = iC ? price + tp3Dist : price - tp3Dist;
+
+  // ===== SAME-DIRECTION CONTINUATION — LOCK TP1 (added 2026-05-14) =====
+  // When a new same-direction signal fires while the existing trade is still active and
+  // hasn't hit TP1 yet, KEEP the original entry + the existing (closer-to-current-price) TP1.
+  // Locks in the partial-close gain we're already partway to instead of resetting TP1 further.
+  // TP2/TP3 still update to new (further) levels — fine, they're stretch targets.
+  // SL also kept from original entry (the original risk budget already determined that).
+  const oldTrade = sym && S[sym] ? S[sym].trade : null;
+  const sameDirContinuation =
+    oldTrade && oldTrade.active && oldTrade.isCfd &&
+    oldTrade.type === type && !oldTrade.t1;
+  if (sameDirContinuation) {
+    // For PUT: TP1 below entry. The HIGHER tp1 price is closer to current price → easier to hit
+    // For CALL: TP1 above entry. The LOWER tp1 price is closer to current price → easier to hit
+    const lockedTp1 = iC
+      ? Math.min(oldTrade.tp1Price, tp1)
+      : Math.max(oldTrade.tp1Price, tp1);
+    log(sym, '🔒 SAME-DIR CONTINUATION — keeping original entry $' + oldTrade.ep.toFixed(2) + ' + TP1 $' + lockedTp1.toFixed(2) + ' (was $' + oldTrade.tp1Price.toFixed(2) + ', new signal would have made it $' + tp1.toFixed(2) + '). TP2/TP3 use new levels.');
+    return {
+      active: true, type: type,
+      ep: oldTrade.ep,                  // keep ORIGINAL entry — locks accounting / partial-close math
+      t1: false, t2: oldTrade.t2 || false, sl: oldTrade.sl || false, rev: false,
+      lastETs: oldTrade.lastETs || 0,
+      ts: oldTrade.ts,                  // keep original entry timestamp
+      slPrice: oldTrade.slPrice,        // keep original SL — the risk budget was set at entry
+      tp1Price: lockedTp1,              // the EASIER TP1 → take partial profit sooner
+      tp2Price: tp2,                    // new (further) — stretch target OK to extend
+      tp3Price: tp3,                    // new (further) — stretch target OK to extend
+      atr: atr,
+      bestPrice: oldTrade.bestPrice || price,  // keep best-price tracking
+      trailSl: oldTrade.trailSl || 0,
+      isCfd: true
+    };
+  }
+
   return {
     active: true, type: type, ep: price,
     t1: false, t2: false, sl: false, rev: false,
