@@ -109,6 +109,10 @@ SYMBOLS.forEach(sym => {
     signals: [], tickBuf: [], lastPrice: 0,
     crossAssetDir: null, crossAssetTs: 0,
     sessionHigh: -Infinity, sessionLow: Infinity, rsiAtSessionHigh: 50, rsiAtSessionLow: 50,
+    // Timestamps when session extremes were last updated (added 2026-05-14 for Session Range
+    // Bias "fresh break" detection — if sessionHigh updated <5 min ago, price is making a new
+    // high right now and CALL breakout signals are valid even in upper half).
+    sessionHighUpdateTs: 0, sessionLowUpdateTs: 0,
     gapDayMode: false, gapDirection: null, prevClose: null,
     lastSameDir: null, lastSameDirMacd: 0, lastSameDirTs: 0, lastSameDirPrice: 0,
     // Rolling multi-day high/low for ATH/ATL reversal detection
@@ -1287,8 +1291,8 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  if (price > s.sessionHigh) s.sessionHigh = price;
-  if (price < s.sessionLow) s.sessionLow = price;
+  if (price > s.sessionHigh) { s.sessionHigh = price; s.sessionHighUpdateTs = Date.now(); }
+  if (price < s.sessionLow) { s.sessionLow = price; s.sessionLowUpdateTs = Date.now(); }
 
   // Update rolling 5-day high/low for ATH/ATL detector
   // Simple approach: rollingHigh = max(past 5 daily highs, today's sessionHigh)
@@ -1728,8 +1732,26 @@ function processPrice(sym, price, hi, lo) {
       if ((isCall && qqqDir2 === 'up') || (!isCall && qqqDir2 === 'down')) { sc++; factors.push('QQQ'); }
       // DXY inverse (dollar up = equity/crypto bear)
       if ((isCall && dxyDir === 'down') || (!isCall && dxyDir === 'up')) { sc++; factors.push('DXY'); }
-      // Order blocks aligned
-      if (s._orderBlocks && s._orderBlocks.length > 0) { sc++; factors.push('OB'); }
+      // Order blocks aligned — direction-aware (2026-05-14). Previously fired +1 conv if ANY
+      // OB existed regardless of direction. Now: only +1 if the most recent unmitigated OB
+      // direction matches the signal direction (bull OB = CALL alignment, bear OB = PUT).
+      // The OB type indicates which side the smart-money interest was — aligning with it is
+      // a quality marker. If price has broken THROUGH the OB ("mitigated"), the level flipped
+      // — opposite direction is now aligned.
+      if (s._orderBlocks && s._orderBlocks.length > 0) {
+        const recentOB = s._orderBlocks[s._orderBlocks.length - 1];
+        if (recentOB && !recentOB.mitigated) {
+          // Unmitigated: bull OB → CALL aligned, bear OB → PUT aligned
+          if ((isCall && recentOB.type === 'bull') || (!isCall && recentOB.type === 'bear')) {
+            sc++; factors.push('OB');
+          }
+        } else if (recentOB && recentOB.mitigated) {
+          // Mitigated (broken through): flip the alignment
+          if ((isCall && recentOB.type === 'bear') || (!isCall && recentOB.type === 'bull')) {
+            sc++; factors.push('OB-flip');
+          }
+        }
+      }
       // NAS100: also check BTC as risk-on correlation
       if (isNAS) {
         const btcS = S['BTC'];
@@ -1921,6 +1943,93 @@ function processPrice(sym, price, hi, lo) {
       const remainMin = Math.round((POST_TP3_COOLDOWN_MS - (Date.now() - lastTp3Ts)) / 60000);
       log(sym, '🚫 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — post-TP3 cooldown: same-direction TP3 hit ' + tp3AgoMin + 'min ago, ' + remainMin + 'min remaining of 90min lockout (move is exhausted, wait for reversal or fresh setup).');
       return false;
+    }
+
+    // ===== (A) SESSION RANGE BIAS — reject-or-break logic (added 2026-05-14) =====
+    // For trend/momentum signals: don't fire in the WRONG HALF of the session range UNLESS
+    // price is currently making a new session extreme (fresh break — continuation valid).
+    // Fade detectors (HI/LO/ATH/ATL/VREV/DIV/SWEEP) are EXEMPT — they're designed for extremes.
+    //
+    // Logic:
+    //   - PUT in lower half + NOT making new low → stale exhausted move, BLOCK
+    //   - PUT in lower half + making new low (sessionLowUpdateTs < 5 min ago) → fresh
+    //     breakdown continuation, ALLOW
+    //   - CALL in upper half + making new high → fresh breakout, ALLOW
+    //   - CALL in upper half + not making new high → stale, BLOCK
+    //   - PUT in UPPER half (fading top) → ALLOW (correct setup)
+    //   - CALL in LOWER half (fading bottom) → ALLOW (correct setup)
+    //
+    // Trace 5/14: blocks signals #2/3/4 (PUTs in lower half not breaking down) while keeping
+    // signal #1 (PUT in upper half = fading top of range, the winner).
+    const isTrendOrMomentum = /BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(tag) && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP/.test(tag);
+    if (isTrendOrMomentum && s.sessionHigh > -Infinity && s.sessionLow < Infinity && s.openPrice) {
+      const sessionRange = s.sessionHigh - s.sessionLow;
+      const midpoint = (s.sessionHigh + s.sessionLow) / 2;
+      const minRangeForBias = isBTC ? 800 : isNAS ? 100 : 20; // XAU $20
+      const FRESH_BREAK_MS = 300000; // 5 min — "fresh new extreme"
+      const tNow = Date.now();
+      if (sessionRange >= minRangeForBias) {
+        const inUpperHalf = price > midpoint;
+        const inLowerHalf = price < midpoint;
+        const freshNewHigh = s.sessionHighUpdateTs > 0 && (tNow - s.sessionHighUpdateTs) < FRESH_BREAK_MS;
+        const freshNewLow  = s.sessionLowUpdateTs > 0 && (tNow - s.sessionLowUpdateTs) < FRESH_BREAK_MS;
+
+        // PUT in lower half + NOT making new low = stale exhausted move
+        if (sig.type === 'put' && inLowerHalf && !freshNewLow) {
+          Object.assign(s, _emitSnapshot);
+          const pctFromHigh = ((s.sessionHigh - price) / sessionRange * 100).toFixed(0);
+          log(sym, '🚫 ' + tag + ' PUT BLOCKED — session-range bias: price $' + price.toFixed(2) + ' is in lower half of session range ($' + s.sessionLow.toFixed(2) + '-$' + s.sessionHigh.toFixed(2) + ', ' + pctFromHigh + '% off high) and NOT making new low — move is stale.');
+          return false;
+        }
+        // CALL in upper half + NOT making new high = stale
+        if (sig.type === 'call' && inUpperHalf && !freshNewHigh) {
+          Object.assign(s, _emitSnapshot);
+          const pctFromLow = ((price - s.sessionLow) / sessionRange * 100).toFixed(0);
+          log(sym, '🚫 ' + tag + ' CALL BLOCKED — session-range bias: price $' + price.toFixed(2) + ' is in upper half of session range ($' + s.sessionLow.toFixed(2) + '-$' + s.sessionHigh.toFixed(2) + ', ' + pctFromLow + '% off low) and NOT making new high — move is stale.');
+          return false;
+        }
+        // Log the fresh-break override when allowing through
+        if (sig.type === 'put' && inLowerHalf && freshNewLow) {
+          const breakAgoSec = Math.round((tNow - s.sessionLowUpdateTs) / 1000);
+          log(sym, '↪️ ' + tag + ' PUT session-range-bias BYPASS — fresh new session low ' + breakAgoSec + 's ago, allowing breakdown continuation.');
+        }
+        if (sig.type === 'call' && inUpperHalf && freshNewHigh) {
+          const breakAgoSec = Math.round((tNow - s.sessionHighUpdateTs) / 1000);
+          log(sym, '↪️ ' + tag + ' CALL session-range-bias BYPASS — fresh new session high ' + breakAgoSec + 's ago, allowing breakout continuation.');
+        }
+      }
+    }
+
+    // ===== (C) PDH/PDL PROXIMITY AWARENESS (added 2026-05-14) =====
+    // Previous Day High / Low are well-known reaction levels. When price is approaching PDH/PDL
+    // from the "fade direction", PUT/CALL near the level is a high-quality setup. When price
+    // BREAKS through with $X buffer, the level is broken — opposite direction continuation
+    // is valid. PDH/PDL are taken from s.dailyLevels (saved at each daily reset).
+    //
+    // Block when: price is "stuck" mid-range between PDH and PDL with a trend signal that
+    // doesn't align with either level (no rejection, no break — pure chop). For now we only
+    // block if BOTH session-range bias and PDH/PDL bias agree the signal is bad — kept light
+    // for first deployment.
+    if (isTrendOrMomentum && s.dailyLevels && s.dailyLevels.length >= 1) {
+      const pdh = s.dailyLevels[s.dailyLevels.length - 1].high; // yesterday's high
+      const pdl = s.dailyLevels[s.dailyLevels.length - 1].low;  // yesterday's low
+      const pdhPdlBreakBuffer = isBTC ? 50 : isNAS ? 10 : 2; // XAU $2
+      // Mark on the sig for downstream visibility (no block yet — soft feature for tomorrow's analysis)
+      if (pdh && pdl) {
+        const nearPdh = Math.abs(price - pdh) <= pdhPdlBreakBuffer;
+        const nearPdl = Math.abs(price - pdl) <= pdhPdlBreakBuffer;
+        const brokeAbovePdh = price > pdh + pdhPdlBreakBuffer;
+        const brokeBelowPdl = price < pdl - pdhPdlBreakBuffer;
+        // Annotate signal for CSV/log diagnostics, no blocking decision yet
+        sig._pdhPdl = { pdh: +pdh.toFixed(2), pdl: +pdl.toFixed(2), nearPdh, nearPdl, brokeAbovePdh, brokeBelowPdl };
+        if (nearPdh || nearPdl || brokeAbovePdh || brokeBelowPdl) {
+          const ctx = nearPdh ? 'near PDH $' + pdh.toFixed(2) :
+                     nearPdl ? 'near PDL $' + pdl.toFixed(2) :
+                     brokeAbovePdh ? 'broke above PDH $' + pdh.toFixed(2) :
+                     'broke below PDL $' + pdl.toFixed(2);
+          log(sym, '📍 ' + tag + ' ' + sig.type.toUpperCase() + ' — PDH/PDL context: ' + ctx + ' (price $' + price.toFixed(2) + ')');
+        }
+      }
     }
 
     // ===== WINNERS-ONLY MODE GATES (added 2026-05-14 from 3-day loser audit) =====
@@ -2601,7 +2710,10 @@ function processPrice(sym, price, hi, lo) {
   // Conditions: hit session high, reversed >$1 from it, RSI > 60 (was overbought), MACD turning bearish
   // RSI sanity: skip when RSI is corrupted from reconnection gaps (RSI 13.8, 99.2 artifacts)
   const hiLoRsiSane = rsiV >= 10 && rsiV <= 90;
-  if (s.sessionHigh > -Infinity && s.openPrice && cool && hiLoRsiSane && flipCoolFor('put') && winProtectDir !== 'call' && (isMT5 || s.dailySignalCount < MAX_SIG) && etMin >= 570 && etMin < 955) {
+  // Time gate: equities 9:30-15:55 ET only. MT5 instruments (XAU/BTC/NAS100) trade 24h.
+  // BUG FIX 2026-05-14: previously the etMin gate applied to MT5 too, blocking ⬇HI from
+  // firing at the 5/14 $4716 peak (03:00 ET = etMin 180 < 570). XAU/BTC/NAS need 24h coverage.
+  if (s.sessionHigh > -Infinity && s.openPrice && cool && hiLoRsiSane && flipCoolFor('put') && winProtectDir !== 'call' && (isMT5 || (s.dailySignalCount < MAX_SIG && etMin >= 570 && etMin < 955))) {
     const distFromHigh = s.sessionHigh - price;
     const sessionRange = s.sessionHigh - s.sessionLow;
     const highWasRecent = s.prices.length >= 10 && Math.max(...s.prices.slice(-30 > -s.prices.length ? -30 : 0)) >= s.sessionHigh - 0.05;
@@ -2637,7 +2749,8 @@ function processPrice(sym, price, hi, lo) {
   // CALL side was missing this signal class entirely. Also writes s.lastLoRevTs which is read
   // by TRv2 SHORT-blocking guards at lines ~3528 / 3617-3625 — those guards were dead code
   // until this detector existed because nothing wrote the timestamp.
-  if (s.sessionLow < Infinity && s.openPrice && cool && hiLoRsiSane && flipCoolFor('call') && winProtectDir !== 'put' && (isMT5 || s.dailySignalCount < MAX_SIG) && etMin >= 570 && etMin < 955) {
+  // Same 24h fix as ⬇HI above — MT5 instruments need session-low reversal detection any hour.
+  if (s.sessionLow < Infinity && s.openPrice && cool && hiLoRsiSane && flipCoolFor('call') && winProtectDir !== 'put' && (isMT5 || (s.dailySignalCount < MAX_SIG && etMin >= 570 && etMin < 955))) {
     const distFromLow = price - s.sessionLow;
     const sessionRange = s.sessionHigh - s.sessionLow;
     const lowWasRecent = s.prices.length >= 10 && Math.min(...s.prices.slice(-30 > -s.prices.length ? -30 : 0)) <= s.sessionLow + 0.05;
@@ -5409,6 +5522,7 @@ setInterval(() => {
       s.signals = []; s.tickBuf = []; // in-memory today array cleared — full history persisted in signalHistory[]
       s.crossAssetDir = null; s.crossAssetTs = 0;
       s.sessionHigh = -Infinity; s.sessionLow = Infinity; s.rsiAtSessionHigh = 50; s.rsiAtSessionLow = 50;
+      s.sessionHighUpdateTs = 0; s.sessionLowUpdateTs = 0;
       s.lastHiRevTs = 0; s.lastLoRevTs = 0; // reset session extreme tracking
       // Rolling ATH/ATL: save today's high/low before resetting, keep 5 days
       if (s.sessionHigh > -Infinity && s.sessionLow < Infinity) {
