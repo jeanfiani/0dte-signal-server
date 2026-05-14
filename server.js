@@ -899,14 +899,42 @@ function loadSignalHistory() {
   } catch (e) { console.log('[' + ts() + '] No signal history file — starting fresh'); }
 }
 
+// Track save activity for visibility — log throttled at 1 per minute even when called many times.
+let _lastSaveSignalHistoryLogTs = 0;
+let _saveSignalHistoryCallCount = 0;
 function saveSignalHistory() {
   try {
     // Prune entries older than 7 days before saving
     const cutoff = Date.now() - HISTORY_MAX_AGE_MS;
     signalHistory = signalHistory.filter(h => h.ts > cutoff);
     fs.writeFileSync(HISTORY_FILE, JSON.stringify(signalHistory));
-  } catch (e) { console.error('[' + ts() + '] Failed to save signal history:', e.message); }
+    _saveSignalHistoryCallCount++;
+    // Throttled startup-visible log so we can see persistence is alive (1/min cap).
+    const now = Date.now();
+    if (now - _lastSaveSignalHistoryLogTs > 60000) {
+      console.log('[' + ts() + '] 💾 saveSignalHistory — ' + signalHistory.length + ' entries persisted to ' + HISTORY_FILE + ' (' + _saveSignalHistoryCallCount + ' saves since startup)');
+      _lastSaveSignalHistoryLogTs = now;
+      _saveSignalHistoryCallCount = 0;
+    }
+  } catch (e) {
+    console.error('[' + ts() + '] ❌ Failed to save signal history:', e.message);
+    // If the directory is missing (e.g. volume not mounted), recreate it once
+    if (e.code === 'ENOENT') {
+      try {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+        fs.writeFileSync(HISTORY_FILE, JSON.stringify(signalHistory));
+        console.log('[' + ts() + '] ✅ saveSignalHistory recovered — recreated DATA_DIR');
+      } catch (e2) { console.error('[' + ts() + '] ❌ Recovery write also failed:', e2.message); }
+    }
+  }
 }
+
+// Periodic backup save — every 60 seconds, catches snapshot updates and outcome changes
+// that may not trigger an explicit save through logSignal or updateSignalOutcome.
+setInterval(() => {
+  try { saveSignalHistory(); } catch (e) { /* error already logged in saveSignalHistory */ }
+}, 60000);
+console.log('[STARTUP] Persistence: signalHistory saves every 60s + on every emit/outcome update');
 
 // Save signal history every 5 minutes
 setInterval(saveSignalHistory, 300000);
@@ -1169,6 +1197,12 @@ function logSignal(sym, sig) {
       s.recentFires = s.recentFires.filter(f => f.ts > cutoff);
     }
   } catch (e) { /* never crash signal emission on cap tracking */ }
+
+  // Persist signalHistory after every emit (added 2026-05-14 to fix data loss on Railway
+  // deploys). Was only saving on shutdown + daily reset — Railway deploys SIGTERM with a
+  // short grace window and sometimes lost the in-memory state. Per-signal save is cheap
+  // (file ~20KB at peak) and guarantees zero loss on crash/redeploy.
+  try { saveSignalHistory(); } catch (e) { /* already logged */ }
 }
 
 // ===== PROCESS PRICE (same engine as mobile/desktop) =====
@@ -4593,6 +4627,9 @@ function updateSignalOutcome(sym, finalPrice) {
       entry.outcomes.closePrice = finalPrice;
     }
   }
+  // Persist after outcome update (added 2026-05-14). Outcomes are critical for audit —
+  // every TP/SL hit must survive a restart.
+  try { saveSignalHistory(); } catch (e) { /* already logged */ }
 }
 
 function checkExit(sym, price) {
