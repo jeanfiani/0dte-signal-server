@@ -115,6 +115,11 @@ SYMBOLS.forEach(sym => {
     sessionHighUpdateTs: 0, sessionLowUpdateTs: 0,
     gapDayMode: false, gapDirection: null, prevClose: null,
     lastSameDir: null, lastSameDirMacd: 0, lastSameDirTs: 0, lastSameDirPrice: 0,
+    // LHF/LLF (Local High/Low Fade) — fresh local-extreme reversal detector cooldowns.
+    // Added 2026-05-15. PUT fires when price is $3-7 off a fresh local 60-min high (formed
+    // within last 25 min) AND macro PUT-aligned AND RSI rolling over AND MACD compressing.
+    // Symmetric LLF CALL at fresh local 60-min low. 30-min cooldown per direction.
+    lastLhfPutTs: 0, lastLlfCallTs: 0,
     // Rolling multi-day high/low for ATH/ATL reversal detection
     // Simple: one entry per day {high, low, date}. rollingHigh/Low computed from 5 daily entries + today's session.
     dailyLevels: [],     // [{high, low, date}] — last 5 completed days
@@ -1910,7 +1915,7 @@ function processPrice(sym, price, hi, lo) {
     const isCounterTrend = macroDir && ((isCall && macroDir === 'bear') || (!isCall && macroDir === 'bull'));
     // Specialist fade tags — by design these signals fight extremes and need extra confirmation
     const tag = sig.score || '';
-    const isFadeSignal = /ATH|ATL|HI|LO/.test(tag) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tag);
+    const isFadeSignal = /ATH|ATL|HI|LO|LHF|LLF/.test(tag) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tag);
 
     // ===== SAME-DIRECTION CAP (added 2026-05-14, max 2 per 30 min) =====
     // Caught 5/14 03:58 PUT FAST: 3rd PUT in 19 min after 2 winners, SL'd despite max conv 7/7.
@@ -1961,7 +1966,7 @@ function processPrice(sym, price, hi, lo) {
     //
     // Trace 5/14: blocks signals #2/3/4 (PUTs in lower half not breaking down) while keeping
     // signal #1 (PUT in upper half = fading top of range, the winner).
-    const isTrendOrMomentum = /BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(tag) && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP/.test(tag);
+    const isTrendOrMomentum = /BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(tag) && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP|LHF|LLF/.test(tag);
     if (isTrendOrMomentum && s.sessionHigh > -Infinity && s.sessionLow < Infinity && s.openPrice) {
       const sessionRange = s.sessionHigh - s.sessionLow;
       const midpoint = (s.sessionHigh + s.sessionLow) / 2;
@@ -2053,7 +2058,7 @@ function processPrice(sym, price, hi, lo) {
     // TP1) had no STRUCT and would now be blocked. Forward-looking, STRUCT-required raises
     // quality bar.
     // NAS100 still exempt — NAS data sample too small to validate.
-    const isStructureReq = (isXAU || isBTC) && /BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(tag) && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP/.test(tag);
+    const isStructureReq = (isXAU || isBTC) && /BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(tag) && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP|LHF|LLF/.test(tag);
     if (isStructureReq) {
       const hasStruct = conv.factors && conv.factors.indexOf('STRUCT') !== -1;
       if (!hasStruct) {
@@ -2786,6 +2791,176 @@ function processPrice(sym, price, hi, lo) {
         SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'call'; S[other].crossAssetTs = now2; } });
         return;
       }
+    }
+  }
+
+  // ===== LOCAL HIGH FADE (LHF) / LOCAL LOW FADE (LLF) — added 2026-05-15 =====
+  // Top-fade detector: fires when price has just made a fresh local 60-min high (LHF PUT)
+  // or low (LLF CALL) AND is showing first signs of rejection. The goal is entering NEAR
+  // the local extreme ($3-8 off it), NOT after $15+ confirmation — so this is a fade
+  // detector, not momentum. R:R designed at ~1:3 (tight SL above local high + buffer, TP
+  // targets at 1.5x / 3x / 5x SL distance).
+  //
+  // Born from 5/15 XAU $4572 → $4545 drop where the bot fired nothing because:
+  //  - FAST detectors confirm after RSI flips deep (RSI was 24-35 by the time price made
+  //    a $15+ drop — already chasing the bottom).
+  //  - BREAK needs candle break of structure — also late.
+  //  - Session HI Reversal only fires at the FULL SESSION high, not local 60-min highs.
+  // LHF fills the gap: fire $3-7 off a fresh LOCAL high while macro PUT-aligned.
+  //
+  // STRICT gates (this is fading WITH macro bias, so the macro alignment IS the trend
+  // confirmation — but we still need pattern proof the local rejection is real):
+  //   • Macro 6+/7 aligned in fade direction, stable ≥5 min (macroAlignedFor)
+  //   • Fresh local extreme: high formed 3-25 min ago (3min min = real rejection, not 1-tick spike)
+  //   • Sweet spot distance: price is $3-7 (XAU) / $100-250 (BTC) / $12-30 (NAS) off it
+  //   • RSI rolled over from overbought: now 35-60 (was >65 recently for PUT)
+  //   • MACD compressing in fade direction (line crossed below signal for PUT, vice versa)
+  //   • Local range meaningful: localHi - localLo ≥ $6 (XAU) / $200 (BTC) / $25 (NAS) — no chop
+  //   • Cooldown 30 min per direction
+  //   • Standard flipCool / winProtectDir / cool guards apply (same as other detectors)
+  const hasLocalCandles = s.atrCandles && s.atrCandles.length >= 6;
+  if (hasLocalCandles && cool && (rsiV >= 10 && rsiV <= 90)) {
+    const last6 = s.atrCandles.slice(-6); // 6 × 5-min candles = 30 min lookback
+    let localHi6 = -Infinity, localHi6Idx = -1;
+    let localLo6 = Infinity,  localLo6Idx = -1;
+    last6.forEach((c, i) => {
+      if (c && c.h > localHi6) { localHi6 = c.h; localHi6Idx = i; }
+      if (c && c.l < localLo6) { localLo6 = c.l; localLo6Idx = i; }
+    });
+    // Approx age: oldest candle = index 0 (~30 min ago at start), newest = index 5 (~0-5 min)
+    // Use midpoint of each candle: (5 - idx) * 5 - 2.5 + adjustment for last-tick recency
+    const lhfHiAgeMin = Math.max(0, (last6.length - 1 - localHi6Idx) * 5 + 2.5);
+    const lhfLoAgeMin = Math.max(0, (last6.length - 1 - localLo6Idx) * 5 + 2.5);
+    const lhfLocalRange = localHi6 - localLo6;
+
+    // Thresholds per instrument
+    const lhfDistMin    = isBTC ? 100 : isNAS ? 12 : isXAU ? 3 : 0.25;
+    const lhfDistMax    = isBTC ? 250 : isNAS ? 30 : isXAU ? 8 : 0.60;
+    const lhfRangeMin   = isBTC ? 200 : isNAS ? 25 : isXAU ? 6 : 0.50;
+    const lhfSlBuffer   = isBTC ? 50  : isNAS ? 8  : isXAU ? 2 : 0.20;
+    const lhfMinAgeMin  = 3;
+    const lhfMaxAgeMin  = 25;
+    const lhfCooldownMs = 30 * 60 * 1000;
+
+    // ---- LHF PUT (fade fresh local high) ----
+    const dropFromLocalHi = localHi6 - price;
+    const lhfPutTimingOk = lhfHiAgeMin >= lhfMinAgeMin && lhfHiAgeMin <= lhfMaxAgeMin;
+    const lhfPutDistOk   = dropFromLocalHi >= lhfDistMin && dropFromLocalHi <= lhfDistMax;
+    const lhfPutRangeOk  = lhfLocalRange >= lhfRangeMin;
+    const lhfPutCoolOk   = (Date.now() - s.lastLhfPutTs) >= lhfCooldownMs;
+    const lhfPutRsiOk    = rsiV < 60 && rsiV > 35;
+    const lhfPutMacdOk   = macdL < macdS && macdHist < 0;
+    const lhfPutMacroOk  = macroAlignedFor('put');
+    const lhfPutFlipOk   = flipCoolFor('put');
+    const lhfPutWinOk    = winProtectDir !== 'call';
+    if (lhfPutTimingOk && lhfPutDistOk && lhfPutRangeOk && lhfPutCoolOk &&
+        lhfPutRsiOk && lhfPutMacdOk && lhfPutMacroOk && lhfPutFlipOk && lhfPutWinOk) {
+      if (s.lastSignalDir !== 'put' || (now2 - s.lastNTs > COOLDOWN_MS)) {
+        s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
+        if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
+        s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
+        s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+        const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇LHF', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        if (!enrichSig(sig)) return; s.signals.push(sig);
+        logSignal(sym, sig);
+        if (isMT5) {
+          // Tight SL at local high + buffer; TPs scaled off that SL distance for 1:1.5/3/5 R:R.
+          // Trade object uses *Price keys (slPrice/tp1Price/...); sig keys are sl/tp1/... strings.
+          const lhfSlPrice = localHi6 + lhfSlBuffer;
+          const slDist = lhfSlPrice - price;
+          if (slDist > 0) {
+            const tp1P = price - slDist * 1.5;
+            const tp2P = price - slDist * 3.0;
+            const tp3P = price - slDist * 5.0;
+            s.trade = buildCfdTrade('put', price, atrVal, sym);
+            s.trade.slPrice = +lhfSlPrice.toFixed(2);
+            s.trade.tp1Price = +tp1P.toFixed(2);
+            s.trade.tp2Price = +tp2P.toFixed(2);
+            s.trade.tp3Price = +tp3P.toFixed(2);
+            sig.sl = lhfSlPrice.toFixed(2);
+            sig.tp1 = tp1P.toFixed(2);
+            sig.tp2 = tp2P.toFixed(2);
+            sig.tp3 = tp3P.toFixed(2);
+          } else {
+            // Defensive: if local high not above price (shouldn't happen — dropFromLocalHi ≥ 3),
+            // fall back to standard buildCfdTrade + attachTpSl so we never have an inverted SL.
+            s.trade = buildCfdTrade('put', price, atrVal, sym);
+            attachTpSl(sig, 'put', price, atrVal, sym);
+          }
+        }
+        s.lastLhfPutTs = now2;
+        log(sym, '🎯 LOCAL HIGH FADE PUT — $' + dropFromLocalHi.toFixed(2) + ' off local high $' + localHi6.toFixed(2) + ' (' + Math.round(lhfHiAgeMin) + 'min ago) · RSI ' + rsiV.toFixed(1) + ' · range $' + lhfLocalRange.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+        sendPush('🎯 ' + sym + ' LOCAL HIGH FADE PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + dropFromLocalHi.toFixed(2) + ' off local high · macro PUT-aligned', 'signal');
+        SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'put'; S[other].crossAssetTs = now2; } });
+        return;
+      }
+    } else if (lhfPutTimingOk && lhfPutDistOk && lhfPutRangeOk && lhfPutCoolOk) {
+      // Log near-misses so we can audit how often the gates block real setups
+      let reason;
+      if (!lhfPutMacroOk) reason = 'macro not PUT-aligned ≥5min';
+      else if (!lhfPutRsiOk) reason = 'RSI ' + rsiV.toFixed(1) + ' outside 35-60';
+      else if (!lhfPutMacdOk) reason = 'MACD not compressing bearish (line ' + macdL.toFixed(3) + ' vs sig ' + macdS.toFixed(3) + ', hist ' + macdHist.toFixed(3) + ')';
+      else if (!lhfPutFlipOk) reason = 'flip cooldown';
+      else if (!lhfPutWinOk) reason = 'protecting winning CALL';
+      if (reason) log(sym, '🚫 ⬇LHF PUT BLOCKED — ' + reason + ' (was $' + dropFromLocalHi.toFixed(2) + ' off local high $' + localHi6.toFixed(2) + ', ' + Math.round(lhfHiAgeMin) + 'min ago).');
+    }
+
+    // ---- LLF CALL (fade fresh local low) — symmetric mirror ----
+    const riseFromLocalLo = price - localLo6;
+    const llfCallTimingOk = lhfLoAgeMin >= lhfMinAgeMin && lhfLoAgeMin <= lhfMaxAgeMin;
+    const llfCallDistOk   = riseFromLocalLo >= lhfDistMin && riseFromLocalLo <= lhfDistMax;
+    const llfCallRangeOk  = lhfLocalRange >= lhfRangeMin;
+    const llfCallCoolOk   = (Date.now() - s.lastLlfCallTs) >= lhfCooldownMs;
+    const llfCallRsiOk    = rsiV > 40 && rsiV < 65;
+    const llfCallMacdOk   = macdL > macdS && macdHist > 0;
+    const llfCallMacroOk  = macroAlignedFor('call');
+    const llfCallFlipOk   = flipCoolFor('call');
+    const llfCallWinOk    = winProtectDir !== 'put';
+    if (llfCallTimingOk && llfCallDistOk && llfCallRangeOk && llfCallCoolOk &&
+        llfCallRsiOk && llfCallMacdOk && llfCallMacroOk && llfCallFlipOk && llfCallWinOk) {
+      if (s.lastSignalDir !== 'call' || (now2 - s.lastNTs > COOLDOWN_MS)) {
+        s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
+        if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
+        s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
+        s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+        const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆LLF', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        if (!enrichSig(sig)) return; s.signals.push(sig);
+        logSignal(sym, sig);
+        if (isMT5) {
+          const llfSlPrice = localLo6 - lhfSlBuffer;
+          const slDist = price - llfSlPrice;
+          if (slDist > 0) {
+            const tp1P = price + slDist * 1.5;
+            const tp2P = price + slDist * 3.0;
+            const tp3P = price + slDist * 5.0;
+            s.trade = buildCfdTrade('call', price, atrVal, sym);
+            s.trade.slPrice = +llfSlPrice.toFixed(2);
+            s.trade.tp1Price = +tp1P.toFixed(2);
+            s.trade.tp2Price = +tp2P.toFixed(2);
+            s.trade.tp3Price = +tp3P.toFixed(2);
+            sig.sl = llfSlPrice.toFixed(2);
+            sig.tp1 = tp1P.toFixed(2);
+            sig.tp2 = tp2P.toFixed(2);
+            sig.tp3 = tp3P.toFixed(2);
+          } else {
+            s.trade = buildCfdTrade('call', price, atrVal, sym);
+            attachTpSl(sig, 'call', price, atrVal, sym);
+          }
+        }
+        s.lastLlfCallTs = now2;
+        log(sym, '🎯 LOCAL LOW FADE CALL — $' + riseFromLocalLo.toFixed(2) + ' off local low $' + localLo6.toFixed(2) + ' (' + Math.round(lhfLoAgeMin) + 'min ago) · RSI ' + rsiV.toFixed(1) + ' · range $' + lhfLocalRange.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+        sendPush('🎯 ' + sym + ' LOCAL LOW FADE CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + riseFromLocalLo.toFixed(2) + ' off local low · macro CALL-aligned', 'signal');
+        SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'call'; S[other].crossAssetTs = now2; } });
+        return;
+      }
+    } else if (llfCallTimingOk && llfCallDistOk && llfCallRangeOk && llfCallCoolOk) {
+      let reason;
+      if (!llfCallMacroOk) reason = 'macro not CALL-aligned ≥5min';
+      else if (!llfCallRsiOk) reason = 'RSI ' + rsiV.toFixed(1) + ' outside 40-65';
+      else if (!llfCallMacdOk) reason = 'MACD not compressing bullish (line ' + macdL.toFixed(3) + ' vs sig ' + macdS.toFixed(3) + ', hist ' + macdHist.toFixed(3) + ')';
+      else if (!llfCallFlipOk) reason = 'flip cooldown';
+      else if (!llfCallWinOk) reason = 'protecting winning PUT';
+      if (reason) log(sym, '🚫 ⬆LLF CALL BLOCKED — ' + reason + ' (was $' + riseFromLocalLo.toFixed(2) + ' off local low $' + localLo6.toFixed(2) + ', ' + Math.round(lhfLoAgeMin) + 'min ago).');
     }
   }
 
