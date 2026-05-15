@@ -900,25 +900,36 @@ const HISTORY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 let signalHistory = []; // [{date, time, ts, symbol, type, price, score, rsi, macd, roc, vix, chop, num, trv2}]
 
 function loadSignalHistory() {
-  try {
-    const raw = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
-    const cutoff = Date.now() - HISTORY_MAX_AGE_MS;
-    signalHistory = (raw || []).filter(h => h.ts > cutoff);
-    console.log('[' + ts() + '] Signal history loaded — ' + signalHistory.length + ' signals (last 7 days)');
-    // Also restore per-symbol s.signals for today
-    const today = todayDateET();
-    SYMBOLS.forEach(sym => {
-      const todaySignals = signalHistory.filter(h => h.date === today && h.symbol === sym);
-      if (todaySignals.length > 0) {
-        S[sym].signals = todaySignals.map(h => ({
-          type: h.type, time: h.time, price: h.price, score: h.score,
-          rsi: h.rsi, macd: h.macd, roc: h.roc, num: h.num, conv: h.conv || null
-        }));
-        S[sym].dailySignalCount = todaySignals.length;
-        console.log('[' + ts() + '] ' + sym + ' — restored ' + todaySignals.length + ' signals for today');
-      }
-    });
-  } catch (e) { console.log('[' + ts() + '] No signal history file — starting fresh'); }
+  // Try primary then .bak fallback. The .bak file is the previous successful write — if a
+  // crash mid-write corrupted the primary, the .bak is the last known-good state.
+  const candidates = [HISTORY_FILE, HISTORY_FILE + '.bak'];
+  for (const file of candidates) {
+    try {
+      const txt = fs.readFileSync(file, 'utf8');
+      if (!txt || txt.trim().length === 0) { throw new Error('empty file'); }
+      const raw = JSON.parse(txt);
+      const cutoff = Date.now() - HISTORY_MAX_AGE_MS;
+      signalHistory = (raw || []).filter(h => h.ts > cutoff);
+      console.log('[' + ts() + '] Signal history loaded — ' + signalHistory.length + ' signals (last 7 days) from ' + (file === HISTORY_FILE ? 'primary' : 'BACKUP (.bak)'));
+      // Also restore per-symbol s.signals for today
+      const today = todayDateET();
+      SYMBOLS.forEach(sym => {
+        const todaySignals = signalHistory.filter(h => h.date === today && h.symbol === sym);
+        if (todaySignals.length > 0) {
+          S[sym].signals = todaySignals.map(h => ({
+            type: h.type, time: h.time, price: h.price, score: h.score,
+            rsi: h.rsi, macd: h.macd, roc: h.roc, num: h.num, conv: h.conv || null
+          }));
+          S[sym].dailySignalCount = todaySignals.length;
+          console.log('[' + ts() + '] ' + sym + ' — restored ' + todaySignals.length + ' signals for today');
+        }
+      });
+      return; // success — done
+    } catch (e) {
+      console.log('[' + ts() + '] Signal history load failed from ' + file + ': ' + e.message);
+    }
+  }
+  console.log('[' + ts() + '] No usable signal history file — starting fresh');
 }
 
 // Track save activity for visibility — log throttled at 1 per minute even when called many times.
@@ -929,12 +940,34 @@ function saveSignalHistory() {
     // Prune entries older than 7 days before saving
     const cutoff = Date.now() - HISTORY_MAX_AGE_MS;
     signalHistory = signalHistory.filter(h => h.ts > cutoff);
-    fs.writeFileSync(HISTORY_FILE, JSON.stringify(signalHistory));
+    const payload = JSON.stringify(signalHistory);
+    // ATOMIC WRITE + FSYNC (added 2026-05-15 after Railway container restart wiped
+    // /data/signal_history.json mid-write):
+    //   1. Write to a temp file (so a crash mid-write never corrupts the primary)
+    //   2. fsync the temp file (force OS page cache → durable storage)
+    //   3. If primary exists, copy it to .bak (last-known-good fallback for load)
+    //   4. Rename temp → primary (POSIX atomic on the same filesystem)
+    // This is the standard "atomic-rename" pattern. Without fsync, fs.writeFileSync()
+    // returns before the OS has actually durably written the data — on a network volume
+    // like Railway's, a fast container kill can lose those buffered writes.
+    const tmpFile = HISTORY_FILE + '.tmp';
+    const fd = fs.openSync(tmpFile, 'w');
+    try {
+      fs.writeSync(fd, payload);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    // Roll the previous primary to .bak before atomic rename (best-effort; ENOENT is fine)
+    if (fs.existsSync(HISTORY_FILE)) {
+      try { fs.copyFileSync(HISTORY_FILE, HISTORY_FILE + '.bak'); } catch (e) { /* not fatal */ }
+    }
+    fs.renameSync(tmpFile, HISTORY_FILE);
     _saveSignalHistoryCallCount++;
     // Throttled startup-visible log so we can see persistence is alive (1/min cap).
     const now = Date.now();
     if (now - _lastSaveSignalHistoryLogTs > 60000) {
-      console.log('[' + ts() + '] 💾 saveSignalHistory — ' + signalHistory.length + ' entries persisted to ' + HISTORY_FILE + ' (' + _saveSignalHistoryCallCount + ' saves since startup)');
+      console.log('[' + ts() + '] 💾 saveSignalHistory — ' + signalHistory.length + ' entries persisted (atomic+fsync) to ' + HISTORY_FILE + ' (' + _saveSignalHistoryCallCount + ' saves since startup)');
       _lastSaveSignalHistoryLogTs = now;
       _saveSignalHistoryCallCount = 0;
     }
@@ -944,7 +977,12 @@ function saveSignalHistory() {
     if (e.code === 'ENOENT') {
       try {
         fs.mkdirSync(DATA_DIR, { recursive: true });
-        fs.writeFileSync(HISTORY_FILE, JSON.stringify(signalHistory));
+        // Retry with same atomic pattern
+        const tmpFile = HISTORY_FILE + '.tmp';
+        const fd = fs.openSync(tmpFile, 'w');
+        try { fs.writeSync(fd, JSON.stringify(signalHistory)); fs.fsyncSync(fd); }
+        finally { fs.closeSync(fd); }
+        fs.renameSync(tmpFile, HISTORY_FILE);
         console.log('[' + ts() + '] ✅ saveSignalHistory recovered — recreated DATA_DIR');
       } catch (e2) { console.error('[' + ts() + '] ❌ Recovery write also failed:', e2.message); }
     }
@@ -2068,28 +2106,35 @@ function processPrice(sym, price, hi, lo) {
       }
     }
 
-    // 2-consecutive-same-direction history block. Looks at last few signals in s.signals.
-    // If last 2 signals were both same direction AND in last 60 min, block opposite direction
-    // for 60 min. Catches 5/14 01:30 CALL FAST that fired after 2 consecutive PUTs (conv 4
-    // each, just below the 6-threshold for macro contra-block). Doesn't depend on conviction
-    // hitting 6 — works off actual signal history. Fades exempt (counter-trend by design).
-    if (!isFadeSignal && Array.isArray(s.signals) && s.signals.length >= 2) {
-      const recent = s.signals.slice(-5); // look at last 5 emitted
-      const sameDirOpposite = [];
+    // 2-consecutive-same-direction history block. Fade signals exempt (counter-trend by design).
+    //
+    // FIX 2026-05-15 (XAU lockout bug): the previous version used s.signals (which lacks
+    // outcome data + lacks ts timestamps) and counted SL'd signals as part of a valid
+    // streak. Result: 2 V-REV CALLs (10:54 TP1 winner + 11:10 SL'd loser) locked the bot
+    // out of PUTs for the rest of the session — even though XAU went $14 bearish after
+    // the second CALL hit SL.
+    //
+    // New logic: pull from signalHistory (has ts + outcomes), enforce real 60-min window,
+    // and STOP counting at either a same-dir signal OR an SL'd signal. A signal that SL'd
+    // proves the market disagreed with that direction — so it's not a real "streak member"
+    // and shouldn't keep the opposite direction locked out. Only TP-hit or still-open
+    // opposite signals count toward the streak.
+    if (!isFadeSignal && Array.isArray(signalHistory) && signalHistory.length >= 2) {
       const oppDir = sig.type === 'call' ? 'put' : 'call';
-      for (let i = recent.length - 1; i >= 0; i--) {
-        const r = recent[i];
-        if (!r || !r.time) continue;
-        // Parse signal time in ET to ms-ago — sig.time is from ts() which is ET HH:MM:SS
-        // Use the trade timestamp if available (r.ts wasn't tracked) — fall back to assuming
-        // the signal is recent enough since we only track last 5.
-        if (r.type === oppDir) sameDirOpposite.push(r);
-        else break; // hit a same-direction or unknown — break the streak
+      const cutoffTs = Date.now() - 60 * 60 * 1000; // 60-min window
+      const recentSym = signalHistory
+        .filter(h => h.symbol === sym && h.ts >= cutoffTs)
+        .sort((a, b) => b.ts - a.ts); // newest first
+      const streak = [];
+      for (const r of recentSym) {
+        if (r.type === sig.type) break;                    // hit a same-dir signal → streak broken
+        if (r.outcomes && r.outcomes.slHit) break;          // opposite SL'd → not a real streak member
+        streak.push(r);                                     // opposite + working (TP hit or open)
       }
-      // If last 2+ signals were opposite to current, block this flip
-      if (sameDirOpposite.length >= 2) {
+      if (streak.length >= 2) {
         Object.assign(s, _emitSnapshot);
-        log(sym, '🚫 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — direction-consistency guard: last ' + sameDirOpposite.length + ' signals were ' + oppDir.toUpperCase() + '. Need clear flip (one signal alone) before allowing opposite.');
+        const ages = streak.map(r => Math.round((Date.now() - r.ts) / 60000) + 'min').join(', ');
+        log(sym, '🚫 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — direction-consistency guard: last ' + streak.length + ' working ' + oppDir.toUpperCase() + ' signals in 60min (' + ages + ' ago, no SL between). Need clear flip.');
         return false;
       }
     }
@@ -3993,12 +4038,50 @@ function processPrice(sym, price, hi, lo) {
         if (price > lo1h && price < lo1h + vrevRoomBuffer) vrevRoomOkPut = false;
       }
 
+      // RECENT-MACRO-OPPOSITE GUARD (added 2026-05-15 after 5/15 08:47 XAU V-REV CALL @
+      // $4550 SL'd). V-REV is exempt from the live macro contra-block in enrichSig (the
+      // fade regex doesn't include VREV). And the macro-flip cooldown gives a flicker
+      // bypass for opposite alignment <30 min. The combined effect: if macro was strongly
+      // PUT-aligned during a downtrend, then the V-bottom bounce momentarily eases macro
+      // back below 6/7, V-REV CALL fires AGAINST the still-prevailing trend and SLs as
+      // a dead-cat. Symmetric for V-REV PUT after a CALL-aligned uptrend.
+      //
+      // Fix: independent of the live contra-block, check whether macro was 6+/7 aligned
+      // OPPOSITE the V-REV direction within the last 45 min for ≥5 min stable. If yes,
+      // we're catching a counter-trend pop — block. Allow the V-REV to fire only when the
+      // opposite alignment was a brief flicker (<5 min) OR ended >45 min ago.
+      const VREV_RECENT_MACRO_MS = 45 * 60 * 1000;   // look back 45 min
+      const VREV_RECENT_STABLE_MS = 5 * 60 * 1000;   // opposite must have been stable ≥5 min
+      const tVR = Date.now();
+      let vrevMacroOppOkCall = true;
+      let vrevMacroOppOkPut = true;
+      // V-REV CALL: opposite = PUT-aligned. Check lastFullConvPutEndTs + duration, OR still active.
+      const putEnd = s.lastFullConvPutEndTs || 0;
+      const putDur = s.lastFullConvPutDurationMs || 0;
+      const putStillActive = s.fullConvSincePut > 0;
+      const putRecentlyActive = putEnd > 0 && (tVR - putEnd) < VREV_RECENT_MACRO_MS;
+      if (putStillActive || (putRecentlyActive && putDur >= VREV_RECENT_STABLE_MS)) {
+        vrevMacroOppOkCall = false;
+      }
+      // V-REV PUT: opposite = CALL-aligned.
+      const callEnd = s.lastFullConvCallEndTs || 0;
+      const callDur = s.lastFullConvCallDurationMs || 0;
+      const callStillActive = s.fullConvSinceCall > 0;
+      const callRecentlyActive = callEnd > 0 && (tVR - callEnd) < VREV_RECENT_MACRO_MS;
+      if (callStillActive || (callRecentlyActive && callDur >= VREV_RECENT_STABLE_MS)) {
+        vrevMacroOppOkPut = false;
+      }
+
       // RSI band widened 2026-05-13: CALL lower bound 35 → 28, PUT upper bound 65 → 72.
       // The 35-65 band rejected exactly the trades VREV exists to catch — deep washouts where
       // RSI is still oversold at the turn. Asymmetric: keep the *opposite* side tight (CALL
       // still capped at 65 because if RSI is >65 you're catching the bounce too late and the
       // setup is more BREAK than VREV; same logic reversed for PUT).
-      if (dropThenBounce && roc3 > symRocThr * 2 && rsiV > 28 && rsiV < 65 && vrevGapOkCall && vrevRoundOkCall && vrevRoomOkCall && flipCoolFor('call') && vrevFlipOk('call') && winProtectDir !== 'put') {
+      if (dropThenBounce && !vrevMacroOppOkCall) {
+        const which = putStillActive ? 'still active' : 'ended ' + Math.round((tVR - putEnd) / 60000) + 'min ago after ' + Math.round(putDur / 60000) + 'min';
+        log(sym, '🚫 ⬆VREV CALL BLOCKED — macro PUT recently aligned (' + which + '). Bounce is dead-cat in PUT trend, not real reversal.');
+      }
+      if (dropThenBounce && roc3 > symRocThr * 2 && rsiV > 28 && rsiV < 65 && vrevGapOkCall && vrevRoundOkCall && vrevRoomOkCall && vrevMacroOppOkCall && flipCoolFor('call') && vrevFlipOk('call') && winProtectDir !== 'put') {
         // CALL reversal: was dropping, now bouncing with strong upward ROC
         s.vrevLastTs = now2;
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
@@ -4014,7 +4097,11 @@ function processPrice(sym, price, hi, lo) {
         return;
       }
 
-      if (rallyThenDrop && roc3 < -symRocThr * 2 && rsiV > 35 && rsiV < 72 && vrevGapOkPut && vrevRoundOkPut && vrevRoomOkPut && flipCoolFor('put') && vrevFlipOk('put') && winProtectDir !== 'call') {
+      if (rallyThenDrop && !vrevMacroOppOkPut) {
+        const which = callStillActive ? 'still active' : 'ended ' + Math.round((tVR - callEnd) / 60000) + 'min ago after ' + Math.round(callDur / 60000) + 'min';
+        log(sym, '🚫 ⬇VREV PUT BLOCKED — macro CALL recently aligned (' + which + '). Drop is profit-taking in CALL trend, not real reversal.');
+      }
+      if (rallyThenDrop && roc3 < -symRocThr * 2 && rsiV > 35 && rsiV < 72 && vrevGapOkPut && vrevRoundOkPut && vrevRoomOkPut && vrevMacroOppOkPut && flipCoolFor('put') && vrevFlipOk('put') && winProtectDir !== 'call') {
         // PUT reversal: was rallying, now dropping with strong downward ROC
         s.vrevLastTs = now2;
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
