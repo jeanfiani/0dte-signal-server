@@ -2095,8 +2095,13 @@ function processPrice(sym, price, hi, lo) {
     // BTC needs equal treatment. Trade-off: one historical BTC winner (5/12 15:56 PUT BREAK
     // TP1) had no STRUCT and would now be blocked. Forward-looking, STRUCT-required raises
     // quality bar.
-    // NAS100 still exempt — NAS data sample too small to validate.
-    const isStructureReq = (isXAU || isBTC) && /BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(tag) && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP|LHF|LLF/.test(tag);
+    //
+    // Extended to NAS100 on 2026-05-15 after today's loss pattern: 2 NAS100 momentum
+    // signals lacking STRUCT both SL'd (12:54 FAST PUT @ $29284 conv 6 HIGH → SL $29360;
+    // 15:31 ATL CALL @ $29313 conv 5 HIGH — fade, STRUCT-exempt). The one NAS100 momentum
+    // signal that DID have STRUCT (16:00 RIDE PUT @ $29216 conv 6) hit TP1+TP2. Consistent
+    // with the XAU/BTC pattern — STRUCT separates winners from losers in momentum signals.
+    const isStructureReq = (isXAU || isBTC || isNAS) && /BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(tag) && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP|LHF|LLF/.test(tag);
     if (isStructureReq) {
       const hasStruct = conv.factors && conv.factors.indexOf('STRUCT') !== -1;
       if (!hasStruct) {
