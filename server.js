@@ -1974,6 +1974,14 @@ function processPrice(sym, price, hi, lo) {
         const freshNewHigh = s.sessionHighUpdateTs > 0 && (tNow - s.sessionHighUpdateTs) < FRESH_BREAK_MS;
         const freshNewLow  = s.sessionLowUpdateTs > 0 && (tNow - s.sessionLowUpdateTs) < FRESH_BREAK_MS;
 
+        // NOTE 2026-05-15: a "local-leg bypass" was briefly considered (allow PUT in lower half
+        // if price had dropped $15+ off the 60-min high). It was rejected because by the time
+        // momentum detectors (BREAK/FAST/TREND) trigger after a $15+ drop, the move is already
+        // mostly done — firing $3 from the local low is exactly the chase-the-bottom failure
+        // mode we just patched. Better to miss the trade than to fire late. The proper fix for
+        // catching local-top reversals is a dedicated LOCAL-HIGH/LOW fade detector (top-fade
+        // signal that fires only $3-7 off a fresh local extreme with R:R 1:4+) — separate work.
+
         // PUT in lower half + NOT making new low = stale exhausted move
         if (sig.type === 'put' && inLowerHalf && !freshNewLow) {
           Object.assign(s, _emitSnapshot);
@@ -2040,11 +2048,12 @@ function processPrice(sym, price, hi, lo) {
     // 6/6 / SUST / SQZ / RIDE). NOT required for fade/reversal detectors (ATH / ATL / HI / LO /
     // VREV / DIV / SWEEP) because those fire AGAINST price structure by design.
     //
-    // XAU-ONLY (added 2026-05-14b): Winner #4 (BTC 5/12 15:56 PUT BREAK) hit TP1 without STRUCT —
-    // BTC's price structure is more chaotic / less directional than XAU. The STRUCT filter is
-    // less reliable on BTC and would have killed that winner. Restricting to XAU only.
-    // Once BTC has more data, we can reassess.
-    const isStructureReq = isXAU && /BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(tag) && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP/.test(tag);
+    // Extended to BTC on 2026-05-14c at user request — XAU has been doing well with the gate,
+    // BTC needs equal treatment. Trade-off: one historical BTC winner (5/12 15:56 PUT BREAK
+    // TP1) had no STRUCT and would now be blocked. Forward-looking, STRUCT-required raises
+    // quality bar.
+    // NAS100 still exempt — NAS data sample too small to validate.
+    const isStructureReq = (isXAU || isBTC) && /BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(tag) && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP/.test(tag);
     if (isStructureReq) {
       const hasStruct = conv.factors && conv.factors.indexOf('STRUCT') !== -1;
       if (!hasStruct) {
@@ -3166,12 +3175,23 @@ function processPrice(sym, price, hi, lo) {
         // virtually the same level.
         const fmGap = isXAU ? 7 : isBTC ? 450 : isNAS ? 60 : 7;
         let fmGapOk = true;
-        if (s.lastSameDir === fmDir && s.lastSameDirPrice > 0) {
+        // FIX 2026-05-15: time-decay the same-direction anchor after 4h. Without this, an
+        // overnight TP3 winner (e.g. 01:10 PUT at $4592 settling to $4532) anchors morning
+        // entries 6-8h later — blocking every fresh PUT in a new $27 local leg because the
+        // gap is measured vs a price the market has already digested. Within a single session
+        // the gap protection is the right behavior (prevent stacking); across sessions it's
+        // not. 4h = ample buffer for a single-leg play to fully resolve.
+        const fmGapAgeMs = 4 * 3600 * 1000;
+        const fmGapAnchorFresh = s.lastSameDirTs > 0 && (Date.now() - s.lastSameDirTs) < fmGapAgeMs;
+        if (s.lastSameDir === fmDir && s.lastSameDirPrice > 0 && fmGapAnchorFresh) {
           if (fmDir === 'put' && price > s.lastSameDirPrice - fmGap) fmGapOk = false;
           if (fmDir === 'call' && price < s.lastSameDirPrice + fmGap) fmGapOk = false;
           if (!fmGapOk) {
             log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — same-dir price gap not met ($' + price.toFixed(2) + ' vs last $' + s.lastSameDirPrice.toFixed(2) + ', need $' + fmGap + ' move)');
           }
+        } else if (s.lastSameDir === fmDir && s.lastSameDirPrice > 0 && !fmGapAnchorFresh) {
+          const ageH = ((Date.now() - s.lastSameDirTs) / 3600000).toFixed(1);
+          log(sym, '↪️ FAST ' + fmDir.toUpperCase() + ' same-dir gap BYPASSED — anchor $' + s.lastSameDirPrice.toFixed(2) + ' is ' + ageH + 'h old (>4h), allowing fresh session leg.');
         }
         // "Room to grow/sell" exhaustion gate (added 2026-05-12 after user analysis showed FAST
         // consistently fires AT THE END of the directional leg, right before mean reversion).
@@ -3224,7 +3244,40 @@ function processPrice(sym, price, hi, lo) {
           }
         }
 
-        if (fmRsiOk && fmRocOk && fmMacdOk && fmGapOk && fmRoomOk && fmRoundOk && flipCoolFor(fmDir) && (winProtectDir === null || winProtectDir === fmDir)) {
+        // FAST "chase-the-bottom" guard (added 2026-05-15) — XAU only for now.
+        // FAST detector fires AFTER a sharp move, which puts entries at the LOCAL EXTREME of
+        // the move — exactly when a $5-10 bounce/dip is most likely. If a same-direction
+        // signal already hit TP or SL in the last 30 min, the chop pattern is established
+        // and FAST is chasing the local low/high. Block to avoid stair-step SL losses.
+        // Caught 5/15 05:16 FAST PUT (SL'd 20s after 05:07 VREV TP1) and 5/15 05:50 FAST PUT
+        // (SL'd 26 min after 05:16 SL). Both had conv 6 HIGH + STRUCT, no other gate blocked.
+        let fmRecentTpSlOk = true;
+        if (isXAU) {
+          const fmRecentTpSlMs = 1800000; // 30 minutes
+          const tFm = Date.now();
+          for (let hi = signalHistory.length - 1; hi >= 0; hi--) {
+            const h = signalHistory[hi];
+            if (!h || h.symbol !== sym || h.type !== fmDir) continue;
+            const o = h.outcomes;
+            if (!o) continue;
+            const tpTs = o.tp1HitTs || o.tp2HitTs || o.tp3HitTs || 0;
+            const slTs = o.slHitTs || 0;
+            const lastTs = Math.max(tpTs, slTs);
+            if (lastTs === 0) continue;
+            if ((tFm - lastTs) > fmRecentTpSlMs) break; // sorted oldest→newest, this is too old, stop
+            // Found a same-direction TP/SL within 30 min
+            fmRecentTpSlOk = false;
+            const event = (o.slHit && (!o.tp1Hit || slTs > tpTs)) ? 'SL'
+                        : o.tp3Hit ? 'TP3'
+                        : o.tp2Hit ? 'TP2'
+                        : 'TP1';
+            const ageMin = Math.round((tFm - lastTs) / 60000);
+            log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — same-direction ' + event + ' hit ' + ageMin + 'min ago (FAST chase-the-bottom guard, 30-min cooldown). Local extreme likely, wait for clearer setup.');
+            break;
+          }
+        }
+
+        if (fmRecentTpSlOk && fmRsiOk && fmRocOk && fmMacdOk && fmGapOk && fmRoomOk && fmRoundOk && flipCoolFor(fmDir) && (winProtectDir === null || winProtectDir === fmDir)) {
           s.fastMoveLastTs = now2;
           s.fastLastDir = fmDir; // for 30-min opposite-direction flip-cool
           s.lastAT = fmDir; if (fmDir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
@@ -3993,8 +4046,12 @@ function processPrice(sym, price, hi, lo) {
       const atrRatio = trv2Atr > 0 ? Math.min(baselineAtr / trv2Atr, 2.0) : 1.0;
       const entryRocBase = NAS_ROC_THR * 0.5;
       const entryRocMin = entryRocBase * atrRatio;
-      let longOk = priceAbove && roc3 > entryRocMin && rsiV > 30 && rsiV < 75;
-      let shortOk = priceBelow && roc3 < -entryRocMin && rsiV > 25 && rsiV < 70;
+      // RSI bands tightened 2026-05-14 after 5/14 15:21 NAS100 RIDE LONG @ RSI 73.3 SL'd
+      // (-$30 in 30min). RSI 73 was "in the band" with old <75 cap but is overbought entry
+      // for trend-continuation CALL. Aligned with XAU/BTC BREAK ceiling pattern (~70).
+      // Symmetric tightening on SHORT side: RSI > 30 (was > 25) — same as BREAK PUT floor.
+      let longOk = priceAbove && roc3 > entryRocMin && rsiV > 30 && rsiV < 68;
+      let shortOk = priceBelow && roc3 < -entryRocMin && rsiV > 32 && rsiV < 70;
 
       // MACRO GATE: only enter in the direction of the macro (3h) trend
       // If macro is bull → only LONG. If macro is bear → only SHORT.
