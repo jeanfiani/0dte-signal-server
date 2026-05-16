@@ -1889,6 +1889,19 @@ function processPrice(sym, price, hi, lo) {
     const isFadeEarly = /ATH|ATL|HI|LO|DIV/.test(tagEarly) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tagEarly);
     const macroContraNow = Date.now();
 
+    // ===== BTC WEEKEND PUT-ONLY GATE (added 2026-05-16) =====
+    // 52-week analysis showed BTC weekends are CALL-skewed overall (57.7% CALL) but the
+    // recent 6-month regime (Nov 2025 → May 2026) is 58% PUT-favorable with bigger PUT
+    // magnitudes (-1.83% vs +1.50%). Decision: allow PUT signals on weekends, block CALL
+    // entirely. The hard weekend block at processTicks level was lifted; this is the
+    // direction-aware enforcement. CALL signals at low-liquidity weekend chop have poor
+    // risk/reward — wait until Mon open instead.
+    if (isBTC && s._weekendBtcPutOnly && sig.type === 'call') {
+      Object.assign(s, _emitSnapshot);
+      log(sym, '🚫 ' + tagEarly + ' CALL BLOCKED — BTC weekend PUT-only mode (recent 6mo regime: 58% PUT-favorable, weekend CALL setups have poor R:R).');
+      return false;
+    }
+
     // ===== MACRO-FLIP COOLDOWN (added 2026-05-13) =====
     // Caught 5/13 10:32 ATL CALL @ conv 6 HIGH SL'd 32 min after PUT alignment ended. The
     // 20-min contra-block had just expired AND fade exemption let ATL through anyway. When
@@ -2285,16 +2298,21 @@ function processPrice(sym, price, hi, lo) {
   if (isXAU) {
     if (etMin >= 1020 && etMin < 1080) return; // XAU closed 5-6 PM ET
   } else if (isBTC) {
-    // BTC trades 24/7 but weekends are ultra-thin liquidity → high chop, signal noise.
-    // 5/9 (Sat) data showed only 1 signal that ended ~flat; weekend BTC moves rarely
-    // sustain in either direction. Hard-block all signals on Sat & Sun (ET timezone).
+    // BTC trades 24/7 but weekends are ultra-thin liquidity. Previously hard-blocked all
+    // signals Sat/Sun. Updated 2026-05-16 after 52-week analysis showed:
+    //   • Full year: 57.7% CALL weekends / 42.3% PUT (slightly CALL-biased overall)
+    //   • Last 6 months (Nov 2025 → May 2026): 57.7% PUT / 42.3% CALL with -16.56%
+    //     cumulative; PUT moves average -1.83% vs CALL +1.50% (bigger downside swings)
+    //   • Top 5 PUT weekends ranged -3.18% to -8.5%; top 5 CALL +2.43% to +3.10%
+    // Decision: allow BTC PUT signals on weekends (with normal macro/STRUCT/conviction
+    // gates handling quality). Keep blocking BTC CALL signals on weekends — recent regime
+    // is PUT-favorable and CALL setups would need to overcome lower frequency + smaller
+    // magnitude. Sets a flag that enrichSig() reads to block CALL emits.
     const dow = gETDow();
-    if (dow === 0 || dow === 6) {
-      if (now2 - (s.weekendBlockLogTs || 0) > 600000) { // log every 10 min, not every tick
-        log(sym, '⏸ Weekend block: BTC signals disabled Sat/Sun (low-liquidity chop)');
-        s.weekendBlockLogTs = now2;
-      }
-      return;
+    s._weekendBtcPutOnly = (dow === 0 || dow === 6);
+    if (s._weekendBtcPutOnly && now2 - (s.weekendBlockLogTs || 0) > 600000) {
+      log(sym, '⏸ Weekend mode: BTC CALL signals blocked Sat/Sun (PUT-only — last 6mo 58% PUT-favorable, low-liquidity chop on CALL setups).');
+      s.weekendBlockLogTs = now2;
     }
   } else if (isNAS) {
     // NAS100 futures: Sun 6PM - Fri 5PM ET, daily break 5-6PM ET (1020-1080 min)
