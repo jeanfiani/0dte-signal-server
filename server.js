@@ -259,6 +259,8 @@ SYMBOLS.forEach(sym => {
     breakCoilActive: false,  // true when range < threshold for >= 3 min
     breakFrozenHi: 0,       // locked coil high at moment coil started (doesn't drift with rolling window)
     breakFrozenLo: Infinity, // locked coil low at moment coil started
+    coilArmedAlerted: false, // (NAS only) true after the "COIL ARMED" push alert has fired for the current coil — prevents spamming
+    coilArmedAlertedTs: 0,   // when the COIL ARMED alert fired (used by EA-side pre-positioning if/when added)
     breakLastTs: 0,          // when last breakout signal fired (cooldown)
     breakLastDir: null,      // direction of last breakout signal ('call'/'put')
     breakLastPrice: 0,       // entry price of last breakout signal
@@ -3032,7 +3034,7 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // ===== CONSOLIDATION BREAKOUT DETECTOR (MT5 instruments: XAU + BTC) =====
+  // ===== CONSOLIDATION BREAKOUT DETECTOR (MT5 instruments: XAU + BTC + NAS100) =====
   // Fires INSTANTLY when price escapes a tight range — no lagging indicator delay.
   // This is the fastest signal: catches moves 2-3 min before EMAs/RSI/MACD confirm.
   // The coil detection + breakout pending flag is set in processTicks (runs every 1s).
@@ -3222,6 +3224,39 @@ function processPrice(sym, price, hi, lo) {
       sendPush('💥 ' + sym + ' BREAKOUT ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · broke ' + (dir === 'call' ? 'above' : 'below') + ' ' + rangeStr + ' (' + coilMin + 'min coil)', 'signal');
       s.trade = isMT5 ? attachOTE(buildCfdTrade(dir, price, atrVal, sym), s, sym, dir) : { active: true, type: dir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
       if (isMT5 && s.trade.oteLimit) log(sym, '🎯 OTE ' + dir.toUpperCase() + ' limit set @ $' + s.trade.oteLimit.toFixed(2) + ' (BREAK retracement entry, expires in 3min)');
+
+      // ===== NAS BREAK — override SL/TPs with coil-relative levels (added 2026-05-16) =====
+      // For NAS specifically: when BREAK fires, the coil high/low are the natural structural
+      // levels. SL just inside the OPPOSITE coil edge keeps risk tight (typically $15-25 vs
+      // ATR-based $50). TPs scaled to the coil range (the bigger the coil, the bigger the
+      // post-break expansion target — standard 1:1 to 1:N coil-to-break-expansion ratio).
+      // For a $20 coil this produces SL ~$15-20, TP1 $40 (2× range), TP2 $80, TP3 $160.
+      // R:R ~1:2 / 1:4 / 1:8 — far better than the previous ATR-based 1:1.5 / 1:2.5 / 1:4.
+      if (isNAS && isMT5 && bo.coilHi && bo.coilLo && s.trade && s.trade.isCfd) {
+        const coilRange = bo.coilHi - bo.coilLo;
+        // SL = OPPOSITE side of coil + small buffer (so noise inside the coil doesn't trip it)
+        // For CALL: SL = coilLo (or coilMid if you want tighter — we use coilLo for safety against
+        //   the immediate-retest pattern). For PUT: SL = coilHi.
+        const slBuffer = 2; // small NAS buffer
+        const coilSL = dir === 'call' ? bo.coilLo - slBuffer : bo.coilHi + slBuffer;
+        const slOk = dir === 'call' ? coilSL < price : coilSL > price;
+        if (slOk) {
+          s.trade.slPrice = +coilSL.toFixed(2);
+          const tp1P = dir === 'call' ? price + coilRange * 2 : price - coilRange * 2;
+          const tp2P = dir === 'call' ? price + coilRange * 4 : price - coilRange * 4;
+          const tp3P = dir === 'call' ? price + coilRange * 8 : price - coilRange * 8;
+          s.trade.tp1Price = +tp1P.toFixed(2);
+          s.trade.tp2Price = +tp2P.toFixed(2);
+          s.trade.tp3Price = +tp3P.toFixed(2);
+          sig.sl = s.trade.slPrice.toFixed(2);
+          sig.tp1 = s.trade.tp1Price.toFixed(2);
+          sig.tp2 = s.trade.tp2Price.toFixed(2);
+          sig.tp3 = s.trade.tp3Price.toFixed(2);
+          const slDistDollars = Math.abs(price - coilSL).toFixed(2);
+          log(sym, '🎯 NAS BREAK coil-levels: SL $' + s.trade.slPrice.toFixed(2) + ' ($' + slDistDollars + ' risk) · TPs $' + s.trade.tp1Price.toFixed(2) + ' / $' + s.trade.tp2Price.toFixed(2) + ' / $' + s.trade.tp3Price.toFixed(2) + ' (2/4/8× coil range $' + coilRange.toFixed(2) + ')');
+        }
+        // If slOk is false (rare: coilSL on wrong side of price), keep the default ATR-based SL.
+      }
       return;
     } else {
       // Cooldown blocked — clear pending
@@ -5033,11 +5068,20 @@ function attachOTE(trade, s, sym, dir) {
 
 function buildCfdTrade(type, price, atr, sym) {
   const iC = type === 'call';
-  // Unified TP/SL policy: SL=2×ATR, TP1=1.5×, TP2=2.5×, TP3=4×
-  const mults = { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
+  const isXAU = sym === 'XAU';
+  const isNAS = sym === 'NAS100';
+  // Per-instrument TP/SL policy (multiples of ATR).
+  // Default (XAU, BTC): SL=2×, TP1=1.5×, TP2=2.5×, TP3=4×.
+  // NAS (updated 2026-05-16): NAS futures show much cleaner directional legs than XAU/BTC
+  // — e.g., 5/15 $29400→$29000 was a clean $400 leg with minimal counter-spikes. Old TPs cut
+  // winners at ~$38/$75/$120 (with ATR~25). New TPs at 3/6/12× ATR capture the full leg.
+  // SL stays tight at 2× ATR — NAS doesn't spike against you the way XAU/BTC do, so wider
+  // SLs aren't needed for survival, and tight SLs keep the per-trade risk small.
+  const mults = isNAS
+    ? { sl: 2, t1: 3, t2: 6, t3: 12 }
+    : { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
   // Minimum $5 for SL and TP1 — prevents noise-level levels during low-ATR periods
   // XAU max $10 cap — keeps risk tight on gold's typical ATR range
-  const isXAU = sym === 'XAU';
   const slDist = isXAU ? Math.min(Math.max(atr * mults.sl, 5), 10) : Math.max(atr * mults.sl, 5);
   const tp1Dist = isXAU ? Math.min(Math.max(atr * mults.t1, 5), 10) : Math.max(atr * mults.t1, 5);
   const tp2Dist = atr * mults.t2;
@@ -5095,10 +5139,13 @@ function buildCfdTrade(type, price, atr, sym) {
 // Attaches TP/SL levels to a signal object (for display in bots/mobile)
 function attachTpSl(sig, type, price, atr, sym) {
   const iC = type === 'call';
-  // Unified TP/SL policy: SL=2×ATR, TP1=1.5×, TP2=2.5×, TP3=4×
-  // XAU: SL and TP1 clamped to $5–$10 range
-  const mults = { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
   const isXAU = sym === 'XAU';
+  const isNAS = sym === 'NAS100';
+  // Per-instrument TP/SL policy (mirror buildCfdTrade). NAS gets bigger TPs to capture
+  // its cleaner directional legs (updated 2026-05-16).
+  const mults = isNAS
+    ? { sl: 2, t1: 3, t2: 6, t3: 12 }
+    : { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
   const tp1D = isXAU ? Math.min(Math.max(atr * mults.t1, 5), 10) : Math.max(atr * mults.t1, 5);
   const slD = isXAU ? Math.min(Math.max(atr * mults.sl, 5), 10) : Math.max(atr * mults.sl, 5);
   sig.tp1 = (iC ? price + tp1D : price - tp1D).toFixed(2);
@@ -5623,9 +5670,33 @@ function processTicks(symbols) {
           s.breakCoilActive = true;
           s.breakFrozenHi = bHi;  // locked coil high — won't move with rolling window
           s.breakFrozenLo = bLo;  // locked coil low
+          s.coilArmedAlerted = false; // reset for the new coil
         } else if (s.breakCoilActive && bRange < coilMaxRange) {
           // STILL COILING — boundaries stay FROZEN. Do not update.
           // If we widen them, the breakout detection drifts with price (the original bug).
+        }
+
+        // COIL ARMED ALERT (NAS only, added 2026-05-16): fire a one-time push notification
+        // once the coil has been stable for ≥3 minutes. Goal: pre-position before BREAK fires.
+        // The BREAK detector still needs accel + ROC confirmation to fire the actual trade,
+        // which means the trade entry is ~10-30 seconds AFTER the spike starts. This alert
+        // tells you a coil is mature so you can place a manual limit just inside the edges
+        // (e.g., buy stop $5 above coilHi, sell stop $5 below coilLo) and get filled at the
+        // optimal level on the break, regardless of when the bot's BREAK signal lands.
+        // NAS-only because XAU coils often produce false breaks and BTC has weekend chop.
+        if (isNASt && s.breakCoilActive && !s.coilArmedAlerted) {
+          const coilAge = bNow - s.breakCoilStart;
+          if (coilAge >= 180000) { // 3 minutes
+            const coilRange = s.breakFrozenHi - s.breakFrozenLo;
+            const coilMid = (s.breakFrozenHi + s.breakFrozenLo) / 2;
+            const upperBreak = (s.breakFrozenHi + escapeMin).toFixed(2);
+            const lowerBreak = (s.breakFrozenLo - escapeMin).toFixed(2);
+            const ageMin = (coilAge / 60000).toFixed(1);
+            log(sym, '🎯 COIL ARMED — coiled ' + ageMin + 'min in $' + s.breakFrozenLo.toFixed(2) + '-$' + s.breakFrozenHi.toFixed(2) + ' (range $' + coilRange.toFixed(2) + ', mid $' + coilMid.toFixed(2) + '). Watch break ↑$' + upperBreak + ' or ↓$' + lowerBreak + '.');
+            sendPush('🎯 ' + sym + ' COIL ARMED', 'Coiled ' + ageMin + 'min @ $' + s.breakFrozenLo.toFixed(2) + '-$' + s.breakFrozenHi.toFixed(2) + ' (mid $' + coilMid.toFixed(2) + ') · Place limit ↑$' + upperBreak + ' or ↓$' + lowerBreak, 'coil-armed');
+            s.coilArmedAlerted = true;
+            s.coilArmedAlertedTs = bNow;
+          }
         }
 
         // BREAKOUT CHECK — every tick while coil is active, compare price to FROZEN boundaries
