@@ -104,6 +104,11 @@ SYMBOLS.forEach(sym => {
     lossStreak: 0, lossStreakBoost: 0, lossStreakUntil: 0,
     lastAT: '', lastNTs: 0, lastReversalTs: 0,
     dailySignalCount: 0, lastSignalDir: null, lastSignalTs: 0,
+    // Per-direction signal timestamps for cross-asset confluence (added 2026-05-16).
+    // NAS conviction reads S['QQQ'].lastCallSignalTs / lastPutSignalTs to add a QQQ_SIG factor
+    // when QQQ bot has fired the same direction within the last 10 min. Symmetric for QQQ
+    // reading NAS. Catches the "two correlated bots independently agree" alpha.
+    lastCallSignalTs: 0, lastPutSignalTs: 0,
     nC: 0, nP: 0, nBl: 0,
     chopShort: [], chopLong: [], chopCount: 0, trendCount: 0, chopActive: false,
     signals: [], tickBuf: [], lastPrice: 0,
@@ -1119,6 +1124,15 @@ function logSignal(sym, sig) {
     }
   } catch (e) { /* never let chop-breaker bookkeeping crash signal emission */ }
 
+  // Per-direction signal timestamps for cross-asset confluence (added 2026-05-16).
+  // Updated centrally here (one place, covers every detector site) instead of editing every emit.
+  // NAS conviction reads S['QQQ'].lastCallSignalTs / lastPutSignalTs; symmetric for QQQ→NAS.
+  try {
+    const s = S[sym];
+    if (s && sig.type === 'call') s.lastCallSignalTs = Date.now();
+    else if (s && sig.type === 'put') s.lastPutSignalTs = Date.now();
+  } catch (e) { /* never crash signal emission on bookkeeping */ }
+
   const dateStr = todayDateET();
   // CSV log (legacy)
   const file = path.join(SIGNALS_DIR, dateStr + '.csv');
@@ -1777,6 +1791,19 @@ function processPrice(sym, price, hi, lo) {
       if ((isCall && qqqDir2 === 'up') || (!isCall && qqqDir2 === 'down')) { sc++; factors.push('QQQ'); }
       // DXY inverse (dollar up = equity/crypto bear)
       if ((isCall && dxyDir === 'down') || (!isCall && dxyDir === 'up')) { sc++; factors.push('DXY'); }
+      // Cross-asset SIGNAL confluence (added 2026-05-16). The QQQ factor above is just
+      // QQQ's price-direction alignment — useful but noisy. This factor adds +1 ONLY when the
+      // QQQ bot has independently FIRED a signal in the same direction within the last 10 min.
+      // A QQQ bot signal means QQQ already cleared its own RSI/MACD/HI/LO/6-of-6 gates, so
+      // that's much higher-quality info than just "QQQ price is trending up". When both bots
+      // independently agree, the directional edge is meaningfully stronger.
+      const CROSS_SIG_WINDOW_MS = 10 * 60 * 1000; // 10 min
+      if (qqqS) {
+        const lastQqqSameDirTs = isCall ? (qqqS.lastCallSignalTs || 0) : (qqqS.lastPutSignalTs || 0);
+        if (lastQqqSameDirTs > 0 && (Date.now() - lastQqqSameDirTs) < CROSS_SIG_WINDOW_MS) {
+          sc++; factors.push('QQQ_SIG');
+        }
+      }
       // Order blocks aligned — direction-aware (2026-05-14). Previously fired +1 conv if ANY
       // OB existed regardless of direction. Now: only +1 if the most recent unmitigated OB
       // direction matches the signal direction (bull OB = CALL alignment, bear OB = PUT).
@@ -4971,17 +4998,35 @@ function processPrice(sym, price, hi, lo) {
     // Don't fire 6/6 indicator signals for BTC/NAS100 — TRv2 handles them
     return;
   }
+  // Cross-asset confluence annotation (added 2026-05-16). When QQQ/SPY base-scoring fires
+  // and NAS100 bot has independently fired the same direction within the last 10 min, mark
+  // the signal as confirmed-by-NAS. Shown in log + push notification so the user knows two
+  // correlated bots agree — much higher-quality confirmation than the base score alone.
+  const CROSS_SIG_WINDOW = 10 * 60 * 1000;
+  const tCrossNow = Date.now();
+  const nasS = S['NAS100'];
+  const nasCallRecent = nasS && nasS.lastCallSignalTs > 0 && (tCrossNow - nasS.lastCallSignalTs) < CROSS_SIG_WINDOW;
+  const nasPutRecent = nasS && nasS.lastPutSignalTs > 0 && (tCrossNow - nasS.lastPutSignalTs) < CROSS_SIG_WINDOW;
+  const eligibleForCross = (sym === 'QQQ' || sym === 'SPY');
+
   if (fireCall && cool && flipCoolFor('call')) {
     s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
     if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
     s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
     s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
     const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: cS + '/' + mi, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+    const nasConfirm = eligibleForCross && nasCallRecent;
+    if (nasConfirm) {
+      sig.nasConfirm = true;
+      const nasAgoMin = Math.round((tCrossNow - nasS.lastCallSignalTs) / 60000);
+      sig.nasConfirmAgoMin = nasAgoMin;
+    }
     if (!enrichSig(sig)) return; s.signals.push(sig);
     logSignal(sym, sig);
     const convLbl = sig.conv ? ' [' + sig.conv.label + ' ' + sig.conv.score + '/7]' : '';
-    log(sym, '🚀 CALL ' + sig.score + ' RSI:' + sig.rsi + ' $' + sig.price + convLbl + ' [#' + s.dailySignalCount + ']');
-    sendPush('🚀 ' + sym + ' CALL ' + sig.score + ' #' + s.dailySignalCount, '$' + sig.price + ' · RSI:' + sig.rsi + ' · ROC:' + sig.roc + (sig.conv ? ' · ' + sig.conv.label + ' ' + sig.conv.score + '/7' : ''), 'signal');
+    const nasTag = nasConfirm ? ' ✓NAS_SIG (' + sig.nasConfirmAgoMin + 'min ago)' : '';
+    log(sym, '🚀 CALL ' + sig.score + ' RSI:' + sig.rsi + ' $' + sig.price + convLbl + nasTag + ' [#' + s.dailySignalCount + ']');
+    sendPush('🚀 ' + sym + ' CALL ' + sig.score + (nasConfirm ? ' ✓NAS' : '') + ' #' + s.dailySignalCount, '$' + sig.price + ' · RSI:' + sig.rsi + ' · ROC:' + sig.roc + (sig.conv ? ' · ' + sig.conv.label + ' ' + sig.conv.score + '/7' : '') + (nasConfirm ? ' · NAS CALL ' + sig.nasConfirmAgoMin + 'min ago' : ''), 'signal');
     if (isMT5) attachTpSl(sig, 'call', price, atrVal, sym);
     // Activate trade monitor for this signal
     s.trade = isMT5 ? buildCfdTrade('call', price, atrVal, sym) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
@@ -4993,11 +5038,17 @@ function processPrice(sym, price, hi, lo) {
     s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
     s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
     const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: pS + '/' + mi, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+    const nasConfirm2 = eligibleForCross && nasPutRecent;
+    if (nasConfirm2) {
+      sig.nasConfirm = true;
+      sig.nasConfirmAgoMin = Math.round((tCrossNow - nasS.lastPutSignalTs) / 60000);
+    }
     if (!enrichSig(sig)) return; s.signals.push(sig);
     logSignal(sym, sig);
     const convLbl2 = sig.conv ? ' [' + sig.conv.label + ' ' + sig.conv.score + '/7]' : '';
-    log(sym, '📉 PUT ' + sig.score + ' RSI:' + sig.rsi + ' $' + sig.price + convLbl2 + ' [#' + s.dailySignalCount + ']');
-    sendPush('📉 ' + sym + ' PUT ' + sig.score + ' #' + s.dailySignalCount, '$' + sig.price + ' · RSI:' + sig.rsi + ' · ROC:' + sig.roc + (sig.conv ? ' · ' + sig.conv.label + ' ' + sig.conv.score + '/7' : ''), 'signal');
+    const nasTag2 = nasConfirm2 ? ' ✓NAS_SIG (' + sig.nasConfirmAgoMin + 'min ago)' : '';
+    log(sym, '📉 PUT ' + sig.score + ' RSI:' + sig.rsi + ' $' + sig.price + convLbl2 + nasTag2 + ' [#' + s.dailySignalCount + ']');
+    sendPush('📉 ' + sym + ' PUT ' + sig.score + (nasConfirm2 ? ' ✓NAS' : '') + ' #' + s.dailySignalCount, '$' + sig.price + ' · RSI:' + sig.rsi + ' · ROC:' + sig.roc + (sig.conv ? ' · ' + sig.conv.label + ' ' + sig.conv.score + '/7' : '') + (nasConfirm2 ? ' · NAS PUT ' + sig.nasConfirmAgoMin + 'min ago' : ''), 'signal');
     if (isMT5) attachTpSl(sig, 'put', price, atrVal, sym);
     // Activate trade monitor for this signal
     s.trade = isMT5 ? buildCfdTrade('put', price, atrVal, sym) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
@@ -5651,6 +5702,36 @@ function processTicks(symbols) {
       const coilMaxRange = isBTCt ? 120.0 : isNASt ? 30.0 : 10.0;  // max range to count as consolidation (XAU was $6 — too tight, missed $9-range coils)
       const escapeMin    = isBTCt ? 30.0  : isNASt ? 8.0  : 1.5;   // min distance beyond coil edge = confirmed breakout (XAU raised to $1.50)
       const bNow = Date.now();
+
+      // ===== MARKET-GAP RESET (added 2026-05-16) =====
+      // Coil state must NOT survive a market closure. NAS futures pause Fri 5PM → Sun 6PM ET
+      // (49h) and also break daily 5-6PM ET (1h). XAU pauses 5-6PM ET. If a coil was active
+      // before the close, the FROZEN boundaries from Friday/yesterday persist while the
+      // server keeps running. When the market reopens with a price gap, the breakout check
+      // compares NEW price against STALE boundaries — any reopen gap registers as a false
+      // breakout (e.g., NAS coiling $29100-$29115 Friday close → Sunday open $29200 = "BREAK
+      // CALL!" but the move is just the weekend re-pricing, not real momentum).
+      //
+      // Detection: if no tick was received for >30 minutes (much longer than any normal
+      // tick gap during open markets, but shorter than any genuine market break), assume a
+      // closure happened and clear all coil state. The breakRange buffer's own 5-min trim
+      // would clean stale ticks, but the FROZEN boundaries + breakCoilActive flag + coil
+      // start time + coilArmedAlerted flag persist independently and need explicit reset.
+      const TICK_GAP_RESET_MS = 30 * 60 * 1000; // 30 minutes
+      const lastTickTs = s.breakRange.length > 0 ? s.breakRange[s.breakRange.length - 1].ts : 0;
+      if (lastTickTs > 0 && (bNow - lastTickTs) > TICK_GAP_RESET_MS) {
+        const gapMin = Math.round((bNow - lastTickTs) / 60000);
+        log(sym, '⏸ Market-gap reset — ' + gapMin + 'min since last tick. Clearing coil state (breakRange + breakCoilActive + frozen boundaries + alert flag) to prevent stale-coil false breakouts on reopen.');
+        s.breakRange = [];
+        s.breakCoilActive = false;
+        s.breakFrozenHi = 0;
+        s.breakFrozenLo = Infinity;
+        s.breakCoilStart = 0;
+        s.coilArmedAlerted = false;
+        s.breakHi = 0;
+        s.breakLo = Infinity;
+      }
+
       s.breakRange.push({ ts: bNow, p: price });
       // Trim to 5-min window
       const bCutoff = bNow - 300000;
@@ -5684,10 +5765,14 @@ function processTicks(symbols) {
         // (e.g., buy stop $5 above coilHi, sell stop $5 below coilLo) and get filled at the
         // optimal level on the break, regardless of when the bot's BREAK signal lands.
         // NAS-only because XAU coils often produce false breaks and BTC has weekend chop.
+        //
+        // FIX 2026-05-16: require minimum coil range to suppress false alerts on flat
+        // (market-closed) ticks where breakFrozenHi == breakFrozenLo gives a $0 "coil".
         if (isNASt && s.breakCoilActive && !s.coilArmedAlerted) {
           const coilAge = bNow - s.breakCoilStart;
-          if (coilAge >= 180000) { // 3 minutes
-            const coilRange = s.breakFrozenHi - s.breakFrozenLo;
+          const coilRange = s.breakFrozenHi - s.breakFrozenLo;
+          const coilMinRangeForAlert = 8; // NAS: need ≥$8 spread to be a real coil (not flat ticks)
+          if (coilAge >= 180000 && coilRange >= coilMinRangeForAlert) { // 3 minutes + real range
             const coilMid = (s.breakFrozenHi + s.breakFrozenLo) / 2;
             const upperBreak = (s.breakFrozenHi + escapeMin).toFixed(2);
             const lowerBreak = (s.breakFrozenLo - escapeMin).toFixed(2);
@@ -5696,6 +5781,27 @@ function processTicks(symbols) {
             sendPush('🎯 ' + sym + ' COIL ARMED', 'Coiled ' + ageMin + 'min @ $' + s.breakFrozenLo.toFixed(2) + '-$' + s.breakFrozenHi.toFixed(2) + ' (mid $' + coilMid.toFixed(2) + ') · Place limit ↑$' + upperBreak + ' or ↓$' + lowerBreak, 'coil-armed');
             s.coilArmedAlerted = true;
             s.coilArmedAlertedTs = bNow;
+
+            // QQQ MIRROR (added 2026-05-16): during RTH (9:30-16:00 ET), also emit a QQQ COIL
+            // ARMED alert with the proportional break levels. QQQ tracks NAS at ratio ~41×
+            // (NAS $29200 ≈ QQQ $711). This lets you pre-position QQQ 0DTE options against the
+            // same coil — a NAS $20 coil = QQQ $0.49 range, easy to set limits around.
+            // RTH-only because QQQ is thinly liquid pre/post market.
+            try {
+              const qqqState = S['QQQ'];
+              const etMinCoil = gET();
+              if (qqqState && qqqState.lastPrice > 0 && etMinCoil >= 570 && etMinCoil < 960) {
+                const ratio = qqqState.lastPrice / price; // QQQ price per 1pt NAS
+                const qqqCoilHi = (s.breakFrozenHi * ratio).toFixed(2);
+                const qqqCoilLo = (s.breakFrozenLo * ratio).toFixed(2);
+                const qqqCoilMid = (coilMid * ratio).toFixed(2);
+                const qqqUpper = ((s.breakFrozenHi + escapeMin) * ratio).toFixed(2);
+                const qqqLower = ((s.breakFrozenLo - escapeMin) * ratio).toFixed(2);
+                const qqqRange = (coilRange * ratio).toFixed(2);
+                log('QQQ', '🎯 COIL ARMED (mirrored from NAS100) — projected $' + qqqCoilLo + '-$' + qqqCoilHi + ' (range $' + qqqRange + ', mid $' + qqqCoilMid + '). Watch break ↑$' + qqqUpper + ' or ↓$' + qqqLower + '.');
+                sendPush('🎯 QQQ COIL ARMED (NAS mirror)', 'Projected $' + qqqCoilLo + '-$' + qqqCoilHi + ' (mid $' + qqqCoilMid + ') · Watch ↑$' + qqqUpper + ' or ↓$' + qqqLower, 'coil-armed');
+              }
+            } catch (e) { /* never crash on mirror; the primary NAS alert already fired */ }
           }
         }
 
