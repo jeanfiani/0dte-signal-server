@@ -1918,6 +1918,46 @@ function processPrice(sym, price, hi, lo) {
     const isFadeEarly = /ATH|ATL|HI|LO|DIV/.test(tagEarly) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tagEarly);
     const macroContraNow = Date.now();
 
+    // ===== ACTIVE-TRADE REVERSAL LOCKOUT (added 2026-05-16) =====
+    // User reported "reversals firing too much and unnecessarily" — root cause: while an
+    // MT5 trade is active in direction D, any opposite-direction signal that passes the
+    // normal detector gates becomes a "reversal" from the EA's perspective (current EA
+    // closes; new XAU scratch logic moves SL to entry; either way it interrupts a trade
+    // that might still be working). winProtectDir already blocks opposite signals when the
+    // trade is profitable above threshold ($1 XAU / $10 NAS / $50 BTC), but trades sitting
+    // at breakeven or small-loss got no protection — exactly where most "reversals" fire.
+    //
+    // New rule (MT5 only, applies to all 3 instruments): if a trade is active in direction
+    // D, the opposite direction can ONLY emit if:
+    //   1. Conviction ≥ 6 (HIGH) — a real, multi-factor reversal, not just a fade detector
+    //      blip
+    //   2. Macro stably aligned in the OPPOSITE direction (macroAlignedFor returns true,
+    //      meaning 6+/7 alignment for ≥5min) — the macro has actually flipped, not just a
+    //      flicker
+    // If either fails, block. The original trend signal continues to work.
+    //
+    // FADE signals (ATH/ATL/HI/LO/DIV/VREV/LHF/LLF) are EXEMPT from this gate — they fire
+    // at extremes by design and a HI/ATH fade against an active winning CALL is the exact
+    // top-reversal we WANT to catch. winProtectDir + per-detector cooldowns already gate
+    // fades adequately.
+    const isTrendForReversalLockout = /BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(tagEarly) && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP|LHF|LLF/.test(tagEarly);
+    if (isTrendForReversalLockout && s.trade && s.trade.active && s.trade.ep > 0 && s.trade.type && s.trade.type !== sig.type) {
+      // Trade is active in opposite direction → apply stricter gate
+      const tradeAgeMin = Math.round((Date.now() - (s.trade.ts || Date.now())) / 60000);
+      const convOk = conv && conv.score >= 6;
+      const macroOk = macroAlignedFor(sig.type);
+      if (!convOk || !macroOk) {
+        Object.assign(s, _emitSnapshot);
+        const why = !convOk
+          ? 'conviction ' + (conv ? conv.score : 0) + '/7 < 6 (HIGH required)'
+          : 'macro not stably aligned ' + sig.type.toUpperCase() + ' for ≥5min';
+        log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — active-trade reversal lockout: ' + s.trade.type.toUpperCase() + ' trade open ' + tradeAgeMin + 'min, opposite needs conv ≥6 + macro flipped (' + why + ').');
+        return false;
+      }
+      // Both pass → genuine reversal, allow through with a log note for visibility
+      log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' active-trade reversal allowed — conv ' + conv.score + '/7 + macro stably ' + sig.type.toUpperCase() + '-aligned. ' + s.trade.type.toUpperCase() + ' trade (' + tradeAgeMin + 'min) is genuinely reversing.');
+    }
+
     // ===== BTC WEEKEND PUT-ONLY GATE (added 2026-05-16) =====
     // 52-week analysis showed BTC weekends are CALL-skewed overall (57.7% CALL) but the
     // recent 6-month regime (Nov 2025 → May 2026) is 58% PUT-favorable with bigger PUT
