@@ -3428,6 +3428,18 @@ function processPrice(sym, price, hi, lo) {
   // FAST is NOT blocked during chop (changed 2026-05-08): a $5 burst in 3 min during a quiet
   // range can BE the moment chop ends. The new MACD-extremity gate (XAU ±1.0, BTC ±100,
   // NAS ±25) already prevents FAST from firing into exhausted moves — chop block was redundant.
+  //
+  // FAST DISABLED FOR XAU (trial, 2026-05-18): 4 resolved FAST signals on XAU last 3 days
+  // produced 1 TP1→SL (~+$5) and 3 full SLs (~-$30) = net -$25. The detector keeps catching
+  // micro-spike tops/bottoms on XAU which then immediately mean-revert. Multiple iterations
+  // of RSI/MACD/chase-the-bottom gates couldn't fix the structural mismatch between FAST's
+  // "$5 momentum continuation" design and XAU's mean-reverting micro-character. Trial period:
+  // few days. If win rate on remaining detectors (BREAK / TREND / ATH / ATL / HI / LO / VREV
+  // chop-blocked) doesn't improve, re-enable. FAST stays active for BTC (1/1 TP3 in sample)
+  // and NAS100 (small sample, structurally different — futures momentum sustains better).
+  if (isXAU) {
+    // Skip FAST detector entirely for XAU. Other detectors below still evaluate.
+  } else
   if (isMT5 && s.vrevSnaps.length >= 20 && cool && (now2 - s.fastMoveLastTs > 600000)) {
     const fmWindow = 180000; // 3-minute lookback
     const fmSnaps = s.vrevSnaps.filter(sn => sn.ts > now2 - fmWindow);
