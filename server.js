@@ -2293,6 +2293,37 @@ function processPrice(sym, price, hi, lo) {
         sig._rangeBoundBump = +(range4h).toFixed(2);
       }
     }
+
+    // ===== BTC WEEKEND SUSTAINED-MOVE OVERRIDE (added 2026-05-18) =====
+    // On weekends, cross-asset macro factors (DXY/TLT/SLV/GDX/SPY/QQQ) are stale → BTC
+    // conviction caps at conv 2-3 even during real directional moves. The winners-only
+    // conv ≥4 threshold for BREAK/FAST then blocks every PUT during a sustained drop.
+    // Example: 5/18 Asian session $78K→$76.3K (-2.2% over hours) produced ZERO signals
+    // because conv stayed at 3 (just ROC×3 + STRUCT, no macro/cross-asset alignment).
+    //
+    // Override: if BTC has dropped ≥1.5% in 2h AND STRUCT confirms PUT direction AND
+    // the signal is a momentum signal (BREAK/FAST/TREND/RIDE/MFLIP), lower minConv from 4
+    // to 3 for this single emission. STRUCT confirmation is the safety net — we still
+    // require price structure to agree, just don't require macro that can't be measured
+    // when the equity feeds are closed.
+    //
+    // PUT-only because BTC CALL is hard-blocked on weekends regardless (separate gate).
+    // BTC-only because XAU/NAS have their own structural macro stacks.
+    const dowOverride = gETDow();
+    const isWeekendBtcDow = isBTC && (dowOverride === 0 || dowOverride === 6);
+    if (isWeekendBtcDow && sig.type === 'put' && minConv >= 4 && conv.score < 4 && conv.score >= 3) {
+      const hasStruct = conv.factors && conv.factors.indexOf('STRUCT') !== -1;
+      const isMomentum = /BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(tag) && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP|LHF|LLF/.test(tag);
+      if (hasStruct && isMomentum && s.atrCandles && s.atrCandles.length >= 24) {
+        const candle2hAgo = s.atrCandles[s.atrCandles.length - 24]; // 24 × 5min = 2h
+        const dropPct2h = candle2hAgo && candle2hAgo.c ? ((price - candle2hAgo.c) / candle2hAgo.c) * 100 : 0;
+        if (dropPct2h <= -1.5) {
+          log(sym, '↪️ ' + tag + ' PUT conv-floor BYPASS — weekend sustained drop ' + dropPct2h.toFixed(2) + '% in 2h + STRUCT confirmed. Allowing conv ' + conv.score + ' (was blocked by ≥4 winners-only floor on macro-stale Sunday).');
+          minConv = 3;
+        }
+      }
+    }
+
     if (conv.score < minConv) {
       // Rollback emit-related state to start-of-tick snapshot. Without this, the emit
       // code's pre-gate mutations (dailySignalCount++, lastNTs = now2, fastMoveLastTs = now2,
