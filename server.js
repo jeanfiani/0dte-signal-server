@@ -3461,8 +3461,16 @@ function processPrice(sym, price, hi, lo) {
         // the equivalent danger zone for CALL. Tightened bands: PUT 37-45, CALL 57-63.
         // VREV PUT keeps its 35 floor because VREV is designed for oversold reversals —
         // 5/14 03:39 VREV PUT @ RSI 37.8 won +$15.88 in 30min.
-        const fmRsiFloorPut = fmBreakConfirmed ? 25 : 37;
-        const fmRsiCeilCall = fmBreakConfirmed ? 75 : 63;
+        //
+        // ROUND-NUMBER-BREAK RELAXATION (tightened 2026-05-16): the relaxed bands were
+        // 25-85 PUT / 15-65→25-75 CALL — far too wide. User flagged a FAST CALL firing at
+        // RSI 73 (squarely overbought) because the round-break ceiling was 75. RSI 70+ is
+        // reliable exhaustion regardless of whether a round-break is in progress; the
+        // break itself doesn't immunize the entry against top-buying. Tightened the
+        // relaxation: CALL ceiling 75→68 (still 5 above normal 63), PUT floor 25→30
+        // (still 7 below normal 37). Symmetric and well clear of true overbought/oversold.
+        const fmRsiFloorPut = fmBreakConfirmed ? 30 : 37;
+        const fmRsiCeilCall = fmBreakConfirmed ? 68 : 63;
         // Winners-only confirmation ceilings. Both ends tightened on 2026-05-14:
         //   PUT band: 35-45 → 37-45 (floor up to escape oversold trap)
         //   CALL band: 55-65 → 57-63 (floor up + ceiling down — symmetric to PUT)
