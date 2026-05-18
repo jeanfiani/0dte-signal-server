@@ -1918,6 +1918,25 @@ function processPrice(sym, price, hi, lo) {
     const isFadeEarly = /ATH|ATL|HI|LO|DIV/.test(tagEarly) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tagEarly);
     const macroContraNow = Date.now();
 
+    // ===== V-REV CONVICTION FLOOR (added 2026-05-18) =====
+    // XAU 5/17-18 audit: 6 of 7 XAU signals SL'd in one night. 4 of the 6 losers were V-REV
+    // conv-3 (the minimum allowed for V-REV under the isMomentumCatch exemption). All four
+    // had factors WITHOUT the MACRO label — meaning fewer than ~4 cross-asset factors agreed
+    // on the V-REV's direction. The one V-REV winner (#2 PUT) had conv 3 BUT did include
+    // the MACRO factor.
+    //
+    // New rule for V-REV (XAU/BTC/NAS): require conv ≥ 4 OR the MACRO label present.
+    // Catches the "bottom of a borderline-aligned macro" failure mode without crippling
+    // V-REV when macro is genuinely flipping (MACRO factor confirms the flip is real).
+    if (/VREV/.test(tagEarly)) {
+      const vrevHasMacro = conv.factors && conv.factors.indexOf('MACRO') !== -1;
+      if (conv.score < 4 && !vrevHasMacro) {
+        Object.assign(s, _emitSnapshot);
+        log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — V-REV conv floor: conv ' + conv.score + '/7 [' + (conv.factors || []).join(',') + '] < 4 AND no MACRO factor. V-REV needs either 4+ factors OR macro confirmation to avoid dead-cat catches.');
+        return false;
+      }
+    }
+
     // ===== ACTIVE-TRADE REVERSAL LOCKOUT (added 2026-05-16) =====
     // User reported "reversals firing too much and unnecessarily" — root cause: while an
     // MT5 trade is active in direction D, any opposite-direction signal that passes the
@@ -4090,9 +4109,14 @@ function processPrice(sym, price, hi, lo) {
   // ===== V-REVERSAL DETECTOR (XAU only) =====
   // Catches momentum reversals: price drops/rallies $8+ in 15 min, then ROC flips sharply
   // Different from trend-following signals — fires on the turn itself, not after EMAs catch up
-  // NOTE: V-REV does NOT have a chop block. It's a reversal detector — designed exactly for the
-  // sharp drop+bounce pattern that often happens during ranging/chop sessions. Sits with HI/LO Rev
-  // and ATH/ATL as a "fade in chop" detector. (Earlier audit lumped it with TREND/BREAKOUT — wrong.)
+  //
+  // CHOP BLOCK (added 2026-05-18 after 5/17-18 XAU audit: 4 of 6 losers were V-REV during
+  // a clearly choppy XAU range): V-REV is RE-BLOCKED during chopActive. The earlier removal
+  // (task #26) reasoned "V-REV is designed for the sharp drop+bounce pattern that often
+  // happens during chop." But empirically that's wrong — in chop, every wobble LOOKS like a
+  // sharp drop+bounce but the bounce is just the next wobble, not a real reversal. V-REV
+  // works in DIRECTIONAL markets where a deep washout actually reverses. In chop, V-REV
+  // fires both directions repeatedly (catalogued tonight 22:07 PUT + 22:37 CALL both SL'd).
   // Cooldown raised 2026-05-11 b: 10 → 15 min. Earlier 10-min was too short — two VREVs
   // fired 10 min apart at $4726.51 and $4726.97 (same direction, virtually same price).
   // VREV-specific opposite-direction cooldown — stricter than the global 10-min flipCool.
@@ -4107,7 +4131,17 @@ function processPrice(sym, price, hi, lo) {
   // → $80,700 in 2hr — a $900 V that nothing caught because BTC had no V-REV detector).
   // All thresholds are scaled by symbol — BTC values are ~40× XAU.
   const vrevEnabled = isXAU || isBTC;
-  if (vrevEnabled && s.vrevSnaps.length >= 60 && cool && (now2 - s.vrevLastTs > 900000)) {
+
+  // Chop block (2026-05-18): if chopActive, suppress V-REV but continue to other detectors
+  // below (ATH/ATL, MFLIP, TREND RIDE still need to evaluate). Throttled log every 10 min so
+  // we don't spam each tick.
+  const vrevChopBlocked = vrevEnabled && s.chopActive;
+  if (vrevChopBlocked && now2 - (s.vrevChopBlockLogTs || 0) > 600000) {
+    log(sym, '🌊 V-REV suppressed — chop mode active (V-REV fires too often in chop, each wobble looks like a reversal).');
+    s.vrevChopBlockLogTs = now2;
+  }
+
+  if (vrevEnabled && !vrevChopBlocked && s.vrevSnaps.length >= 60 && cool && (now2 - s.vrevLastTs > 900000)) {
     // Find the high and low in the last 15 min of snapshots
     const lookback = s.vrevSnaps.filter(sn => sn.ts > now2 - 900000); // 15 min
     if (lookback.length >= 30) {
@@ -4210,11 +4244,17 @@ function processPrice(sym, price, hi, lo) {
       // RSI is still oversold at the turn. Asymmetric: keep the *opposite* side tight (CALL
       // still capped at 65 because if RSI is >65 you're catching the bounce too late and the
       // setup is more BREAK than VREV; same logic reversed for PUT).
+      //
+      // FIX 2026-05-18 (XAU 5/17-18 audit: 4 of 6 losers were V-REV conv-3 catching falling-
+      // knife at RSI 32.9): the RSI 28 floor was too aggressive — V-REV CALL at RSI 32.9
+      // SL'd as price kept dropping. Floor raised back from 28 → 32. Symmetric: PUT ceiling
+      // 72 → 68. Keeps V-REV's deep-washout edge but blocks the most-extreme entries where
+      // the "bounce" was just a dead-cat.
       if (dropThenBounce && !vrevMacroOppOkCall) {
         const which = putStillActive ? 'still active' : 'ended ' + Math.round((tVR - putEnd) / 60000) + 'min ago after ' + Math.round(putDur / 60000) + 'min';
         log(sym, '🚫 ⬆VREV CALL BLOCKED — macro PUT recently aligned (' + which + '). Bounce is dead-cat in PUT trend, not real reversal.');
       }
-      if (dropThenBounce && roc3 > symRocThr * 2 && rsiV > 28 && rsiV < 65 && vrevGapOkCall && vrevRoundOkCall && vrevRoomOkCall && vrevMacroOppOkCall && flipCoolFor('call') && vrevFlipOk('call') && winProtectDir !== 'put') {
+      if (dropThenBounce && roc3 > symRocThr * 2 && rsiV > 32 && rsiV < 65 && vrevGapOkCall && vrevRoundOkCall && vrevRoomOkCall && vrevMacroOppOkCall && flipCoolFor('call') && vrevFlipOk('call') && winProtectDir !== 'put') {
         // CALL reversal: was dropping, now bouncing with strong upward ROC
         s.vrevLastTs = now2;
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
@@ -4234,7 +4274,7 @@ function processPrice(sym, price, hi, lo) {
         const which = callStillActive ? 'still active' : 'ended ' + Math.round((tVR - callEnd) / 60000) + 'min ago after ' + Math.round(callDur / 60000) + 'min';
         log(sym, '🚫 ⬇VREV PUT BLOCKED — macro CALL recently aligned (' + which + '). Drop is profit-taking in CALL trend, not real reversal.');
       }
-      if (rallyThenDrop && roc3 < -symRocThr * 2 && rsiV > 35 && rsiV < 72 && vrevGapOkPut && vrevRoundOkPut && vrevRoomOkPut && vrevMacroOppOkPut && flipCoolFor('put') && vrevFlipOk('put') && winProtectDir !== 'call') {
+      if (rallyThenDrop && roc3 < -symRocThr * 2 && rsiV > 35 && rsiV < 68 && vrevGapOkPut && vrevRoundOkPut && vrevRoomOkPut && vrevMacroOppOkPut && flipCoolFor('put') && vrevFlipOk('put') && winProtectDir !== 'call') {
         // PUT reversal: was rallying, now dropping with strong downward ROC
         s.vrevLastTs = now2;
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
