@@ -2023,6 +2023,25 @@ function processPrice(sym, price, hi, lo) {
       }
     }
 
+    // ===== ATH/ATL CONVICTION FLOOR (added 2026-05-18) =====
+    // ATH/ATL fade against 5-day rolling extremes — they're STRUCT-exempt by design
+    // (faders against price structure). But without MACRO confirmation, fading a rolling
+    // extreme during a bigger trend is exactly the "catching a falling/rising knife"
+    // failure mode. 5/18 16:00 XAU ATH PUT @ $4559 SL'd: had conv 4 (ROC×3·TLT·GDX·TRUMP)
+    // but no MACRO and no STRUCT — price was above macro EMA in a bigger uptrend → fade
+    // failed and price continued up $4-5 against the PUT.
+    //
+    // New rule: ATH/ATL needs conv ≥ 5 OR MACRO factor present. Stricter than V-REV (≥4)
+    // because rolling-extreme fades carry more risk than fresh-V-bottom catches.
+    if (/ATH|ATL/.test(tagEarly)) {
+      const fadeHasMacro = conv.factors && conv.factors.indexOf('MACRO') !== -1;
+      if (conv.score < 5 && !fadeHasMacro) {
+        Object.assign(s, _emitSnapshot);
+        log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ATH/ATL conv floor: conv ' + conv.score + '/7 [' + (conv.factors || []).join(',') + '] < 5 AND no MACRO factor. Rolling-extreme fades need stronger confirmation (macro alignment or 5+ factors) to avoid fading into a bigger trend.');
+        return false;
+      }
+    }
+
     // ===== ACTIVE-TRADE REVERSAL LOCKOUT (added 2026-05-16) =====
     // User reported "reversals firing too much and unnecessarily" — root cause: while an
     // MT5 trade is active in direction D, any opposite-direction signal that passes the
