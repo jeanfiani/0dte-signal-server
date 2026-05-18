@@ -1559,9 +1559,26 @@ function processPrice(sym, price, hi, lo) {
   const roc12 = isMT5 ? calcROC(s.prices, 720) : 0;
 
   // Track RSI at session high — used by Session High Reversal Detector
-  if (price >= s.sessionHigh) s.rsiAtSessionHigh = rsiV;
-  // Track RSI at session low — used by Session Low Reversal Detector (added 2026-05-13)
-  if (price <= s.sessionLow) s.rsiAtSessionLow = rsiV;
+  // FIX 2026-05-18: was snapshot-at-first-touch — if RSI was <55 at initial high touch,
+  // HI signal was locked out for the rest of the session even when RSI later rose to 60+
+  // at the same level. New: track the MAX RSI seen anywhere within proximity of session
+  // high (XAU ±$1, BTC ±$50, NAS ±$10). Symmetric: track MIN RSI near session low for LO.
+  // This unlocks HI/LO when price drifts up/down slowly with RSI catching up later.
+  // sessionHigh/Low itself is updated at line ~1353 (with sessionHighUpdateTs). Here we
+  // ONLY track the RSI characterization at those levels.
+  const sessionLvlProximity = isBTC ? 50 : isNAS ? 10 : isXAU ? 1 : 0.10;
+  if (price >= s.sessionHigh) {
+    s.rsiAtSessionHigh = rsiV; // fresh high → fresh RSI snapshot
+  } else if (s.sessionHigh > -Infinity && (s.sessionHigh - price) <= sessionLvlProximity) {
+    // near session high (within $X) — keep the MAX RSI seen at this level
+    if (rsiV > s.rsiAtSessionHigh) s.rsiAtSessionHigh = rsiV;
+  }
+  if (price <= s.sessionLow) {
+    s.rsiAtSessionLow = rsiV;
+  } else if (s.sessionLow < Infinity && (price - s.sessionLow) <= sessionLvlProximity) {
+    // near session low (within $X) — keep the MIN RSI seen at this level
+    if (rsiV < s.rsiAtSessionLow) s.rsiAtSessionLow = rsiV;
+  }
   // Track RSI at rolling ATH/ATL — used by ATH/ATL Reversal Detector
   if (isMT5) {
     if (s.rollingHigh > 0 && price >= s.rollingHigh * 0.999) { s.rsiAtRollingHigh = rsiV; s.athApproachTs = Date.now(); s.athApproachPrice = price; }
@@ -1782,6 +1799,20 @@ function processPrice(sym, price, hi, lo) {
       if ((isCall && tltDir === 'up') || (!isCall && tltDir === 'down')) { sc++; factors.push('TLT'); }
       if (slvPrice > 0 && ((isCall && slvDir === 'up') || (!isCall && slvDir === 'down'))) { sc++; factors.push('SLV'); }
       if (gdxPrice > 0 && ((isCall && gdxDir === 'up') || (!isCall && gdxDir === 'down'))) { sc++; factors.push('GDX'); }
+      // OB factor for XAU (added 2026-05-18): previously only in BTC/NAS conv block.
+      // XAU does track obZone, and 5/18 audit showed multiple XAU FAST CALL losers
+      // firing into bearish supply zones (-1 obBoost penalty was applied to base score
+      // but didn't influence conv → didn't help reach the conv ≥4 threshold either way).
+      // Direction-aware: bull OB unmitigated → CALL aligned; mitigated flips to PUT aligned.
+      if (s.obZone && !s.obMitigated) {
+        if ((isCall && s.obZone.dir === 'call') || (!isCall && s.obZone.dir === 'put')) {
+          sc++; factors.push('OB');
+        }
+      } else if (s.obZone && s.obMitigated) {
+        if ((isCall && s.obZone.dir === 'put') || (!isCall && s.obZone.dir === 'call')) {
+          sc++; factors.push('OB-flip');
+        }
+      }
     } else if (isBTC || isNAS) {
       // BTC/NAS100-specific: SPY, QQQ, DXY (risk-on correlation), cross-asset
       const spyS = S['SPY'], qqqS = S['QQQ'];
@@ -1917,6 +1948,61 @@ function processPrice(sym, price, hi, lo) {
     const tagEarly = sig.score || '';
     const isFadeEarly = /ATH|ATL|HI|LO|DIV/.test(tagEarly) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tagEarly);
     const macroContraNow = Date.now();
+
+    // ===== OB PROXIMITY HARD BLOCK (added 2026-05-18) =====
+    // The soft obBoost penalty (-1 on base score) wasn't strong enough to stop signals
+    // firing into known opposing OB zones. 5/18 log showed XAU CALL fire while bot was
+    // logging "OB penalty: CALL -1 — at bearish supply $4540.36-$4541.83" — the bot
+    // recognized the resistance and still fired anyway.
+    //
+    // New rule: if a signal direction is INTO an opposing unmitigated OB zone within
+    // proximity range (XAU $5, BTC $200, NAS $25), HARD BLOCK the signal. The OB zone
+    // is a documented institutional supply/demand level — buying right below bearish
+    // supply or selling right above bullish demand is structurally bad.
+    //
+    // "Into" means: CALL firing while price < ob.lo (approaching bearish OB from below)
+    //               OR PUT firing while price > ob.hi (approaching bullish OB from above)
+    // Fade signals (HI/LO/ATH/ATL/VREV/DIV/SWEEP/LHF/LLF) are EXEMPT — those are designed
+    // to fire AT extremes/levels by definition.
+    if (s.obZone && !s.obMitigated && !s.obDeparted) {
+      const obProxRange = isBTC ? 200 : isNAS ? 25 : isXAU ? 5 : 0;
+      const isFadeForOb = /VREV|ATH|ATL|HI|LO|DIV|SWEEP|LHF|LLF/.test(tagEarly);
+      if (obProxRange > 0 && !isFadeForOb) {
+        const ob = s.obZone;
+        // CALL firing into bearish supply (ob.dir === 'put' = bearish OB above)
+        if (sig.type === 'call' && ob.dir === 'put' && price < ob.lo && (ob.lo - price) <= obProxRange) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🧱 ' + tagEarly + ' CALL BLOCKED — OB proximity: bearish supply zone $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' is $' + (ob.lo - price).toFixed(2) + ' above current price (within $' + obProxRange + ' hard-block range). Wait for OB break or fade signal.');
+          return false;
+        }
+        // PUT firing into bullish demand (ob.dir === 'call' = bullish OB below)
+        if (sig.type === 'put' && ob.dir === 'call' && price > ob.hi && (price - ob.hi) <= obProxRange) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🧱 ' + tagEarly + ' PUT BLOCKED — OB proximity: bullish demand zone $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' is $' + (price - ob.hi).toFixed(2) + ' below current price (within $' + obProxRange + ' hard-block range). Wait for OB break or fade signal.');
+          return false;
+        }
+      }
+    }
+
+    // ===== NAS CHOP SUPPRESSION (added 2026-05-18) =====
+    // 5/18 audit: 4 of 5 NAS RIDE losses + 1 BREAK loss happened during NAS chop range
+    // $28800-29150 overnight. RIDE/FAST/BREAK kept chasing perceived trend in a flat
+    // range. User decision: in NAS chop, allow ONLY fade-at-extremes detectors (V-REV,
+    // LHF, LLF) which are DESIGNED for the bounce-off-the-edges pattern. Block all other
+    // detectors.
+    //
+    // V-REV is currently disabled for NAS (vrevEnabled = isXAU || isBTC) so the V-REV
+    // exception is structurally moot today, but keeping it in the regex preserves the
+    // rule's intent if V-REV gets extended to NAS later. LHF/LLF DO run for NAS — they're
+    // the active fade detectors that survive this gate.
+    if (isNAS && s.chopActive) {
+      const isFadeAllowedInChop = /VREV|LHF|LLF/.test(tagEarly);
+      if (!isFadeAllowedInChop) {
+        Object.assign(s, _emitSnapshot);
+        log(sym, '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — NAS chop mode active (only V-REV / LHF / LLF allowed in chop; other detectors consistently lose in flat NAS range).');
+        return false;
+      }
+    }
 
     // ===== V-REV CONVICTION FLOOR (added 2026-05-18) =====
     // XAU 5/17-18 audit: 6 of 7 XAU signals SL'd in one night. 4 of the 6 losers were V-REV
@@ -3037,7 +3123,16 @@ function processPrice(sym, price, hi, lo) {
     const lhfPutCoolOk   = (Date.now() - s.lastLhfPutTs) >= lhfCooldownMs;
     const lhfPutRsiOk    = rsiV < 60 && rsiV > 35;
     const lhfPutMacdOk   = macdL < macdS && macdHist < 0;
-    const lhfPutMacroOk  = macroAlignedFor('put');
+    // Relaxed LHF macro gate (2026-05-18): original macroAlignedFor required 6+/7 stable
+    // for 5min — far too strict, produced 885 blocks in one session with zero fires.
+    // New: accept EITHER the strict alignment OR a softer "5+/7 stable for 2min" check.
+    // The softer path catches setups where macro is forming but hasn't reached full strength.
+    // Other gates (RSI rolling, MACD compressing, fresh local high <25min) still gate quality.
+    const SOFT_MACRO_THR = 5;
+    const SOFT_MACRO_STABLE_MS = 120000; // 2 min
+    const tSoftMacro = Date.now();
+    const lhfPutMacroOk  = macroAlignedFor('put') ||
+      (s.fullConvSincePut > 0 && (tSoftMacro - s.fullConvSincePut) >= SOFT_MACRO_STABLE_MS && convictionFor('put').score >= SOFT_MACRO_THR);
     const lhfPutFlipOk   = flipCoolFor('put');
     const lhfPutWinOk    = winProtectDir !== 'call';
     if (lhfPutTimingOk && lhfPutDistOk && lhfPutRangeOk && lhfPutCoolOk &&
@@ -3084,7 +3179,7 @@ function processPrice(sym, price, hi, lo) {
     } else if (lhfPutTimingOk && lhfPutDistOk && lhfPutRangeOk && lhfPutCoolOk) {
       // Log near-misses so we can audit how often the gates block real setups
       let reason;
-      if (!lhfPutMacroOk) reason = 'macro not PUT-aligned ≥5min';
+      if (!lhfPutMacroOk) reason = 'macro not PUT-aligned (need strict 6+/7@5min OR soft 5+/7@2min)';
       else if (!lhfPutRsiOk) reason = 'RSI ' + rsiV.toFixed(1) + ' outside 35-60';
       else if (!lhfPutMacdOk) reason = 'MACD not compressing bearish (line ' + macdL.toFixed(3) + ' vs sig ' + macdS.toFixed(3) + ', hist ' + macdHist.toFixed(3) + ')';
       else if (!lhfPutFlipOk) reason = 'flip cooldown';
@@ -3100,7 +3195,9 @@ function processPrice(sym, price, hi, lo) {
     const llfCallCoolOk   = (Date.now() - s.lastLlfCallTs) >= lhfCooldownMs;
     const llfCallRsiOk    = rsiV > 40 && rsiV < 65;
     const llfCallMacdOk   = macdL > macdS && macdHist > 0;
-    const llfCallMacroOk  = macroAlignedFor('call');
+    // Same relaxed macro gate for LLF (mirror of LHF). See LHF comment above.
+    const llfCallMacroOk  = macroAlignedFor('call') ||
+      (s.fullConvSinceCall > 0 && (tSoftMacro - s.fullConvSinceCall) >= SOFT_MACRO_STABLE_MS && convictionFor('call').score >= SOFT_MACRO_THR);
     const llfCallFlipOk   = flipCoolFor('call');
     const llfCallWinOk    = winProtectDir !== 'put';
     if (llfCallTimingOk && llfCallDistOk && llfCallRangeOk && llfCallCoolOk &&
@@ -3142,7 +3239,7 @@ function processPrice(sym, price, hi, lo) {
       }
     } else if (llfCallTimingOk && llfCallDistOk && llfCallRangeOk && llfCallCoolOk) {
       let reason;
-      if (!llfCallMacroOk) reason = 'macro not CALL-aligned ≥5min';
+      if (!llfCallMacroOk) reason = 'macro not CALL-aligned (need strict 6+/7@5min OR soft 5+/7@2min)';
       else if (!llfCallRsiOk) reason = 'RSI ' + rsiV.toFixed(1) + ' outside 40-65';
       else if (!llfCallMacdOk) reason = 'MACD not compressing bullish (line ' + macdL.toFixed(3) + ' vs sig ' + macdS.toFixed(3) + ', hist ' + macdHist.toFixed(3) + ')';
       else if (!llfCallFlipOk) reason = 'flip cooldown';
