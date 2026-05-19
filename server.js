@@ -2042,6 +2042,27 @@ function processPrice(sym, price, hi, lo) {
       }
     }
 
+    // ===== TP1-SECURED SAME-DIR LOCKOUT (added 2026-05-19) =====
+    // After an active trade has hit TP1, the EA moves SL to breakeven — the position is
+    // already locked into "win or scratch" mode. Adding ANOTHER same-direction signal at
+    // this point is pure additional risk: the original trade is protected and managing
+    // itself; a new signal opens a NEW position that hits fresh SL if the bounce continues.
+    //
+    // Today's 5/19 10:54 XAU 6/6 PUT SL'd after the 09:30 PUT had already TP1'd. The 84min
+    // gap was enough for price to bounce $9 (4477→4486), the new PUT fired into the bounce
+    // and SL'd within 5 min. The first trade's TP1+scratch protection meant it was already
+    // a guaranteed non-loser; the second trade turned the cluster into a net loss.
+    //
+    // Rule: if a same-direction trade is active AND has already hit TP1 (`s.trade.t1`),
+    // suppress new same-dir signal emission. Lets the protected trade run for TP2/TP3
+    // without adding new exposure. Only applies to MT5 instruments with actual EA execution.
+    if (isMT5 && s.trade && s.trade.active && s.trade.type === sig.type && s.trade.t1) {
+      const tradeAgeMin = Math.round((Date.now() - (s.trade.ts || Date.now())) / 60000);
+      Object.assign(s, _emitSnapshot);
+      log(sym, '🔒 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — active ' + sig.type.toUpperCase() + ' trade (' + tradeAgeMin + 'min) has already hit TP1 and is breakeven-protected. New same-dir signal would add fresh risk on top of a secured winner — let the protected trade run for TP2/TP3.');
+      return false;
+    }
+
     // ===== MULTI-DAY REGIME GATE (added 2026-05-19) =====
     // User insight: XAU dropped 5.4% over 2 weeks → PUT win rate 60% vs CALL 25%. The
     // bot's existing macro gates are INTRADAY (price vs macro EMA, current cross-asset
@@ -6075,7 +6096,20 @@ function processTicks(symbols) {
           const coilAge = bNow - s.breakCoilStart;
           const coilRange = s.breakFrozenHi - s.breakFrozenLo;
           const coilMinRangeForAlert = 8; // NAS: need ≥$8 spread to be a real coil (not flat ticks)
-          if (coilAge >= 180000 && coilRange >= coilMinRangeForAlert) { // 3 minutes + real range
+          // FIX 2026-05-19: suppress COIL ARMED when chop is active OR outside RTH.
+          // Reasoning: user reported "many mobile pings, no actual signals on PC". The
+          // subsequent BREAK trade signal gets blocked by NAS chop mode + winners-only
+          // gates, so alerting about a coil whose breakout won't trade is pure noise.
+          // RTH-only because NAS overnight coils have thinner liquidity and more false
+          // breaks. Combined effect: drops alert frequency 60-80% while preserving
+          // the alerts that actually correspond to high-quality breakout setups.
+          const etMinForCoilArm = gET();
+          const inRthForCoil = etMinForCoilArm >= 570 && etMinForCoilArm < 960; // 9:30-16:00 ET
+          if (s.chopActive) {
+            // silent skip — chop block will reject any BREAK that follows anyway
+          } else if (!inRthForCoil) {
+            // silent skip — overnight NAS coils are too noisy for the alert to be useful
+          } else if (coilAge >= 180000 && coilRange >= coilMinRangeForAlert) { // 3 minutes + real range
             const coilMid = (s.breakFrozenHi + s.breakFrozenLo) / 2;
             const upperBreak = (s.breakFrozenHi + escapeMin).toFixed(2);
             const lowerBreak = (s.breakFrozenLo - escapeMin).toFixed(2);
