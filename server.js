@@ -1984,22 +1984,22 @@ function processPrice(sym, price, hi, lo) {
       }
     }
 
-    // ===== NAS CHOP SUPPRESSION (added 2026-05-18) =====
-    // 5/18 audit: 4 of 5 NAS RIDE losses + 1 BREAK loss happened during NAS chop range
-    // $28800-29150 overnight. RIDE/FAST/BREAK kept chasing perceived trend in a flat
-    // range. User decision: in NAS chop, allow ONLY fade-at-extremes detectors (V-REV,
-    // LHF, LLF) which are DESIGNED for the bounce-off-the-edges pattern. Block all other
-    // detectors.
+    // ===== CHOP SUPPRESSION — NAS + BTC (extended 2026-05-19 to BTC) =====
+    // Original 5/18: 4 of 5 NAS RIDE losses + 1 BREAK loss during NAS chop $28800-29150.
+    // Extended 5/19: 3 BTC BREAK losses overnight in $76,600-77,200 chop range. Same
+    // failure mode — BREAK/FAST chase false range escapes that immediately revert.
     //
-    // V-REV is currently disabled for NAS (vrevEnabled = isXAU || isBTC) so the V-REV
-    // exception is structurally moot today, but keeping it in the regex preserves the
-    // rule's intent if V-REV gets extended to NAS later. LHF/LLF DO run for NAS — they're
-    // the active fade detectors that survive this gate.
-    if (isNAS && s.chopActive) {
+    // Rule: in chop mode (for NAS or BTC), allow ONLY fade-at-extremes detectors (V-REV,
+    // LHF, LLF). These are DESIGNED for the bounce-off-the-edges pattern. Block all other
+    // detectors (BREAK, FAST, TREND, RIDE, ATH, ATL, HI, LO, MFLIP, 6/6, etc.).
+    //
+    // XAU is NOT included — XAU chop produces different patterns and its detectors have
+    // separate gates (e.g., V-REV chop block at the V-REV level, FAST disabled, etc.).
+    if ((isNAS || isBTC) && s.chopActive) {
       const isFadeAllowedInChop = /VREV|LHF|LLF/.test(tagEarly);
       if (!isFadeAllowedInChop) {
         Object.assign(s, _emitSnapshot);
-        log(sym, '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — NAS chop mode active (only V-REV / LHF / LLF allowed in chop; other detectors consistently lose in flat NAS range).');
+        log(sym, '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' chop mode active (only V-REV / LHF / LLF allowed in chop; other detectors consistently lose in flat range).');
         return false;
       }
     }
@@ -2039,6 +2039,57 @@ function processPrice(sym, price, hi, lo) {
         Object.assign(s, _emitSnapshot);
         log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ATH/ATL conv floor: conv ' + conv.score + '/7 [' + (conv.factors || []).join(',') + '] < 5 AND no MACRO factor. Rolling-extreme fades need stronger confirmation (macro alignment or 5+ factors) to avoid fading into a bigger trend.');
         return false;
+      }
+    }
+
+    // ===== MULTI-DAY REGIME GATE (added 2026-05-19) =====
+    // User insight: XAU dropped 5.4% over 2 weeks → PUT win rate 60% vs CALL 25%. The
+    // bot's existing macro gates are INTRADAY (price vs macro EMA, current cross-asset
+    // alignment). They don't capture the multi-day directional regime that makes one
+    // direction structurally favored for days/weeks.
+    //
+    // This gate adds an explicit regime layer using s.dailyLevels (last 5 completed days
+    // of high/low). Compare current price to the midpoint of the OLDEST day in the window:
+    //   - Net change ≥ +X% over 5 days → BULL regime (counter PUT needs higher conv)
+    //   - Net change ≤ -X% over 5 days → BEAR regime (counter CALL needs higher conv)
+    //   - Strong regime (≥2% XAU / ≥5% BTC / ≥3% NAS) → counter direction needs conv ≥6
+    //   - Weak regime   (≥1% XAU / ≥2.5% BTC / ≥1.5% NAS) → counter direction needs conv ≥5
+    //   - Neutral → no change
+    //
+    // Effect: in a strong bearish regime like the current XAU downtrend, CALL signals
+    // need rare conv ≥6 HIGH — most XAU CALLs (the consistent losers) get blocked while
+    // PUT signals fire normally. Symmetric for bull regimes. The bot effectively "trades
+    // with the trend" without hard-blocking the rare high-conviction counter-trend setup.
+    if (s.dailyLevels && s.dailyLevels.length >= 5 && price > 0) {
+      const oldestDay = s.dailyLevels[0]; // 5 days ago
+      if (oldestDay && oldestDay.high > 0 && oldestDay.low > 0) {
+        const oldestMid = (oldestDay.high + oldestDay.low) / 2;
+        const netChgPct = ((price - oldestMid) / oldestMid) * 100;
+        // Per-symbol regime thresholds (% change over 5 days)
+        const strongThr = isXAU ? 2.0 : isBTC ? 5.0 : isNAS ? 3.0 : 1.0;
+        const weakThr   = isXAU ? 1.0 : isBTC ? 2.5 : isNAS ? 1.5 : 0.5;
+        let regimeDir = 'neutral', regimeStrength = 0;
+        if (netChgPct >=  strongThr) { regimeDir = 'bull'; regimeStrength = 2; }
+        else if (netChgPct <= -strongThr) { regimeDir = 'bear'; regimeStrength = 2; }
+        else if (netChgPct >=  weakThr) { regimeDir = 'bull'; regimeStrength = 1; }
+        else if (netChgPct <= -weakThr) { regimeDir = 'bear'; regimeStrength = 1; }
+
+        // Annotate for diagnostics
+        sig._regime = { dir: regimeDir, strength: regimeStrength, netChgPct: +netChgPct.toFixed(2) };
+
+        // Block counter-regime signals if conviction insufficient
+        const isCounterRegime = (regimeDir === 'bear' && sig.type === 'call') ||
+                               (regimeDir === 'bull' && sig.type === 'put');
+        if (isCounterRegime) {
+          const requiredConv = regimeStrength === 2 ? 6 : 5;
+          if (conv.score < requiredConv) {
+            Object.assign(s, _emitSnapshot);
+            const strengthLabel = regimeStrength === 2 ? 'STRONG' : 'WEAK';
+            const dirLabel = regimeDir.toUpperCase();
+            log(sym, '🌍 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — multi-day ' + strengthLabel + ' ' + dirLabel + ' regime (5-day ' + (netChgPct >= 0 ? '+' : '') + netChgPct.toFixed(1) + '%): counter-direction needs conv ≥' + requiredConv + ', got ' + conv.score + '/7.');
+            return false;
+          }
+        }
       }
     }
 
@@ -5381,7 +5432,11 @@ function buildCfdTrade(type, price, atr, sym) {
   // Minimum $5 for SL and TP1 — prevents noise-level levels during low-ATR periods
   // XAU max $10 cap — keeps risk tight on gold's typical ATR range
   const slDist = isXAU ? Math.min(Math.max(atr * mults.sl, 5), 10) : Math.max(atr * mults.sl, 5);
-  const tp1Dist = isXAU ? Math.min(Math.max(atr * mults.t1, 5), 10) : Math.max(atr * mults.t1, 5);
+  // XAU TP1 hard-capped at $5 (added 2026-05-19): user wants fast profit-secure on XAU
+  // since the SL→breakeven scratch logic depends on TP1 hitting. Smaller TP1 = higher hit
+  // rate = more trades locked at breakeven instead of full SL. TP2/TP3 stay ATR-based to
+  // capture larger runners.
+  const tp1Dist = isXAU ? 5.0 : Math.max(atr * mults.t1, 5);
   const tp2Dist = atr * mults.t2;
   const tp3Dist = atr * mults.t3;
   const sl = iC ? price - slDist : price + slDist;
@@ -5444,7 +5499,8 @@ function attachTpSl(sig, type, price, atr, sym) {
   const mults = isNAS
     ? { sl: 2, t1: 3, t2: 6, t3: 12 }
     : { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
-  const tp1D = isXAU ? Math.min(Math.max(atr * mults.t1, 5), 10) : Math.max(atr * mults.t1, 5);
+  // XAU TP1 hard-capped at $5 (mirrors buildCfdTrade — added 2026-05-19)
+  const tp1D = isXAU ? 5.0 : Math.max(atr * mults.t1, 5);
   const slD = isXAU ? Math.min(Math.max(atr * mults.sl, 5), 10) : Math.max(atr * mults.sl, 5);
   sig.tp1 = (iC ? price + tp1D : price - tp1D).toFixed(2);
   sig.tp2 = (iC ? price + atr * mults.t2 : price - atr * mults.t2).toFixed(2);
