@@ -1942,6 +1942,17 @@ function processPrice(sym, price, hi, lo) {
   // of conv-logged data shows what wins / loses.
   function enrichSig(sig) {
     if (!isMT5) return true; // non-MT5 instruments don't have conv — let them through
+
+    // ===== XAU CALL TRIAL DISABLE (added 2026-05-20, 48h trial) =====
+    // XAU CALL win rate 25% (worse than coin flip) vs PUT 60% in recent data. Macro has
+    // been structurally bearish ($4720→$4470 over 2 weeks). User decision: hard-disable
+    // XAU CALL emission for 48h to validate PUT-only performance. Revert by deleting
+    // this block when XAU regime flips bullish or trial ends.
+    if (isXAU && sig.type === 'call') {
+      log(sym, '🛑 ' + (sig.score || '') + ' CALL BLOCKED — XAU CALL signals disabled (48h trial, PUT-only mode). Recent CALL win rate 25% vs PUT 60%; macro structurally bearish.');
+      return false;
+    }
+
     const conv = convictionFor(sig.type);
     sig.conv = conv;
 
@@ -2081,35 +2092,61 @@ function processPrice(sym, price, hi, lo) {
     // need rare conv ≥6 HIGH — most XAU CALLs (the consistent losers) get blocked while
     // PUT signals fire normally. Symmetric for bull regimes. The bot effectively "trades
     // with the trend" without hard-blocking the rare high-conviction counter-trend setup.
-    if (s.dailyLevels && s.dailyLevels.length >= 5 && price > 0) {
-      const oldestDay = s.dailyLevels[0]; // 5 days ago
-      if (oldestDay && oldestDay.high > 0 && oldestDay.low > 0) {
-        const oldestMid = (oldestDay.high + oldestDay.low) / 2;
-        const netChgPct = ((price - oldestMid) / oldestMid) * 100;
-        // Per-symbol regime thresholds (% change over 5 days)
-        const strongThr = isXAU ? 2.0 : isBTC ? 5.0 : isNAS ? 3.0 : 1.0;
-        const weakThr   = isXAU ? 1.0 : isBTC ? 2.5 : isNAS ? 1.5 : 0.5;
-        let regimeDir = 'neutral', regimeStrength = 0;
-        if (netChgPct >=  strongThr) { regimeDir = 'bull'; regimeStrength = 2; }
-        else if (netChgPct <= -strongThr) { regimeDir = 'bear'; regimeStrength = 2; }
-        else if (netChgPct >=  weakThr) { regimeDir = 'bull'; regimeStrength = 1; }
-        else if (netChgPct <= -weakThr) { regimeDir = 'bear'; regimeStrength = 1; }
+    // Compute regime via best-available data source. Two paths:
+    //   PRIMARY:  s.dailyLevels (5+ completed days) — most accurate, used when persisted
+    //   FALLBACK: s.macroSnaps (5-min price history) — kicks in when dailyLevels < 5 days,
+    //             which happens after a fresh deploy or any state wipe. Uses the oldest
+    //             macroSnap as the anchor, requires ≥24h of history to be meaningful.
+    //
+    // The fallback bootstrap was added 2026-05-20 after 5/19 XAU showed 3 of 4 counter-
+    // regime CALL signals firing because dailyLevels hadn't accumulated yet after the
+    // deploy. Without the fallback, the regime gate is silent until 5 daily resets pass.
+    let regimeNetChgPct = null;
+    let regimeWindowLabel = '';
+    if (price > 0) {
+      if (s.dailyLevels && s.dailyLevels.length >= 5) {
+        const oldestDay = s.dailyLevels[0];
+        if (oldestDay && oldestDay.high > 0 && oldestDay.low > 0) {
+          const oldestMid = (oldestDay.high + oldestDay.low) / 2;
+          regimeNetChgPct = ((price - oldestMid) / oldestMid) * 100;
+          regimeWindowLabel = '5-day';
+        }
+      }
+      // Fallback: use macroSnaps oldest entry if ≥ 24h old
+      if (regimeNetChgPct === null && s.macroSnaps && s.macroSnaps.length > 0) {
+        const oldest = s.macroSnaps[0];
+        const ageHours = (Date.now() - oldest.ts) / 3600000;
+        if (ageHours >= 24 && oldest.p > 0) {
+          regimeNetChgPct = ((price - oldest.p) / oldest.p) * 100;
+          regimeWindowLabel = ageHours >= 96 ? '4-day' : ageHours >= 48 ? '2-day' : '1-day';
+        }
+      }
+    }
 
-        // Annotate for diagnostics
-        sig._regime = { dir: regimeDir, strength: regimeStrength, netChgPct: +netChgPct.toFixed(2) };
+    if (regimeNetChgPct !== null) {
+      // Per-symbol regime thresholds (% change)
+      const strongThr = isXAU ? 2.0 : isBTC ? 5.0 : isNAS ? 3.0 : 1.0;
+      const weakThr   = isXAU ? 1.0 : isBTC ? 2.5 : isNAS ? 1.5 : 0.5;
+      let regimeDir = 'neutral', regimeStrength = 0;
+      if (regimeNetChgPct >=  strongThr) { regimeDir = 'bull'; regimeStrength = 2; }
+      else if (regimeNetChgPct <= -strongThr) { regimeDir = 'bear'; regimeStrength = 2; }
+      else if (regimeNetChgPct >=  weakThr) { regimeDir = 'bull'; regimeStrength = 1; }
+      else if (regimeNetChgPct <= -weakThr) { regimeDir = 'bear'; regimeStrength = 1; }
 
-        // Block counter-regime signals if conviction insufficient
-        const isCounterRegime = (regimeDir === 'bear' && sig.type === 'call') ||
-                               (regimeDir === 'bull' && sig.type === 'put');
-        if (isCounterRegime) {
-          const requiredConv = regimeStrength === 2 ? 6 : 5;
-          if (conv.score < requiredConv) {
-            Object.assign(s, _emitSnapshot);
-            const strengthLabel = regimeStrength === 2 ? 'STRONG' : 'WEAK';
-            const dirLabel = regimeDir.toUpperCase();
-            log(sym, '🌍 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — multi-day ' + strengthLabel + ' ' + dirLabel + ' regime (5-day ' + (netChgPct >= 0 ? '+' : '') + netChgPct.toFixed(1) + '%): counter-direction needs conv ≥' + requiredConv + ', got ' + conv.score + '/7.');
-            return false;
-          }
+      // Annotate for diagnostics
+      sig._regime = { dir: regimeDir, strength: regimeStrength, netChgPct: +regimeNetChgPct.toFixed(2), window: regimeWindowLabel };
+
+      // Block counter-regime signals if conviction insufficient
+      const isCounterRegime = (regimeDir === 'bear' && sig.type === 'call') ||
+                             (regimeDir === 'bull' && sig.type === 'put');
+      if (isCounterRegime) {
+        const requiredConv = regimeStrength === 2 ? 6 : 5;
+        if (conv.score < requiredConv) {
+          Object.assign(s, _emitSnapshot);
+          const strengthLabel = regimeStrength === 2 ? 'STRONG' : 'WEAK';
+          const dirLabel = regimeDir.toUpperCase();
+          log(sym, '🌍 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — multi-day ' + strengthLabel + ' ' + dirLabel + ' regime (' + regimeWindowLabel + ' ' + (regimeNetChgPct >= 0 ? '+' : '') + regimeNetChgPct.toFixed(1) + '%): counter-direction needs conv ≥' + requiredConv + ', got ' + conv.score + '/7.');
+          return false;
         }
       }
     }
@@ -6489,6 +6526,103 @@ app.post('/trade/clear', (req, res) => {
   const { sym } = req.body;
   if (S[sym]) S[sym].trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
   res.json({ ok: true });
+});
+
+// ===== /state/:sym — gate diagnostic endpoint (added 2026-05-20) =====
+// Returns the state vars that the gates read from, so we can debug why a gate
+// fired or didn't fire without parsing logs. Especially useful for the multi-day
+// regime gate (dailyLevels + macroSnaps + computed netChgPct).
+app.get('/state/:sym', (req, res) => {
+  const sym = req.params.sym.toUpperCase();
+  const s = S[sym];
+  if (!s) return res.status(404).json({ error: 'Unknown symbol: ' + sym });
+
+  // Compute live regime classification using the same logic as enrichSig
+  const price = s.lastPrice || 0;
+  const isXAU = sym === 'XAU';
+  const isBTC = sym === 'BTC';
+  const isNAS = sym === 'NAS100';
+  let regimeWindow = null, regimeNetChgPct = null, regimeDir = 'neutral', regimeStrength = 0;
+  if (price > 0) {
+    if (s.dailyLevels && s.dailyLevels.length >= 5) {
+      const oldestDay = s.dailyLevels[0];
+      if (oldestDay && oldestDay.high > 0 && oldestDay.low > 0) {
+        const oldestMid = (oldestDay.high + oldestDay.low) / 2;
+        regimeNetChgPct = ((price - oldestMid) / oldestMid) * 100;
+        regimeWindow = '5-day (dailyLevels)';
+      }
+    }
+    if (regimeNetChgPct === null && s.macroSnaps && s.macroSnaps.length > 0) {
+      const oldest = s.macroSnaps[0];
+      const ageHours = (Date.now() - oldest.ts) / 3600000;
+      if (ageHours >= 24 && oldest.p > 0) {
+        regimeNetChgPct = ((price - oldest.p) / oldest.p) * 100;
+        regimeWindow = (ageHours >= 96 ? '4-day' : ageHours >= 48 ? '2-day' : '1-day') + ' (macroSnaps fallback, ' + ageHours.toFixed(1) + 'h)';
+      }
+    }
+    if (regimeNetChgPct !== null) {
+      const strongThr = isXAU ? 2.0 : isBTC ? 5.0 : isNAS ? 3.0 : 1.0;
+      const weakThr   = isXAU ? 1.0 : isBTC ? 2.5 : isNAS ? 1.5 : 0.5;
+      if (regimeNetChgPct >=  strongThr) { regimeDir = 'bull'; regimeStrength = 2; }
+      else if (regimeNetChgPct <= -strongThr) { regimeDir = 'bear'; regimeStrength = 2; }
+      else if (regimeNetChgPct >=  weakThr) { regimeDir = 'bull'; regimeStrength = 1; }
+      else if (regimeNetChgPct <= -weakThr) { regimeDir = 'bear'; regimeStrength = 1; }
+    }
+  }
+
+  res.json({
+    symbol: sym,
+    lastPrice: price,
+    sessionHigh: s.sessionHigh === -Infinity ? null : s.sessionHigh,
+    sessionLow: s.sessionLow === Infinity ? null : s.sessionLow,
+    rsiAtSessionHigh: s.rsiAtSessionHigh,
+    rsiAtSessionLow: s.rsiAtSessionLow,
+    rollingHigh: s.rollingHigh || 0,
+    rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
+    chopActive: !!s.chopActive,
+    weekendBtcPutOnly: !!s._weekendBtcPutOnly,
+    breakCoilActive: !!s.breakCoilActive,
+    breakFrozenHi: s.breakFrozenHi || null,
+    breakFrozenLo: s.breakFrozenLo === Infinity ? null : s.breakFrozenLo,
+    obZone: s.obZone || null,
+    obMitigated: !!s.obMitigated,
+    obDeparted: !!s.obDeparted,
+    trade: s.trade && s.trade.active ? {
+      type: s.trade.type, ep: s.trade.ep,
+      t1: s.trade.t1, t2: s.trade.t2,
+      slPrice: s.trade.slPrice, tp1Price: s.trade.tp1Price,
+      tp2Price: s.trade.tp2Price, tp3Price: s.trade.tp3Price,
+      ageMin: s.trade.ts ? Math.round((Date.now() - s.trade.ts) / 60000) : null
+    } : null,
+    dailyLevels: {
+      count: (s.dailyLevels || []).length,
+      data: s.dailyLevels || []
+    },
+    macroSnaps: {
+      count: (s.macroSnaps || []).length,
+      oldest: s.macroSnaps && s.macroSnaps.length > 0 ? {
+        price: s.macroSnaps[0].p,
+        ageHours: +((Date.now() - s.macroSnaps[0].ts) / 3600000).toFixed(2)
+      } : null
+    },
+    regime: regimeNetChgPct !== null ? {
+      window: regimeWindow,
+      netChgPct: +regimeNetChgPct.toFixed(3),
+      direction: regimeDir,
+      strength: regimeStrength === 2 ? 'STRONG' : regimeStrength === 1 ? 'WEAK' : 'NEUTRAL',
+      callBlockedBelow: regimeStrength > 0 && regimeDir === 'bear' ? (regimeStrength === 2 ? 6 : 5) : null,
+      putBlockedBelow: regimeStrength > 0 && regimeDir === 'bull' ? (regimeStrength === 2 ? 6 : 5) : null
+    } : { status: 'insufficient data (need 5 daily levels or 24h+ macroSnaps)' },
+    macroAlignment: {
+      callStableSinceMin: s.fullConvSinceCall > 0 ? Math.round((Date.now() - s.fullConvSinceCall) / 60000) : null,
+      putStableSinceMin: s.fullConvSincePut > 0 ? Math.round((Date.now() - s.fullConvSincePut) / 60000) : null,
+      callContraBlockMin: s.macroContraBlockCallUntil > Date.now() ? Math.round((s.macroContraBlockCallUntil - Date.now()) / 60000) : null,
+      putContraBlockMin: s.macroContraBlockPutUntil > Date.now() ? Math.round((s.macroContraBlockPutUntil - Date.now()) / 60000) : null
+    },
+    lastSignalDir: s.lastSignalDir,
+    lastSignalAgeMin: s.lastSignalTs > 0 ? Math.round((Date.now() - s.lastSignalTs) / 60000) : null,
+    dailySignalCount: s.dailySignalCount || 0
+  });
 });
 
 // ===== EXTERNAL PRICE FEED (MT5 → Railway) =====
