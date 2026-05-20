@@ -1943,15 +1943,9 @@ function processPrice(sym, price, hi, lo) {
   function enrichSig(sig) {
     if (!isMT5) return true; // non-MT5 instruments don't have conv — let them through
 
-    // ===== XAU CALL TRIAL DISABLE (added 2026-05-20, 48h trial) =====
-    // XAU CALL win rate 25% (worse than coin flip) vs PUT 60% in recent data. Macro has
-    // been structurally bearish ($4720→$4470 over 2 weeks). User decision: hard-disable
-    // XAU CALL emission for 48h to validate PUT-only performance. Revert by deleting
-    // this block when XAU regime flips bullish or trial ends.
-    if (isXAU && sig.type === 'call') {
-      log(sym, '🛑 ' + (sig.score || '') + ' CALL BLOCKED — XAU CALL signals disabled (48h trial, PUT-only mode). Recent CALL win rate 25% vs PUT 60%; macro structurally bearish.');
-      return false;
-    }
+    // XAU CALL trial disable reverted 2026-05-20: user flagged today as a bullish XAU
+    // day. Letting the multi-day regime gate handle direction-bias automatically based
+    // on current market action instead of hardcoded symbol+direction rule.
 
     const conv = convictionFor(sig.type);
     sig.conv = conv;
@@ -2049,6 +2043,23 @@ function processPrice(sym, price, hi, lo) {
       if (conv.score < 5 && !fadeHasMacro) {
         Object.assign(s, _emitSnapshot);
         log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ATH/ATL conv floor: conv ' + conv.score + '/7 [' + (conv.factors || []).join(',') + '] < 5 AND no MACRO factor. Rolling-extreme fades need stronger confirmation (macro alignment or 5+ factors) to avoid fading into a bigger trend.');
+        return false;
+      }
+    }
+
+    // ===== BTC BREAK CONV FLOOR (added 2026-05-20) =====
+    // 5/16-19 audit: BTC BREAK win rate = 28% (5 SLs out of 7 resolved). The conv 3-4
+    // BREAK signals consistently fire at false range escapes in BTC's choppy regime.
+    // FAST is 67% win rate on BTC — clearly the better detector. BREAK needs a higher
+    // bar.
+    //
+    // Rule: BTC BREAK requires conv ≥ 5 (HIGH). Catches the conv 3-4 BREAK losers we saw
+    // (5/19 had 4 conv-4 BREAK losses + 1 conv-3 BREAK loss). Allows the rare conv-5
+    // BREAK setups where macro + structure + multiple cross-asset factors all confirm.
+    if (isBTC && /BREAK/.test(tagEarly)) {
+      if (conv.score < 5) {
+        Object.assign(s, _emitSnapshot);
+        log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — BTC BREAK conv floor: conv ' + conv.score + '/7 [' + (conv.factors || []).join(',') + '] < 5 (HIGH). BTC BREAK has 28% win rate at conv 3-4; needs stronger confirmation to fire.');
         return false;
       }
     }
