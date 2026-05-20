@@ -1947,6 +1947,32 @@ function processPrice(sym, price, hi, lo) {
     // day. Letting the multi-day regime gate handle direction-bias automatically based
     // on current market action instead of hardcoded symbol+direction rule.
 
+    // ===== XAU RSI EXHAUSTION FLOOR (added 2026-05-20) =====
+    // Today's 10:12 XAU 6/6 PUT fired with conv 8/7 (MAX) at RSI 33.6 — and SL'd hard
+    // as price rallied $47 within 30min. Conviction count alone can't overcome immediate
+    // RSI exhaustion. Macro factors LAG the price reversal — by the time all 8 macro
+    // factors confirm PUT direction, the move is mostly done and a V-bottom forms.
+    //
+    // Hard rule: don't fire XAU PUT at oversold RSI (<35) or XAU CALL at overbought
+    // RSI (>65). Other detectors have similar checks but this enforces it at the
+    // signal-emit layer for all XAU detectors uniformly. Fade signals (HI/LO/ATH/ATL/
+    // DIV) which exist specifically to catch reversals at RSI extremes are exempt —
+    // they need to fire AT the extremes by design.
+    if (isXAU) {
+      const tagX = sig.score || '';
+      const isFadeAtExtreme = /HI|LO|ATH|ATL|DIV|SWEEP/.test(tagX) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tagX);
+      if (!isFadeAtExtreme) {
+        if (sig.type === 'put' && typeof rsiV === 'number' && rsiV < 35) {
+          log(sym, '🛑 ' + tagX + ' PUT BLOCKED — XAU RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' < 35 (oversold). No PUT at the bottom regardless of conviction — macro factors lag price exhaustion.');
+          return false;
+        }
+        if (sig.type === 'call' && typeof rsiV === 'number' && rsiV > 65) {
+          log(sym, '🛑 ' + tagX + ' CALL BLOCKED — XAU RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' > 65 (overbought). No CALL at the top regardless of conviction — macro factors lag price exhaustion.');
+          return false;
+        }
+      }
+    }
+
     const conv = convictionFor(sig.type);
     sig.conv = conv;
 
@@ -2060,6 +2086,19 @@ function processPrice(sym, price, hi, lo) {
       if (conv.score < 5) {
         Object.assign(s, _emitSnapshot);
         log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — BTC BREAK conv floor: conv ' + conv.score + '/7 [' + (conv.factors || []).join(',') + '] < 5 (HIGH). BTC BREAK has 28% win rate at conv 3-4; needs stronger confirmation to fire.');
+        return false;
+      }
+    }
+
+    // ===== BTC FAST CONV FLOOR (added 2026-05-20) =====
+    // Pattern from data: BTC FAST conv 4-6 = TP1/TP3 winners. BTC FAST conv 3 (today's
+    // 04:39 CALL @ $77,497) = SL. Raise BTC FAST minimum to conv 4 to filter out the
+    // weakest setups. Conv 4 still allows reasonable opportunity since BTC FAST 67%
+    // win rate is the best detector for BTC.
+    if (isBTC && /FAST/.test(tagEarly)) {
+      if (conv.score < 4) {
+        Object.assign(s, _emitSnapshot);
+        log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — BTC FAST conv floor: conv ' + conv.score + '/7 [' + (conv.factors || []).join(',') + '] < 4 (MOD). BTC FAST at conv 3 has poor win rate; conv 4+ is the threshold for actual edge.');
         return false;
       }
     }
