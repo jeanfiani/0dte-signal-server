@@ -50,6 +50,17 @@ app.use((req, res, next) => {
 // ===== CONFIG =====
 const API = process.env.FINNHUB_API_KEY;
 const PORT = process.env.PORT || 3000;
+// ===== TRADIER SANDBOX API (added 2026-05-20) =====
+// Fetches real ATM 0DTE option premium for QQQ/SPY signal outcome tracking.
+// Sandbox returns 15-min delayed quotes — sufficient for retrospective outcome analysis,
+// not for live execution. Set TRADIER_SANDBOX_TOKEN env var in Railway to enable.
+const TRADIER_TOKEN = process.env.TRADIER_SANDBOX_TOKEN || process.env.TRADIER_TOKEN || '';
+const TRADIER_BASE = 'https://sandbox.tradier.com/v1';
+// Option outcome thresholds (% gain on option premium)
+const OPTION_TP1_PCT = parseFloat(process.env.OPTION_TP1_PCT) || 30;
+const OPTION_TP2_PCT = parseFloat(process.env.OPTION_TP2_PCT) || 60;
+const OPTION_TP3_PCT = parseFloat(process.env.OPTION_TP3_PCT) || 100;
+const OPTION_SL_PCT  = parseFloat(process.env.OPTION_SL_PCT)  || -50;
 const SYMBOLS = ['QQQ', 'SPY', 'XAU', 'BTC', 'NAS100'];
 const RSI_CALL_LO = { QQQ: 45, SPY: 45, XAU: 40, BTC: 42, NAS100: 42 };
 const RSI_CALL_HI = { QQQ: 65, SPY: 65, XAU: 56, BTC: 60, NAS100: 60 }; // XAU 6/6-base tightened 2026-05-11 g: 60 → 56 (only affects 6/6 — specialists have own gates). Mirror of PUT_LO 35→40.
@@ -901,6 +912,232 @@ function todayDateET() {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' }); // YYYY-MM-DD
 }
 
+// ===== TRADIER OPTION CHAIN HELPERS (added 2026-05-20, updated 2026-05-20 for premium-picker) =====
+// Fetch the full chain (all strikes) for a symbol+expiration+type. Used both for the
+// initial premium-based strike picker AND for the real-time bid poller below.
+async function fetchTradierChain(symbol, expiration, optionType) {
+  if (!TRADIER_TOKEN) return null;
+  const url = TRADIER_BASE + '/markets/options/chains?symbol=' + symbol +
+              '&expiration=' + expiration + '&greeks=false';
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'Authorization': 'Bearer ' + TRADIER_TOKEN,
+        'Accept': 'application/json'
+      }
+    });
+    if (!res.ok) {
+      console.log('[' + ts() + '] Tradier ' + symbol + ' chain ' + expiration + ' fetch failed: HTTP ' + res.status);
+      return null;
+    }
+    const data = await res.json();
+    const options = data && data.options && data.options.option ? data.options.option : null;
+    if (!Array.isArray(options) || options.length === 0) return null;
+    return options.filter(o => o.option_type === optionType);
+  } catch (e) {
+    console.log('[' + ts() + '] Tradier fetch error: ' + e.message);
+    return null;
+  }
+}
+
+// Fetch a specific option's current quote (bid/ask/mid). Returns null on failure.
+async function fetchTradierOptionQuote(symbol, expiration, strike, optionType) {
+  const chain = await fetchTradierChain(symbol, expiration, optionType);
+  if (!chain) return null;
+  const match = chain.find(o => Math.abs((o.strike || 0) - strike) < 0.01);
+  if (!match) return null;
+  const bid = parseFloat(match.bid) || 0;
+  const ask = parseFloat(match.ask) || 0;
+  const last = parseFloat(match.last) || 0;
+  const mid = (bid > 0 && ask > 0) ? +((bid + ask) / 2).toFixed(2) : last;
+  return { bid: +bid.toFixed(2), ask: +ask.toFixed(2), mid: mid, last: +last.toFixed(2) };
+}
+
+// 0DTE expiration date in YYYY-MM-DD ET (Tradier uses NY date for SPY/QQQ daily options)
+function todayExpirationET() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+}
+
+// ===== OPTION PREMIUM PICKER (added 2026-05-20) =====
+// User strategy: pick option whose MID is closest to a target premium (default $0.90).
+// Allows the bot to systematically buy OTM options with consistent premium cost rather
+// than ATM strikes (which vary in cost dramatically based on IV and time-to-expiry).
+const OPTION_TARGET_PREMIUM = parseFloat(process.env.OPTION_TARGET_PREMIUM) || 0.90;
+const OPTION_TP1_TRIGGER_BID = parseFloat(process.env.OPTION_TP1_TRIGGER_BID) || 1.00;
+const OPTION_INITIAL_SL_BID  = parseFloat(process.env.OPTION_INITIAL_SL_BID)  || 0.80;
+const OPTION_SCRATCH_SL_BID  = parseFloat(process.env.OPTION_SCRATCH_SL_BID)  || 0.90;
+const OPTION_POLL_INTERVAL_MS = parseInt(process.env.OPTION_POLL_INTERVAL_MS) || 30000;
+const OPTION_TRACK_TIMEOUT_MS = parseInt(process.env.OPTION_TRACK_TIMEOUT_MS) || 30 * 60 * 1000;
+
+async function pickOptionByTargetPremium(symbol, expiration, optionType, targetPremium) {
+  const chain = await fetchTradierChain(symbol, expiration, optionType);
+  if (!chain || chain.length === 0) return null;
+  // Find option whose mid is closest to target
+  let best = null;
+  let bestDistance = Infinity;
+  for (const o of chain) {
+    const bid = parseFloat(o.bid) || 0;
+    const ask = parseFloat(o.ask) || 0;
+    if (bid <= 0 || ask <= 0) continue; // skip illiquid/no-quote strikes
+    const mid = (bid + ask) / 2;
+    const distance = Math.abs(mid - targetPremium);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = {
+        strike: parseFloat(o.strike),
+        bid: +bid.toFixed(2),
+        ask: +ask.toFixed(2),
+        mid: +mid.toFixed(2),
+        last: parseFloat(o.last) || 0,
+        volume: parseInt(o.volume) || 0,
+        openInterest: parseInt(o.open_interest) || 0,
+        iv: parseFloat(o.iv) || 0,
+        delta: parseFloat(o.delta) || 0,
+        gamma: parseFloat(o.gamma) || 0,
+        theta: parseFloat(o.theta) || 0
+      };
+    }
+  }
+  return best;
+}
+
+// ===== REAL-TIME OPTION TRACKER (added 2026-05-20) =====
+// Active tracks polled every 30s. Each track represents a live "trade" — entry option
+// picked by premium, then bid monitored until TP1 / scratch SL / initial SL / timeout.
+// State machine:
+//   active → (bid ≥ $1.00) → tp1Hit=true, effectiveSlBid=$0.90
+//   active → (bid ≤ $0.80) → SL exit
+//   tp1Hit → (bid ≤ $0.90) → SCRATCH exit (breakeven)
+//   tp1Hit → (bid keeps going) → track maxBid; user exits manually
+//   any → (timeout 30min) → TIMEOUT exit
+let activeOptionTracks = []; // [{ histIdx, symbol, strike, type, expiry, ...state }]
+
+// Fire-and-forget — picks option, opens a track, signal emit doesn't block.
+async function trackEquityOptionEntry(entry, signalPrice, optionType) {
+  if (!TRADIER_TOKEN) return;
+  if (entry.symbol !== 'QQQ' && entry.symbol !== 'SPY') return;
+  // Capture histIdx BEFORE awaiting Tradier — caller must call this AFTER signalHistory.push(entry)
+  // so the index lines up. If we awaited first, another signal could push and shift the index.
+  const histIdx = signalHistory.length - 1;
+  const expiry = todayExpirationET();
+  const picked = await pickOptionByTargetPremium(entry.symbol, expiry, optionType, OPTION_TARGET_PREMIUM);
+  if (!picked) {
+    log(entry.symbol, '⚠️ Tradier option pick failed (' + optionType + ' ~$' + OPTION_TARGET_PREMIUM + ' ' + expiry + ') — option tracking skipped');
+    return;
+  }
+  // Store initial state on history entry
+  entry.option0dte = {
+    strike: picked.strike,
+    expiry: expiry,
+    type: optionType,
+    targetPremium: OPTION_TARGET_PREMIUM,
+    entryMid: picked.mid,
+    entryBid: picked.bid,
+    entryAsk: picked.ask,
+    entryDelta: picked.delta,
+    entryIv: picked.iv,
+    tp1TriggerBid: OPTION_TP1_TRIGGER_BID,
+    initialSlBid: OPTION_INITIAL_SL_BID,
+    scratchSlBid: OPTION_SCRATCH_SL_BID,
+    effectiveSlBid: OPTION_INITIAL_SL_BID,
+    tp1Hit: false,
+    tp1HitTs: null,
+    tp1HitBid: null,
+    maxBid: picked.bid,
+    minBid: picked.bid,
+    outcome: 'active',
+    exitBid: null,
+    exitTs: null,
+    exitReason: null,
+    polls: [{ ts: Date.now(), bid: picked.bid, ask: picked.ask }]
+  };
+  // Push to active tracks for polling — use the index captured before the await
+  activeOptionTracks.push({
+    histIdx: histIdx,
+    symbol: entry.symbol,
+    strike: picked.strike,
+    type: optionType,
+    expiry: expiry,
+    startTs: Date.now()
+  });
+  log(entry.symbol, '📋 0DTE ' + optionType.toUpperCase() + ' $' + picked.strike + ' picked @ mid $' + picked.mid.toFixed(2) + ' (bid ' + picked.bid + ', ask ' + picked.ask + ', delta ' + picked.delta.toFixed(2) + ') — tracking for bid ≥ $' + OPTION_TP1_TRIGGER_BID);
+  try { saveSignalHistory(); } catch (e) {}
+}
+
+// Process all active option tracks — called by setInterval below
+async function pollActiveOptionTracks() {
+  if (!TRADIER_TOKEN || activeOptionTracks.length === 0) return;
+  const now = Date.now();
+  const stillActive = [];
+  for (const tr of activeOptionTracks) {
+    const entry = signalHistory[tr.histIdx];
+    if (!entry || !entry.option0dte) continue; // entry gone or no option data
+    const od = entry.option0dte;
+
+    // Timeout check first
+    const elapsedMs = now - tr.startTs;
+    if (elapsedMs > OPTION_TRACK_TIMEOUT_MS) {
+      od.outcome = od.tp1Hit ? 'TP1_TIMEOUT' : 'TIMEOUT';
+      od.exitTs = now;
+      od.exitReason = 'timeout';
+      log(tr.symbol, '⏱ 0DTE option ' + tr.type.toUpperCase() + ' $' + tr.strike + ' TIMEOUT after ' + (elapsedMs/60000).toFixed(1) + 'min · maxBid $' + od.maxBid.toFixed(2) + ' · TP1 ' + (od.tp1Hit ? 'hit' : 'never'));
+      try { saveSignalHistory(); } catch (e) {}
+      continue; // don't push to stillActive
+    }
+
+    // Fetch current quote
+    const q = await fetchTradierOptionQuote(tr.symbol, tr.expiry, tr.strike, tr.type);
+    if (!q) {
+      stillActive.push(tr); // keep trying
+      continue;
+    }
+    od.polls.push({ ts: now, bid: q.bid, ask: q.ask });
+    if (od.polls.length > 120) od.polls.shift(); // cap memory (60 min @ 30s)
+    if (q.bid > od.maxBid) od.maxBid = q.bid;
+    if (q.bid < od.minBid) od.minBid = q.bid;
+
+    // State transitions
+    if (!od.tp1Hit && q.bid >= od.tp1TriggerBid) {
+      od.tp1Hit = true;
+      od.tp1HitTs = now;
+      od.tp1HitBid = q.bid;
+      od.effectiveSlBid = od.scratchSlBid; // SL → $0.90 (breakeven from $0.90 entry target)
+      od.outcome = 'TP1';
+      log(tr.symbol, '🎯 0DTE option TP1 HIT — ' + tr.type.toUpperCase() + ' $' + tr.strike + ' bid $' + q.bid.toFixed(2) + ' ≥ $' + od.tp1TriggerBid + ' · SL moved to $' + od.scratchSlBid + ' (breakeven) · tracking for more upside');
+      try { saveSignalHistory(); } catch (e) {}
+    }
+
+    // SL check (initial OR scratch)
+    if (q.bid <= od.effectiveSlBid) {
+      od.exitBid = q.bid;
+      od.exitTs = now;
+      od.exitReason = od.tp1Hit ? 'scratch' : 'initial_sl';
+      od.outcome = od.tp1Hit ? 'TP1_SCRATCH' : 'SL';
+      log(tr.symbol, (od.tp1Hit ? '🛡 0DTE option SCRATCH' : '🛑 0DTE option SL') + ' — ' + tr.type.toUpperCase() + ' $' + tr.strike + ' bid $' + q.bid.toFixed(2) + ' ≤ $' + od.effectiveSlBid + ' · maxBid was $' + od.maxBid.toFixed(2));
+      try { saveSignalHistory(); } catch (e) {}
+      continue; // remove from active
+    }
+
+    stillActive.push(tr);
+  }
+  activeOptionTracks = stillActive;
+}
+
+// Kick off the polling loop (called once at server start, near other setInterval setups)
+let optionPollerStarted = false;
+function startOptionPoller() {
+  if (optionPollerStarted) return;
+  if (!TRADIER_TOKEN) {
+    console.log('[STARTUP] Option tracker: TRADIER_TOKEN not set — skipping poller');
+    return;
+  }
+  optionPollerStarted = true;
+  setInterval(() => {
+    pollActiveOptionTracks().catch(e => console.log('[' + ts() + '] pollActiveOptionTracks error: ' + e.message));
+  }, OPTION_POLL_INTERVAL_MS);
+  console.log('[STARTUP] Option tracker: polling active tracks every ' + (OPTION_POLL_INTERVAL_MS/1000) + 's · target premium $' + OPTION_TARGET_PREMIUM + ' · TP1 ≥$' + OPTION_TP1_TRIGGER_BID + ' · initial SL ≤$' + OPTION_INITIAL_SL_BID + ' · scratch SL ≤$' + OPTION_SCRATCH_SL_BID + ' · timeout ' + (OPTION_TRACK_TIMEOUT_MS/60000) + 'min');
+}
+
 // ===== 7-DAY SIGNAL HISTORY (survives daily resets + redeploys) =====
 const HISTORY_FILE = path.join(DATA_DIR, 'signal_history.json');
 const HISTORY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -1210,6 +1447,13 @@ function logSignal(sym, sig) {
   }
   signalHistory.push(histEntry);
 
+  // QQQ/SPY 0DTE option tracking — fire-and-forget Tradier fetch
+  // Placed AFTER push so signalHistory.length - 1 = this entry's index inside trackEquityOptionEntry.
+  if ((sym === 'QQQ' || sym === 'SPY') && (sig.type === 'call' || sig.type === 'put')) {
+    trackEquityOptionEntry(histEntry, sig.price, sig.type).catch(e =>
+      console.log('[' + ts() + '] trackEquityOptionEntry error for ' + sym + ': ' + e.message));
+  }
+
   // Fast-forward previous signal's outcomes before reassigning lastHistIdx (added 2026-05-13).
   // BUG it fixes: when a same-direction signal fires while a previous trade is still active,
   // the detector overwrites s.trade with buildCfdTrade() right after logSignal. Any subsequent
@@ -1381,6 +1625,34 @@ function processPrice(sym, price, hi, lo) {
   // Post-signal price snapshots (added 2026-05-14). For each pending signal entry, check if
   // we've crossed the +5min / +15min / +30min thresholds since fire and capture the price.
   // Once all 3 captured (or histEntry missing), remove from pending list.
+  //
+  // EQUITY OUTCOME TRACKING (updated 2026-05-20): QQQ/SPY signals are 0DTE option triggers
+  // with fast theta decay — meaningful action happens in the first 5-15 min. Time-based
+  // outcome model using 5/10/15 min snapshots instead of MT5's 5/15/30:
+  //   TP1 at 5min:  favorable move >= $0.15  (option already at ~20-30% gain)
+  //   TP2 at 10min: favorable move >= $0.30  (option at ~40-60% gain)
+  //   TP3 at 15min: favorable move >= $0.50  (option at ~80-100% gain)
+  //   SL at any time: $0.25 against (only if TP1 hasn't hit — TP1 means user took quick profit)
+  // Stops at 15min for equities — option theta beyond 15min makes outcomes irrelevant.
+  const evalEquityOutcomes = (entry, snapPrice, snapStage) => {
+    if (!entry || !entry.outcomes || !entry.price) return;
+    if (entry.symbol !== 'QQQ' && entry.symbol !== 'SPY') return;
+    const ep = parseFloat(entry.price);
+    if (!isFinite(ep)) return;
+    const isCall = entry.type === 'call';
+    const favMove = isCall ? (snapPrice - ep) : (ep - snapPrice);
+    const advMove = -favMove;
+    const now = Date.now();
+    // Time-staged TP thresholds for 0DTE options
+    if (snapStage === '5m'  && !entry.outcomes.tp1Hit && favMove >= 0.15) { entry.outcomes.tp1Hit = true; entry.outcomes.tp1HitTs = now; }
+    if (snapStage === '10m' && !entry.outcomes.tp2Hit && favMove >= 0.30) { entry.outcomes.tp2Hit = true; entry.outcomes.tp2HitTs = now; }
+    if (snapStage === '15m' && !entry.outcomes.tp3Hit && favMove >= 0.50) { entry.outcomes.tp3Hit = true; entry.outcomes.tp3HitTs = now; entry.outcomes.closePrice = snapPrice; }
+    // SL: only if TP1 hasn't hit yet (TP1+scratch logic — quick profit-take protects)
+    if (!entry.outcomes.tp1Hit && !entry.outcomes.slHit && advMove >= 0.25) {
+      entry.outcomes.slHit = true; entry.outcomes.slHitTs = now; entry.outcomes.closePrice = snapPrice;
+    }
+  };
+
   if (Array.isArray(s.pendingSnapshots) && s.pendingSnapshots.length > 0) {
     const tNow = Date.now();
     s.pendingSnapshots = s.pendingSnapshots.filter(ps => {
@@ -1389,17 +1661,48 @@ function processPrice(sym, price, hi, lo) {
       const ageS = (tNow - ps.fireTs) / 1000;
       if (!entry.priceSnaps) entry.priceSnaps = {};
       let snapWritten = false;
-      if (ageS >= 5 * 60  && entry.priceSnaps.p5m  == null) { entry.priceSnaps.p5m  = +price.toFixed(2); snapWritten = true; }
-      if (ageS >= 15 * 60 && entry.priceSnaps.p15m == null) { entry.priceSnaps.p15m = +price.toFixed(2); snapWritten = true; }
-      if (ageS >= 30 * 60 && entry.priceSnaps.p30m == null) {
-        entry.priceSnaps.p30m = +price.toFixed(2);
-        // Persist immediately when this snapshot completes (added 2026-05-14). Don't rely
-        // solely on the 60-sec periodic save — if a deploy happens in the 60-sec window
-        // after the snapshot captures, we'd lose it.
-        try { saveSignalHistory(); } catch (e) { /* already logged */ }
-        return false; // all 3 captured — done
+      const isEquity = entry.symbol === 'QQQ' || entry.symbol === 'SPY';
+
+      // 5-min snapshot (all instruments — both MT5 and equities use this)
+      if (ageS >= 5 * 60 && entry.priceSnaps.p5m == null) {
+        entry.priceSnaps.p5m = +price.toFixed(2); snapWritten = true;
+        if (isEquity) {
+          evalEquityOutcomes(entry, price, '5m');
+          // Async refetch real option premium from Tradier (fire-and-forget)
+          snapshotEquityOption(entry, '5m').catch(e =>
+            console.log('[' + ts() + '] snapshotEquityOption 5m error: ' + e.message));
+        }
       }
-      // Persist immediately when a 5m or 15m snap is freshly captured
+
+      // 10-min snapshot (equities only — for TP2 at 0DTE-relevant timeframe)
+      if (isEquity && ageS >= 10 * 60 && entry.priceSnaps.p10m == null) {
+        entry.priceSnaps.p10m = +price.toFixed(2); snapWritten = true;
+        evalEquityOutcomes(entry, price, '10m');
+        snapshotEquityOption(entry, '10m').catch(e =>
+          console.log('[' + ts() + '] snapshotEquityOption 10m error: ' + e.message));
+      }
+
+      // 15-min snapshot (all instruments — MT5 uses for trade-progress, equities for TP3)
+      if (ageS >= 15 * 60 && entry.priceSnaps.p15m == null) {
+        entry.priceSnaps.p15m = +price.toFixed(2); snapWritten = true;
+        if (isEquity) {
+          evalEquityOutcomes(entry, price, '15m');
+          snapshotEquityOption(entry, '15m').catch(e =>
+            console.log('[' + ts() + '] snapshotEquityOption 15m error: ' + e.message));
+          // For equities, p15m completes the outcome window — persist + drop from pending
+          try { saveSignalHistory(); } catch (e) { /* already logged */ }
+          return false;
+        }
+      }
+
+      // 30-min snapshot (MT5 only — equities skip this since theta makes 30-min outcomes irrelevant for 0DTE options)
+      if (!isEquity && ageS >= 30 * 60 && entry.priceSnaps.p30m == null) {
+        entry.priceSnaps.p30m = +price.toFixed(2);
+        try { saveSignalHistory(); } catch (e) { /* already logged */ }
+        return false; // all MT5 captures done
+      }
+
+      // Persist immediately when a snap is freshly captured (covers both equities and MT5 in-progress)
       if (snapWritten) { try { saveSignalHistory(); } catch (e) { /* already logged */ } }
       return true; // still pending
     });
@@ -1941,7 +2244,85 @@ function processPrice(sym, price, hi, lo) {
   // The thresholds are deliberately moderate for the first deployment; tune after a week
   // of conv-logged data shows what wins / loses.
   function enrichSig(sig) {
-    if (!isMT5) return true; // non-MT5 instruments don't have conv — let them through
+    // ===== MULTI-DAY REGIME GATE — ALL INSTRUMENTS (extended 2026-05-20) =====
+    // Previously MT5-only inside enrichSig's MT5-conditional body. Today's QQQ/SPY data
+    // (5/20) showed 6+ losing PUT signals firing into a clear intraday uptrend. The same
+    // regime logic that protects MT5 from counter-trend chases should protect equities.
+    //
+    // Apply to ALL symbols using either dailyLevels (>=5 entries) or macroSnaps fallback
+    // (>=24h history). For equities, macroSnaps spans US RTH only so the window is
+    // effectively "today's session vs N hours ago" — close enough to catch obvious
+    // directional regimes like today's QQQ +$5/2hr rally.
+    {
+      const tagEarlyRG = sig.score || '';
+      let regimeNetChgPctRG = null;
+      let regimeWindowLabelRG = '';
+      if (price > 0) {
+        if (s.dailyLevels && s.dailyLevels.length >= 5) {
+          const oldestDay = s.dailyLevels[0];
+          if (oldestDay && oldestDay.high > 0 && oldestDay.low > 0) {
+            const oldestMid = (oldestDay.high + oldestDay.low) / 2;
+            regimeNetChgPctRG = ((price - oldestMid) / oldestMid) * 100;
+            regimeWindowLabelRG = '5-day';
+          }
+        }
+        if (regimeNetChgPctRG === null && s.macroSnaps && s.macroSnaps.length > 0) {
+          const oldest = s.macroSnaps[0];
+          const ageHours = (Date.now() - oldest.ts) / 3600000;
+          // For MT5 (24/7-ish), require ≥24h. For equities (RTH-only), require ≥2h —
+          // matches "is the intraday regime clearly directional?" question.
+          const minAge = (sym === 'QQQ' || sym === 'SPY') ? 2 : 24;
+          if (ageHours >= minAge && oldest.p > 0) {
+            regimeNetChgPctRG = ((price - oldest.p) / oldest.p) * 100;
+            regimeWindowLabelRG = ageHours >= 96 ? '4-day' : ageHours >= 48 ? '2-day' : ageHours >= 24 ? '1-day' : ageHours.toFixed(1) + 'h-intraday';
+          }
+        }
+      }
+      if (regimeNetChgPctRG !== null) {
+        // Per-symbol thresholds. Equities use smaller %s since the window is intraday.
+        const isEq = (sym === 'QQQ' || sym === 'SPY');
+        const strongThr = isXAU ? 2.0 : isBTC ? 5.0 : isNAS ? 3.0 : isEq ? 0.5 : 1.0;
+        const weakThr   = isXAU ? 1.0 : isBTC ? 2.5 : isNAS ? 1.5 : isEq ? 0.25 : 0.5;
+        let regimeDirRG = 'neutral', regimeStrengthRG = 0;
+        if (regimeNetChgPctRG >=  strongThr) { regimeDirRG = 'bull'; regimeStrengthRG = 2; }
+        else if (regimeNetChgPctRG <= -strongThr) { regimeDirRG = 'bear'; regimeStrengthRG = 2; }
+        else if (regimeNetChgPctRG >=  weakThr) { regimeDirRG = 'bull'; regimeStrengthRG = 1; }
+        else if (regimeNetChgPctRG <= -weakThr) { regimeDirRG = 'bear'; regimeStrengthRG = 1; }
+
+        sig._regime = { dir: regimeDirRG, strength: regimeStrengthRG, netChgPct: +regimeNetChgPctRG.toFixed(2), window: regimeWindowLabelRG };
+
+        const isCounterRegime = (regimeDirRG === 'bear' && sig.type === 'call') ||
+                               (regimeDirRG === 'bull' && sig.type === 'put');
+        if (isCounterRegime) {
+          // For MT5 we use conv-based threshold. For equities (no conv), block counter-
+          // regime entirely in strong regime, and during weak only if signal is a fade
+          // detector (HI/LO/6/6) — those are the ones that consistently fire counter-trend.
+          if (isEq) {
+            const isCounterFade = /HI|LO|6\/6|7\/6/.test(tagEarlyRG);
+            if (regimeStrengthRG === 2 || isCounterFade) {
+              const strengthLabel = regimeStrengthRG === 2 ? 'STRONG' : 'WEAK';
+              const dirLabel = regimeDirRG.toUpperCase();
+              log(sym, '🌍 ' + tagEarlyRG + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + strengthLabel + ' ' + dirLabel + ' intraday regime (' + regimeWindowLabelRG + ' ' + (regimeNetChgPctRG >= 0 ? '+' : '') + regimeNetChgPctRG.toFixed(2) + '%): equity counter-trend ' + (isCounterFade ? 'fade' : 'signal') + ' blocked.');
+              return false;
+            }
+          } else {
+            // MT5 path — conv-based threshold (existing logic)
+            const conv = convictionFor(sig.type);
+            sig.conv = conv; // also annotate (since we may return before normal conv set below)
+            const requiredConv = regimeStrengthRG === 2 ? 6 : 5;
+            if (conv.score < requiredConv) {
+              Object.assign(s, _emitSnapshot);
+              const strengthLabel = regimeStrengthRG === 2 ? 'STRONG' : 'WEAK';
+              const dirLabel = regimeDirRG.toUpperCase();
+              log(sym, '🌍 ' + tagEarlyRG + ' ' + sig.type.toUpperCase() + ' BLOCKED — multi-day ' + strengthLabel + ' ' + dirLabel + ' regime (' + regimeWindowLabelRG + ' ' + (regimeNetChgPctRG >= 0 ? '+' : '') + regimeNetChgPctRG.toFixed(1) + '%): counter-direction needs conv ≥' + requiredConv + ', got ' + conv.score + '/7.');
+              return false;
+            }
+          }
+        }
+      }
+    }
+
+    if (!isMT5) return true; // non-MT5 instruments don't have conv — let them through (regime gate above already applied)
 
     // XAU CALL trial disable reverted 2026-05-20: user flagged today as a bullish XAU
     // day. Letting the multi-day regime gate handle direction-bias automatically based
@@ -6043,8 +6424,10 @@ function processTicks(symbols) {
       }
     }
 
-    // Macro trend snapshots — MT5 instruments (XAU + BTC), every 5 min, 6-hour rolling window
-    if ((sym === 'XAU' || sym === 'BTC' || sym === 'NAS100') && (Date.now() - s.macroLastSnapTs >= 300000)) {
+    // Macro trend snapshots — all instruments (XAU, BTC, NAS100, QQQ, SPY), every 5 min,
+    // 6-hour rolling window (extended from MT5-only on 2026-05-20 so the multi-day regime
+    // gate works for equities too).
+    if ((sym === 'XAU' || sym === 'BTC' || sym === 'NAS100' || sym === 'QQQ' || sym === 'SPY') && (Date.now() - s.macroLastSnapTs >= 300000)) {
       s.macroLastSnapTs = Date.now();
       s.macroSnaps.push({ ts: Date.now(), p: price });
       if (s.macroSnaps.length > 72) s.macroSnaps.shift(); // keep 6 hours
@@ -7072,6 +7455,9 @@ app.listen(PORT, () => {
   fetchTLT();
   fetchSLV();
   fetchGDX();
+
+  // Start real-time 0DTE option premium tracker (QQQ/SPY)
+  startOptionPoller();
 
   // Save state on shutdown (deploy/restart) so TRv2 trades survive
   process.on('SIGTERM', () => { console.log('[' + ts() + '] SIGTERM — saving state...'); saveTrv2State(); saveRollingLevels(); process.exit(0); });
