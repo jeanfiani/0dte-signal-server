@@ -902,6 +902,18 @@ function sendPush(title, body, tag) {
 
 function log(sym, msg) {
   console.log(`[${ts()}] ${sym}: ${msg}`);
+  // ===== BLOCKED-ATTEMPT TRACKING (added 2026-05-22) =====
+  // Auto-capture any message containing "BLOCKED" or "SUPPRESSED" into S[sym].blockedAttempts
+  // so the /status endpoint can surface why signals didn't fire. Useful for diagnosing
+  // over-gating without needing to read Railway logs (e.g., BTC dropped from 4-5/day to
+  // 0-1/day — we need to see what's getting eliminated).
+  try {
+    if (S && S[sym] && (msg.includes('BLOCKED') || msg.includes('SUPPRESSED'))) {
+      S[sym].blockedAttempts = S[sym].blockedAttempts || [];
+      S[sym].blockedAttempts.push({ ts: Date.now(), time: ts(), msg: msg.substring(0, 240) });
+      if (S[sym].blockedAttempts.length > 30) S[sym].blockedAttempts.shift();
+    }
+  } catch (e) { /* never let blocked-tracking crash logging */ }
 }
 
 // ===== PERSISTENT SIGNAL LOGGING =====
@@ -2079,22 +2091,26 @@ function processPrice(sym, price, hi, lo) {
   // Check exit for active trades
   checkExit(sym, price);
 
-  // ===== CONVICTION SCORE CALCULATOR (MT5 instruments: XAU + BTC) =====
-  // Returns { score: 0-7, label: 'HIGH'|'MOD'|'LOW', factors: [...] } for a given direction
+  // ===== CONVICTION SCORE CALCULATOR (MT5 + QQQ) =====
+  // Returns { score: 0-7, label: 'HIGH'|'MOD'|'LOW', factors: [...] } for a given direction.
+  // QQQ added 2026-05-22 — uses SPY/NAS/BTC cross-asset alignment as conv factors (since
+  // SPY was demoted to indicator-only, it's now an input to QQQ conv rather than a signal source).
   function convictionFor(dir) {
-    if (!isMT5) return { score: 0, label: '', factors: [] };
+    if (!isMT5 && sym !== 'QQQ') return { score: 0, label: '', factors: [] };
     const isCall = dir === 'call';
     const factors = [];
     let sc = 0;
-    // 3. Macro trend aligned (shared)
+    // 3. Macro trend aligned (shared — macroEma is computed for QQQ too)
     const macroDir = s.macroEma ? (price > s.macroEma ? 'bull' : 'bear') : null;
     if ((isCall && macroDir === 'bull') || (!isCall && macroDir === 'bear')) { sc++; factors.push('MACRO'); }
-    // 6. Multi-TF ROC aligned (shared)
-    const rocAllCall = roc3 > 0 && roc6 > 0 && roc12 > 0;
-    const rocAllPut = roc3 < 0 && roc6 < 0 && roc12 < 0;
-    if ((isCall && rocAllCall) || (!isCall && rocAllPut)) { sc++; factors.push('ROC×3'); }
-    // 7. Price structure aligned (shared)
-    if ((isCall && s._priceStructure === 'bull') || (!isCall && s._priceStructure === 'bear')) { sc++; factors.push('STRUCT'); }
+    // 6. Multi-TF ROC aligned (MT5-only — roc6/roc12 are 0 on equities so the check below would always fail)
+    // 7. Price structure aligned (MT5-only — _priceStructure detector is gated on isMT5)
+    if (isMT5) {
+      const rocAllCall = roc3 > 0 && roc6 > 0 && roc12 > 0;
+      const rocAllPut = roc3 < 0 && roc6 < 0 && roc12 < 0;
+      if ((isCall && rocAllCall) || (!isCall && rocAllPut)) { sc++; factors.push('ROC×3'); }
+      if ((isCall && s._priceStructure === 'bull') || (!isCall && s._priceStructure === 'bear')) { sc++; factors.push('STRUCT'); }
+    }
 
     if (isXAU) {
       // XAU-specific: DXY, TLT, SLV, GDX
@@ -2164,6 +2180,28 @@ function processPrice(sym, price, hi, lo) {
         const btcDir2 = btcS && btcS.pE5 && btcS.pE13 ? (btcS.pE5 > btcS.pE13 ? 'up' : 'down') : null;
         if ((isCall && btcDir2 === 'up') || (!isCall && btcDir2 === 'down')) { sc++; factors.push('BTC'); }
       }
+    } else if (sym === 'QQQ') {
+      // QQQ-specific cross-asset factors (added 2026-05-22 after SPY demoted to indicator).
+      // Factors: SPY direction, NAS100 direction, BTC direction (risk-on), NAS_SIG (NAS bot
+      // independently fired in same direction within 10min). Total available factors for QQQ:
+      // MACRO (shared) + SPY + NAS + BTC + NAS_SIG + TRUMP = up to 6. Threshold conv >=3 is
+      // applied in enrichSig.
+      const spyS_Q = S['SPY'], nasS_Q = S['NAS100'], btcS_Q = S['BTC'];
+      const spyDirQ = spyS_Q && spyS_Q.pE5 && spyS_Q.pE13 ? (spyS_Q.pE5 > spyS_Q.pE13 ? 'up' : 'down') : null;
+      const nasDirQ = nasS_Q && nasS_Q.pE5 && nasS_Q.pE13 ? (nasS_Q.pE5 > nasS_Q.pE13 ? 'up' : 'down') : null;
+      const btcDirQ = btcS_Q && btcS_Q.pE5 && btcS_Q.pE13 ? (btcS_Q.pE5 > btcS_Q.pE13 ? 'up' : 'down') : null;
+      if ((isCall && spyDirQ === 'up') || (!isCall && spyDirQ === 'down')) { sc++; factors.push('SPY'); }
+      if ((isCall && nasDirQ === 'up') || (!isCall && nasDirQ === 'down')) { sc++; factors.push('NAS'); }
+      if ((isCall && btcDirQ === 'up') || (!isCall && btcDirQ === 'down')) { sc++; factors.push('BTC'); }
+      // Cross-signal: NAS bot independently fired same direction within 10min — high-quality
+      // confirmation (NAS already cleared its own RSI/MACD/HI/LO gates).
+      const CROSS_SIG_WINDOW_MS_Q = 10 * 60 * 1000;
+      if (nasS_Q) {
+        const lastNasSameDirTs = isCall ? (nasS_Q.lastCallSignalTs || 0) : (nasS_Q.lastPutSignalTs || 0);
+        if (lastNasSameDirTs > 0 && (Date.now() - lastNasSameDirTs) < CROSS_SIG_WINDOW_MS_Q) {
+          sc++; factors.push('NAS_SIG');
+        }
+      }
     }
 
     // TRUMP factor (added 2026-05-09) — political-risk signal that boosts conviction
@@ -2181,6 +2219,30 @@ function processPrice(sym, price, hi, lo) {
       const aligned = (isCall && symBias === 'bullish') || (!isCall && symBias === 'bearish');
       if (aligned) {
         sc++; factors.push('TRUMP');
+      }
+    }
+
+    // ===== CONV MATURITY PENALTY (added 2026-05-22) =====
+    // When a high-conv signal (sc≥5) JOINS a move that already happened (signal direction
+    // matches the prior 30-min price move with magnitude above a per-symbol threshold),
+    // apply -1 penalty. The rationale: ROC/MACD/cross-asset factors flip TOGETHER late in a
+    // move, producing a 5-7/7 conv reading right as the move exhausts. Caught by:
+    //   • 5/21 XAU afternoon stack: 3 ATL CALLs at conv 5-7 after $36 rally — 1 scratch + 2 rolls
+    //   • 5/21 NAS chop cascade: every TRv2 reverse fired at conv 5-6, all flipped together
+    if (sc >= 5 && s.prices && s.prices.length >= 30) {
+      // MT5 ticks ~1s, equities ~3s → 30min lookback = 1800 / 600 ticks respectively
+      const lookback = isMT5 ? 1800 : 600;
+      const pricesAgo = s.prices[Math.max(0, s.prices.length - lookback)];
+      if (pricesAgo > 0) {
+        const movePct = Math.abs((price - pricesAgo) / pricesAgo) * 100;
+        const meaningfulThr = isXAU ? 0.4 : isBTC ? 0.6 : isNAS ? 0.3 : 0.2;
+        const meaningful = movePct >= meaningfulThr;
+        const moveDir = price > pricesAgo ? 'up' : 'down';
+        const joining = (isCall && moveDir === 'up') || (!isCall && moveDir === 'down');
+        if (meaningful && joining) {
+          sc -= 1;
+          factors.push('mature-1');
+        }
       }
     }
 
@@ -2320,6 +2382,58 @@ function processPrice(sym, price, hi, lo) {
           }
         }
       }
+    }
+
+    // ===== SPY DEMOTED TO INDICATOR-ONLY (added 2026-05-22) =====
+    // Yesterday's 5/21 audit: SPY went 0/4 across all signals (3 PUT SL'd, 1 CALL SL'd)
+    // while QQQ went 2/3 on identical setups (both winners were QQQ PUTs at 11:00 and 13:22).
+    // SPY's signal quality dropped below useful threshold. Keep SPY data flowing
+    // (price/RSI/MACD/macroSnaps) so it can serve as a confirmation source for QQQ and
+    // BTC/NAS100 cross-asset factors, but stop EMITTING SPY signals entirely. Trial —
+    // re-enable if quality recovers in a future audit.
+    if (sym === 'SPY') {
+      log(sym, '🪧 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' SUPPRESSED — SPY demoted to indicator-only (5/21 audit: 0/4 SL across PUT+CALL). SPY data still feeds cross-asset confirmation.');
+      return false;
+    }
+
+    // ===== QQQ RSI EXHAUSTION FLOOR (added 2026-05-22) =====
+    // 5/21 SPY signal #7 SL'd at entry RSI 19.6 (chasing breakdown into extreme oversold).
+    // Equity PUTs at deeply oversold RSI and CALLs at deeply overbought RSI are typically
+    // chasing exhaustion. Hard rule mirroring the XAU pattern (XAU uses 35/65, equities
+    // run tighter at 30/70 since they're less volatile and reach extremes less often).
+    // Fade signals (HI/LO/ATH/ATL/DIV/SWEEP) are exempt — those are designed to fire at
+    // RSI extremes by definition.
+    if (sym === 'QQQ') {
+      const tagQ = sig.score || '';
+      const isFadeAtExtremeQ = /HI|LO|ATH|ATL|DIV|SWEEP/.test(tagQ) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tagQ);
+      if (!isFadeAtExtremeQ) {
+        if (sig.type === 'put' && typeof rsiV === 'number' && rsiV < 30) {
+          log(sym, '🛑 ' + tagQ + ' PUT BLOCKED — QQQ RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' < 30 (oversold). Equity PUT at deep oversold chases exhaustion.');
+          return false;
+        }
+        if (sig.type === 'call' && typeof rsiV === 'number' && rsiV > 70) {
+          log(sym, '🛑 ' + tagQ + ' CALL BLOCKED — QQQ RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' > 70 (overbought). Equity CALL at deep overbought chases exhaustion.');
+          return false;
+        }
+      }
+    }
+
+    // ===== QQQ CONVICTION GATE (added 2026-05-22) =====
+    // Now that SPY is suppressed and convictionFor() returns real factors for QQQ
+    // (MACRO + SPY + NAS + BTC + NAS_SIG + TRUMP — up to 6), gate QQQ signal emission
+    // on conv ≥3. Mirrors the MT5 conviction-gate pattern but with equity-appropriate
+    // factors. Yesterday's 5/21 QQQ losers fired with zero cross-asset confirmation —
+    // requiring 3+ aligned cross-assets (or macro + 2 cross) eliminates the worst entries.
+    if (sym === 'QQQ') {
+      const convQ = convictionFor(sig.type);
+      sig.conv = convQ;
+      const MIN_CONV_QQQ = 3;
+      if (convQ.score < MIN_CONV_QQQ) {
+        Object.assign(s, _emitSnapshot);
+        log(sym, '🎯 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' BLOCKED — QQQ conv ' + convQ.score + '/' + MIN_CONV_QQQ + ' (factors: ' + (convQ.factors.join(',') || 'none') + '). Need SPY/NAS/BTC/NAS_SIG/MACRO alignment.');
+        return false;
+      }
+      return true;
     }
 
     if (!isMT5) return true; // non-MT5 instruments don't have conv — let them through (regime gate above already applied)
@@ -5056,6 +5170,10 @@ function processPrice(sym, price, hi, lo) {
           const slPnl = isLong ? t.trailSl - t.ep : t.ep - t.trailSl;
           log(sym, '🛑 TRv2 TRAIL SL HIT — $' + price.toFixed(2) + ' · SL was $' + t.trailSl.toFixed(2) + ' · P&L $' + slPnl.toFixed(2));
           sendPush('🛑 ' + sym + ' TRAIL SL', '$' + price.toFixed(2) + ' · P&L $' + slPnl.toFixed(2), 'signal');
+          // Record SL for cascade-limit and EMA-spread dedupe gates (added 2026-05-22)
+          s.trv2SlHistory = s.trv2SlHistory || [];
+          s.trv2SlHistory.push({ ts: now3, dir: t.dir, price: price, ema: tEma || 0, spreadPct: spreadPct });
+          if (s.trv2SlHistory.length > 10) s.trv2SlHistory.shift();
           s.trv2Trade = null; s.trv2LastSignalTs = now3;
         }
       }
@@ -5067,6 +5185,10 @@ function processPrice(sym, price, hi, lo) {
           const slPnl = isLong ? t.sl - t.ep : t.ep - t.sl;
           log(sym, '🛑 TRv2 INITIAL SL HIT — $' + price.toFixed(2) + ' · SL $' + t.sl.toFixed(2) + ' · P&L $' + slPnl.toFixed(2));
           sendPush('🛑 ' + sym + ' SL HIT', '$' + price.toFixed(2) + ' · loss $' + slPnl.toFixed(2), 'signal');
+          // Record SL for cascade-limit and EMA-spread dedupe gates (added 2026-05-22)
+          s.trv2SlHistory = s.trv2SlHistory || [];
+          s.trv2SlHistory.push({ ts: now3, dir: t.dir, price: price, ema: tEma || 0, spreadPct: spreadPct });
+          if (s.trv2SlHistory.length > 10) s.trv2SlHistory.shift();
           s.trv2Trade = null; s.trv2LastSignalTs = now3;
         }
       }
@@ -5109,8 +5231,29 @@ function processPrice(sym, price, hi, lo) {
           // Session extreme gate for reverse too
           const revHiBlock = s.lastHiRevTs && (now3 - s.lastHiRevTs < 1800000) && revDir === 'long';
           const revLoBlock = s.lastLoRevTs && (now3 - s.lastLoRevTs < 1800000) && revDir === 'short';
+          // ===== TRv2 AUTO-REVERSE GUARDS (added 2026-05-22) =====
+          // 5/21 NAS chop disaster: 3 back-to-back auto-reverses produced 1 scratch + 2 SLs
+          // in 80min. Auto-reverse calls enrichSig() but ignores its return value (line 5210
+          // pattern: enrichSig(revSig); s.signals.push(...); logSignal(...)), so the chop
+          // block at enrichSig line 2488 was bypassed. Three new gates:
+          //   (1) chop check  — block auto-reverse when chopActive is true
+          //   (2) cascade limit — 2+ TRv2 SLs in last 60min triggers 30min cooldown
+          //   (3) EMA-spread dedupe — current spread must exceed last SL's spread by 1.5×
+          s.trv2SlHistory = s.trv2SlHistory || [];
+          const slHistRecent_R = s.trv2SlHistory.filter(h => now3 - h.ts < 3600000);
+          const cascadeActive_R = slHistRecent_R.length >= 2 && (now3 - slHistRecent_R[slHistRecent_R.length - 1].ts < 1800000);
+          const lastSlSpread_R = slHistRecent_R.length > 0 ? slHistRecent_R[slHistRecent_R.length - 1].spreadPct : 0;
+          const spreadFreshEnough_R = lastSlSpread_R === 0 ? true : spreadPct >= lastSlSpread_R * 1.5;
+
           if (revHiBlock || revLoBlock) {
             log(sym, '🏔️ TRv2 auto-reverse ' + revDir.toUpperCase() + ' blocked — session extreme reversal signal active');
+          } else if (s.chopActive) {
+            log(sym, '🌊 TRv2 auto-reverse ' + revDir.toUpperCase() + ' BLOCKED — chop mode active (5/21 NAS: 3 chop auto-reverses → 1 scratch + 2 SLs).');
+          } else if (cascadeActive_R) {
+            const minsSinceLast_R = Math.round((now3 - slHistRecent_R[slHistRecent_R.length - 1].ts) / 60000);
+            log(sym, '⛔ TRv2 auto-reverse ' + revDir.toUpperCase() + ' BLOCKED — cascade cooldown (' + slHistRecent_R.length + ' SLs in last 60min, last ' + minsSinceLast_R + 'min ago). 30min cooldown.');
+          } else if (!spreadFreshEnough_R) {
+            log(sym, '🔁 TRv2 auto-reverse ' + revDir.toUpperCase() + ' BLOCKED — EMA-spread dedupe: current spread ' + spreadPct.toFixed(3) + '% < 1.5× last SL spread ' + lastSlSpread_R.toFixed(3) + '%. Avoid same-level flip.');
           } else if (revRocOk && revWithMacro) {
             // Unified TP/SL policy: SL=2×ATR, TP1=1.5×, TP2=2.5×, TP3=4× (min $5 for SL/TP1)
             const revMults = { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
@@ -5173,7 +5316,31 @@ function processPrice(sym, price, hi, lo) {
       }
     }
 
-    if (!s.trv2Trade && entryReady && spreadPct >= minSpreadPct && trendAgeMature) {
+    // ===== TRv2 ENTRY GUARDS (added 2026-05-22) — cascade limit + EMA-spread dedupe =====
+    // Mirror the auto-reverse guards. Chop check intentionally NOT applied here — past
+    // analysis showed NAS chop detector overfires on staircase trends. But after a TRv2 SL,
+    // re-entering at the same EMA level is the known whipsaw pattern (5/21 cascade).
+    s.trv2SlHistory = s.trv2SlHistory || [];
+    const slHistRecent_E = s.trv2SlHistory.filter(h => now3 - h.ts < 3600000);
+    const cascadeActive_E = slHistRecent_E.length >= 2 && (now3 - slHistRecent_E[slHistRecent_E.length - 1].ts < 1800000);
+    const lastSlSpread_E = slHistRecent_E.length > 0 ? slHistRecent_E[slHistRecent_E.length - 1].spreadPct : 0;
+    const spreadFreshEnough_E = lastSlSpread_E === 0 ? true : spreadPct >= lastSlSpread_E * 1.5;
+
+    if (!s.trv2Trade && entryReady && spreadPct >= minSpreadPct && trendAgeMature && cascadeActive_E) {
+      if (!s._trv2CascadeLogTs || now3 - s._trv2CascadeLogTs > 60000) {
+        const minsSinceLast_E = Math.round((now3 - slHistRecent_E[slHistRecent_E.length - 1].ts) / 60000);
+        log(sym, '⛔ TRv2 entry blocked — cascade cooldown (' + slHistRecent_E.length + ' SLs in last 60min, last ' + minsSinceLast_E + 'min ago).');
+        s._trv2CascadeLogTs = now3;
+      }
+    }
+    if (!s.trv2Trade && entryReady && spreadPct >= minSpreadPct && trendAgeMature && !cascadeActive_E && !spreadFreshEnough_E) {
+      if (!s._trv2DedupLogTs || now3 - s._trv2DedupLogTs > 60000) {
+        log(sym, '🔁 TRv2 entry blocked — EMA-spread dedupe: current spread ' + spreadPct.toFixed(3) + '% < 1.5× last SL spread ' + lastSlSpread_E.toFixed(3) + '%.');
+        s._trv2DedupLogTs = now3;
+      }
+    }
+
+    if (!s.trv2Trade && entryReady && spreadPct >= minSpreadPct && trendAgeMature && !cascadeActive_E && spreadFreshEnough_E) {
       // ATR-SCALED ROC FILTER: on low-vol days, raise ROC threshold to filter noise
       // When ATR is below baseline, multiply ROC requirement by (baseline/ATR) capped at 2x
       const baselineAtr = 30; // NAS100 only now
@@ -7209,7 +7376,11 @@ app.get('/status', (req, res) => {
       signals: s.dailySignalCount,
       chopActive: s.chopActive,
       trade: s.trade.active ? { type: s.trade.type, ep: s.trade.ep, t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl } : null,
-      recentSignals: s.signals.slice(-5)
+      recentSignals: s.signals.slice(-5),
+      // Blocked-attempt visibility (added 2026-05-22) — surfaces enrichSig gates that
+      // suppressed signal emission. Useful for diagnosing over-gating, especially BTC.
+      blocked: (s.blockedAttempts || []).length,
+      recentBlocks: (s.blockedAttempts || []).slice(-5)
     };
   });
   const wsState = ws ? ['CONNECTING','OPEN','CLOSING','CLOSED'][ws.readyState] : 'NULL';
