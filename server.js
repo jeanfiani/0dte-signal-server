@@ -1353,6 +1353,91 @@ function saveSignalHistory() {
   }
 }
 
+// ===== BLOCKED-OUTCOMES PERSISTENCE (added 2026-05-25) =====
+// Persists shadow-fire blocked-outcome tracking to /data/blocked_outcomes.json so the
+// evidence-collection survives Railway redeploys. Same atomic+fsync pattern as
+// signalHistory. Stored per-symbol with 30-day retention (longer than signalHistory
+// because we need multi-week samples to make confident tuning decisions).
+const BLOCKED_OUTCOMES_FILE = path.join(DATA_DIR, 'blocked_outcomes.json');
+const BLOCKED_OUTCOMES_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+function loadBlockedOutcomes() {
+  const candidates = [BLOCKED_OUTCOMES_FILE, BLOCKED_OUTCOMES_FILE + '.bak'];
+  for (const file of candidates) {
+    try {
+      const txt = fs.readFileSync(file, 'utf8');
+      if (!txt || txt.trim().length === 0) { throw new Error('empty file'); }
+      const raw = JSON.parse(txt);
+      const cutoff = Date.now() - BLOCKED_OUTCOMES_MAX_AGE_MS;
+      let totalLoaded = 0;
+      SYMBOLS.forEach(sym => {
+        if (!S[sym]) return;
+        const symData = raw[sym] || {};
+        const outcomes = Array.isArray(symData.outcomes) ? symData.outcomes : [];
+        // Drop entries older than 30 days
+        S[sym].blockedOutcomes = outcomes.filter(o => o.ts && o.ts > cutoff);
+        S[sym].lastBlockTrackedTs = symData.lastBlockTrackedTs || 0;
+        totalLoaded += S[sym].blockedOutcomes.length;
+      });
+      console.log('[' + ts() + '] Blocked-outcomes loaded — ' + totalLoaded + ' tracked entries (last 30 days) from ' + (file === BLOCKED_OUTCOMES_FILE ? 'primary' : 'BACKUP (.bak)'));
+      return;
+    } catch (e) {
+      console.log('[' + ts() + '] Blocked-outcomes load failed from ' + file + ': ' + e.message);
+    }
+  }
+  console.log('[' + ts() + '] No usable blocked-outcomes file — starting fresh');
+}
+
+let _lastSaveBlockedOutcomesLogTs = 0;
+let _saveBlockedOutcomesCallCount = 0;
+function saveBlockedOutcomes() {
+  try {
+    const cutoff = Date.now() - BLOCKED_OUTCOMES_MAX_AGE_MS;
+    const payload = {};
+    SYMBOLS.forEach(sym => {
+      if (!S[sym]) return;
+      const outcomes = Array.isArray(S[sym].blockedOutcomes) ? S[sym].blockedOutcomes : [];
+      payload[sym] = {
+        outcomes: outcomes.filter(o => o.ts && o.ts > cutoff),
+        lastBlockTrackedTs: S[sym].lastBlockTrackedTs || 0
+      };
+    });
+    const tmpFile = BLOCKED_OUTCOMES_FILE + '.tmp';
+    const fd = fs.openSync(tmpFile, 'w');
+    try {
+      fs.writeSync(fd, JSON.stringify(payload));
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    if (fs.existsSync(BLOCKED_OUTCOMES_FILE)) {
+      try { fs.copyFileSync(BLOCKED_OUTCOMES_FILE, BLOCKED_OUTCOMES_FILE + '.bak'); } catch (e) { /* not fatal */ }
+    }
+    fs.renameSync(tmpFile, BLOCKED_OUTCOMES_FILE);
+    _saveBlockedOutcomesCallCount++;
+    const now = Date.now();
+    if (now - _lastSaveBlockedOutcomesLogTs > 300000) { // log once per 5min
+      const totalEntries = SYMBOLS.reduce((a, sym) => a + (S[sym] && S[sym].blockedOutcomes ? S[sym].blockedOutcomes.length : 0), 0);
+      console.log('[' + ts() + '] 💾 saveBlockedOutcomes — ' + totalEntries + ' tracked entries persisted (' + _saveBlockedOutcomesCallCount + ' saves since last log)');
+      _lastSaveBlockedOutcomesLogTs = now;
+      _saveBlockedOutcomesCallCount = 0;
+    }
+  } catch (e) {
+    console.error('[' + ts() + '] ❌ Failed to save blocked outcomes:', e.message);
+    if (e.code === 'ENOENT') {
+      try {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+        const tmpFile = BLOCKED_OUTCOMES_FILE + '.tmp';
+        const fd = fs.openSync(tmpFile, 'w');
+        try { fs.writeSync(fd, JSON.stringify({})); fs.fsyncSync(fd); }
+        finally { fs.closeSync(fd); }
+        fs.renameSync(tmpFile, BLOCKED_OUTCOMES_FILE);
+        console.log('[' + ts() + '] ✅ saveBlockedOutcomes recovered — recreated DATA_DIR');
+      } catch (e2) { console.error('[' + ts() + '] ❌ Recovery write also failed:', e2.message); }
+    }
+  }
+}
+
 // Periodic backup save — every 60 seconds, catches snapshot updates and outcome changes
 // that may not trigger an explicit save through logSignal or updateSignalOutcome.
 setInterval(() => {
@@ -1362,6 +1447,9 @@ console.log('[STARTUP] Persistence: signalHistory saves every 60s + on every emi
 
 // Save signal history every 5 minutes
 setInterval(saveSignalHistory, 300000);
+
+// Save blocked-outcomes every 5 minutes (added 2026-05-25) — survives Railway redeploys
+setInterval(saveBlockedOutcomes, 300000);
 
 // ===== DAILY CSV BACKUP =====
 // Posts the previous day's CSV to BACKUP_WEBHOOK_URL so we have an off-server copy
@@ -7786,6 +7874,7 @@ app.listen(PORT, () => {
   loadRollingLevels();
   loadTrv2State();
   loadSignalHistory();
+  loadBlockedOutcomes(); // shadow-fire data — survives redeploys (added 2026-05-25)
   loadTrumpState();
   console.log('[' + ts() + '] Trump factor: ' + (ANTHROPIC_API_KEY ? 'enabled (' + TRUMP_CLASSIFIER_MODEL + ')' : 'enabled (heuristic-only — set ANTHROPIC_API_KEY for accurate classification)') + ', TTL ' + Math.round(TRUMP_BIAS_TTL_MS / 60000) + 'min, min-intensity ' + TRUMP_MIN_INTENSITY);
   console.log('[' + ts() + '] Trump feed poller: ' + (TRUMP_FEED_URL ? 'enabled, every ' + Math.round(TRUMP_POLL_INTERVAL_MS / 60000) + 'min from ' + TRUMP_FEED_URL : 'disabled (set TRUMP_FEED_URL to enable auto-polling, or POST manually to /trump/post)'));
