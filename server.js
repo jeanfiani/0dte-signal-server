@@ -5454,10 +5454,22 @@ function processPrice(sym, price, hi, lo) {
           } else if (!spreadFreshEnough_R) {
             log(sym, '🔁 TRv2 auto-reverse ' + revDir.toUpperCase() + ' BLOCKED — EMA-spread dedupe: current spread ' + spreadPct.toFixed(3) + '% < 1.5× last SL spread ' + lastSlSpread_R.toFixed(3) + '%. Avoid same-level flip.');
           } else if (revRocOk && revWithMacro) {
-            // Unified TP/SL policy: SL=2×ATR, TP1=1.5×, TP2=2.5×, TP3=4× (min $5 for SL/TP1)
-            const revMults = { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
+            // TP/SL policy: SL=2×ATR (always tight), TPs differ by symbol.
+            // NAS (extended 2026-05-25 to match buildCfdTrade NAS extension from task #102):
+            //   NAS futures show clean directional legs — 5/15 was $29400→$29000 with minimal
+            //   counter-spikes. Default 1.5/2.5/4× was cutting TP3 at ~0.08% (Sunday TRv2 win:
+            //   only $24.75). NAS now uses 3/6/12× to capture full legs (~$30/$60/$120 with
+            //   typical ATR ~10). BTC keeps default — BTC chops harder, tighter TPs are safer.
+            //
+            // TP1 min floor (updated 2026-05-25): $5 is too tight for NAS at $29k+ (only 0.017%).
+            // Raised to $30 for NAS so even low-ATR entries get a meaningful first target.
+            // XAU/BTC keep $5 floor (proportional to their price levels).
+            const revMults = isNAS
+              ? { sl: 2, t1: 3, t2: 6, t3: 12 }
+              : { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
+            const revTp1Floor = isNAS ? 30 : 5;
             const revSl = revDir === 'long' ? price - Math.max(trv2Atr * revMults.sl, 5) : price + Math.max(trv2Atr * revMults.sl, 5);
-            const revTp1 = revDir === 'long' ? price + Math.max(trv2Atr * revMults.t1, 5) : price - Math.max(trv2Atr * revMults.t1, 5);
+            const revTp1 = revDir === 'long' ? price + Math.max(trv2Atr * revMults.t1, revTp1Floor) : price - Math.max(trv2Atr * revMults.t1, revTp1Floor);
             const revTp2 = revDir === 'long' ? price + trv2Atr * revMults.t2 : price - trv2Atr * revMults.t2;
             const revTp3 = revDir === 'long' ? price + trv2Atr * revMults.t3 : price - trv2Atr * revMults.t3;
 
@@ -5581,10 +5593,22 @@ function processPrice(sym, price, hi, lo) {
 
       if (longOk || shortOk) {
         const dir = longOk ? 'long' : 'short';
-        // Unified TP/SL policy: SL=2×ATR, TP1=1.5×, TP2=2.5×, TP3=4× (min $5 for SL/TP1)
-        const entMults = { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
+        // TP/SL policy: SL=2×ATR (always tight), TPs differ by symbol.
+        // NAS (extended 2026-05-25 to match buildCfdTrade NAS extension from task #102):
+        //   NAS futures produce clean directional legs that the default 1.5/2.5/4× was cutting
+        //   short. Sunday TRv2 NAS PUT hit TP3 at +$24.75 (0.08%) — the leg actually ran
+        //   $30-$50 lower. NAS now uses 3/6/12× to capture the full leg (~$30/$60/$120 with
+        //   typical ATR ~10). BTC keeps default — BTC chops harder, wide TPs risk give-back.
+        //
+        // TP1 min floor (updated 2026-05-25): $5 was too small for NAS at $29k+ (only 0.017%
+        // of price). Raised to $30 so even low-ATR TRv2 entries have a meaningful first
+        // target. XAU/BTC keep $5 (proportional to their price levels).
+        const entMults = isNAS
+          ? { sl: 2, t1: 3, t2: 6, t3: 12 }
+          : { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
+        const tp1Floor = isNAS ? 30 : 5;
         const sl = dir === 'long' ? price - Math.max(trv2Atr * entMults.sl, 5) : price + Math.max(trv2Atr * entMults.sl, 5);
-        const tp1 = dir === 'long' ? price + Math.max(trv2Atr * entMults.t1, 5) : price - Math.max(trv2Atr * entMults.t1, 5);
+        const tp1 = dir === 'long' ? price + Math.max(trv2Atr * entMults.t1, tp1Floor) : price - Math.max(trv2Atr * entMults.t1, tp1Floor);
         const tp2 = dir === 'long' ? price + trv2Atr * entMults.t2 : price - trv2Atr * entMults.t2;
         const tp3 = dir === 'long' ? price + trv2Atr * entMults.t3 : price - trv2Atr * entMults.t3;
 
@@ -6310,7 +6334,10 @@ function buildCfdTrade(type, price, atr, sym) {
   // since the SL→breakeven scratch logic depends on TP1 hitting. Smaller TP1 = higher hit
   // rate = more trades locked at breakeven instead of full SL. TP2/TP3 stay ATR-based to
   // capture larger runners.
-  const tp1Dist = isXAU ? 5.0 : Math.max(atr * mults.t1, 5);
+  // NAS TP1 min floor raised $5 → $30 (added 2026-05-25): NAS at $29k+ makes $5 floor
+  // only 0.017% of price — too small to be a meaningful first target. $30 floor matches
+  // ~3× ATR with typical NAS ATR ~10, only kicks in during low-vol periods.
+  const tp1Dist = isXAU ? 5.0 : isNAS ? Math.max(atr * mults.t1, 30) : Math.max(atr * mults.t1, 5);
   const tp2Dist = atr * mults.t2;
   const tp3Dist = atr * mults.t3;
   const sl = iC ? price - slDist : price + slDist;
