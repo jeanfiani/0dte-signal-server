@@ -6862,7 +6862,16 @@ function processTicks(symbols) {
 
     // === TREND RIDE TRAILING STOP — monitor every tick for TREND signals ===
     // Dynamic ATR-based stop with trailing: breakeven at 1x ATR profit, trail at 1x ATR after 2x ATR profit
-    if ((isXAUt || isBTCt || isNASt) && s.trade.active && s.trade.isTrend) {
+    //
+    // BUG FIX (2026-05-25): gated to !s.trade.isCfd — this legacy trailing logic was
+    // ratcheting slPrice to BE at 1× ATR profit, which is BEFORE TP1 hits (TP1 is at
+    // 1.5× ATR for default, 3× ATR for NAS). For CFD trades (TRv2, BREAKOUT, FAST, TREND
+    // entered via buildCfdTrade), this caused SL to move to entry too early — any tick
+    // back to entry would SL out the trade before TP1 booked a partial profit, breaking
+    // the 0-losers strategy. CFD trades use the TP1/TP2/TP3 trailSl mechanism in
+    // checkExit() which correctly waits for TP1 hit before moving SL to BE.
+    // Legacy percentage-based trades (non-CFD) still use this trailing logic as before.
+    if ((isXAUt || isBTCt || isNASt) && s.trade.active && s.trade.isTrend && !s.trade.isCfd) {
       const t = s.trade;
       const tPnl = t.type === 'call' ? price - t.ep : t.ep - price;
       const atr = t.atr || (isBTCt ? 50 : sym === 'NAS100' ? 15 : 3);
