@@ -5408,10 +5408,29 @@ function processPrice(sym, price, hi, lo) {
           : false;
         const macroTag = withMacro ? '+MACRO' : '';
         const sig = { type: sigType, time: ts(), price: price.toFixed(2), score: (dir === 'long' ? '⬆' : '⬇') + 'RIDE' + macroTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount, tp1: tp1.toFixed(2), tp2: tp2.toFixed(2), tp3: tp3.toFixed(2), sl: sl.toFixed(2) };
-        if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
+        // ===== TRv2 NOTIFICATION + TRADE MONITOR — always fire when TRv2 enters (added 2026-05-25) =====
+        // Previously: `if (!enrichSig(sig)) return;` blocked the notification + s.trade activation
+        // when enrichSig returned false (e.g., RIDE blocked by chop suppression at line 2524).
+        // The trade still ran in the background (s.trv2Trade was set above) but the user got no
+        // entry notification and the EA's trade monitor never picked it up — only the TP1/TP2/TP3
+        // alerts fired later. 5/24-25 case: NAS TRv2 won a full TP3 sweep silently in chop mode.
+        //
+        // Fix: TRv2's own gates (EMA spread, ATR, cascade limit #154, EMA dedupe #155, conv
+        // maturity #156, RSI bands #79) are stricter than enrichSig's general checks. If TRv2
+        // decided to enter, we trust it — ALWAYS notify + activate s.trade. enrichSig still runs
+        // for analytics (signalHistory inclusion), but it can no longer suppress the entry alert
+        // or trade monitor handoff.
         log(sym, '🚀 TRv2 ENTRY ' + dir.toUpperCase() + (withMacro ? ' +MACRO' : '') + ' — $' + price.toFixed(2) + ' > EMA $' + tEma.toFixed(2) + ' (+' + spreadPct.toFixed(3) + '%) · ATR $' + trv2Atr.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('🚀 ' + sym + ' ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2), 'signal');
         s.trade = { active: true, type: sigType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, ts: Date.now(), pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: sl, tp1Price: tp1, tp2Price: tp2, tp3Price: tp3, atr: trv2Atr, bestPrice: price, trailSl: 0 };
+        // Run enrichSig for analytics — if it blocks, signal won't be added to signalHistory
+        // but the trade still runs and the user already got the notification.
+        if (enrichSig(sig)) {
+          s.signals.push(sig);
+          logSignal(sym, sig);
+        } else {
+          log(sym, '📊 TRv2 entry not added to signalHistory (blocked by enrichSig — analytics only, trade still active)');
+        }
         return;
       }
     }
