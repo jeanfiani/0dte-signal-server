@@ -912,8 +912,116 @@ function log(sym, msg) {
       S[sym].blockedAttempts = S[sym].blockedAttempts || [];
       S[sym].blockedAttempts.push({ ts: Date.now(), time: ts(), msg: msg.substring(0, 240) });
       if (S[sym].blockedAttempts.length > 30) S[sym].blockedAttempts.shift();
+      // Shadow-fire outcome tracking (added 2026-05-25, rate-limited)
+      trackBlockedOutcome(sym, msg);
     }
   } catch (e) { /* never let blocked-tracking crash logging */ }
+}
+
+// ===== SHADOW-FIRE BLOCKED OUTCOME TRACKER (added 2026-05-25) =====
+// Records virtual TP1/SL outcomes for blocked signals to gather evidence on whether
+// our gates are correctly filtering losers vs over-blocking winners. PURE DATA COLLECTION —
+// does NOT affect signal-firing behavior, conviction scoring, or the 0-losers policy.
+//
+// Rate-limited to 1 tracked entry per symbol per 35min. Bot blocks 500-600 signals/session;
+// tracking all of them would create unmanageable noise. Sampling one per 35min gives
+// ~10-15 entries per symbol per session — enough to spot patterns without spam.
+//
+// Use GET /blocked-outcomes/:sym to review. After 1-2 weeks of data, we can decide on
+// targeted tuning (e.g., "chop block on ATH PUT correctly avoided 12 losers and only
+// missed 2 winners — keep it" or "trend-block on ATH avoided 1 loser and missed 8
+// winners — relax it").
+const BLOCK_TRACK_COOLDOWN_MS = 35 * 60 * 1000;
+
+function trackBlockedOutcome(sym, msg) {
+  const s = S[sym];
+  if (!s) return;
+  if (!Array.isArray(s.prices) || s.prices.length === 0) return;
+  const now = Date.now();
+  s.lastBlockTrackedTs = s.lastBlockTrackedTs || 0;
+  if (now - s.lastBlockTrackedTs < BLOCK_TRACK_COOLDOWN_MS) return;
+  // Parse direction from message (most block logs contain "CALL" or "PUT")
+  const typeMatch = msg.match(/\b(CALL|PUT)\b/);
+  if (!typeMatch) return; // can't determine direction — skip
+  const type = typeMatch[1].toLowerCase();
+  // Parse detector tag — try common patterns
+  let detector = 'unknown';
+  const tagMatch = msg.match(/[⬆⬇]?(RIDE|BREAK|BREAKOUT|LHF|LLF|FAST|ATH|ATL|VREV|MFLIP|HI|LO|DIV|SWEEP|TREND)/);
+  if (tagMatch) detector = tagMatch[1];
+  else if (/V-REV/.test(msg)) detector = 'VREV';
+  else if (/RSI hard/.test(msg)) detector = 'RSI-FLOOR';
+  const price = s.prices[s.prices.length - 1];
+  if (!isFinite(price) || price <= 0) return;
+  // Per-symbol virtual TP1/SL distances — match real-signal scales
+  let tp1Dist;
+  if (sym === 'XAU') tp1Dist = 5;
+  else if (sym === 'BTC') tp1Dist = 50;
+  else if (sym === 'NAS100') tp1Dist = 10;
+  else if (sym === 'QQQ' || sym === 'SPY') tp1Dist = 0.3;
+  else tp1Dist = 5;
+  const slDist = tp1Dist; // 1:1 for measurement purposes
+  const virtualTp1 = type === 'call' ? price + tp1Dist : price - tp1Dist;
+  const virtualSl  = type === 'call' ? price - slDist  : price + slDist;
+  s.blockedOutcomes = s.blockedOutcomes || [];
+  s.blockedOutcomes.push({
+    ts: now,
+    time: ts(),
+    symbol: sym,
+    detector: detector,
+    type: type,
+    price: +price.toFixed(2),
+    virtualTp1: +virtualTp1.toFixed(2),
+    virtualSl: +virtualSl.toFixed(2),
+    blockReason: msg.substring(0, 200),
+    snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+    tp1Hit: false, tp1HitTs: null,
+    slHit: false, slHitTs: null,
+    closed: false, closedTs: null,
+    outcome: null  // 'win' | 'loss' | 'scratch' | 'no_resolve'
+  });
+  s.lastBlockTrackedTs = now;
+  // Cap rolling buffer at 50 entries per symbol (~3-5 sessions of data)
+  if (s.blockedOutcomes.length > 50) s.blockedOutcomes.shift();
+}
+
+// Update tracked block outcomes on each tick — snapshots + TP1/SL hit detection.
+// Called from the tick processor for each symbol. Mirrors the BE-trail logic of real
+// signals: TP1 hit → SL trails to entry → if reversed, outcome = 'scratch' (BE, no loss).
+function updateBlockedOutcomes(sym, price) {
+  const s = S[sym];
+  if (!s || !Array.isArray(s.blockedOutcomes) || s.blockedOutcomes.length === 0) return;
+  const now = Date.now();
+  for (const b of s.blockedOutcomes) {
+    if (b.closed) continue;
+    const elapsedMin = (now - b.ts) / 60000;
+    // Take snapshots at 5/15/30/60 min
+    if (b.snaps.p5m == null && elapsedMin >= 5) b.snaps.p5m = +price.toFixed(2);
+    if (b.snaps.p15m == null && elapsedMin >= 15) b.snaps.p15m = +price.toFixed(2);
+    if (b.snaps.p30m == null && elapsedMin >= 30) b.snaps.p30m = +price.toFixed(2);
+    if (b.snaps.p60m == null && elapsedMin >= 60) b.snaps.p60m = +price.toFixed(2);
+    // TP1/SL hit detection
+    if (!b.tp1Hit && !b.slHit) {
+      const tp1Reached = b.type === 'call' ? price >= b.virtualTp1 : price <= b.virtualTp1;
+      const slReached  = b.type === 'call' ? price <= b.virtualSl  : price >= b.virtualSl;
+      if (tp1Reached) { b.tp1Hit = true; b.tp1HitTs = now; }
+      else if (slReached) { b.slHit = true; b.slHitTs = now; }
+    } else if (b.tp1Hit && !b.slHit) {
+      // After TP1: SL trails to entry (matches real signal BE-trail behavior). If price
+      // reverses back to entry, outcome is 'scratch' (BE, not a loss).
+      const beReached = b.type === 'call' ? price <= b.price : price >= b.price;
+      if (beReached) { b.slHit = true; b.slHitTs = now; }
+    }
+    // Close conditions: 60min elapsed OR resolved (TP1+SL=scratch, SL only=loss, etc.)
+    const resolved = (b.tp1Hit && b.slHit) || (b.slHit && !b.tp1Hit);
+    if (elapsedMin >= 60 || resolved) {
+      if (b.tp1Hit && b.slHit) b.outcome = 'scratch';
+      else if (b.tp1Hit && !b.slHit) b.outcome = 'win';
+      else if (b.slHit && !b.tp1Hit) b.outcome = 'loss';
+      else b.outcome = 'no_resolve';
+      b.closed = true;
+      b.closedTs = now;
+    }
+  }
 }
 
 // ===== PERSISTENT SIGNAL LOGGING =====
@@ -1719,6 +1827,9 @@ function processPrice(sym, price, hi, lo) {
       return true; // still pending
     });
   }
+  // Shadow-fire blocked-outcome tracking (added 2026-05-25) — read-only data collection
+  // for evidence-based future tuning. Does not affect signal-firing path.
+  try { updateBlockedOutcomes(sym, price); } catch (e) { /* never crash tick loop */ }
   // MT5 needs 720+ entries for 12-min ROC (1 tick/sec), equities need 200
   const maxPrices = isMT5 ? 800 : 200;
   if (s.prices.length > maxPrices) { s.prices.shift(); s.highs.shift(); s.lows.shift(); }
@@ -7151,6 +7262,45 @@ app.post('/trade/clear', (req, res) => {
 // Returns the state vars that the gates read from, so we can debug why a gate
 // fired or didn't fire without parsing logs. Especially useful for the multi-day
 // regime gate (dailyLevels + macroSnaps + computed netChgPct).
+// GET /blocked-outcomes/:sym — review shadow-fire data for blocked signals (added 2026-05-25).
+// Returns summary stats + last 30 tracked entries. Use to decide on future tuning:
+//   - High win-rate on blocked signals = we're over-blocking, consider relaxing
+//   - High loss-rate on blocked signals = gates are correctly filtering, keep tight
+//   - Mixed = need more data or per-detector analysis
+// Read-only — no side effects on signal firing.
+app.get('/blocked-outcomes/:sym', (req, res) => {
+  const sym = req.params.sym.toUpperCase();
+  const s = S[sym];
+  if (!s) return res.status(404).json({ error: 'Unknown symbol: ' + sym });
+  const outcomes = Array.isArray(s.blockedOutcomes) ? s.blockedOutcomes : [];
+  const closed = outcomes.filter(o => o.closed);
+  const wins = closed.filter(o => o.outcome === 'win').length;
+  const losses = closed.filter(o => o.outcome === 'loss').length;
+  const scratches = closed.filter(o => o.outcome === 'scratch').length;
+  const unresolved = closed.filter(o => o.outcome === 'no_resolve').length;
+  // Per-detector breakdown
+  const byDetector = {};
+  closed.forEach(o => {
+    const key = o.detector + '-' + o.type;
+    if (!byDetector[key]) byDetector[key] = { total: 0, win: 0, loss: 0, scratch: 0, no_resolve: 0 };
+    byDetector[key].total++;
+    byDetector[key][o.outcome]++;
+  });
+  res.json({
+    symbol: sym,
+    total: outcomes.length,
+    open: outcomes.length - closed.length,
+    closed: closed.length,
+    summary: { wins, losses, scratches, unresolved },
+    winRate: closed.length > 0 ? (((wins + scratches * 0.5) / closed.length) * 100).toFixed(1) + '%' : 'n/a',
+    avoidedLossRate: closed.length > 0 ? (((losses + scratches * 0.5) / closed.length) * 100).toFixed(1) + '%' : 'n/a',
+    byDetector,
+    lastTrackedAgoMin: s.lastBlockTrackedTs ? Math.round((Date.now() - s.lastBlockTrackedTs) / 60000) : null,
+    cooldownMin: BLOCK_TRACK_COOLDOWN_MS / 60000,
+    entries: outcomes.slice(-30)
+  });
+});
+
 app.get('/state/:sym', (req, res) => {
   const sym = req.params.sym.toUpperCase();
   const s = S[sym];
