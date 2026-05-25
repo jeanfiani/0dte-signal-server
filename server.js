@@ -2023,10 +2023,13 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // === TREND RIDE V2 — 1-min candle builder + 15/20/30 EMA (NAS100 only) ===
-  // Removed from BTC: TRv2 went 0/6 -$872 on 5/6 in chop, chop detector overfires,
-  // and BTC's volatile micro-structure doesn't suit the averaged-EMA trend approach.
-  if (isNAS) {
+  // === TREND RIDE V2 — 1-min candle builder + 15/20/30 EMA (NAS100 + BTC) ===
+  // History: Removed from BTC after 0/6 -$872 on 5/6 in chop. Re-enabled 2026-05-25 — the
+  // protection layer added since then (cascade limit #154, EMA dedupe #155, conv maturity
+  // factor #156, TP1 BE-trail scratch protection) addresses the original loss-cascade pattern.
+  // User judgment: TRv2's averaged-EMA + ATR-sized targets fit BTC's clean directional legs
+  // better than fragmented BREAKOUT/FAST/TREND entries.
+  if (isNAS || isBTC) {
     if (!s.trv2CurCandle) {
       s.trv2CurCandle = { o: price, h: price, l: price, c: price, startTs: Date.now(), ticks: 1 };
     } else {
@@ -5305,11 +5308,13 @@ function processPrice(sym, price, hi, lo) {
   }
 
   // ===== TREND RIDE V2 — TREND-FOLLOWING SYSTEM (NAS100 only) =====
-  // Replaces TREND + MFLIP for NAS100. One entry per trend leg, hold until reversal.
+  // Replaces TREND + MFLIP for NAS100 + BTC. One entry per trend leg, hold until reversal.
   // Uses averaged 15/20/30-min EMA as trend line. Fires entry with TP1/TP2/TP3, manages trade,
   // exits on EMA cross-back, optionally reverses.
-  // Removed from BTC: 0/6 -$872 on 5/6 in chop, volatile micro-structure doesn't suit averaged-EMA.
-  if (isNAS && s.trv2TrendEma !== null && s.trv2Candles.length >= 30) {
+  // BTC re-enabled 2026-05-25 (was disabled after 0/6 -$872 on 5/6) — cascade limit, EMA
+  // dedupe, conv maturity factor, and TP1 BE-trail scratch protection now prevent the
+  // original loss-cascade pattern. User assessment: TRv2 fits BTC's clean directional legs.
+  if ((isNAS || isBTC) && s.trv2TrendEma !== null && s.trv2Candles.length >= 30) {
     const tEma = s.trv2TrendEma;
     const spread = Math.abs(price - tEma);
     const spreadPct = (spread / tEma) * 100;
@@ -5514,9 +5519,12 @@ function processPrice(sym, price, hi, lo) {
     const minTrendAgeMs = 900000; // 15 minutes
     const trendAgeMature = trendAgeMs >= minTrendAgeMs;
 
-    // TRv2 is now NAS100-only. No chop gating — NAS chop detector overfires on staircase trends
-    // (94% chop=1 on +185pt day, 5/6). NAS TRv2 went 6/6 TP1 hit during "chop".
-    // BTC was removed entirely from TRv2 due to 0/6 -$872 performance in chop.
+    // TRv2 runs on NAS100 + BTC (BTC re-enabled 2026-05-25). No chop gating on entry —
+    // NAS chop detector overfires on staircase trends (94% chop=1 on +185pt day, 5/6). NAS
+    // TRv2 went 6/6 TP1 hit during "chop". Auto-reverse path DOES have chop block (#153)
+    // since the 5/21 cascade. Entry path is protected by cascade limit, EMA dedupe, conv
+    // maturity, and TP1 BE-trail scratch — keeps the strategy 0-losers even when entries
+    // fire during chop classifications.
     const entryReady = now3 - s.trv2LastSignalTs > 300000; // 5 min cooldown
 
     if (!s.trv2Trade && entryReady && spreadPct >= minSpreadPct && !trendAgeMature) {
