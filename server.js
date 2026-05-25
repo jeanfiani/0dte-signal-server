@@ -2007,9 +2007,22 @@ function processPrice(sym, price, hi, lo) {
             }
           }
         }
-        // Mitigate OBs — if price passes through an OB zone completely, it's spent
+        // Mitigate OBs — if price passes through an OB zone completely, it's spent.
+        // Fresh-mitigation flag (added 2026-05-25): when an OB transitions to mitigated, mark
+        // it for the continuation detector. Bull OB mitigated = demand broken = bearish
+        // continuation; Bear OB mitigated = supply broken = bullish continuation.
         s.orderBlocks.forEach(ob => {
           if (!ob.mitigated) {
+            const becameMit = (ob.type === 'bull' && price < ob.lo) || (ob.type === 'bear' && price > ob.hi);
+            if (becameMit) {
+              ob.mitigated = true;
+              s.lastObMitTs = Date.now();
+              s.lastObMitType = ob.type;          // 'bull' or 'bear'
+              s.lastObMitLevel = (ob.hi + ob.lo) / 2;
+              s.obMitFired = false;                // reset so the continuation detector can fire
+              log(sym, '⚡ OB freshly MITIGATED: ' + ob.type.toUpperCase() + ' $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' broken — watching for ' + (ob.type === 'bull' ? 'PUT' : 'CALL') + ' continuation');
+            }
+            // Note: ob.mitigated may also be set by the simpler price-cross check below for backward compat
             if (ob.type === 'bull' && price < ob.lo) ob.mitigated = true; // demand broken
             if (ob.type === 'bear' && price > ob.hi) ob.mitigated = true; // supply broken
           }
@@ -3707,29 +3720,39 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // Order Block Zone Filter — soft +1/-1 based on proximity to OB zones
-  // CALL near bullish OB (demand) = +1, CALL into bearish OB (supply overhead) = -1
-  // PUT near bearish OB (supply) = +1, PUT into bullish OB (demand below) = -1
+  // Order Block Zone Filter — proximity-weighted boost (dynamic ±2/±1 based on closeness)
+  // CALL near bullish OB (demand) = boost, CALL into bearish OB (supply overhead) = penalty
+  // PUT near bearish OB (supply) = boost, PUT into bullish OB (demand below) = penalty
+  //
+  // Proximity tiers (added 2026-05-25): closer to the OB edge = stronger structural signal.
+  //   - Tier 1 (very close, within $2 of edge or inside zone) = ±2 (the price IS at the level)
+  //   - Tier 2 (within $5 of edge) = ±1 (approaching)
+  //   - Beyond $5 = 0 (out of range)
+  // Previously a flat ±1 — the dynamic weight makes near-OB setups (where reversal is most
+  // likely) hit higher conv tiers, and far-OB setups don't get artificial inflation.
   if (isXAU && s.orderBlocks.length > 0) {
     let obBoost = 0;
-    const obProximity = isXAU ? 5.0 : 1.0; // within $5 of OB zone for XAU
+    const tier1Range = 2.0;  // very-close (inside OB or within $2 of edge)
+    const tier2Range = 5.0;  // approaching ($2-5 from edge)
     for (const ob of s.orderBlocks) {
-      const inZone = price >= ob.lo - obProximity && price <= ob.hi + obProximity;
-      if (!inZone) continue;
+      // Distance to nearest OB edge (0 if price is INSIDE the zone)
+      const distToEdge = price < ob.lo ? (ob.lo - price) : price > ob.hi ? (price - ob.hi) : 0;
+      if (distToEdge > tier2Range) continue;
+      const tier = distToEdge <= tier1Range ? 2 : 1;
       if (ob.type === 'bull') {
         // Price at bullish OB (demand zone) — good for CALL, bad for PUT
-        if (cS >= pS) { obBoost = 1; log(sym, '🟩 OB boost: CALL +1 — at bullish demand $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2)); }
-        else { obBoost = -1; log(sym, '🟩 OB penalty: PUT -1 — at bullish demand $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2)); }
+        if (cS >= pS) { obBoost = tier; log(sym, '🟩 OB boost: CALL +' + tier + ' — at bullish demand $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' (dist $' + distToEdge.toFixed(2) + ', tier ' + tier + ')'); }
+        else { obBoost = -tier; log(sym, '🟩 OB penalty: PUT -' + tier + ' — at bullish demand $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' (dist $' + distToEdge.toFixed(2) + ', tier ' + tier + ')'); }
       }
       if (ob.type === 'bear') {
         // Price at bearish OB (supply zone) — good for PUT, bad for CALL
-        if (pS > cS) { obBoost = 1; log(sym, '🟥 OB boost: PUT +1 — at bearish supply $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2)); }
-        else { obBoost = -1; log(sym, '🟥 OB penalty: CALL -1 — at bearish supply $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2)); }
+        if (pS > cS) { obBoost = tier; log(sym, '🟥 OB boost: PUT +' + tier + ' — at bearish supply $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' (dist $' + distToEdge.toFixed(2) + ', tier ' + tier + ')'); }
+        else { obBoost = -tier; log(sym, '🟥 OB penalty: CALL -' + tier + ' — at bearish supply $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' (dist $' + distToEdge.toFixed(2) + ', tier ' + tier + ')'); }
       }
       break; // use closest/most recent OB only
     }
-    if (obBoost > 0) { if (cS >= pS) cS++; else pS++; }
-    if (obBoost < 0) { if (cS >= pS) cS--; else pS--; }
+    if (obBoost > 0) { if (cS >= pS) cS += obBoost; else pS += obBoost; }
+    if (obBoost < 0) { if (cS >= pS) cS += obBoost; else pS += obBoost; } // obBoost is negative
   }
   s._orderBlocks = isXAU ? s.orderBlocks.filter(ob => !ob.mitigated) : [];
 
@@ -4006,8 +4029,27 @@ function processPrice(sym, price, hi, lo) {
     const SOFT_MACRO_THR = 5;
     const SOFT_MACRO_STABLE_MS = 120000; // 2 min
     const tSoftMacro = Date.now();
+    // OB-confluence bypass (added 2026-05-25): if there's an unmitigated bearish OB zone
+    // overhead and ROC is strongly negative, treat OB as macro-substitute. The OB IS
+    // structural supply — by definition it's where institutions sold last time. EMAs lag
+    // price but OB doesn't. Today's case: XAU dropped $4576→$4564 with 341 OB boost
+    // events and 122 LHF blocks (macro lagged). Bot fired BREAKOUT at the bottom instead
+    // of LHF mid-move. OB-confluence path:
+    //   1. obZone exists, unmitigated, direction = 'put' (bearish supply)
+    //   2. Price is within proximity of the OB (it IS the structural top)
+    //   3. ROC strongly negative (move underway, not just noise)
+    // All other LHF gates (timing, distance, range, cooldown, RSI, MACD, flip, win-protect)
+    // still apply. 0-losers safe — tight SL at localHi+buffer is unchanged.
+    const obProxXAU = 5.0, obProxBTC = 200, obProxNAS = 25;
+    const obProx = isBTC ? obProxBTC : isNAS ? obProxNAS : obProxXAU;
+    const rocStrongBearThr = isBTC ? -0.08 : isNAS ? -0.05 : isXAU ? -0.05 : -0.05;
+    const lhfPutObOk = s.obZone && !s.obMitigated && !s.obDeparted &&
+      s.obZone.dir === 'put' &&
+      (s.obZone.lo - price) <= obProx && price < s.obZone.hi + obProx &&
+      roc3 < rocStrongBearThr;
     const lhfPutMacroOk  = macroAlignedFor('put') ||
-      (s.fullConvSincePut > 0 && (tSoftMacro - s.fullConvSincePut) >= SOFT_MACRO_STABLE_MS && convictionFor('put').score >= SOFT_MACRO_THR);
+      (s.fullConvSincePut > 0 && (tSoftMacro - s.fullConvSincePut) >= SOFT_MACRO_STABLE_MS && convictionFor('put').score >= SOFT_MACRO_THR) ||
+      lhfPutObOk;
     const lhfPutFlipOk   = flipCoolFor('put');
     const lhfPutWinOk    = winProtectDir !== 'call';
     if (lhfPutTimingOk && lhfPutDistOk && lhfPutRangeOk && lhfPutCoolOk &&
@@ -4071,8 +4113,16 @@ function processPrice(sym, price, hi, lo) {
     const llfCallRsiOk    = rsiV > 40 && rsiV < 65;
     const llfCallMacdOk   = macdL > macdS && macdHist > 0;
     // Same relaxed macro gate for LLF (mirror of LHF). See LHF comment above.
+    // OB-confluence bypass (added 2026-05-25): mirror of LHF — when there's an unmitigated
+    // bullish OB zone below and ROC strongly positive, treat OB as macro-substitute.
+    const rocStrongBullThr = isBTC ? 0.08 : isNAS ? 0.05 : isXAU ? 0.05 : 0.05;
+    const llfCallObOk = s.obZone && !s.obMitigated && !s.obDeparted &&
+      s.obZone.dir === 'call' &&
+      (price - s.obZone.hi) <= obProx && price > s.obZone.lo - obProx &&
+      roc3 > rocStrongBullThr;
     const llfCallMacroOk  = macroAlignedFor('call') ||
-      (s.fullConvSinceCall > 0 && (tSoftMacro - s.fullConvSinceCall) >= SOFT_MACRO_STABLE_MS && convictionFor('call').score >= SOFT_MACRO_THR);
+      (s.fullConvSinceCall > 0 && (tSoftMacro - s.fullConvSinceCall) >= SOFT_MACRO_STABLE_MS && convictionFor('call').score >= SOFT_MACRO_THR) ||
+      llfCallObOk;
     const llfCallFlipOk   = flipCoolFor('call');
     const llfCallWinOk    = winProtectDir !== 'put';
     if (llfCallTimingOk && llfCallDistOk && llfCallRangeOk && llfCallCoolOk &&
@@ -4419,6 +4469,53 @@ function processPrice(sym, price, hi, lo) {
         return;
       }
       } // end else (flipCool/winProtect ok)
+    }
+  }
+
+  // ===== OB-MITIGATED TREND CONTINUATION (added 2026-05-25) =====
+  // When an OB zone from s.orderBlocks is freshly mitigated (price punched THROUGH the
+  // demand/supply zone), it's strong evidence that the level held — then broke. This is a
+  // high-quality continuation setup in the punch-through direction.
+  //   - Bull OB (demand) mitigated by drop = bears overpowered demand = PUT continuation
+  //   - Bear OB (supply) mitigated by rise = bulls overpowered supply = CALL continuation
+  //
+  // Conditions:
+  //   - Fresh mitigation within last 60s (s.lastObMitTs set in the OB-builder block above)
+  //   - Not already fired for this mitigation (s.obMitFired flag)
+  //   - 30-min cooldown per symbol (avoid spam if multiple OBs break in succession)
+  //   - ROC + MACD confirm direction (no chasing reversals)
+  //   - All standard gates via enrichSig (chop, regime, RSI floor, etc.)
+  //
+  // 0-losers safe: uses standard buildCfdTrade SL/TP, including OB-anchored TP1 (Fix 2)
+  // which will set TP1 just before the NEXT downstream OB if one exists.
+  if (isMT5 && s.lastObMitTs && !s.obMitFired) {
+    const obMitAgeMs = now2 - s.lastObMitTs;
+    const obMitCoolMs = 30 * 60 * 1000; // 30 min
+    const obMitFresh = obMitAgeMs < 60000; // within last 60s
+    const obMitCoolOk = (s.lastObMitSignalTs || 0) === 0 || (now2 - s.lastObMitSignalTs) > obMitCoolMs;
+    if (obMitFresh && obMitCoolOk && cool) {
+      const dir = s.lastObMitType === 'bull' ? 'put' : 'call';
+      const rocOk = (dir === 'call' && roc3 > 0.02) || (dir === 'put' && roc3 < -0.02);
+      const macdDirOk = (dir === 'call' && macdHist > 0) || (dir === 'put' && macdHist < 0);
+      const flipOk = flipCoolFor(dir);
+      const winOk = winProtectDir === null || winProtectDir === dir;
+      if (rocOk && macdDirOk && flipOk && winOk) {
+        s.obMitFired = true;
+        s.lastObMitSignalTs = now2;
+        s.lastAT = dir; if (dir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
+        if (s.lastSignalDir && s.lastSignalDir !== dir) s.lastReversalTs = now2;
+        s.lastSignalDir = dir; s.lastSignalTs = now2; s.lastNTs = now2;
+        s.lastSameDir = dir; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+        const scoreTag = dir === 'call' ? '⬆OBMIT' : '⬇OBMIT';
+        const sig = { type: dir, time: ts(), price: price.toFixed(2), score: scoreTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        if (!enrichSig(sig)) return;
+        s.signals.push(sig); logSignal(sym, sig);
+        if (isMT5) attachTpSl(sig, dir, price, atrVal, sym);
+        log(sym, '⚡ OB-MIT CONTINUATION ' + dir.toUpperCase() + ' — ' + s.lastObMitType.toUpperCase() + ' OB broken @ $' + s.lastObMitLevel.toFixed(2) + ' · ROC ' + roc3.toFixed(3) + '% · MACD hist ' + macdHist.toFixed(3) + ' [#' + s.dailySignalCount + ']');
+        sendPush('⚡ ' + sym + ' OB-MIT ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · ' + s.lastObMitType.toUpperCase() + ' OB broken @ $' + s.lastObMitLevel.toFixed(2), 'signal');
+        s.trade = isMT5 ? buildCfdTrade(dir, price, atrVal, sym) : { active: true, type: dir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
+        return;
+      }
     }
   }
 
@@ -6321,6 +6418,48 @@ function attachOTE(trade, s, sym, dir) {
   return trade;
 }
 
+// ===== OB-ANCHORED TP1 (added 2026-05-25) =====
+// Find the closest UNMITIGATED opposing OB in the trade direction. For a PUT trade going
+// down, look for a BULLISH OB (demand zone) below — that's where price typically bounces.
+// For a CALL trade going up, look for a BEARISH OB (supply zone) above — where price
+// typically rejects. If found and CLOSER than the default ATR-based TP1, anchor TP1
+// just before the OB edge. Result: higher TP1 hit rate at structurally meaningful levels.
+//
+// Only TIGHTENS TP1 — never widens it. If the OB is further than default TP1, default
+// wins. This is 0-losers-safe: smaller TP1 = higher hit rate = more BE-trail protection.
+//
+// Returns the OB-anchored TP1 price, or null if no usable OB found.
+function findObAnchoredTp1(s, sym, dir, entryPrice, atr) {
+  if (!s.orderBlocks || s.orderBlocks.length === 0) return null;
+  // Per-symbol buffer before the OB edge (how much room to leave for TP1 to hit reliably)
+  const buffer = sym === 'XAU' ? 0.50 : sym === 'BTC' ? 20 : sym === 'NAS100' ? 2.0 : 0.20;
+  // Minimum distance from entry — don't anchor TP1 if OB is too close (would be insta-hit)
+  const minDist = sym === 'XAU' ? 1.5 : sym === 'BTC' ? 30 : sym === 'NAS100' ? 3 : 0.10;
+  let bestTp1 = null;
+  let bestDist = Infinity;
+  for (const ob of s.orderBlocks) {
+    if (ob.mitigated) continue;
+    if (dir === 'put') {
+      // PUT going down → look for BULL OB below entry (price will bounce off demand)
+      if (ob.type !== 'bull') continue;
+      if (ob.hi >= entryPrice) continue; // OB must be below entry
+      const tp1Candidate = ob.hi + buffer;
+      const dist = entryPrice - tp1Candidate;
+      if (dist < minDist) continue;
+      if (dist < bestDist) { bestDist = dist; bestTp1 = tp1Candidate; }
+    } else {
+      // CALL going up → look for BEAR OB above entry (price will reject off supply)
+      if (ob.type !== 'bear') continue;
+      if (ob.lo <= entryPrice) continue; // OB must be above entry
+      const tp1Candidate = ob.lo - buffer;
+      const dist = tp1Candidate - entryPrice;
+      if (dist < minDist) continue;
+      if (dist < bestDist) { bestDist = dist; bestTp1 = tp1Candidate; }
+    }
+  }
+  return bestTp1;
+}
+
 function buildCfdTrade(type, price, atr, sym) {
   const iC = type === 'call';
   const isXAU = sym === 'XAU';
@@ -6349,9 +6488,25 @@ function buildCfdTrade(type, price, atr, sym) {
   const tp2Dist = atr * mults.t2;
   const tp3Dist = atr * mults.t3;
   const sl = iC ? price - slDist : price + slDist;
-  const tp1 = iC ? price + tp1Dist : price - tp1Dist;
+  let tp1 = iC ? price + tp1Dist : price - tp1Dist;
   const tp2 = iC ? price + tp2Dist : price - tp2Dist;
   const tp3 = iC ? price + tp3Dist : price - tp3Dist;
+  // ===== OB-ANCHORED TP1 (added 2026-05-25) =====
+  // If there's an unmitigated opposing OB in the trade direction CLOSER than the
+  // ATR-based TP1, anchor TP1 to just before the OB edge. The OB is a structural
+  // reversal level — TP1 there has a much higher hit rate than blindly $5/$30/3×ATR
+  // out. Only tightens TP1; never widens it. 0-losers safe.
+  const sStateForOb = sym && S[sym] ? S[sym] : null;
+  if (sStateForOb) {
+    const obTp1 = findObAnchoredTp1(sStateForOb, sym, type, price, atr);
+    if (obTp1 !== null) {
+      const tighterTp1 = iC ? Math.min(obTp1, tp1) : Math.max(obTp1, tp1);
+      if (tighterTp1 !== tp1) {
+        console.log('[' + ts() + '] ' + sym + ': 🎯 OB-anchored TP1 — using $' + tighterTp1.toFixed(2) + ' (before opposing OB) vs ATR default $' + tp1.toFixed(2));
+        tp1 = tighterTp1;
+      }
+    }
+  }
 
   // ===== SAME-DIRECTION CONTINUATION — LOCK TP1 (added 2026-05-14) =====
   // When a new same-direction signal fires while the existing trade is still active and
