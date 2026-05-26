@@ -2437,14 +2437,19 @@ function processPrice(sym, price, hi, lo) {
       }
     }
 
-    // ===== CONV MATURITY PENALTY (added 2026-05-22) =====
-    // When a high-conv signal (sc≥5) JOINS a move that already happened (signal direction
-    // matches the prior 30-min price move with magnitude above a per-symbol threshold),
-    // apply -1 penalty. The rationale: ROC/MACD/cross-asset factors flip TOGETHER late in a
-    // move, producing a 5-7/7 conv reading right as the move exhausts. Caught by:
+    // ===== CONV MATURITY PENALTY (added 2026-05-22, threshold lowered 2026-05-26) =====
+    // When a signal (sc≥3) JOINS a move that already happened (signal direction matches
+    // the prior 30-min price move with magnitude above a per-symbol threshold), apply -1
+    // penalty. The rationale: ROC/MACD/cross-asset factors flip TOGETHER late in a move,
+    // producing a 5-7/7 conv reading right as the move exhausts. Threshold lowered from
+    // sc≥5 to sc≥3 on 2026-05-26 because TRv2 RIDE entries typically run conv 3-4 and were
+    // missing this penalty entirely. Today's BTC TRv2 SHORT at $76,778 fired at conv 3
+    // (MACRO+ROC×3+STRUCT) right at the bottom of a sweep — the penalty would have flagged
+    // it as 'mature' but the old threshold ignored it. Caught by:
     //   • 5/21 XAU afternoon stack: 3 ATL CALLs at conv 5-7 after $36 rally — 1 scratch + 2 rolls
     //   • 5/21 NAS chop cascade: every TRv2 reverse fired at conv 5-6, all flipped together
-    if (sc >= 5 && s.prices && s.prices.length >= 30) {
+    //   • 5/26 BTC TRv2 SHORT at $76,778 fresh trough — conv 3 (would now get -1 → 2)
+    if (sc >= 3 && s.prices && s.prices.length >= 30) {
       // MT5 ticks ~1s, equities ~3s → 30min lookback = 1800 / 600 ticks respectively
       const lookback = isMT5 ? 1800 : 600;
       const pricesAgo = s.prices[Math.max(0, s.prices.length - lookback)];
@@ -4851,6 +4856,7 @@ function processPrice(sym, price, hi, lo) {
         s.divSwingPrice = price;
         s.divSwingRsi = rsiV;
         s.divSwingTs = now2;
+        s.lastDivTroughInvalTs = now2; // timestamp for TRv2 liquidity-sweep cooldown (added 2026-05-26)
         return;
       }
       // Tracking a potential peak — update running extreme as price rises
@@ -4927,6 +4933,7 @@ function processPrice(sym, price, hi, lo) {
         s.divSwingPrice = price;
         s.divSwingRsi = rsiV;
         s.divSwingTs = now2;
+        s.lastDivPeakInvalTs = now2; // timestamp for TRv2 liquidity-sweep cooldown (added 2026-05-26)
         return;
       }
       // Tracking a potential trough — update running extreme as price falls
@@ -5589,6 +5596,31 @@ function processPrice(sym, price, hi, lo) {
           } else if (!spreadFreshEnough_R) {
             log(sym, '🔁 TRv2 auto-reverse ' + revDir.toUpperCase() + ' BLOCKED — EMA-spread dedupe: current spread ' + spreadPct.toFixed(3) + '% < 1.5× last SL spread ' + lastSlSpread_R.toFixed(3) + '%. Avoid same-level flip.');
           } else if (revRocOk && revWithMacro) {
+            // ===== AUTO-REVERSE GUARDS (mirror initial-entry, added 2026-05-26) =====
+            const revEntryType = revDir === 'long' ? 'call' : 'put';
+            const revConv_g = convictionFor(revEntryType);
+            if (revConv_g.score < 5) {
+              log(sym, '🎯 TRv2 auto-reverse ' + revDir.toUpperCase() + ' BLOCKED — conv ' + revConv_g.score + '/5 (factors: ' + (revConv_g.factors.join(',') || 'none') + '). Needs HIGH conv (5+/7).');
+              return;
+            }
+            const DIV_INVAL_COOL_MS_R = 15 * 60 * 1000;
+            if (revDir === 'short' && s.lastDivTroughInvalTs && (now3 - s.lastDivTroughInvalTs) < DIV_INVAL_COOL_MS_R) {
+              log(sym, '🌊 TRv2 auto-reverse SHORT BLOCKED — DIV trough invalidated ' + Math.round((now3 - s.lastDivTroughInvalTs) / 60000) + 'min ago (liquidity-sweep).');
+              return;
+            }
+            if (revDir === 'long' && s.lastDivPeakInvalTs && (now3 - s.lastDivPeakInvalTs) < DIV_INVAL_COOL_MS_R) {
+              log(sym, '🌊 TRv2 auto-reverse LONG BLOCKED — DIV peak invalidated ' + Math.round((now3 - s.lastDivPeakInvalTs) / 60000) + 'min ago (liquidity-sweep).');
+              return;
+            }
+            const FRESH_EXT_COOL_MS_R = 15 * 60 * 1000;
+            if (revDir === 'short' && s.rollingLowUpdateTs && (now3 - s.rollingLowUpdateTs) < FRESH_EXT_COOL_MS_R) {
+              log(sym, '🏔️ TRv2 auto-reverse SHORT BLOCKED — fresh local low ' + Math.round((now3 - s.rollingLowUpdateTs) / 60000) + 'min ago (selling-the-bottom).');
+              return;
+            }
+            if (revDir === 'long' && s.rollingHighUpdateTs && (now3 - s.rollingHighUpdateTs) < FRESH_EXT_COOL_MS_R) {
+              log(sym, '🏔️ TRv2 auto-reverse LONG BLOCKED — fresh local high ' + Math.round((now3 - s.rollingHighUpdateTs) / 60000) + 'min ago (buying-the-top).');
+              return;
+            }
             // TP/SL policy: SL=2×ATR (always tight), TPs differ by symbol.
             // NAS (extended 2026-05-25 to match buildCfdTrade NAS extension from task #102):
             //   NAS futures show clean directional legs — 5/15 was $29400→$29000 with minimal
@@ -5731,6 +5763,48 @@ function processPrice(sym, price, hi, lo) {
 
       if (longOk || shortOk) {
         const dir = longOk ? 'long' : 'short';
+        // ===== TRv2 ENTRY GUARDS (added 2026-05-26 — three coordinated checks) =====
+        // User strategy: TRv2 should fire only when 70%+ directionally confident.
+        // The three new guards address the 5/26 BTC SHORT loss (entered at $76,778 right
+        // after DIV trough invalidated at $76,777 = textbook liquidity-sweep loss) +
+        // two NAS LONGs that SL'd in chop-range tops.
+        //
+        // Guard 1: Conv 5+/7 floor — TRv2 entry must reach HIGH conv tier
+        const trv2EntryType = dir === 'long' ? 'call' : 'put';
+        const trv2Conv = convictionFor(trv2EntryType);
+        const TRv2_MIN_CONV = 5;
+        if (trv2Conv.score < TRv2_MIN_CONV) {
+          log(sym, '🎯 TRv2 ' + dir.toUpperCase() + ' BLOCKED — conv ' + trv2Conv.score + '/' + TRv2_MIN_CONV + ' (factors: ' + (trv2Conv.factors.join(',') || 'none') + '). TRv2 needs HIGH conv tier (5+/7).');
+          return;
+        }
+        // Guard 2: DIV invalidation cooldown (15 min) — fresh trough/peak break is a
+        // liquidity-sweep pattern, not a continuation. 5/26 BTC SHORT fired 3 min after
+        // DIV trough invalidated at $76,777 → price reversed UP $156 from entry.
+        const DIV_INVAL_COOL_MS = 15 * 60 * 1000;
+        if (dir === 'short' && s.lastDivTroughInvalTs && (now3 - s.lastDivTroughInvalTs) < DIV_INVAL_COOL_MS) {
+          const minsAgo = Math.round((now3 - s.lastDivTroughInvalTs) / 60000);
+          log(sym, '🌊 TRv2 SHORT BLOCKED — DIV trough invalidated ' + minsAgo + 'min ago (liquidity-sweep pattern). 15min cooldown.');
+          return;
+        }
+        if (dir === 'long' && s.lastDivPeakInvalTs && (now3 - s.lastDivPeakInvalTs) < DIV_INVAL_COOL_MS) {
+          const minsAgo = Math.round((now3 - s.lastDivPeakInvalTs) / 60000);
+          log(sym, '🌊 TRv2 LONG BLOCKED — DIV peak invalidated ' + minsAgo + 'min ago (liquidity-sweep pattern). 15min cooldown.');
+          return;
+        }
+        // Guard 3: Fresh-extreme guard (15 min) — don't fire TRv2 at a freshly-set local
+        // extreme. SHORT at a fresh local low or LONG at a fresh local high is the
+        // "selling-the-bottom / buying-the-top" anti-pattern.
+        const FRESH_EXTREME_COOL_MS = 15 * 60 * 1000;
+        if (dir === 'short' && s.rollingLowUpdateTs && (now3 - s.rollingLowUpdateTs) < FRESH_EXTREME_COOL_MS) {
+          const minsAgo = Math.round((now3 - s.rollingLowUpdateTs) / 60000);
+          log(sym, '🏔️ TRv2 SHORT BLOCKED — fresh local low set ' + minsAgo + 'min ago at $' + s.rollingLow.toFixed(2) + ' (selling-the-bottom pattern). 15min cooldown.');
+          return;
+        }
+        if (dir === 'long' && s.rollingHighUpdateTs && (now3 - s.rollingHighUpdateTs) < FRESH_EXTREME_COOL_MS) {
+          const minsAgo = Math.round((now3 - s.rollingHighUpdateTs) / 60000);
+          log(sym, '🏔️ TRv2 LONG BLOCKED — fresh local high set ' + minsAgo + 'min ago at $' + s.rollingHigh.toFixed(2) + ' (buying-the-top pattern). 15min cooldown.');
+          return;
+        }
         // TP/SL policy: SL=2×ATR (always tight), TPs differ by symbol.
         // NAS (extended 2026-05-25 to match buildCfdTrade NAS extension from task #102):
         //   NAS futures produce clean directional legs that the default 1.5/2.5/4× was cutting
