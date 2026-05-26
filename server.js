@@ -4043,10 +4043,27 @@ function processPrice(sym, price, hi, lo) {
     const obProxXAU = 5.0, obProxBTC = 200, obProxNAS = 25;
     const obProx = isBTC ? obProxBTC : isNAS ? obProxNAS : obProxXAU;
     const rocStrongBearThr = isBTC ? -0.08 : isNAS ? -0.05 : isXAU ? -0.05 : -0.05;
-    const lhfPutObOk = s.obZone && !s.obMitigated && !s.obDeparted &&
+    // OB path A: s.obZone (universal, set after BREAKOUT fires)
+    const lhfPutObZoneOk = s.obZone && !s.obMitigated && !s.obDeparted &&
       s.obZone.dir === 'put' &&
       (s.obZone.lo - price) <= obProx && price < s.obZone.hi + obProx &&
       roc3 < rocStrongBearThr;
+    // OB path B (XAU only, added 2026-05-26): s.orderBlocks ARRAY also tracks displacement
+    // OBs that exist BEFORE any breakout. Today's case: 508 LHF blocks while a matching
+    // bearish OB existed in orderBlocks but s.obZone wasn't set yet. Without this, the
+    // bypass misses XAU setups where the demand/supply zone is from a displacement candle.
+    let lhfPutObArrayOk = false;
+    if (isXAU && Array.isArray(s.orderBlocks) && roc3 < rocStrongBearThr) {
+      for (const ob of s.orderBlocks) {
+        if (ob.mitigated) continue;
+        if (ob.type !== 'bear') continue;            // PUT needs bearish supply OB
+        if (price > ob.hi + obProxXAU) continue;     // price too far above the supply zone
+        if (price < ob.lo - obProxXAU) continue;     // price punched through (mitigated)
+        lhfPutObArrayOk = true;
+        break;
+      }
+    }
+    const lhfPutObOk = lhfPutObZoneOk || lhfPutObArrayOk;
     const lhfPutMacroOk  = macroAlignedFor('put') ||
       (s.fullConvSincePut > 0 && (tSoftMacro - s.fullConvSincePut) >= SOFT_MACRO_STABLE_MS && convictionFor('put').score >= SOFT_MACRO_THR) ||
       lhfPutObOk;
@@ -4116,10 +4133,26 @@ function processPrice(sym, price, hi, lo) {
     // OB-confluence bypass (added 2026-05-25): mirror of LHF — when there's an unmitigated
     // bullish OB zone below and ROC strongly positive, treat OB as macro-substitute.
     const rocStrongBullThr = isBTC ? 0.08 : isNAS ? 0.05 : isXAU ? 0.05 : 0.05;
-    const llfCallObOk = s.obZone && !s.obMitigated && !s.obDeparted &&
+    // OB path A: s.obZone (universal)
+    const llfCallObZoneOk = s.obZone && !s.obMitigated && !s.obDeparted &&
       s.obZone.dir === 'call' &&
       (price - s.obZone.hi) <= obProx && price > s.obZone.lo - obProx &&
       roc3 > rocStrongBullThr;
+    // OB path B (XAU only, added 2026-05-26): s.orderBlocks ARRAY for displacement OBs.
+    // Today's case: 508 LLF CALL blocks at $4528 while bullish OB existed in orderBlocks
+    // at $4527-$4529. Without this path, the bypass missed the structural confluence.
+    let llfCallObArrayOk = false;
+    if (isXAU && Array.isArray(s.orderBlocks) && roc3 > rocStrongBullThr) {
+      for (const ob of s.orderBlocks) {
+        if (ob.mitigated) continue;
+        if (ob.type !== 'bull') continue;            // CALL needs bullish demand OB
+        if (price < ob.lo - obProxXAU) continue;     // price too far below the demand zone
+        if (price > ob.hi + obProxXAU) continue;     // price punched through (mitigated)
+        llfCallObArrayOk = true;
+        break;
+      }
+    }
+    const llfCallObOk = llfCallObZoneOk || llfCallObArrayOk;
     const llfCallMacroOk  = macroAlignedFor('call') ||
       (s.fullConvSinceCall > 0 && (tSoftMacro - s.fullConvSinceCall) >= SOFT_MACRO_STABLE_MS && convictionFor('call').score >= SOFT_MACRO_THR) ||
       llfCallObOk;
