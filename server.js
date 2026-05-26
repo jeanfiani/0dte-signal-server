@@ -2728,6 +2728,56 @@ function processPrice(sym, price, hi, lo) {
           return false;
         }
       }
+      // ===== FADE-INSIDE-OPPOSING-OB BLOCK (added 2026-05-26) =====
+      // Fade signals (ATL/ATH/HI/LO/VREV/DIV/SWEEP/LHF/LLF) are normally exempt from OB
+      // proximity blocks because they're designed to fire AT extremes. But when a fade
+      // would enter LITERALLY INSIDE an opposing OB zone, the move is structurally capped
+      // and the fade likely fails.
+      // 5/26 case: XAU ATL CALL fired at $4,506.85 inside bearish supply OB $4506.41-$4507.62.
+      // Entry conv was 5/HIGH from cross-asset metals, but lacked MACRO and OB factors.
+      // Price stalled at supply, reversed, SL'd. Price then ran $20+ in the OPPOSITE direction.
+      if (isFadeForOb) {
+        const insideObZone = price >= ob.lo && price <= ob.hi;
+        if (insideObZone) {
+          // CALL fade INSIDE bearish supply OB → capped by overhead supply
+          if (sig.type === 'call' && ob.dir === 'put') {
+            Object.assign(s, _emitSnapshot);
+            log(sym, '🧱 ' + tagEarly + ' CALL BLOCKED — fade fires INSIDE bearish supply OB $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' at price $' + price.toFixed(2) + '. Move capped by overhead supply.');
+            return false;
+          }
+          // PUT fade INSIDE bullish demand OB → capped by underlying demand
+          if (sig.type === 'put' && ob.dir === 'call') {
+            Object.assign(s, _emitSnapshot);
+            log(sym, '🧱 ' + tagEarly + ' PUT BLOCKED — fade fires INSIDE bullish demand OB $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' at price $' + price.toFixed(2) + '. Move capped by underlying demand.');
+            return false;
+          }
+        }
+      }
+    }
+    // ===== FADE-INSIDE-OPPOSING-OB BLOCK — XAU orderBlocks array (added 2026-05-26) =====
+    // XAU also tracks displacement OBs in s.orderBlocks (separate from s.obZone). Apply
+    // the same "no fading inside opposing OB" rule to those zones too.
+    if (isXAU && Array.isArray(s.orderBlocks) && s.orderBlocks.length > 0) {
+      const isFadeForObXAU = /VREV|ATH|ATL|HI|LO|DIV|SWEEP|LHF|LLF/.test(tagEarly);
+      if (isFadeForObXAU) {
+        for (const ob of s.orderBlocks) {
+          if (ob.mitigated) continue;
+          const insideOb = price >= ob.lo && price <= ob.hi;
+          if (!insideOb) continue;
+          // CALL fade INSIDE bearish supply (orderBlocks type 'bear')
+          if (sig.type === 'call' && ob.type === 'bear') {
+            Object.assign(s, _emitSnapshot);
+            log(sym, '🧱 ' + tagEarly + ' CALL BLOCKED — fade fires INSIDE bearish supply (orderBlocks) $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' at $' + price.toFixed(2) + '. Move capped by overhead supply.');
+            return false;
+          }
+          // PUT fade INSIDE bullish demand (orderBlocks type 'bull')
+          if (sig.type === 'put' && ob.type === 'bull') {
+            Object.assign(s, _emitSnapshot);
+            log(sym, '🧱 ' + tagEarly + ' PUT BLOCKED — fade fires INSIDE bullish demand (orderBlocks) $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' at $' + price.toFixed(2) + '. Move capped by underlying demand.');
+            return false;
+          }
+        }
+      }
     }
 
     // ===== CHOP SUPPRESSION — NAS + BTC (extended 2026-05-19 to BTC) =====
@@ -2742,7 +2792,7 @@ function processPrice(sym, price, hi, lo) {
     // XAU is NOT included — XAU chop produces different patterns and its detectors have
     // separate gates (e.g., V-REV chop block at the V-REV level, FAST disabled, etc.).
     if ((isNAS || isBTC) && s.chopActive) {
-      const isFadeAllowedInChop = /VREV|LHF|LLF/.test(tagEarly);
+      const isFadeAllowedInChop = /VREV|LHF|LLF|OBREJ/.test(tagEarly);
       if (!isFadeAllowedInChop) {
         Object.assign(s, _emitSnapshot);
         log(sym, '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' chop mode active (only V-REV / LHF / LLF allowed in chop; other detectors consistently lose in flat range).');
@@ -4553,6 +4603,96 @@ function processPrice(sym, price, hi, lo) {
         sendPush('⚡ ' + sym + ' OB-MIT ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · ' + s.lastObMitType.toUpperCase() + ' OB broken @ $' + s.lastObMitLevel.toFixed(2), 'signal');
         s.trade = isMT5 ? buildCfdTrade(dir, price, atrVal, sym) : { active: true, type: dir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
         return;
+      }
+    }
+  }
+
+  // ===== OB-REJECTION FADE DETECTOR (added 2026-05-26) =====
+  // Fires fade signal when price ENTERS an unmitigated OB in the OB direction.
+  // Bearish supply OB holds → fire PUT (price rejects DOWN off supply).
+  // Bullish demand OB holds → fire CALL (price rejects UP off demand).
+  //
+  // Complement to OBMIT (above) which fires when OB BREAKS — OBREJ fires when OB HOLDS.
+  // Today's case: 5/26 XAU ATL CALL fired at $4,506.85 INSIDE bearish supply OB
+  // $4,506.41-$4,507.62 → SL'd → price dropped $20 to $4,486. OBREJ PUT would have
+  // fired at the same moment with tight SL at OB high + buffer, catching the $20 move.
+  //
+  // 0-losers safety:
+  //   - Tight SL at OB outer edge + buffer (typically $2-$4 risk on XAU)
+  //   - TP1 capped per-symbol ($5 XAU / $50 BTC / $30 NAS) — high hit rate
+  //   - TP1 BE-trail engages on TP1 hit
+  //   - Conv ≥3 confirmation (some cross-asset alignment)
+  //   - RSI exhaustion floor enforced (PUT≥35, CALL≤65)
+  //   - 30-min cooldown per direction (no spam on chop near OB level)
+  //   - All standard enrichSig gates (regime, win-protect, etc.)
+  if (isMT5 && cool) {
+    const obRejCoolMs = 30 * 60 * 1000;
+    const obRejBuffer = isBTC ? 50 : isNAS ? 8 : isXAU ? 2 : 0.20;
+    const tryObRej = (ob, isBearOb, isBullOb) => {
+      if (!isBearOb && !isBullOb) return false;
+      const insideOb = price >= ob.lo && price <= ob.hi;
+      if (!insideOb) return false;
+      const dir = isBearOb ? 'put' : 'call';
+      // Cooldown
+      const lastTs = dir === 'put' ? (s.lastObRejPutTs || 0) : (s.lastObRejCallTs || 0);
+      if (lastTs > 0 && (Date.now() - lastTs) < obRejCoolMs) return false;
+      // Direction-aware gates
+      if (!flipCoolFor(dir)) return false;
+      if (winProtectDir !== null && winProtectDir !== dir) return false;
+      // RSI exhaustion floor — don't fade an already-exhausted move
+      if (dir === 'put' && rsiV < 35) return false;
+      if (dir === 'call' && rsiV > 65) return false;
+      // Conv ≥3 confirmation
+      const obrConv = convictionFor(dir);
+      if (obrConv.score < 3) return false;
+      // Build signal
+      const scoreTag = (dir === 'call' ? '⬆' : '⬇') + 'OBREJ';
+      s.lastAT = dir; if (dir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
+      if (s.lastSignalDir && s.lastSignalDir !== dir) s.lastReversalTs = now2;
+      s.lastSignalDir = dir; s.lastSignalTs = now2; s.lastNTs = now2;
+      s.lastSameDir = dir; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+      const sig = { type: dir, time: ts(), price: price.toFixed(2), score: scoreTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+      if (!enrichSig(sig)) return true; // blocked by other gates — still consume to avoid spam
+      s.signals.push(sig); logSignal(sym, sig);
+      // Custom SL/TP based on OB structure
+      const slPrice = dir === 'put' ? ob.hi + obRejBuffer : ob.lo - obRejBuffer;
+      const slDist = Math.abs(slPrice - price);
+      if (slDist > 0) {
+        const tp1Cap = isXAU ? 5 : isBTC ? 50 : isNAS ? 30 : 5;
+        const tp1Dist = Math.min(slDist * 1.5, tp1Cap);
+        const tp1P = dir === 'put' ? price - tp1Dist : price + tp1Dist;
+        const tp2P = dir === 'put' ? price - slDist * 2.5 : price + slDist * 2.5;
+        const tp3P = dir === 'put' ? price - slDist * 4.0 : price + slDist * 4.0;
+        s.trade = buildCfdTrade(dir, price, atrVal, sym);
+        s.trade.slPrice = +slPrice.toFixed(2);
+        s.trade.tp1Price = +tp1P.toFixed(2);
+        s.trade.tp2Price = +tp2P.toFixed(2);
+        s.trade.tp3Price = +tp3P.toFixed(2);
+        sig.sl = slPrice.toFixed(2);
+        sig.tp1 = tp1P.toFixed(2);
+        sig.tp2 = tp2P.toFixed(2);
+        sig.tp3 = tp3P.toFixed(2);
+      } else {
+        s.trade = buildCfdTrade(dir, price, atrVal, sym);
+        attachTpSl(sig, dir, price, atrVal, sym);
+      }
+      if (dir === 'put') s.lastObRejPutTs = Date.now();
+      else s.lastObRejCallTs = Date.now();
+      log(sym, '🧱 OB-REJECTION ' + dir.toUpperCase() + ' — price $' + price.toFixed(2) + ' INSIDE ' + (isBearOb ? 'bearish supply' : 'bullish demand') + ' OB $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' · conv ' + obrConv.score + ' [' + (obrConv.factors.join(',') || 'none') + '] [#' + s.dailySignalCount + ']');
+      sendPush('🧱 ' + sym + ' OBREJ ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · ' + (isBearOb ? 'rejected at supply' : 'bounced off demand') + ' $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2), 'signal');
+      return true;
+    };
+    // Check s.obZone (universal, set on breakouts) — must not be mitigated/departed
+    if (s.obZone && !s.obMitigated && !s.obDeparted) {
+      const fired = tryObRej(s.obZone, s.obZone.dir === 'put', s.obZone.dir === 'call');
+      if (fired) return;
+    }
+    // Check s.orderBlocks (XAU array, from displacement candles)
+    if (isXAU && Array.isArray(s.orderBlocks)) {
+      for (const ob of s.orderBlocks) {
+        if (ob.mitigated) continue;
+        const fired = tryObRej(ob, ob.type === 'bear', ob.type === 'bull');
+        if (fired) return;
       }
     }
   }
