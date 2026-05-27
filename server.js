@@ -2695,6 +2695,64 @@ function processPrice(sym, price, hi, lo) {
     const isFadeEarly = /ATH|ATL|HI|LO|DIV/.test(tagEarly) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tagEarly);
     const macroContraNow = Date.now();
 
+    // ===== SESSION-DIRECTION COUNTER-TREND GATE (added 2026-05-26) =====
+    // When the 4-hour price trajectory is decisively in one direction, counter-trend
+    // signals need higher conviction to fire. Cross-asset conv factors can be misleading
+    // when the symbol itself is grinding the other way.
+    //
+    // 5/26 case: 3 XAU CALL signals fired during a $4540→$4486 down-session, all
+    // with conv 5-7 + OB factor, all SL'd. The conv "HIGH" label came from cross-asset
+    // metals (DXY/TLT/SLV/GDX) being CALL-aligned while XAU itself was bleeding.
+    // Meanwhile XAU ATL CALL at the actual low (conv 4, lower!) ran TP3 — the fresh-
+    // extreme fade was the real reversal, not the chase entries.
+    //
+    // Rule: if 4h slope exceeds threshold against the signal direction, require conv ≥6
+    // (raised from typical 5). Fresh-extreme fades (ATL/ATH/VREV/SWEEP/HI/LO/OBREJ) are
+    // EXEMPT — they're designed to fire AT reversal points, not as counter-trend chases.
+    //
+    // 0-losers safety:
+    //   - Only ADDS block conditions, never loosens
+    //   - Conv 6+ still allows exceptional setups through
+    //   - Fresh-extreme fades preserved (saw XAU ATL TP3 winner with this exemption)
+    //   - Per-symbol thresholds (XAU/BTC/NAS have different volatility profiles)
+    const isExtremeFadeExempt = /ATL|ATH|VREV|SWEEP|HI|LO|OBREJ/.test(tagEarly);
+    if (!isExtremeFadeExempt && Array.isArray(s.macroSnaps) && s.macroSnaps.length >= 4) {
+      // Find closest snapshot to 4h ago — macroSnaps is 5-min interval, 72 entries = 6h
+      const fourHrsAgoTs = Date.now() - 4 * 60 * 60 * 1000;
+      let refSnap = null;
+      for (const snap of s.macroSnaps) {
+        if (snap.ts <= fourHrsAgoTs) refSnap = snap;
+        else break;
+      }
+      // Fallback to oldest snap if none is >=4h old yet
+      if (!refSnap) refSnap = s.macroSnaps[0];
+      const refAgeMs = refSnap ? (Date.now() - refSnap.ts) : 0;
+      // Need at least 1h of history for the session trend to be meaningful
+      if (refSnap && refSnap.p > 0 && refAgeMs >= 3600000) {
+        const sessionPct = ((price - refSnap.p) / refSnap.p) * 100;
+        // Per-symbol thresholds — XAU more volatile, NAS even more, BTC most. Equities tight.
+        const ctDownThr = isXAU ? -0.20 : isBTC ? -0.40 : isNAS ? -0.30 : -0.15;
+        const ctUpThr   = isXAU ?  0.20 : isBTC ?  0.40 : isNAS ?  0.30 :  0.15;
+        const inDownSession = sessionPct <= ctDownThr;
+        const inUpSession   = sessionPct >= ctUpThr;
+        const CT_MIN_CONV = 6;
+        if (sig.type === 'call' && inDownSession && conv.score < CT_MIN_CONV) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🌊 ' + tagEarly + ' CALL BLOCKED — counter-trend in DOWN session ('
+            + sessionPct.toFixed(2) + '% over ' + Math.round(refAgeMs / 60000) + 'min, conv '
+            + conv.score + '/' + CT_MIN_CONV + ' required). Fresh-extreme fades exempt.');
+          return false;
+        }
+        if (sig.type === 'put' && inUpSession && conv.score < CT_MIN_CONV) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🌊 ' + tagEarly + ' PUT BLOCKED — counter-trend in UP session (+'
+            + sessionPct.toFixed(2) + '% over ' + Math.round(refAgeMs / 60000) + 'min, conv '
+            + conv.score + '/' + CT_MIN_CONV + ' required). Fresh-extreme fades exempt.');
+          return false;
+        }
+      }
+    }
+
     // ===== OB PROXIMITY HARD BLOCK (added 2026-05-18) =====
     // The soft obBoost penalty (-1 on base score) wasn't strong enough to stop signals
     // firing into known opposing OB zones. 5/18 log showed XAU CALL fire while bot was
