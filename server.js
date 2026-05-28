@@ -2333,6 +2333,27 @@ function processPrice(sym, price, hi, lo) {
       if ((isCall && tltDir === 'up') || (!isCall && tltDir === 'down')) { sc++; factors.push('TLT'); }
       if (slvPrice > 0 && ((isCall && slvDir === 'up') || (!isCall && slvDir === 'down'))) { sc++; factors.push('SLV'); }
       if (gdxPrice > 0 && ((isCall && gdxDir === 'up') || (!isCall && gdxDir === 'down'))) { sc++; factors.push('GDX'); }
+      // ===== XAU CROSS-ASSET SIGNAL CONFLUENCE (added 2026-05-28, Option B) =====
+      // When NAS or BTC has fired a same-direction signal in the last 10 min, XAU's CALL/PUT
+      // gets +1 conv. This is independent confirmation from another asset — much stronger than
+      // just "BTC is rising right now". 5/28 case: NAS TRv2 LONG hit TP1 (+$78) at 10:13 ET
+      // while XAU was in a rally setup but blocked. NAS_SIG / BTC_SIG would have helped XAU
+      // CALL signals reach HIGH conv tier and clear conv-floor gates.
+      const CROSS_SIG_WINDOW_MS_XAU = 10 * 60 * 1000;
+      const nowXauCross = Date.now();
+      const nasS_X = S['NAS100'], btcS_X = S['BTC'];
+      if (nasS_X) {
+        const lastNasSameDirTs = isCall ? (nasS_X.lastCallSignalTs || 0) : (nasS_X.lastPutSignalTs || 0);
+        if (lastNasSameDirTs > 0 && (nowXauCross - lastNasSameDirTs) < CROSS_SIG_WINDOW_MS_XAU) {
+          sc++; factors.push('NAS_SIG');
+        }
+      }
+      if (btcS_X) {
+        const lastBtcSameDirTs = isCall ? (btcS_X.lastCallSignalTs || 0) : (btcS_X.lastPutSignalTs || 0);
+        if (lastBtcSameDirTs > 0 && (nowXauCross - lastBtcSameDirTs) < CROSS_SIG_WINDOW_MS_XAU) {
+          sc++; factors.push('BTC_SIG');
+        }
+      }
       // OB factor for XAU (added 2026-05-18): previously only in BTC/NAS conv block.
       // XAU does track obZone, and 5/18 audit showed multiple XAU FAST CALL losers
       // firing into bearish supply zones (-1 obBoost penalty was applied to base score
@@ -6338,11 +6359,24 @@ function processPrice(sym, price, hi, lo) {
     // The normal 10-min flipCool isn't enough for TREND RIDE because the macro EMA can stay wrong for hours.
     const trFlipGuardMs = 1800000; // 30 min
     const trFlipBlocked = s.lastSignalDir && s.lastSignalDir !== trSigDir && (now2 - s.lastNTs < trFlipGuardMs);
-    if (trFlipBlocked) {
-      log(sym, 'TREND RIDE blocked — last signal was ' + s.lastSignalDir.toUpperCase() + ' ' + Math.round((now2 - s.lastNTs) / 60000) + 'm ago (need 30m for opposite TREND)');
+    // ===== MACRO-STRENGTH OVERRIDE (added 2026-05-28, Option A) =====
+    // If macro is NOW 6+/7 aligned in the NEW (opposite) direction, the market has decisively
+    // flipped — the previous signal was on the wrong side of a real reversal. Allow TREND RIDE
+    // at 15min instead of 30min when macro confirms. 0-losers safe: macro 6+/7 is the strictest
+    // structural confirmation we have.
+    // 5/28 case: XAU PUT @ 10:01, then macro flipped to 6+/7 CALL by 10:10. Bot was still in
+    // 30-min cooldown when XAU rallied $44. With this override, would have caught at 10:16.
+    let trFlipOverride = false;
+    if (trFlipBlocked && (now2 - s.lastNTs >= 15 * 60 * 1000) && macroAlignedFor(trSigDir)) {
+      trFlipOverride = true;
+      log(sym, '✅ TREND RIDE flip-cooldown OVERRIDE — macro 6+/7 aligned ' + trSigDir.toUpperCase() + ', prior ' + s.lastSignalDir.toUpperCase() + ' ' + Math.round((now2 - s.lastNTs) / 60000) + 'min ago (≥15min + macro flip = real reversal).');
+    }
+    const trFlipFinal = trFlipBlocked && !trFlipOverride;
+    if (trFlipFinal) {
+      log(sym, 'TREND RIDE blocked — last signal was ' + s.lastSignalDir.toUpperCase() + ' ' + Math.round((now2 - s.lastNTs) / 60000) + 'm ago (need 30m for opposite TREND, or 15min + macro 6+/7).');
     }
 
-    if (trSpreadPct >= trMinSpread && trRoc3Ok && trRoc6Ok && trMacdOk && trSameDirOk && !trFlipBlocked) {
+    if (trSpreadPct >= trMinSpread && trRoc3Ok && trRoc6Ok && trMacdOk && trSameDirOk && !trFlipFinal) {
       // Calculate 1-min ATR from vrevSnaps for dynamic stop loss
       // ATR = average of per-minute high-low ranges over last 10 minutes
       let trAtr = isBTC ? 50 : isNAS ? 15 : 3; // fallback defaults
