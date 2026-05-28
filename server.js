@@ -7711,11 +7711,32 @@ function processTicks(symbols) {
           }
         }
 
-        // Detect OB mitigation: price sliced through entire OB (breakout failed)
+        // Detect OB mitigation: price sliced through entire OB (breakout failed).
+        // Also feed the OBMIT continuation detector (Fix #166 Fix 4) — this was previously
+        // gap'd because OBMIT only watched s.orderBlocks (XAU array), not s.obZone.
+        // 5/28 XAU case: bearish supply OB at $4393 broke up at 12:30 UTC, XAU then rallied
+        // $48 to $4428 over the next hour. The break of bearish OB by bulls IS the
+        // continuation signal — extending tracking here closes the gap.
         if (ob.dir === 'call' && price < ob.lo - obTolerance) {
+          if (!s.obMitigated) {
+            // Bullish OB mitigated DOWN → bears overpowered demand → PUT continuation
+            s.lastObMitTs = Date.now();
+            s.lastObMitType = 'bull';
+            s.lastObMitLevel = (ob.hi + ob.lo) / 2;
+            s.obMitFired = false;
+            log(sym, '⚡ obZone freshly MITIGATED: BULL $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' broken — watching for PUT continuation');
+          }
           s.obMitigated = true;
           log(sym, '🧱 OB MITIGATED: price $' + price.toFixed(2) + ' broke below OB low $' + ob.lo.toFixed(2) + ' — breakout failed');
         } else if (ob.dir === 'put' && price > ob.hi + obTolerance) {
+          if (!s.obMitigated) {
+            // Bearish OB mitigated UP → bulls overpowered supply → CALL continuation
+            s.lastObMitTs = Date.now();
+            s.lastObMitType = 'bear';
+            s.lastObMitLevel = (ob.hi + ob.lo) / 2;
+            s.obMitFired = false;
+            log(sym, '⚡ obZone freshly MITIGATED: BEAR $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' broken — watching for CALL continuation');
+          }
           s.obMitigated = true;
           log(sym, '🧱 OB MITIGATED: price $' + price.toFixed(2) + ' broke above OB high $' + ob.hi.toFixed(2) + ' — breakout failed');
         }
