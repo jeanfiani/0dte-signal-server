@@ -2715,7 +2715,7 @@ function processPrice(sym, price, hi, lo) {
     //   - Conv 6+ still allows exceptional setups through
     //   - Fresh-extreme fades preserved (saw XAU ATL TP3 winner with this exemption)
     //   - Per-symbol thresholds (XAU/BTC/NAS have different volatility profiles)
-    const isExtremeFadeExempt = /ATL|ATH|VREV|SWEEP|HI|LO|OBREJ/.test(tagEarly);
+    const isExtremeFadeExempt = /ATL|ATH|VREV|SWEEP|HI|LO|OBREJ|LHFP|LLFP/.test(tagEarly);
     if (!isExtremeFadeExempt && Array.isArray(s.macroSnaps) && s.macroSnaps.length >= 4) {
       // Find closest snapshot to 4h ago — macroSnaps is 5-min interval, 72 entries = 6h
       const fourHrsAgoTs = Date.now() - 4 * 60 * 60 * 1000;
@@ -4232,6 +4232,16 @@ function processPrice(sym, price, hi, lo) {
       else if (!lhfPutFlipOk) reason = 'flip cooldown';
       else if (!lhfPutWinOk) reason = 'protecting winning CALL';
       if (reason) log(sym, '🚫 ⬇LHF PUT BLOCKED — ' + reason + ' (was $' + dropFromLocalHi.toFixed(2) + ' off local high $' + localHi6.toFixed(2) + ', ' + Math.round(lhfHiAgeMin) + 'min ago).');
+      // ===== PERSISTENCE TRACKING (added 2026-05-28) =====
+      // Track macro-ONLY blocks (other reasons mean the setup itself has issues).
+      // The LHFP detector below uses this count to fire when persistence is strong.
+      if (!lhfPutMacroOk && lhfPutRsiOk && lhfPutMacdOk) {
+        s.lhfPutMacroBlocks = s.lhfPutMacroBlocks || [];
+        s.lhfPutMacroBlocks.push({ ts: Date.now(), localHi: localHi6, drop: dropFromLocalHi });
+        // Keep only last 10 min of blocks
+        const cutoff = Date.now() - 10 * 60 * 1000;
+        s.lhfPutMacroBlocks = s.lhfPutMacroBlocks.filter(b => b.ts > cutoff);
+      }
     }
 
     // ---- LLF CALL (fade fresh local low) — symmetric mirror ----
@@ -4316,6 +4326,145 @@ function processPrice(sym, price, hi, lo) {
       else if (!llfCallFlipOk) reason = 'flip cooldown';
       else if (!llfCallWinOk) reason = 'protecting winning PUT';
       if (reason) log(sym, '🚫 ⬆LLF CALL BLOCKED — ' + reason + ' (was $' + riseFromLocalLo.toFixed(2) + ' off local low $' + localLo6.toFixed(2) + ', ' + Math.round(lhfLoAgeMin) + 'min ago).');
+      // Persistence tracking — macro-only blocks (added 2026-05-28)
+      if (!llfCallMacroOk && llfCallRsiOk && llfCallMacdOk) {
+        s.llfCallMacroBlocks = s.llfCallMacroBlocks || [];
+        s.llfCallMacroBlocks.push({ ts: Date.now(), localLo: localLo6, rise: riseFromLocalLo });
+        const cutoff = Date.now() - 10 * 60 * 1000;
+        s.llfCallMacroBlocks = s.llfCallMacroBlocks.filter(b => b.ts > cutoff);
+      }
+    }
+
+    // ===== LHF/LLF PERSISTENCE DETECTOR (added 2026-05-28) =====
+    // When LHF/LLF has been blocked 80+ times in last 10 min (macro-only blocks — meaning
+    // RSI/MACD/timing/distance ALL passed, only macro alignment was missing), the setup
+    // is persistent enough to fire. The block count IS the conviction signal.
+    //
+    // 5/28 case: XAU LHF PUT blocked 100+ times before price dropped $18 ($4,403→$4,385).
+    // Bot had structural conviction but macro EMAs lagged. This detector catches that.
+    //
+    // Gates (all must pass):
+    //   - ≥80 macro-only blocks in last 10 min
+    //   - Setup STILL valid (current price still in LHF distance/range)
+    //   - ROC strongly directional (≥0.05% for XAU/NAS, ≥0.08% for BTC)
+    //   - 30-min cooldown per direction
+    //   - All standard enrichSig gates (regime, conv floor, etc.)
+    //
+    // Trade setup:
+    //   - SL: local high + buffer (PUT) / local low - buffer (CALL) — same as LHF/LLF
+    //   - TP1: existing per-symbol cap ($5 XAU / $50 BTC / $30 NAS)
+    //   - TP2/TP3: proportional to slDist (2.5x, 4x)
+    //   - TP1 BE-trail engages on hit
+    const LHFP_BLOCK_THR = 80;
+    const LHFP_COOLDOWN_MS = 30 * 60 * 1000;
+    const lhfpRocBearThr = isBTC ? -0.08 : isNAS ? -0.05 : isXAU ? -0.05 : -0.05;
+    const lhfpRocBullThr = isBTC ?  0.08 : isNAS ?  0.05 : isXAU ?  0.05 :  0.05;
+
+    // --- LHFP PUT (persistence) ---
+    if (Array.isArray(s.lhfPutMacroBlocks) && s.lhfPutMacroBlocks.length >= LHFP_BLOCK_THR) {
+      const lastLhfpPutTs = s.lastLhfpPutTs || 0;
+      const cooldownClear = (Date.now() - lastLhfpPutTs) >= LHFP_COOLDOWN_MS;
+      // Re-verify setup still valid
+      const stillInDistance = dropFromLocalHi >= lhfDistMin && dropFromLocalHi <= lhfDistMax;
+      const rsiBand = rsiV >= 35 && rsiV < 60;
+      const macdBearish = macdL < macdS && macdHist < 0;
+      const rocBearish = roc3 < lhfpRocBearThr;
+      const flipOk = flipCoolFor('put');
+      const winOk = winProtectDir !== 'call';
+      if (cooldownClear && stillInDistance && rsiBand && macdBearish && rocBearish && flipOk && winOk) {
+        if (s.lastSignalDir !== 'put' || (now2 - s.lastNTs > COOLDOWN_MS)) {
+          s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
+          if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
+          s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
+          s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+          const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇LHFP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+          if (!enrichSig(sig)) return;
+          s.signals.push(sig); logSignal(sym, sig);
+          if (isMT5) {
+            // Tight SL at local high + buffer; TPs scaled
+            const lhfSlPrice = localHi6 + lhfSlBuffer;
+            const slDist = lhfSlPrice - price;
+            if (slDist > 0) {
+              const tp1Cap = isXAU ? 5 : isBTC ? 50 : isNAS ? 30 : 0.50;
+              const tp1Dist = Math.min(slDist * 1.5, tp1Cap);
+              const tp1P = price - tp1Dist;
+              const tp2P = price - slDist * 2.5;
+              const tp3P = price - slDist * 4.0;
+              s.trade = buildCfdTrade('put', price, atrVal, sym);
+              s.trade.slPrice = +lhfSlPrice.toFixed(2);
+              s.trade.tp1Price = +tp1P.toFixed(2);
+              s.trade.tp2Price = +tp2P.toFixed(2);
+              s.trade.tp3Price = +tp3P.toFixed(2);
+              sig.sl = lhfSlPrice.toFixed(2);
+              sig.tp1 = tp1P.toFixed(2);
+              sig.tp2 = tp2P.toFixed(2);
+              sig.tp3 = tp3P.toFixed(2);
+            } else {
+              s.trade = buildCfdTrade('put', price, atrVal, sym);
+              attachTpSl(sig, 'put', price, atrVal, sym);
+            }
+          }
+          const lhfpBlockCount = s.lhfPutMacroBlocks.length;
+          s.lastLhfpPutTs = Date.now();
+          s.lhfPutMacroBlocks = []; // reset after fire
+          log(sym, '🎯 LHF PERSISTENCE PUT — ' + lhfpBlockCount + ' macro blocks in 10min · $' + dropFromLocalHi.toFixed(2) + ' off local high $' + localHi6.toFixed(2) + ' · RSI ' + rsiV.toFixed(1) + ' · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
+          sendPush('🎯 ' + sym + ' LHF PERSISTENCE PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · ' + LHFP_BLOCK_THR + '+ persistent blocks · $' + dropFromLocalHi.toFixed(2) + ' off $' + localHi6.toFixed(2), 'signal');
+          SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'put'; S[other].crossAssetTs = now2; } });
+          return;
+        }
+      }
+    }
+
+    // --- LLFP CALL (persistence) ---
+    if (Array.isArray(s.llfCallMacroBlocks) && s.llfCallMacroBlocks.length >= LHFP_BLOCK_THR) {
+      const lastLlfpCallTs = s.lastLlfpCallTs || 0;
+      const cooldownClear = (Date.now() - lastLlfpCallTs) >= LHFP_COOLDOWN_MS;
+      const stillInDistance = riseFromLocalLo >= lhfDistMin && riseFromLocalLo <= lhfDistMax;
+      const rsiBand = rsiV > 40 && rsiV < 65;
+      const macdBullish = macdL > macdS && macdHist > 0;
+      const rocBullish = roc3 > lhfpRocBullThr;
+      const flipOk = flipCoolFor('call');
+      const winOk = winProtectDir !== 'put';
+      if (cooldownClear && stillInDistance && rsiBand && macdBullish && rocBullish && flipOk && winOk) {
+        if (s.lastSignalDir !== 'call' || (now2 - s.lastNTs > COOLDOWN_MS)) {
+          s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
+          if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
+          s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
+          s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+          const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆LLFP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+          if (!enrichSig(sig)) return;
+          s.signals.push(sig); logSignal(sym, sig);
+          if (isMT5) {
+            const llfSlPrice = localLo6 - lhfSlBuffer;
+            const slDist = price - llfSlPrice;
+            if (slDist > 0) {
+              const tp1Cap = isXAU ? 5 : isBTC ? 50 : isNAS ? 30 : 0.50;
+              const tp1Dist = Math.min(slDist * 1.5, tp1Cap);
+              const tp1P = price + tp1Dist;
+              const tp2P = price + slDist * 2.5;
+              const tp3P = price + slDist * 4.0;
+              s.trade = buildCfdTrade('call', price, atrVal, sym);
+              s.trade.slPrice = +llfSlPrice.toFixed(2);
+              s.trade.tp1Price = +tp1P.toFixed(2);
+              s.trade.tp2Price = +tp2P.toFixed(2);
+              s.trade.tp3Price = +tp3P.toFixed(2);
+              sig.sl = llfSlPrice.toFixed(2);
+              sig.tp1 = tp1P.toFixed(2);
+              sig.tp2 = tp2P.toFixed(2);
+              sig.tp3 = tp3P.toFixed(2);
+            } else {
+              s.trade = buildCfdTrade('call', price, atrVal, sym);
+              attachTpSl(sig, 'call', price, atrVal, sym);
+            }
+          }
+          s.lastLlfpCallTs = Date.now();
+          s.llfCallMacroBlocks = []; // reset after fire
+          log(sym, '🎯 LLF PERSISTENCE CALL — ' + LHFP_BLOCK_THR + '+ macro blocks in 10min · $' + riseFromLocalLo.toFixed(2) + ' off local low $' + localLo6.toFixed(2) + ' · RSI ' + rsiV.toFixed(1) + ' · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
+          sendPush('🎯 ' + sym + ' LLF PERSISTENCE CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · ' + LHFP_BLOCK_THR + '+ persistent blocks · $' + riseFromLocalLo.toFixed(2) + ' off $' + localLo6.toFixed(2), 'signal');
+          SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'call'; S[other].crossAssetTs = now2; } });
+          return;
+        }
+      }
     }
   }
 
