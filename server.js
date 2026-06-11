@@ -76,6 +76,10 @@ const COOLDOWN_MS = 180000;
 // signal doesn't get killed before it has any chance to develop.
 const REV_MIN_HOLD_MS = 180000;
 const MAX_SIG = 10;
+// MT5 safety valve (added 2026-06-11, audit v2 A1). MT5 stays deliberately loose —
+// 24h markets need freedom — but a runaway day no longer gets unlimited signals.
+// Only trips on genuinely bad days (20+). Override via env MAX_SIG_MT5.
+const MAX_SIG_MT5 = parseInt(process.env.MAX_SIG_MT5 || '20', 10);
 const THR = 6;
 const ROC_THR = 0.018;
 const EQ_ROC_GATE = 0.030; // Hard ROC gate for equities — ROC-3 must confirm direction
@@ -204,7 +208,8 @@ SYMBOLS.forEach(sym => {
     lastFullConvPutDurationMs: 0,
     // Post-signal price snapshots (added 2026-05-14). For each fired signal, capture price at
     // +5min / +15min / +30min after entry. CSV export adds price5m/delta5m/price15m/delta15m/
-    // price30m/delta30m columns. Entries removed once all 3 captured. List: [{histIdx, fireTs}].
+    // price30m/delta30m columns. Entries removed once all 3 captured. List: [{entry, fireTs}]
+    // (entry = direct signalHistory entry reference — index-based refs removed 2026-06-11).
     pendingSnapshots: [],
     // Same-direction fire history (added 2026-05-14). Caps same-direction signals at 2 per
     // rolling 30-min window. Catches "trend exhaustion stacking" — when a 3rd same-direction
@@ -867,6 +872,16 @@ function gETDow() {
   const e = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
   return e.getDay();
 }
+// TLT/SLV/GDX are RTH-only ETFs — outside US market hours Finnhub keeps returning the
+// last close, so their EMA directions freeze and keep awarding stale conviction points
+// all night (R1 fix, 2026-06-11: the 6/8–6/9 overnight XAU LHFP losers all carried
+// conv 4 on frozen [TLT,SLV,GDX]). Fresh window: weekdays 09:30–16:30 ET (30-min grace).
+function rthEtfFresh() {
+  const dow = gETDow();
+  if (dow === 0 || dow === 6) return false;
+  const m = gET();
+  return m >= 570 && m < 990;
+}
 function ts() { return new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: 'America/New_York' }); }
 
 // ===== PUSH TO ALL SUBSCRIBERS =====
@@ -1130,15 +1145,17 @@ async function pickOptionByTargetPremium(symbol, expiration, optionType, targetP
 //   tp1Hit → (bid ≤ $0.90) → SCRATCH exit (breakeven)
 //   tp1Hit → (bid keeps going) → track maxBid; user exits manually
 //   any → (timeout 30min) → TIMEOUT exit
-let activeOptionTracks = []; // [{ histIdx, symbol, strike, type, expiry, ...state }]
+let activeOptionTracks = []; // [{ entry (direct signalHistory entry ref), symbol, strike, type, expiry, ...state }]
 
 // Fire-and-forget — picks option, opens a track, signal emit doesn't block.
 async function trackEquityOptionEntry(entry, signalPrice, optionType) {
   if (!TRADIER_TOKEN) return;
   if (entry.symbol !== 'QQQ' && entry.symbol !== 'SPY') return;
-  // Capture histIdx BEFORE awaiting Tradier — caller must call this AFTER signalHistory.push(entry)
-  // so the index lines up. If we awaited first, another signal could push and shift the index.
-  const histIdx = signalHistory.length - 1;
+  // FIXED 2026-06-11 (telemetry corruption bug): previously captured histIdx = signalHistory.length-1,
+  // but saveSignalHistory()/loadSignalHistory() reassign-filter the array, shifting every index and
+  // causing snapshots/outcomes to be written onto OTHER symbols' entries (observed: QQQ entries with
+  // NAS100 closePrices). We now hold a direct reference to the entry object instead — array pruning
+  // doesn't invalidate object references.
   const expiry = todayExpirationET();
   const picked = await pickOptionByTargetPremium(entry.symbol, expiry, optionType, OPTION_TARGET_PREMIUM);
   if (!picked) {
@@ -1171,9 +1188,9 @@ async function trackEquityOptionEntry(entry, signalPrice, optionType) {
     exitReason: null,
     polls: [{ ts: Date.now(), bid: picked.bid, ask: picked.ask }]
   };
-  // Push to active tracks for polling — use the index captured before the await
+  // Push to active tracks for polling — direct entry reference (index-safe)
   activeOptionTracks.push({
-    histIdx: histIdx,
+    entry: entry,
     symbol: entry.symbol,
     strike: picked.strike,
     type: optionType,
@@ -1190,7 +1207,7 @@ async function pollActiveOptionTracks() {
   const now = Date.now();
   const stillActive = [];
   for (const tr of activeOptionTracks) {
-    const entry = signalHistory[tr.histIdx];
+    const entry = tr.entry; // direct reference (fixed 2026-06-11 — was stale signalHistory[histIdx])
     if (!entry || !entry.option0dte) continue; // entry gone or no option data
     const od = entry.option0dte;
 
@@ -1672,10 +1689,9 @@ function logSignal(sym, sig) {
   // tp2/tp3 levels and mark the previous signal's outcomes accordingly.
   try {
     const sOld = S[sym];
-    const oldIdx = sOld.lastHistIdx;
+    const oldEntry = sOld.lastHistEntry; // direct reference (fixed 2026-06-11 — was stale signalHistory[lastHistIdx])
     const t = sOld.trade;
-    if (oldIdx != null && t && t.active && t.isCfd && typeof t.bestPrice === 'number') {
-      const oldEntry = signalHistory[oldIdx];
+    if (oldEntry != null && t && t.active && t.isCfd && typeof t.bestPrice === 'number') {
       if (oldEntry && oldEntry.symbol === sym) {
         if (!oldEntry.outcomes) oldEntry.outcomes = {};
         const iC = t.type === 'call';
@@ -1698,9 +1714,11 @@ function logSignal(sym, sig) {
     }
   } catch (e) { /* never let outcome fast-forward crash signal emission */ }
 
-  // Track which signalHistory index represents the active trade for this symbol.
+  // Track which signalHistory entry represents the active trade for this symbol.
   // checkExit() uses this to update outcomes when t.t1/t.t2/t.sl flags flip.
-  S[sym].lastHistIdx = signalHistory.length - 1;
+  // Direct reference (fixed 2026-06-11) — index-based tracking broke whenever
+  // saveSignalHistory() pruned old entries and shifted the array.
+  S[sym].lastHistEntry = histEntry;
 
   // Schedule post-signal price snapshots at +5m / +15m / +30m (added 2026-05-14).
   // processPrice() will check pendingSnapshots each tick and populate priceSnaps on the
@@ -1709,7 +1727,7 @@ function logSignal(sym, sig) {
   try {
     const s = S[sym];
     if (s && Array.isArray(s.pendingSnapshots)) {
-      s.pendingSnapshots.push({ histIdx: signalHistory.length - 1, fireTs: Date.now() });
+      s.pendingSnapshots.push({ entry: histEntry, fireTs: Date.now() }); // direct ref (fixed 2026-06-11)
     }
   } catch (e) { /* never crash signal emission on snapshot scheduling */ }
 
@@ -1864,8 +1882,10 @@ function processPrice(sym, price, hi, lo) {
   if (Array.isArray(s.pendingSnapshots) && s.pendingSnapshots.length > 0) {
     const tNow = Date.now();
     s.pendingSnapshots = s.pendingSnapshots.filter(ps => {
-      const entry = signalHistory[ps.histIdx];
-      if (!entry) return false; // signalHistory entry gone — drop
+      // Direct reference (fixed 2026-06-11 — signalHistory[ps.histIdx] went stale whenever
+      // saveSignalHistory() pruned the array, writing snapshots onto other symbols' entries).
+      const entry = ps.entry;
+      if (!entry || entry.symbol !== sym) return false; // entry gone or mismatched — drop
       const ageS = (tNow - ps.fireTs) / 1000;
       if (!entry.priceSnaps) entry.priceSnaps = {};
       let snapWritten = false;
@@ -2328,11 +2348,15 @@ function processPrice(sym, price, hi, lo) {
     }
 
     if (isXAU) {
-      // XAU-specific: DXY, TLT, SLV, GDX
+      // XAU-specific: DXY (24h FX — always live); TLT/SLV/GDX only count while US RTH is
+      // open (R1 fix 2026-06-11 — frozen overnight directions were inflating conviction).
+      // This also propagates to macroAlignedFor()/contra-blocks, which read conv scores.
       if ((isCall && dxyDir === 'down') || (!isCall && dxyDir === 'up')) { sc++; factors.push('DXY'); }
-      if ((isCall && tltDir === 'up') || (!isCall && tltDir === 'down')) { sc++; factors.push('TLT'); }
-      if (slvPrice > 0 && ((isCall && slvDir === 'up') || (!isCall && slvDir === 'down'))) { sc++; factors.push('SLV'); }
-      if (gdxPrice > 0 && ((isCall && gdxDir === 'up') || (!isCall && gdxDir === 'down'))) { sc++; factors.push('GDX'); }
+      if (rthEtfFresh()) {
+        if ((isCall && tltDir === 'up') || (!isCall && tltDir === 'down')) { sc++; factors.push('TLT'); }
+        if (slvPrice > 0 && ((isCall && slvDir === 'up') || (!isCall && slvDir === 'down'))) { sc++; factors.push('SLV'); }
+        if (gdxPrice > 0 && ((isCall && gdxDir === 'up') || (!isCall && gdxDir === 'down'))) { sc++; factors.push('GDX'); }
+      }
       // ===== XAU CROSS-ASSET SIGNAL CONFLUENCE (added 2026-05-28, Option B) =====
       // When NAS or BTC has fired a same-direction signal in the last 10 min, XAU's CALL/PUT
       // gets +1 conv. This is independent confirmation from another asset — much stronger than
@@ -2373,8 +2397,14 @@ function processPrice(sym, price, hi, lo) {
       const spyS = S['SPY'], qqqS = S['QQQ'];
       const spyDir2 = spyS && spyS.pE5 && spyS.pE13 ? (spyS.pE5 > spyS.pE13 ? 'up' : 'down') : null;
       const qqqDir2 = qqqS && qqqS.pE5 && qqqS.pE13 ? (qqqS.pE5 > qqqS.pE13 ? 'up' : 'down') : null;
-      if ((isCall && spyDir2 === 'up') || (!isCall && spyDir2 === 'down')) { sc++; factors.push('SPY'); }
-      if ((isCall && qqqDir2 === 'up') || (!isCall && qqqDir2 === 'down')) { sc++; factors.push('QQQ'); }
+      // B1 fix (2026-06-11): SPY/QQQ EMAs freeze when US equities close, so these factors
+      // kept paying +1 all night — 4 of 7 BTC SL losses (Jun 4–11) cleared conv 4 on frozen
+      // equity points. Only count them while RTH is fresh (same rule as XAU's TLT/SLV/GDX).
+      // QQQ_SIG below needs no gate — the QQQ bot can't fire outside RTH.
+      if (rthEtfFresh()) {
+        if ((isCall && spyDir2 === 'up') || (!isCall && spyDir2 === 'down')) { sc++; factors.push('SPY'); }
+        if ((isCall && qqqDir2 === 'up') || (!isCall && qqqDir2 === 'down')) { sc++; factors.push('QQQ'); }
+      }
       // DXY inverse (dollar up = equity/crypto bear)
       if ((isCall && dxyDir === 'down') || (!isCall && dxyDir === 'up')) { sc++; factors.push('DXY'); }
       // Cross-asset SIGNAL confluence (added 2026-05-16). The QQQ factor above is just
@@ -2415,6 +2445,14 @@ function processPrice(sym, price, hi, lo) {
         const btcS = S['BTC'];
         const btcDir2 = btcS && btcS.pE5 && btcS.pE13 ? (btcS.pE5 > btcS.pE13 ? 'up' : 'down') : null;
         if ((isCall && btcDir2 === 'up') || (!isCall && btcDir2 === 'down')) { sc++; factors.push('BTC'); }
+      }
+      // BTC: NAS100 direction as risk-on correlate (B1 fix 2026-06-11). NAS100 futures trade
+      // nearly 24h, so unlike SPY/QQQ this factor stays honest overnight — keeps legitimate
+      // conviction reachable after the equity factors stop counting (see rthEtfFresh gate above).
+      if (isBTC) {
+        const nasS_B = S['NAS100'];
+        const nasDir2 = nasS_B && nasS_B.pE5 && nasS_B.pE13 ? (nasS_B.pE5 > nasS_B.pE13 ? 'up' : 'down') : null;
+        if ((isCall && nasDir2 === 'up') || (!isCall && nasDir2 === 'down')) { sc++; factors.push('NAS'); }
       }
     } else if (sym === 'QQQ') {
       // QQQ-specific cross-asset factors (added 2026-05-22 after SPY demoted to indicator).
@@ -2547,6 +2585,18 @@ function processPrice(sym, price, hi, lo) {
   // The thresholds are deliberately moderate for the first deployment; tune after a week
   // of conv-logged data shows what wins / loses.
   function enrichSig(sig) {
+    // ===== MT5 DAILY SIGNAL SAFETY VALVE (added 2026-06-11, audit v2 A1) =====
+    // Equities are capped at MAX_SIG in the main path; MT5 specialists bypassed every cap.
+    // Loose valve, not a tight cap — only a runaway day trips it. Sits here (not as an
+    // early return in processPrice) so TRv2 trade management and exits keep running after
+    // the cap. Exit signals are never blocked. dailySignalCount is usually incremented
+    // pre-gate, so `>` (not `>=`) and the _emitSnapshot rollback keeps the count latched.
+    if (isMT5 && !String(sig.type).startsWith('exit') && s.dailySignalCount > MAX_SIG_MT5) {
+      Object.assign(s, _emitSnapshot);
+      log(sym, '🚫 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' BLOCKED — MT5 daily signal cap (' + MAX_SIG_MT5 + ') reached. Set env MAX_SIG_MT5 to change.');
+      return false;
+    }
+
     // ===== MULTI-DAY REGIME GATE — ALL INSTRUMENTS (extended 2026-05-20) =====
     // Previously MT5-only inside enrichSig's MT5-conditional body. Today's QQQ/SPY data
     // (5/20) showed 6+ losing PUT signals firing into a clear intraday uptrend. The same
@@ -2584,8 +2634,11 @@ function processPrice(sym, price, hi, lo) {
       if (regimeNetChgPctRG !== null) {
         // Per-symbol thresholds. Equities use smaller %s since the window is intraday.
         const isEq = (sym === 'QQQ' || sym === 'SPY');
-        const strongThr = isXAU ? 2.0 : isBTC ? 5.0 : isNAS ? 3.0 : isEq ? 0.5 : 1.0;
-        const weakThr   = isXAU ? 1.0 : isBTC ? 2.5 : isNAS ? 1.5 : isEq ? 0.25 : 0.5;
+        // BTC thresholds tightened 5.0/2.5 → 3.0/1.5 (B3, 2026-06-11): the 6/8–6/10 grind
+        // (-3% over 3 days, ~-1%/day windows) scored "neutral" the whole way down, letting
+        // counter-trend LLFP CALLs fire at conv 4 into a falling market.
+        const strongThr = isXAU ? 2.0 : isBTC ? 3.0 : isNAS ? 3.0 : isEq ? 0.5 : 1.0;
+        const weakThr   = isXAU ? 1.0 : isBTC ? 1.5 : isNAS ? 1.5 : isEq ? 0.25 : 0.5;
         let regimeDirRG = 'neutral', regimeStrengthRG = 0;
         if (regimeNetChgPctRG >=  strongThr) { regimeDirRG = 'bull'; regimeStrengthRG = 2; }
         else if (regimeNetChgPctRG <= -strongThr) { regimeDirRG = 'bear'; regimeStrengthRG = 2; }
@@ -2656,6 +2709,48 @@ function processPrice(sym, price, hi, lo) {
           log(sym, '🛑 ' + tagQ + ' CALL BLOCKED — QQQ RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' > 70 (overbought). Equity CALL at deep overbought chases exhaustion.');
           return false;
         }
+      } else {
+        // ===== DIRECTION-AWARE FADE EXEMPTION (fixed 2026-06-11) =====
+        // The exemption above was direction-blind, letting fades fire on the WRONG side of
+        // their extreme: 6/8 ⬆LO CALL at RSI 81.1, 6/10 ⬆LO CALL at RSI 69.8 (SL'd). A LO
+        // CALL fades a LOW — it's designed to fire near oversold; by RSI > 65 the bounce
+        // already happened and the entry is a chase. Symmetric for HI PUT at deep oversold
+        // (XAU equivalent: 6/8 07:15 ⬇HI PUT at RSI 27.5, SL'd).
+        if (sig.type === 'call' && typeof rsiV === 'number' && rsiV > 65) {
+          log(sym, '🛑 ' + tagQ + ' CALL BLOCKED — fade on wrong side: RSI ' + rsiV.toFixed(1) + ' > 65. LO-fade CALL should fire near the low, not after the bounce.');
+          return false;
+        }
+        if (sig.type === 'put' && typeof rsiV === 'number' && rsiV < 35) {
+          log(sym, '🛑 ' + tagQ + ' PUT BLOCKED — fade on wrong side: RSI ' + rsiV.toFixed(1) + ' < 35. HI-fade PUT should fire near the high, not after the drop.');
+          return false;
+        }
+      }
+    }
+
+    // ===== QQQ VWAP SESSION-BIAS GATE (added 2026-06-11, proposal U3) =====
+    // Momentum entries must be on the right side of session VWAP: 6/6 CALL above, 6/6 PUT
+    // below. Fades (HI/LO) are exempt — they fade extremes by design and routinely fire on
+    // the "wrong" side. This covers the gap the regime gate leaves on slow-drift days that
+    // never leave the neutral band: 6/10 produced three 6/6 CALL losses on a down-drift day
+    // (regime read neutral all morning) — all would-be entries below a falling VWAP.
+    // NOTE (U2 finding): the regime gate's equity fade regex /HI|LO|6\/6|7\/6/ already
+    // matches every QQQ signal type, so counter-regime entries are blocked in WEAK and
+    // STRONG regimes alike — the "weak-regime momentum gap" from the proposal turned out
+    // to be a NEUTRAL-regime gap, and this VWAP gate is the fix for it.
+    if (sym === 'QQQ') {
+      const isMomentumQ = /6\/6|7\/6/.test(sig.score || '');
+      const vwapQ = s._vwap;
+      if (isMomentumQ && typeof vwapQ === 'number' && vwapQ > 0 && isFinite(vwapQ)) {
+        if (sig.type === 'call' && price < vwapQ) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🛑 ' + (sig.score || '') + ' CALL BLOCKED — VWAP session bias: $' + price.toFixed(2) + ' < VWAP $' + vwapQ.toFixed(2) + '. Momentum CALL needs price above VWAP.');
+          return false;
+        }
+        if (sig.type === 'put' && price > vwapQ) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🛑 ' + (sig.score || '') + ' PUT BLOCKED — VWAP session bias: $' + price.toFixed(2) + ' > VWAP $' + vwapQ.toFixed(2) + '. Momentum PUT needs price below VWAP.');
+          return false;
+        }
       }
     }
 
@@ -2706,6 +2801,39 @@ function processPrice(sym, price, hi, lo) {
           log(sym, '🛑 ' + tagX + ' CALL BLOCKED — XAU RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' > 65 (overbought). No CALL at the top regardless of conviction — macro factors lag price exhaustion.');
           return false;
         }
+      } else {
+        // ===== DIRECTION-AWARE FADE EXEMPTION (R3 fix 2026-06-11, ports the QQQ fix) =====
+        // The blanket exemption let fades fire on the WRONG side of their extreme:
+        // 6/5 10:07 ⬆LO CALL at RSI 83.7 (price then dropped $16), 6/8 07:15 ⬇HI PUT at
+        // RSI 27.5 (SL'd). A LO/ATL CALL fades a LOW — by RSI > 65 the bounce already
+        // happened. A HI/ATH PUT fades a HIGH — at RSI < 35 the drop already happened.
+        if (sig.type === 'call' && typeof rsiV === 'number' && rsiV > 65) {
+          log(sym, '🛑 ' + tagX + ' CALL BLOCKED — fade on wrong side: RSI ' + rsiV.toFixed(1) + ' > 65. A low-fade CALL fires near the low, not after the bounce.');
+          return false;
+        }
+        if (sig.type === 'put' && typeof rsiV === 'number' && rsiV < 35) {
+          log(sym, '🛑 ' + tagX + ' PUT BLOCKED — fade on wrong side: RSI ' + rsiV.toFixed(1) + ' < 35. A high-fade PUT fires near the high, not after the drop.');
+          return false;
+        }
+      }
+    }
+
+    // ===== REPEAT-LOSS ZONE LOCKOUT (R5, added 2026-06-11 — 0-losers policy) =====
+    // After 2 SL losses from the same detector+direction within 3 hours, stop re-entering
+    // until price escapes the loss zone by >= 1.5x ATR (or the 3h window rolls off).
+    // 6/8 21:19 + 22:36 + 6/9 01:23: three LHFP PUTs in the same $10 zone, all SL'd —
+    // time-based cooldowns alone produce a slow bleed in overnight ranges.
+    // Extended XAU → all MT5 (B2, 2026-06-11): same re-entry chains on BTC LLFP CALLs 6/8–6/10.
+    if (isMT5 && Array.isArray(s.slLossHistory) && s.slLossHistory.length >= 2) {
+      const detNowR5 = String(sig.score || '').replace(/[^A-Z0-9/]/g, '');
+      const nowR5 = Date.now();
+      const zoneR5 = (typeof atrVal === 'number' && atrVal > 0 ? atrVal : (isBTC ? 35 : isNAS ? 15 : 2)) * 1.5;
+      const recentR5 = s.slLossHistory.filter(l =>
+        l.det === detNowR5 && l.dir === sig.type && (nowR5 - l.ts) < 10800000);
+      if (recentR5.length >= 2 && recentR5.some(l => Math.abs(price - l.ep) <= zoneR5)) {
+        Object.assign(s, _emitSnapshot);
+        log(sym, '🛑 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' BLOCKED — repeat-loss lockout: ' + recentR5.length + ' ' + detNowR5 + ' ' + sig.type.toUpperCase() + ' SLs in last 3h within $' + zoneR5.toFixed(2) + ' of this price. Re-entry requires price to escape the loss zone (R5).');
+        return false;
       }
     }
 
@@ -4124,7 +4252,11 @@ function processPrice(sym, price, hi, lo) {
   //   • Cooldown 30 min per direction
   //   • Standard flipCool / winProtectDir / cool guards apply (same as other detectors)
   const hasLocalCandles = s.atrCandles && s.atrCandles.length >= 6;
-  if (hasLocalCandles && cool && (rsiV >= 10 && rsiV <= 90)) {
+  // N3 kill-switch (2026-06-11): NAS100 local fades (LHF/LLF/LHFP/LLFP) produced 0 clean wins
+  // in Jun 4–11 fired set and 3W/38L+S blocked — TRv2 already covers NAS comprehensively.
+  // Set env DISABLE_NAS_FADES=1 to suppress all four NAS fade paths for an A/B period.
+  const nasFadesOff = isNAS && process.env.DISABLE_NAS_FADES === '1';
+  if (hasLocalCandles && cool && !nasFadesOff && (rsiV >= 10 && rsiV <= 90)) {
     const last6 = s.atrCandles.slice(-6); // 6 × 5-min candles = 30 min lookback
     let localHi6 = -Infinity, localHi6Idx = -1;
     let localLo6 = Infinity,  localLo6Idx = -1;
@@ -4155,6 +4287,9 @@ function processPrice(sym, price, hi, lo) {
     const lhfPutCoolOk   = (Date.now() - s.lastLhfPutTs) >= lhfCooldownMs;
     const lhfPutRsiOk    = rsiV < 60 && rsiV > 35;
     const lhfPutMacdOk   = macdL < macdS && macdHist < 0;
+    // R4 fix (2026-06-11): don't fade INTO a live up-thrust. 6/8 05:36 ⬇LHF PUT fired at
+    // ROC +0.277% and SL'd in 25s. Fading is fine; fading fresh momentum is chasing.
+    const lhfPutRocOk    = roc3 <= 0.10;
     // Relaxed LHF macro gate (2026-05-18): original macroAlignedFor required 6+/7 stable
     // for 5min — far too strict, produced 885 blocks in one session with zero fires.
     // New: accept EITHER the strict alignment OR a softer "5+/7 stable for 2min" check.
@@ -4204,7 +4339,7 @@ function processPrice(sym, price, hi, lo) {
     const lhfPutFlipOk   = flipCoolFor('put');
     const lhfPutWinOk    = winProtectDir !== 'call';
     if (lhfPutTimingOk && lhfPutDistOk && lhfPutRangeOk && lhfPutCoolOk &&
-        lhfPutRsiOk && lhfPutMacdOk && lhfPutMacroOk && lhfPutFlipOk && lhfPutWinOk) {
+        lhfPutRsiOk && lhfPutMacdOk && lhfPutRocOk && lhfPutMacroOk && lhfPutFlipOk && lhfPutWinOk) {
       if (s.lastSignalDir !== 'put' || (now2 - s.lastNTs > COOLDOWN_MS)) {
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
         if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
@@ -4250,13 +4385,14 @@ function processPrice(sym, price, hi, lo) {
       if (!lhfPutMacroOk) reason = 'macro not PUT-aligned (need strict 6+/7@5min OR soft 5+/7@2min)';
       else if (!lhfPutRsiOk) reason = 'RSI ' + rsiV.toFixed(1) + ' outside 35-60';
       else if (!lhfPutMacdOk) reason = 'MACD not compressing bearish (line ' + macdL.toFixed(3) + ' vs sig ' + macdS.toFixed(3) + ', hist ' + macdHist.toFixed(3) + ')';
+      else if (!lhfPutRocOk) reason = 'ROC ' + roc3.toFixed(3) + '% > +0.10% — price thrusting up, not fading (R4)';
       else if (!lhfPutFlipOk) reason = 'flip cooldown';
       else if (!lhfPutWinOk) reason = 'protecting winning CALL';
       if (reason) log(sym, '🚫 ⬇LHF PUT BLOCKED — ' + reason + ' (was $' + dropFromLocalHi.toFixed(2) + ' off local high $' + localHi6.toFixed(2) + ', ' + Math.round(lhfHiAgeMin) + 'min ago).');
       // ===== PERSISTENCE TRACKING (added 2026-05-28) =====
       // Track macro-ONLY blocks (other reasons mean the setup itself has issues).
       // The LHFP detector below uses this count to fire when persistence is strong.
-      if (!lhfPutMacroOk && lhfPutRsiOk && lhfPutMacdOk) {
+      if (!lhfPutMacroOk && lhfPutRsiOk && lhfPutMacdOk && lhfPutRocOk) {
         s.lhfPutMacroBlocks = s.lhfPutMacroBlocks || [];
         s.lhfPutMacroBlocks.push({ ts: Date.now(), localHi: localHi6, drop: dropFromLocalHi });
         // Keep only last 10 min of blocks
@@ -4273,6 +4409,8 @@ function processPrice(sym, price, hi, lo) {
     const llfCallCoolOk   = (Date.now() - s.lastLlfCallTs) >= lhfCooldownMs;
     const llfCallRsiOk    = rsiV > 40 && rsiV < 65;
     const llfCallMacdOk   = macdL > macdS && macdHist > 0;
+    // R4 fix (2026-06-11): mirror of LHF PUT ROC ceiling — don't fade INTO a live down-thrust.
+    const llfCallRocOk    = roc3 >= -0.10;
     // Same relaxed macro gate for LLF (mirror of LHF). See LHF comment above.
     // OB-confluence bypass (added 2026-05-25): mirror of LHF — when there's an unmitigated
     // bullish OB zone below and ROC strongly positive, treat OB as macro-substitute.
@@ -4303,7 +4441,7 @@ function processPrice(sym, price, hi, lo) {
     const llfCallFlipOk   = flipCoolFor('call');
     const llfCallWinOk    = winProtectDir !== 'put';
     if (llfCallTimingOk && llfCallDistOk && llfCallRangeOk && llfCallCoolOk &&
-        llfCallRsiOk && llfCallMacdOk && llfCallMacroOk && llfCallFlipOk && llfCallWinOk) {
+        llfCallRsiOk && llfCallMacdOk && llfCallRocOk && llfCallMacroOk && llfCallFlipOk && llfCallWinOk) {
       if (s.lastSignalDir !== 'call' || (now2 - s.lastNTs > COOLDOWN_MS)) {
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
         if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
@@ -4344,11 +4482,12 @@ function processPrice(sym, price, hi, lo) {
       if (!llfCallMacroOk) reason = 'macro not CALL-aligned (need strict 6+/7@5min OR soft 5+/7@2min)';
       else if (!llfCallRsiOk) reason = 'RSI ' + rsiV.toFixed(1) + ' outside 40-65';
       else if (!llfCallMacdOk) reason = 'MACD not compressing bullish (line ' + macdL.toFixed(3) + ' vs sig ' + macdS.toFixed(3) + ', hist ' + macdHist.toFixed(3) + ')';
+      else if (!llfCallRocOk) reason = 'ROC ' + roc3.toFixed(3) + '% < -0.10% — price thrusting down, not fading (R4)';
       else if (!llfCallFlipOk) reason = 'flip cooldown';
       else if (!llfCallWinOk) reason = 'protecting winning PUT';
       if (reason) log(sym, '🚫 ⬆LLF CALL BLOCKED — ' + reason + ' (was $' + riseFromLocalLo.toFixed(2) + ' off local low $' + localLo6.toFixed(2) + ', ' + Math.round(lhfLoAgeMin) + 'min ago).');
       // Persistence tracking — macro-only blocks (added 2026-05-28)
-      if (!llfCallMacroOk && llfCallRsiOk && llfCallMacdOk) {
+      if (!llfCallMacroOk && llfCallRsiOk && llfCallMacdOk && llfCallRocOk) {
         s.llfCallMacroBlocks = s.llfCallMacroBlocks || [];
         s.llfCallMacroBlocks.push({ ts: Date.now(), localLo: localLo6, rise: riseFromLocalLo });
         const cutoff = Date.now() - 10 * 60 * 1000;
@@ -4378,11 +4517,17 @@ function processPrice(sym, price, hi, lo) {
     //   - TP1 BE-trail engages on hit
     const LHFP_BLOCK_THR = 80;
     const LHFP_COOLDOWN_MS = 30 * 60 * 1000;
+    // R2 fix (2026-06-11): on the ~1 tick/sec MT5 feed, 80 blocks ≈ 80 seconds — any setup
+    // that merely persists for ~1.5 min reached the bar, making LHFP 54% of all XAU volume
+    // (Jun 4–11) with poor results. Real persistence = block count AND duration: the oldest
+    // block in the rolling 10-min window must be ≥ 8 min old.
+    const LHFP_MIN_PERSIST_MS = 8 * 60 * 1000;
     const lhfpRocBearThr = isBTC ? -0.08 : isNAS ? -0.05 : isXAU ? -0.05 : -0.05;
     const lhfpRocBullThr = isBTC ?  0.08 : isNAS ?  0.05 : isXAU ?  0.05 :  0.05;
 
     // --- LHFP PUT (persistence) ---
-    if (Array.isArray(s.lhfPutMacroBlocks) && s.lhfPutMacroBlocks.length >= LHFP_BLOCK_THR) {
+    if (Array.isArray(s.lhfPutMacroBlocks) && s.lhfPutMacroBlocks.length >= LHFP_BLOCK_THR &&
+        (Date.now() - s.lhfPutMacroBlocks[0].ts) >= LHFP_MIN_PERSIST_MS) {
       const lastLhfpPutTs = s.lastLhfpPutTs || 0;
       const cooldownClear = (Date.now() - lastLhfpPutTs) >= LHFP_COOLDOWN_MS;
       // Re-verify setup still valid
@@ -4437,7 +4582,8 @@ function processPrice(sym, price, hi, lo) {
     }
 
     // --- LLFP CALL (persistence) ---
-    if (Array.isArray(s.llfCallMacroBlocks) && s.llfCallMacroBlocks.length >= LHFP_BLOCK_THR) {
+    if (Array.isArray(s.llfCallMacroBlocks) && s.llfCallMacroBlocks.length >= LHFP_BLOCK_THR &&
+        (Date.now() - s.llfCallMacroBlocks[0].ts) >= LHFP_MIN_PERSIST_MS) {
       const lastLlfpCallTs = s.lastLlfpCallTs || 0;
       const cooldownClear = (Date.now() - lastLlfpCallTs) >= LHFP_COOLDOWN_MS;
       const stillInDistance = riseFromLocalLo >= lhfDistMin && riseFromLocalLo <= lhfDistMax;
@@ -4719,74 +4865,9 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // ===== ORDER BLOCK RETEST / MITIGATION SIGNALS (MT5 only) =====
-  // DISABLED as standalone signals — 0% win rate across all samples (4/30 + 5/1)
-  // OB zone tracking still active for scoring factor (+1/-1 boost in scoring section)
-  // Keeping detection logic commented for future re-evaluation with better confirmation
-  if (false && isMT5 && s.obZone && cool) {
-    const ob = s.obZone;
-    const obAge = now2 - ob.ts;
-    const obTolerance = isBTC ? 15.0 : 0.50;
-    const obCool = now2 - s.lastNTs > COOLDOWN_MS;
-
-    // --- OB RETEST: price departed, then returned to OB zone → re-entry in breakout direction ---
-    if (s.obDeparted && !s.obFired && !s.obMitigated && obAge <= 1800000 && obCool && flipCoolFor(ob.dir) && (winProtectDir === null || winProtectDir === ob.dir)) {
-      const inZone = price >= (ob.lo - obTolerance) && price <= (ob.hi + obTolerance);
-      if (inZone) {
-        const rsiOk = rsiV >= 30 && rsiV <= 70;
-        const obMinRoc = 0.015;
-        const rocOk = (ob.dir === 'call' && roc3 > obMinRoc) || (ob.dir === 'put' && roc3 < -obMinRoc);
-        const macdOk = (ob.dir === 'call' && macdHist > 0) || (ob.dir === 'put' && macdHist < 0);
-        const obConfirmed = ob.dir === 'call' ? (rocOk && macdOk) : (rocOk || macdOk);
-
-        if (rsiOk && obConfirmed) {
-          s.obFired = true;
-          const dir = ob.dir;
-          s.lastAT = dir; if (dir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
-          if (s.lastSignalDir && s.lastSignalDir !== dir) s.lastReversalTs = now2;
-          s.lastSignalDir = dir; s.lastSignalTs = now2; s.lastNTs = now2;
-          s.lastSameDir = dir; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
-          const scoreTag = dir === 'call' ? '⬆OB' : '⬇OB';
-          const sig = { type: dir, time: ts(), price: price.toFixed(2), score: scoreTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-          if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
-          if (isMT5) attachTpSl(sig, dir, price, atrVal, sym);
-          log(sym, '🧱 OB RETEST ' + dir.toUpperCase() + ' — price $' + price.toFixed(2) + ' retested OB zone $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' (age ' + (obAge / 60000).toFixed(1) + 'min) [#' + s.dailySignalCount + ']');
-          sendPush('🧱 ' + sym + ' OB RETEST ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · retested OB $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2), 'signal');
-          s.trade = isMT5 ? buildCfdTrade(dir, price, atrVal, sym) : { active: true, type: dir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
-          return;
-        }
-      }
-    }
-
-    // --- OB MITIGATION: price broke through OB → breakout failed → reversal signal ---
-    if (s.obMitigated && !s.obFired && obAge <= 1800000 && obCool) {
-      const revDir = ob.dir === 'call' ? 'put' : 'call';
-      if (!flipCoolFor(revDir) || (winProtectDir !== null && winProtectDir !== revDir)) {
-        // blocked by flip cooldown or winning trade protection — skip
-      } else {
-      const revRocOk = (revDir === 'call' && roc3 > 0) || (revDir === 'put' && roc3 < 0);
-      const revMacdOk = (revDir === 'call' && macdHist > 0) || (revDir === 'put' && macdHist < 0);
-
-      if (revRocOk || revMacdOk) {
-        s.obFired = true;
-        const dir = revDir;
-        s.lastAT = dir; if (dir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
-        if (s.lastSignalDir && s.lastSignalDir !== dir) s.lastReversalTs = now2;
-        s.lastSignalDir = dir; s.lastSignalTs = now2; s.lastNTs = now2;
-        s.lastSameDir = dir; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
-        const scoreTag = dir === 'call' ? '⬆OBFAIL' : '⬇OBFAIL';
-        const sig = { type: dir, time: ts(), price: price.toFixed(2), score: scoreTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-        if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
-        if (isMT5) attachTpSl(sig, dir, price, atrVal, sym);
-        log(sym, '🧱 OB MITIGATION ' + dir.toUpperCase() + ' — breakout FAILED, price $' + price.toFixed(2) + ' broke through OB $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2) + ' [#' + s.dailySignalCount + ']');
-        sendPush('🧱 ' + sym + ' OB FAIL ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · breakout failed through OB $' + ob.lo.toFixed(2) + '-$' + ob.hi.toFixed(2), 'signal');
-        s.trade = isMT5 ? buildCfdTrade(dir, price, atrVal, sym) : { active: true, type: dir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
-        s.obZone = null;
-        return;
-      }
-      } // end else (flipCool/winProtect ok)
-    }
-  }
+  // ===== ORDER BLOCK RETEST / MITIGATION SIGNALS — REMOVED 2026-06-11 (audit A4) =====
+  // Was disabled (0% WR across 4/30 + 5/1 samples). Code preserved in
+  // archive/disabled_detectors_2026-06-11.js. OB zone tracking still active for scoring.
 
   // ===== OB-MITIGATED TREND CONTINUATION (added 2026-05-25) =====
   // When an OB zone from s.orderBlocks is freshly mitigated (price punched THROUGH the
@@ -5568,63 +5649,9 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // ===== SUSTAINED MOVE DETECTOR (DISABLED — replaced by ATH/ATL reversal for all MT5) =====
-  // Was catching gradual moves but entering too late (at exhaustion). ATH/ATL reversal
-  // fires on confirmed pullback from extremes instead, which has better timing.
-  if (false && isMT5 && s.vrevSnaps.length >= 120 && cool && (now2 - (s.sustainedMoveLastTs || 0) > 1200000)) {
-    // Multi-window check: [{window ms, min snaps, thresholds per instrument}]
-    const smWindows = [
-      { ms: 600000,  minSnaps: 60,  thr: isBTC ? 400 : isNAS ? 80 : 15 },  // 10 min: $15 XAU, $400 BTC, $80 NAS
-      { ms: 1200000, minSnaps: 120, thr: isBTC ? 600 : isNAS ? 120 : 18 }, // 20 min: $18 XAU, $600 BTC, $120 NAS
-    ];
-    let smFired = false;
-    for (const w of smWindows) {
-      if (smFired) break;
-      const smSnaps = s.vrevSnaps.filter(sn => sn.ts > now2 - w.ms);
-      if (smSnaps.length < w.minSnaps) continue;
-      const smFirst = smSnaps[0].p;
-      const smDelta = price - smFirst;
-      const smAbsDelta = Math.abs(smDelta);
-      if (smAbsDelta < w.thr) continue;
-
-      const smDir = smDelta > 0 ? 'call' : 'put';
-      // Direction must be consistent: check price at 1/3 and 2/3 through the window
-      // to confirm it's a sustained trend, not a V-shape that happened to end higher
-      const smOneThird = smSnaps[Math.floor(smSnaps.length / 3)].p;
-      const smTwoThird = smSnaps[Math.floor(smSnaps.length * 2 / 3)].p;
-      const progressOk = smDir === 'call'
-        ? (smOneThird > smFirst && smTwoThird > smOneThird)
-        : (smOneThird < smFirst && smTwoThird < smOneThird);
-      if (!progressOk) continue;
-
-      // ROC3 must confirm direction
-      const smRocOk = (smDir === 'call' && roc3 > 0) || (smDir === 'put' && roc3 < 0);
-      if (!smRocOk) continue;
-      // RSI not at extreme
-      const smRsiOk = (smDir === 'call' && rsiV > 20 && rsiV < 80) || (smDir === 'put' && rsiV > 20 && rsiV < 80);
-      if (!smRsiOk) continue;
-      // MACD confirms direction (even slightly)
-      const smMacdOk = (smDir === 'call' && macdL > macdS) || (smDir === 'put' && macdL < macdS);
-      if (!smMacdOk) continue;
-
-      // All checks pass — fire signal
-      smFired = true;
-      s.sustainedMoveLastTs = now2;
-      s.lastAT = smDir; if (smDir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
-      if (s.lastSignalDir && s.lastSignalDir !== smDir) s.lastReversalTs = now2;
-      s.lastSignalDir = smDir; s.lastSignalTs = now2; s.lastNTs = now2;
-      s.lastSameDir = smDir; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
-      const smMinutes = Math.round(w.ms / 60000);
-      const smTag = smDir === 'call' ? '⬆SUST' : '⬇SUST';
-      const sig = { type: smDir, time: ts(), price: price.toFixed(2), score: smTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-      if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
-      if (isMT5) attachTpSl(sig, smDir, price, atrVal, sym);
-      log(sym, '🔥 SUSTAINED MOVE ' + smDir.toUpperCase() + ' — $' + smAbsDelta.toFixed(2) + ' move in ' + smMinutes + 'min · price $' + price.toFixed(2) + ' from $' + smFirst.toFixed(2) + ' [#' + s.dailySignalCount + ']');
-      sendPush('🔥 ' + sym + ' SUSTAINED ' + smDir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + smAbsDelta.toFixed(2) + ' move in ' + smMinutes + 'min', 'signal');
-      s.trade = isMT5 ? buildCfdTrade(smDir, price, atrVal, sym) : { active: true, type: smDir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
-      return;
-    }
-  }
+  // ===== SUSTAINED MOVE DETECTOR — REMOVED 2026-06-11 (audit A4) =====
+  // Was disabled (replaced by ATH/ATL reversal — better timing). Code preserved in
+  // archive/disabled_detectors_2026-06-11.js.
 
   // ===== V-REVERSAL DETECTOR (XAU only) =====
   // Catches momentum reversals: price drops/rallies $8+ in 15 min, then ROC flips sharply
@@ -5921,6 +5948,16 @@ function processPrice(sym, price, hi, lo) {
           // Log as exit signal + update cooldown timestamp to prevent rapid re-entry
           s.trv2LastSignalTs = now3;
           s.trv2CrossCount = 0;
+          // N1 (2026-06-11): LOSING crossback exits now feed the cascade-limit + EMA-spread
+          // dedupe guards. They previously only counted SL exits, so a losing crossback could
+          // re-enter ~30min later at a near-identical EMA spread and lose again (6/8 11:56
+          // -$26 → 12:28 -$36 long churn). Winning crossbacks don't count — re-entering after
+          // a profitable trend leg is fine.
+          if (exitPnl < 0) {
+            s.trv2SlHistory = s.trv2SlHistory || [];
+            s.trv2SlHistory.push({ ts: now3, dir: t.dir, price: price, ema: tEma || 0, spreadPct: spreadPct });
+            if (s.trv2SlHistory.length > 10) s.trv2SlHistory.shift();
+          }
           const exitDir = t.dir === 'long' ? 'call' : 'put';
           const exitSig = { type: 'exit-' + exitDir, time: ts(), price: price.toFixed(2), score: '🔄EXIT', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount, pnl: exitPnl.toFixed(2) };
           enrichSig(exitSig); s.signals.push(exitSig); logSignal(sym, exitSig);
@@ -7068,8 +7105,8 @@ function attachTpSl(sig, type, price, atr, sym) {
 // (TP3 path: TP1 hit → TP2 hit → TP3 hit sets t.sl=true; real SL: just t.sl=true with no prior TP2).
 function updateSignalOutcome(sym, finalPrice) {
   const s = S[sym];
-  if (s.lastHistIdx == null) return;
-  const entry = signalHistory[s.lastHistIdx];
+  // Direct reference (fixed 2026-06-11 — signalHistory[lastHistIdx] went stale after array pruning)
+  const entry = s.lastHistEntry;
   if (!entry || entry.symbol !== sym) return;
   if (!entry.outcomes) entry.outcomes = {};
   const t = s.trade;
@@ -7161,6 +7198,14 @@ function checkExit(sym, price) {
         log(sym, '🛑 SL HIT — ' + t.type.toUpperCase() + ' $' + price.toFixed(2) + ' · SL $' + t.slPrice.toFixed(2) + ' · P&L $' + slPnl.toFixed(2));
         sendPush('🛑 ' + sym + ' SL HIT', t.type.toUpperCase() + ' · loss $' + slPnl.toFixed(2) + ' — exit now', 'exit');
         updateSignalOutcome(sym, price);
+        // R5 (2026-06-11): record the loss for the repeat-loss zone lockout (gate in enrichSig)
+        try {
+          const detR5 = (s.lastHistEntry && s.lastHistEntry.symbol === sym && s.lastHistEntry.score)
+            ? String(s.lastHistEntry.score).replace(/[^A-Z0-9/]/g, '') : 'UNKNOWN';
+          s.slLossHistory = s.slLossHistory || [];
+          s.slLossHistory.push({ ts: now, det: detR5, dir: t.type, ep: t.ep });
+          if (s.slLossHistory.length > 20) s.slLossHistory.shift();
+        } catch (e) { /* never crash exit handling */ }
         s.trade = { active: false };
         return;
       }
