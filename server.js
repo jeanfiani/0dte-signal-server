@@ -4537,7 +4537,18 @@ function processPrice(sym, price, hi, lo) {
       const rocBearish = roc3 < lhfpRocBearThr;
       const flipOk = flipCoolFor('put');
       const winOk = winProtectDir !== 'call';
-      if (cooldownClear && stillInDistance && rsiBand && macdBearish && rocBearish && flipOk && winOk) {
+      // ===== ANTI-CHASE GUARD (added 2026-06-12) — mirror of LLFP CALL guard below =====
+      // If price has already dropped more than the per-instrument threshold below the HIGHEST
+      // local high in the persistence window, the down-move is mid-flight — skip, don't chase.
+      const lhfpChaseThr = isBTC ? 300 : isNAS ? 35 : 12;
+      const lhfpWindowHi = Math.max(...s.lhfPutMacroBlocks.map(b => (typeof b.localHi === 'number' ? b.localHi : -Infinity)));
+      const lhfpChasing = isFinite(lhfpWindowHi) && (lhfpWindowHi - price) > lhfpChaseThr;
+      if (lhfpChasing && cooldownClear && stillInDistance && rsiBand && macdBearish && rocBearish &&
+          (!s._lhfpChaseLogTs || Date.now() - s._lhfpChaseLogTs > 60000)) {
+        log(sym, '🏃 ⬇LHFP PUT SKIPPED — anti-chase: price $' + price.toFixed(2) + ' is $' + (lhfpWindowHi - price).toFixed(2) + ' below window high $' + lhfpWindowHi.toFixed(2) + ' (> $' + lhfpChaseThr + '). Move is mid-flight — wait for the bounce.');
+        s._lhfpChaseLogTs = Date.now();
+      }
+      if (cooldownClear && stillInDistance && rsiBand && macdBearish && rocBearish && flipOk && winOk && !lhfpChasing) {
         if (s.lastSignalDir !== 'put' || (now2 - s.lastNTs > COOLDOWN_MS)) {
           s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
           if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
@@ -4592,7 +4603,23 @@ function processPrice(sym, price, hi, lo) {
       const rocBullish = roc3 > lhfpRocBullThr;
       const flipOk = flipCoolFor('call');
       const winOk = winProtectDir !== 'put';
-      if (cooldownClear && stillInDistance && rsiBand && macdBullish && rocBullish && flipOk && winOk) {
+      // ===== ANTI-CHASE GUARD (added 2026-06-12) =====
+      // LLFP is confirmation-lagged by design — by the time persistence proves out, price may
+      // be far above the move's origin. "Distance off local low" can't catch this: the rolling
+      // 30-min local low CLIMBS with the trend, so the entry looks fresh while the move is $20+
+      // old. 6/12 case: LLFP CALL fired at $4226.77 after blocks accumulated from a ~$4205 base;
+      // pulled back to $4216 SL before resuming up. Guard: if price has extended more than the
+      // per-instrument threshold above the LOWEST local low in the persistence window, the move
+      // is mid-flight — skip the entry and wait for the pullback (0-losers: skip > chase).
+      const llfpChaseThr = isBTC ? 300 : isNAS ? 35 : 12;
+      const llfpWindowLo = Math.min(...s.llfCallMacroBlocks.map(b => (typeof b.localLo === 'number' ? b.localLo : Infinity)));
+      const llfpChasing = isFinite(llfpWindowLo) && (price - llfpWindowLo) > llfpChaseThr;
+      if (llfpChasing && cooldownClear && stillInDistance && rsiBand && macdBullish && rocBullish &&
+          (!s._llfpChaseLogTs || Date.now() - s._llfpChaseLogTs > 60000)) {
+        log(sym, '🏃 ⬆LLFP CALL SKIPPED — anti-chase: price $' + price.toFixed(2) + ' is $' + (price - llfpWindowLo).toFixed(2) + ' above window low $' + llfpWindowLo.toFixed(2) + ' (> $' + llfpChaseThr + '). Move is mid-flight — wait for pullback.');
+        s._llfpChaseLogTs = Date.now();
+      }
+      if (cooldownClear && stillInDistance && rsiBand && macdBullish && rocBullish && flipOk && winOk && !llfpChasing) {
         if (s.lastSignalDir !== 'call' || (now2 - s.lastNTs > COOLDOWN_MS)) {
           s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
           if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
@@ -6263,6 +6290,17 @@ function processPrice(sym, price, hi, lo) {
         log(sym, '🚀 TRv2 ENTRY ' + dir.toUpperCase() + (withMacro ? ' +MACRO' : '') + ' — $' + price.toFixed(2) + ' > EMA $' + tEma.toFixed(2) + ' (+' + spreadPct.toFixed(3) + '%) · ATR $' + trv2Atr.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('🚀 ' + sym + ' ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2), 'signal');
         s.trade = { active: true, type: sigType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, ts: Date.now(), pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: sl, tp1Price: tp1, tp2Price: tp2, tp3Price: tp3, atr: trv2Atr, bestPrice: price, trailSl: 0 };
+        // Cross-asset confluence fix (2026-06-12): register this entry's direction timestamp
+        // UNCONDITIONALLY, before the analytics-only enrichSig call. Previously the timestamp
+        // was only set inside logSignal(), which is skipped when enrichSig blocks the entry
+        // from signalHistory (e.g. RIDE chop suppression) — so XAU/BTC NAS_SIG conviction
+        // never saw TRv2 entries in chop. 6/12 case: NAS TRv2 LONG fired pre-market while
+        // XAU LLF CALL sat at conv 3/4 — NAS_SIG was the missing +1; XAU fired 40min late
+        // at $4226 (chase) instead of near the $4205 base, and SL'd on the pullback.
+        try {
+          if (sigType === 'call') s.lastCallSignalTs = Date.now();
+          else if (sigType === 'put') s.lastPutSignalTs = Date.now();
+        } catch (e) { /* never crash entry on bookkeeping */ }
         // Run enrichSig for analytics — if it blocks, signal won't be added to signalHistory
         // but the trade still runs and the user already got the notification.
         if (enrichSig(sig)) {
