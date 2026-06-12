@@ -335,6 +335,11 @@ function loadRollingLevels() {
           S[sym].rollingLow = Math.min(...S[sym].dailyLevels.map(d => d.low));
         }
       }
+      // F1 (2026-06-12): restore macroSnaps (keep entries < 6h old — the rolling window)
+      if (Array.isArray(data[sym].macroSnaps)) {
+        const snapCutoff = Date.now() - 6 * 3600000;
+        S[sym].macroSnaps = data[sym].macroSnaps.filter(sn => sn && sn.ts > snapCutoff && sn.p > 0);
+      }
       // Migration: if old format (rollingHighs/rollingLows arrays), discard — will rebuild from today's session
     });
     console.log('[' + ts() + '] Rolling levels loaded — XAU: ' + S.XAU.dailyLevels.length + ' days, high:$' + (S.XAU.rollingHigh || 0).toFixed(2) + ' low:$' + (S.XAU.rollingLow === Infinity ? 0 : S.XAU.rollingLow).toFixed(2));
@@ -345,12 +350,40 @@ function loadRollingLevels() {
 function saveRollingLevels() {
   const data = {};
   SYMBOLS.forEach(sym => {
-    data[sym] = { dailyLevels: S[sym].dailyLevels || [] };
+    data[sym] = {
+      dailyLevels: S[sym].dailyLevels || [],
+      // F1 (2026-06-12): persist macroSnaps so the multi-day/intraday regime gate survives
+      // redeploys. In-memory-only snaps meant every deploy blinded the gate for 2h — on
+      // 6/12 a ~09:10 deploy let 4 counter-trend QQQ PUTs through on a +1.5% call day.
+      macroSnaps: S[sym].macroSnaps || []
+    };
   });
   try { fs.writeFileSync(ROLLING_FILE, JSON.stringify(data, null, 2)); } catch (e) {}
 }
 // Save rolling levels every 5 minutes
 setInterval(saveRollingLevels, 300000);
+
+// F1 (2026-06-12): seed the equity regime at boot. macroSnaps are now persisted, but on a
+// cold start (or after >6h offline, e.g. overnight) the regime gate would still be blind
+// for 2h. Seed QQQ/SPY with the previous close from Finnhub, backdated 2.5h, so the gate
+// computes a regime within minutes of boot instead of hours.
+async function seedEquityRegime() {
+  for (const sym of ['QQQ', 'SPY']) {
+    try {
+      const s = S[sym];
+      if (!s) continue;
+      const oldestTs = (s.macroSnaps && s.macroSnaps.length > 0) ? s.macroSnaps[0].ts : 0;
+      if (oldestTs > 0 && (Date.now() - oldestTs) >= 2 * 3600000) continue; // window already deep enough
+      const res = await fetch('https://finnhub.io/api/v1/quote?symbol=' + sym + '&token=' + API + '&_=' + Date.now());
+      const d = await res.json();
+      if (d && d.pc > 0) {
+        s.macroSnaps = s.macroSnaps || [];
+        s.macroSnaps.unshift({ ts: Date.now() - Math.round(2.5 * 3600000), p: d.pc });
+        console.log('[' + ts() + '] ' + sym + ' regime seeded from prev close $' + d.pc.toFixed(2) + ' (backdated 2.5h) — regime gate live from boot.');
+      }
+    } catch (e) { console.log('[' + ts() + '] ' + sym + ' regime seed failed: ' + e.message); }
+  }
+}
 
 // ===== TRv2 STATE PERSISTENCE (survives server restarts / deploys) =====
 const TRV2_FILE = path.join(DATA_DIR, 'trv2_state.json');
@@ -1659,15 +1692,21 @@ function logSignal(sym, sig) {
     outcomes: {}
   };
   // Add TRv2 trade context if active (BTC/NAS100)
+  // Defensive number guards added 2026-06-12: a trv2Trade restored from an older saved
+  // state can lack fields, and sl/tp1/tp2/tp3 called .toFixed unguarded (atr was already
+  // guarded — this failure mode has happened before). Suspected source of the 6/12
+  // "processTicks NAS100 error: Cannot read properties of undefined (reading 'toFixed')".
   if (S[sym].trv2Trade) {
+    const _t2 = S[sym].trv2Trade;
+    const _n2 = (v) => (typeof v === 'number' && isFinite(v) ? +v.toFixed(2) : null);
     histEntry.trv2 = {
-      dir: S[sym].trv2Trade.dir,
-      ep: S[sym].trv2Trade.ep,
-      sl: +S[sym].trv2Trade.sl.toFixed(2),
-      tp1: +S[sym].trv2Trade.tp1.toFixed(2),
-      tp2: +S[sym].trv2Trade.tp2.toFixed(2),
-      tp3: +S[sym].trv2Trade.tp3.toFixed(2),
-      atr: S[sym].trv2Trade.atr ? +S[sym].trv2Trade.atr.toFixed(2) : null
+      dir: _t2.dir,
+      ep: _t2.ep,
+      sl: _n2(_t2.sl),
+      tp1: _n2(_t2.tp1),
+      tp2: _n2(_t2.tp2),
+      tp3: _n2(_t2.tp3),
+      atr: _n2(_t2.atr)
     };
   }
   signalHistory.push(histEntry);
@@ -1870,9 +1909,13 @@ function processPrice(sym, price, hi, lo) {
     const advMove = -favMove;
     const now = Date.now();
     // Time-staged TP thresholds for 0DTE options
+    // F4 fix (2026-06-12): once SL has hit, the 0DTE trade is dead — later favorable
+    // snapshots must not stamp TP2/TP3 (6/12 10:08 QQQ PUT SL'd at the 720.37 spike, then
+    // the 15-min snapshot saw 718.09 and marked tp3Hit → exported as "TP3" despite being
+    // a stopped-out loss). MT5 already guards TP3 behind !slHit; equities now match.
     if (snapStage === '5m'  && !entry.outcomes.tp1Hit && favMove >= 0.15) { entry.outcomes.tp1Hit = true; entry.outcomes.tp1HitTs = now; }
-    if (snapStage === '10m' && !entry.outcomes.tp2Hit && favMove >= 0.30) { entry.outcomes.tp2Hit = true; entry.outcomes.tp2HitTs = now; }
-    if (snapStage === '15m' && !entry.outcomes.tp3Hit && favMove >= 0.50) { entry.outcomes.tp3Hit = true; entry.outcomes.tp3HitTs = now; entry.outcomes.closePrice = snapPrice; }
+    if (snapStage === '10m' && !entry.outcomes.slHit && !entry.outcomes.tp2Hit && favMove >= 0.30) { entry.outcomes.tp2Hit = true; entry.outcomes.tp2HitTs = now; }
+    if (snapStage === '15m' && !entry.outcomes.slHit && !entry.outcomes.tp3Hit && favMove >= 0.50) { entry.outcomes.tp3Hit = true; entry.outcomes.tp3HitTs = now; entry.outcomes.closePrice = snapPrice; }
     // SL: only if TP1 hasn't hit yet (TP1+scratch logic — quick profit-take protects)
     if (!entry.outcomes.tp1Hit && !entry.outcomes.slHit && advMove >= 0.25) {
       entry.outcomes.slHit = true; entry.outcomes.slHitTs = now; entry.outcomes.closePrice = snapPrice;
@@ -2674,6 +2717,18 @@ function processPrice(sym, price, hi, lo) {
               return false;
             }
           }
+        }
+      } else if (sym === 'QQQ' || sym === 'SPY') {
+        // ===== REGIME FAIL-SAFE (F2, added 2026-06-12 — 0-losers policy) =====
+        // No regime reading = no equity fades. macroSnaps are in-memory; the 6/12 ~09:10
+        // redeploy wiped them, leaving the regime gate blind until ~11:10 — all 4 QQQ PUTs
+        // (3 losses) fired inside that blind window on a +1.5% call day, the exact pattern
+        // the gate had been blocking the day before. If we can't see the tape's direction,
+        // counter-trend fades don't fire. Trend-mirror (TMIR) signals are unaffected.
+        const isFadeNoRegime = /HI|LO|6\/6|7\/6/.test(tagEarlyRG);
+        if (isFadeNoRegime && !String(sig.type).startsWith('exit')) {
+          log(sym, '🌫️ ' + tagEarlyRG + ' ' + sig.type.toUpperCase() + ' BLOCKED — regime unavailable (macroSnaps window < 2h, likely post-restart). No regime reading = no fades (F2).');
+          return false;
         }
       }
     }
@@ -4170,7 +4225,11 @@ function processPrice(sym, price, hi, lo) {
     // Loosened: RSI at high only needs > 55 (was 60), and ROC OR MACD confirms (was AND)
     const hiRevRocOk = roc3 < -symRocThr;
     const hiRevMacdOk = macdL < macdS;
-    if (distFromHigh >= hiRevDist && s.rsiAtSessionHigh > 55 && sessionRange >= hiRevRange && highWasRecent && (hiRevRocOk || hiRevMacdOk)) {
+    // F3 (2026-06-12): equity one-fade-per-window — the 6/12 stack fired 3 ⬇HI PUTs in
+    // 8 min (10:04/10:08/10:11), the 2nd and 3rd before the 1st had any outcome. Equities
+    // resolve over a 15-min window; don't re-fade the high until the prior fade played out.
+    const hiFadeWindowOk = isMT5 || (now2 - (s.lastEqHiFadeTs || 0) > 900000);
+    if (distFromHigh >= hiRevDist && s.rsiAtSessionHigh > 55 && sessionRange >= hiRevRange && highWasRecent && hiFadeWindowOk && (hiRevRocOk || hiRevMacdOk)) {
       // Don't fire if we already fired a PUT recently (use cooldown)
       if (s.lastSignalDir !== 'put' || (now2 - s.lastNTs > COOLDOWN_MS)) {
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
@@ -4182,6 +4241,7 @@ function processPrice(sym, price, hi, lo) {
         logSignal(sym, sig);
         if (isMT5) attachTpSl(sig, 'put', price, atrVal, sym);
         s.lastHiRevTs = now2; // Track for TRv2 entry suppression
+        if (!isMT5) s.lastEqHiFadeTs = now2; // F3 — one equity high-fade per 15-min window
         log(sym, '🔻 SESSION HIGH REVERSAL PUT — $' + distFromHigh.toFixed(2) + ' off high $' + s.sessionHigh.toFixed(2) + ' RSI@high:' + s.rsiAtSessionHigh.toFixed(1) + ' RSInow:' + rsiV.toFixed(1) + ' [#' + s.dailySignalCount + ']');
         sendPush('🔻 ' + sym + ' HIGH REVERSAL PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromHigh.toFixed(2) + ' off high · RSI@high:' + s.rsiAtSessionHigh.toFixed(1), 'signal');
         s.trade = isMT5 ? buildCfdTrade('put', price, atrVal, sym) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
@@ -4207,7 +4267,9 @@ function processPrice(sym, price, hi, lo) {
     // RSI@low must have been oversold (< 45), and ROC OR MACD confirms upside reversal.
     const loRevRocOk  = roc3 > symRocThr;
     const loRevMacdOk = macdL > macdS;
-    if (distFromLow >= loRevDist && s.rsiAtSessionLow < 45 && sessionRange >= loRevRange && lowWasRecent && (loRevRocOk || loRevMacdOk)) {
+    // F3 (2026-06-12): mirror of the equity high-fade window — one LO fade per 15 min.
+    const loFadeWindowOk = isMT5 || (now2 - (s.lastEqLoFadeTs || 0) > 900000);
+    if (distFromLow >= loRevDist && s.rsiAtSessionLow < 45 && sessionRange >= loRevRange && lowWasRecent && loFadeWindowOk && (loRevRocOk || loRevMacdOk)) {
       if (s.lastSignalDir !== 'call' || (now2 - s.lastNTs > COOLDOWN_MS)) {
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
         if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
@@ -4218,10 +4280,48 @@ function processPrice(sym, price, hi, lo) {
         logSignal(sym, sig);
         if (isMT5) attachTpSl(sig, 'call', price, atrVal, sym);
         s.lastLoRevTs = now2; // Track for TRv2 SHORT-entry suppression
+        if (!isMT5) s.lastEqLoFadeTs = now2; // F3 — one equity low-fade per 15-min window
         log(sym, '🚀 SESSION LOW REVERSAL CALL — $' + distFromLow.toFixed(2) + ' off low $' + s.sessionLow.toFixed(2) + ' RSI@low:' + s.rsiAtSessionLow.toFixed(1) + ' RSInow:' + rsiV.toFixed(1) + ' [#' + s.dailySignalCount + ']');
         sendPush('🚀 ' + sym + ' LOW REVERSAL CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · $' + distFromLow.toFixed(2) + ' off low · RSI@low:' + s.rsiAtSessionLow.toFixed(1), 'signal');
         s.trade = isMT5 ? buildCfdTrade('call', price, atrVal, sym) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
         SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = 'call'; S[other].crossAssetTs = now2; } });
+        return;
+      }
+    }
+  }
+
+  // ===== TREND-MIRROR: QQQ ← NAS100 TRv2 (added 2026-06-12) =====
+  // QQQ had NO trend-following signal source: the session-high blocker vetoes CALLs at
+  // highs (where price lives on trend days) and HI/LO only fade. 6/12 case: +1.5% call
+  // day, bot fired 4 PUTs / 0 CALLs while NAS TRv2 rode the same Nasdaq rally long.
+  // QQQ and NAS100 are the same index — when TRv2 enters and the ETF confirms (VWAP side,
+  // EMA alignment, RSI band, ROC direction), mirror the entry as a QQQ signal. One mirror
+  // per TRv2 entry. Still passes enrichSig (conviction / exhaustion / regime gates apply).
+  if (sym === 'QQQ' && etMin >= 570 && etMin < 945 && !(etMin >= 720 && etMin < 840) && cool) {
+    const nasS_M = S['NAS100'];
+    const t2m = nasS_M && nasS_M.trv2Trade;
+    if (t2m && (t2m.dir === 'long' || t2m.dir === 'short')) {
+      const mDir = t2m.dir === 'long' ? 'call' : 'put';
+      const nasEntryTs = mDir === 'call' ? (nasS_M.lastCallSignalTs || 0) : (nasS_M.lastPutSignalTs || 0);
+      const mFresh = nasEntryTs > 0 && (Date.now() - nasEntryTs) < 600000; // within 10 min of TRv2 entry
+      const mNotMirrored = (s.lastMirrorNasTs || 0) !== nasEntryTs;        // one mirror per entry
+      const mVwapOk = typeof s._vwap === 'number' && s._vwap > 0 &&
+        (mDir === 'call' ? price > s._vwap : price < s._vwap);
+      const mEmaOk = mDir === 'call' ? (s.pE5 > s.pE13) : (s.pE5 < s.pE13);
+      const mRsiOk = mDir === 'call' ? (rsiV >= 50 && rsiV <= 68) : (rsiV >= 32 && rsiV <= 50);
+      const mRocOk = mDir === 'call' ? roc3 > 0.010 : roc3 < -0.010;
+      if (mFresh && mNotMirrored && mVwapOk && mEmaOk && mRsiOk && mRocOk &&
+          flipCoolFor(mDir) && (winProtectDir === null || winProtectDir === mDir)) {
+        s.lastMirrorNasTs = nasEntryTs;
+        s.lastAT = mDir; if (mDir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
+        if (s.lastSignalDir && s.lastSignalDir !== mDir) s.lastReversalTs = now2;
+        s.lastSignalDir = mDir; s.lastSignalTs = now2; s.lastNTs = now2;
+        const sig = { type: mDir, time: ts(), price: price.toFixed(2), score: (mDir === 'call' ? '⬆' : '⬇') + 'TMIR', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        if (!enrichSig(sig)) return; s.signals.push(sig);
+        logSignal(sym, sig);
+        log(sym, '🪞 TREND MIRROR ' + mDir.toUpperCase() + ' — NAS100 TRv2 ' + t2m.dir.toUpperCase() + ' @ $' + (t2m.ep || 0).toFixed(2) + ' + QQQ confirms (VWAP ' + (mDir === 'call' ? '>' : '<') + ' $' + s._vwap.toFixed(2) + ' · RSI ' + rsiV.toFixed(1) + ' · ROC ' + roc3.toFixed(3) + '%) [#' + s.dailySignalCount + ']');
+        sendPush('🪞 QQQ ' + mDir.toUpperCase() + ' #' + s.dailySignalCount + ' (NAS mirror)', '$' + price.toFixed(2) + ' · NAS100 TRv2 ' + t2m.dir.toUpperCase() + ' confirmed by QQQ trend', 'signal');
+        s.trade = { active: true, type: mDir, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
         return;
       }
     }
@@ -7860,7 +7960,13 @@ function processTicks(symbols) {
       }
     }
 
-    } catch (e) { console.error('[' + ts() + '] processTicks ' + sym + ' error:', e.message); }
+    } catch (e) {
+      // Stack added 2026-06-12: 'undefined (reading toFixed)' errors (5/11 BTC, 6/12 NAS100)
+      // were unfindable from message alone — log the top stack frames so the next occurrence
+      // pinpoints the exact line.
+      const frames = (e.stack || '').split('\n').slice(0, 4).join(' | ');
+      console.error('[' + ts() + '] processTicks ' + sym + ' error:', e.message, '·', frames);
+    }
   });
 }
 setInterval(() => processTicks(['QQQ', 'SPY']), 3000);
@@ -8667,6 +8773,7 @@ app.listen(PORT, () => {
   loadSignalHistory();
   loadBlockedOutcomes(); // shadow-fire data — survives redeploys (added 2026-05-25)
   loadTrumpState();
+  seedEquityRegime().catch(e => console.log('[' + ts() + '] seedEquityRegime error: ' + e.message)); // F1 — regime gate live from boot
   console.log('[' + ts() + '] Trump factor: ' + (ANTHROPIC_API_KEY ? 'enabled (' + TRUMP_CLASSIFIER_MODEL + ')' : 'enabled (heuristic-only — set ANTHROPIC_API_KEY for accurate classification)') + ', TTL ' + Math.round(TRUMP_BIAS_TTL_MS / 60000) + 'min, min-intensity ' + TRUMP_MIN_INTENSITY);
   console.log('[' + ts() + '] Trump feed poller: ' + (TRUMP_FEED_URL ? 'enabled, every ' + Math.round(TRUMP_POLL_INTERVAL_MS / 60000) + 'min from ' + TRUMP_FEED_URL : 'disabled (set TRUMP_FEED_URL to enable auto-polling, or POST manually to /trump/post)'));
   connectFinnhub();
