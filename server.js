@@ -6401,14 +6401,26 @@ function processPrice(sym, price, hi, lo) {
           if (sigType === 'call') s.lastCallSignalTs = Date.now();
           else if (sigType === 'put') s.lastPutSignalTs = Date.now();
         } catch (e) { /* never crash entry on bookkeeping */ }
-        // Run enrichSig for analytics — if it blocks, signal won't be added to signalHistory
-        // but the trade still runs and the user already got the notification.
-        if (enrichSig(sig)) {
-          s.signals.push(sig);
-          logSignal(sym, sig);
-        } else {
-          log(sym, '📊 TRv2 entry not added to signalHistory (blocked by enrichSig — analytics only, trade still active)');
+        // ===== ALWAYS-STORE TRv2 ENTRIES (added 2026-06-15) =====
+        // Previously: if enrichSig blocked (e.g., BTC chop suppression), the signal was NOT
+        // pushed to signalHistory — but the trade was still executed via s.trade above.
+        // This caused signalHistory to under-report TRv2 entries vs actual trades. User
+        // confirmed they want ALL TRv2 entries stored, since the trade IS happening regardless.
+        //
+        // New behavior: always push to s.signals + logSignal. If enrichSig blocked, tag the
+        // entry with `conv.enrichBlocked = true` so analytics can distinguish "fired through
+        // all gates" vs "fired but enrichSig would have blocked it". The trade still executes
+        // either way (consistent with the line 6392 s.trade activation above).
+        const enrichPassed = enrichSig(sig);
+        if (!enrichPassed) {
+          // Tag the signal as enrichSig-blocked so analytics can filter/distinguish it.
+          // The trade itself is still active — this is informational metadata only.
+          if (!sig.conv) sig.conv = { score: 0, label: 'BLOCKED', factors: [] };
+          sig.conv.enrichBlocked = true;
+          log(sym, '📊 TRv2 entry stored with enrichBlocked flag (trade still active, enrichSig would have blocked signalHistory inclusion under old behavior)');
         }
+        s.signals.push(sig);
+        logSignal(sym, sig);
         return;
       }
     }
