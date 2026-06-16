@@ -3042,22 +3042,85 @@ function processPrice(sym, price, hi, lo) {
       }
     }
 
-    // ===== CHOP SUPPRESSION — NAS + BTC (extended 2026-05-19 to BTC) =====
+    // ===== CHOP SUPPRESSION — NAS + BTC + XAU (extended 2026-06-16 to XAU) =====
     // Original 5/18: 4 of 5 NAS RIDE losses + 1 BREAK loss during NAS chop $28800-29150.
-    // Extended 5/19: 3 BTC BREAK losses overnight in $76,600-77,200 chop range. Same
-    // failure mode — BREAK/FAST chase false range escapes that immediately revert.
+    // Extended 5/19: 3 BTC BREAK losses overnight in $76,600-77,200 chop range.
+    // Extended 6/16: XAU added after 4 clean SLs on 6/15-16 in $4307-$4327 chop range:
+    //   6/15 20:22 ⬇BREAK PUT → SL -$11.36
+    //   6/15 21:01 ⬆BREAK CALL → SL -$9.69
+    //   6/15 22:06 ⬇6/6 PUT @ $4307.61 → SL -$10.17 (range LOW short)
+    //   6/16 11:25 ⬇LHF PUT → SL -$7.24 (with positive MACD — additional MACD guard below)
     //
-    // Rule: in chop mode (for NAS or BTC), allow ONLY fade-at-extremes detectors (V-REV,
-    // LHF, LLF). These are DESIGNED for the bounce-off-the-edges pattern. Block all other
-    // detectors (BREAK, FAST, TREND, RIDE, ATH, ATL, HI, LO, MFLIP, 6/6, etc.).
-    //
-    // XAU is NOT included — XAU chop produces different patterns and its detectors have
-    // separate gates (e.g., V-REV chop block at the V-REV level, FAST disabled, etc.).
-    if ((isNAS || isBTC) && s.chopActive) {
-      const isFadeAllowedInChop = /VREV|LHF|LLF|OBREJ/.test(tagEarly);
+    // Rule: in chop mode (NAS/BTC/XAU), allow ONLY fade-at-extremes detectors:
+    // V-REV, LHF/LHFP, LLF/LLFP, OBREJ, OBMIT. These are DESIGNED for the bounce-off-the-edges
+    // pattern. Block all other detectors (BREAK, FAST, TREND, RIDE, ATH, ATL, HI, LO,
+    // MFLIP, 6/6, DIV, TMIR, etc.).
+    if ((isNAS || isBTC || isXAU) && s.chopActive) {
+      const isFadeAllowedInChop = /VREV|LHF|LLF|OBREJ|OBMIT/.test(tagEarly);
       if (!isFadeAllowedInChop) {
         Object.assign(s, _emitSnapshot);
-        log(sym, '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' chop mode active (only V-REV / LHF / LLF allowed in chop; other detectors consistently lose in flat range).');
+        log(sym, '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' chop mode active (only V-REV / LHF / LLF / OBREJ / OBMIT allowed in chop; other detectors consistently lose in flat range).');
+        return false;
+      }
+    }
+
+    // ===== LHF/LLF MACD DIRECTION-CONSISTENCY (added 2026-06-16, task #179) =====
+    // 6/16 11:25 XAU ⬇LHF PUT fired with MACD line at +0.248 (BULLISH momentum) and SL'd
+    // for -$7.24/unit. A PUT signal demands declining/negative MACD momentum; with MACD
+    // pointing UP, the "fade" is shorting INTO upward momentum — exactly the wrong setup.
+    //
+    // Rule for LHF/LHFP/LLF/LLFP fade detectors:
+    //   PUT  → block if macdLine > 0 (require MACD line ≤ 0 OR declining significantly)
+    //   CALL → block if macdLine < 0 (require MACD line ≥ 0 OR rising significantly)
+    //
+    // We don't have a clean delta-based check here without restructuring, so we use a simple
+    // sign check. Macd extremity gates handle the "too far" case already; this catches the
+    // basic "wrong direction" case. macdL is the MACD LINE (not histogram), already available
+    // from the sig object as sig.macd (string) — parse it back.
+    if (/LHF|LLF/.test(tagEarly)) {
+      const sigMacd = parseFloat(sig.macd);
+      if (!isNaN(sigMacd)) {
+        if (sig.type === 'put' && sigMacd > 0) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🚫 ' + tagEarly + ' PUT BLOCKED — MACD direction mismatch: MACD line +' + sigMacd.toFixed(3) + ' (bullish momentum) contradicts bearish fade thesis. Fade detectors require MACD ≤ 0 for PUT.');
+          return false;
+        }
+        if (sig.type === 'call' && sigMacd < 0) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🚫 ' + tagEarly + ' CALL BLOCKED — MACD direction mismatch: MACD line ' + sigMacd.toFixed(3) + ' (bearish momentum) contradicts bullish fade thesis. Fade detectors require MACD ≥ 0 for CALL.');
+          return false;
+        }
+      }
+    }
+
+    // ===== SAME-DIRECTION SAME-PRICE DEDUP (added 2026-06-16, task #180) =====
+    // 6/16 XAU showed the textbook chop redundancy pattern:
+    //   11:03:20 ⬇LHFP PUT @ $4324.10 (pending)
+    //   11:25:43 ⬇LHF  PUT @ $4323.66 (SL -$7.24)
+    // Two same-direction fade signals at virtually identical price ($4324 ±$0.50) within
+    // 22 minutes. When the first fade hasn't moved price meaningfully, firing a second is
+    // doubling down on a thesis the market is rejecting — a chop signature.
+    //
+    // Rule for LHF/LHFP/LLF/LLFP detectors only (fade detectors are most prone to this):
+    // Block if any prior same-symbol, same-direction signal fired within last 30min at
+    // a price within ±0.15% of current. Other detectors (BREAK/TREND/RIDE) have their
+    // own cooldowns; this targets the fade-cluster pattern specifically.
+    if (/LHF|LLF/.test(tagEarly) && signalHistory && Array.isArray(signalHistory)) {
+      const dedupWindowMs = 30 * 60 * 1000;
+      const priceThresholdPct = 0.0015; // 0.15%
+      const priceThreshold = price * priceThresholdPct;
+      const nowMs = Date.now();
+      const recentSameDir = signalHistory.filter(h =>
+        h && h.symbol === sym &&
+        h.type === sig.type &&
+        h.ts && (nowMs - h.ts) < dedupWindowMs &&
+        h.price && Math.abs(parseFloat(h.price) - price) <= priceThreshold
+      );
+      if (recentSameDir.length >= 1) {
+        const prior = recentSameDir[recentSameDir.length - 1];
+        const ageMin = Math.round((nowMs - prior.ts) / 60000);
+        Object.assign(s, _emitSnapshot);
+        log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — same-direction ' + (prior.score || '?') + ' fired ' + ageMin + 'min ago at $' + parseFloat(prior.price).toFixed(2) + ' (current $' + price.toFixed(2) + ', within 0.15%). Chop redundancy guard.');
         return false;
       }
     }
@@ -6182,7 +6245,20 @@ function processPrice(sym, price, hi, lo) {
             s.lastSignalDir = revType; s.lastSignalTs = now3; s.lastNTs = now3;
             const macroTag = revWithMacro ? '+MACRO' : '';
             const revSig = { type: revType, time: ts(), price: price.toFixed(2), score: (revDir === 'long' ? '⬆' : '⬇') + 'RIDE' + macroTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount, tp1: revTp1.toFixed(2), tp2: revTp2.toFixed(2), tp3: revTp3.toFixed(2), sl: revSl.toFixed(2) };
-            enrichSig(revSig); s.signals.push(revSig); logSignal(sym, revSig);
+            // ===== AUTO-REVERSE ENRICHSIG GATE (added 2026-06-16, task #178) =====
+            // Same pattern as main entry: enrichSig blocks now prevent trade activation, but
+            // signal is still stored with enrichBlocked flag for analytics. s.trv2Trade above
+            // remains set so internal shadow tracking continues (server sees virtual TP/SL hits
+            // for blocked entries — useful for backtesting whether the blocks were correct).
+            const revEnrichPassed = enrichSig(revSig);
+            if (!revEnrichPassed) {
+              if (!revSig.conv) revSig.conv = { score: 0, label: 'BLOCKED', factors: [] };
+              revSig.conv.enrichBlocked = true;
+              log(sym, '🚫 TRv2 AUTO-REVERSE ' + revDir.toUpperCase() + ' BLOCKED by enrichSig @ $' + price.toFixed(2) + ' — no EA trade activation (shadow only) [#' + s.dailySignalCount + ']');
+              s.signals.push(revSig); logSignal(sym, revSig);
+              return;
+            }
+            s.signals.push(revSig); logSignal(sym, revSig);
             log(sym, '🔄 TRv2 AUTO-REVERSE ' + revDir.toUpperCase() + ' +MACRO — $' + price.toFixed(2) + ' · TP1 $' + revTp1.toFixed(2) + ' · TP2 $' + revTp2.toFixed(2) + ' · TP3 $' + revTp3.toFixed(2) + ' · SL $' + revSl.toFixed(2) + ' [#' + s.dailySignalCount + ']');
             sendPush('🔄 ' + sym + ' REVERSE ' + revDir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · TP1 $' + revTp1.toFixed(2) + ' · SL $' + revSl.toFixed(2), 'signal');
             s.trade = { active: true, type: revType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, ts: Date.now(), pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: revSl, tp1Price: revTp1, tp2Price: revTp2, tp3Price: revTp3, atr: trv2Atr, bestPrice: price, trailSl: 0 };
@@ -6375,50 +6451,49 @@ function processPrice(sym, price, hi, lo) {
           : false;
         const macroTag = withMacro ? '+MACRO' : '';
         const sig = { type: sigType, time: ts(), price: price.toFixed(2), score: (dir === 'long' ? '⬆' : '⬇') + 'RIDE' + macroTag, rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount, tp1: tp1.toFixed(2), tp2: tp2.toFixed(2), tp3: tp3.toFixed(2), sl: sl.toFixed(2) };
-        // ===== TRv2 NOTIFICATION + TRADE MONITOR — always fire when TRv2 enters (added 2026-05-25) =====
-        // Previously: `if (!enrichSig(sig)) return;` blocked the notification + s.trade activation
-        // when enrichSig returned false (e.g., RIDE blocked by chop suppression at line 2524).
-        // The trade still ran in the background (s.trv2Trade was set above) but the user got no
-        // entry notification and the EA's trade monitor never picked it up — only the TP1/TP2/TP3
-        // alerts fired later. 5/24-25 case: NAS TRv2 won a full TP3 sweep silently in chop mode.
+        // ===== TRv2 ENTRY GATING (rewritten 2026-06-16) =====
+        // History:
+        // - Pre-2026-05-25: `if (!enrichSig(sig)) return;` blocked everything (incl. trade).
+        // - 2026-05-25: removed the gate because TRv2's own gates were thought stricter; missed
+        //   one silent TP3 sweep was the trigger.
+        // - 2026-06-15: per #176, added "always store" — entries got stored even if enrichSig
+        //   would have blocked, tagged with `enrichBlocked: true`. BUT s.trade was still firing
+        //   unconditionally — meaning enrichSig blocks NEVER prevented actual trades.
+        // - 2026-06-16: TODAY's data: 6 of 7 enrichBlocked TRv2 RIDE entries SL'd, ~-$564/unit
+        //   across BTC+NAS. enrichSig's chop/cascade/maturity gates were correctly trying to
+        //   stop these — but the trade ran anyway because activation was UNCONDITIONAL.
         //
-        // Fix: TRv2's own gates (EMA spread, ATR, cascade limit #154, EMA dedupe #155, conv
-        // maturity #156, RSI bands #79) are stricter than enrichSig's general checks. If TRv2
-        // decided to enter, we trust it — ALWAYS notify + activate s.trade. enrichSig still runs
-        // for analytics (signalHistory inclusion), but it can no longer suppress the entry alert
-        // or trade monitor handoff.
-        log(sym, '🚀 TRv2 ENTRY ' + dir.toUpperCase() + (withMacro ? ' +MACRO' : '') + ' — $' + price.toFixed(2) + ' > EMA $' + tEma.toFixed(2) + ' (+' + spreadPct.toFixed(3) + '%) · ATR $' + trv2Atr.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2) + ' [#' + s.dailySignalCount + ']');
-        sendPush('🚀 ' + sym + ' ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2), 'signal');
-        s.trade = { active: true, type: sigType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, ts: Date.now(), pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: sl, tp1Price: tp1, tp2Price: tp2, tp3Price: tp3, atr: trv2Atr, bestPrice: price, trailSl: 0 };
-        // Cross-asset confluence fix (2026-06-12): register this entry's direction timestamp
-        // UNCONDITIONALLY, before the analytics-only enrichSig call. Previously the timestamp
-        // was only set inside logSignal(), which is skipped when enrichSig blocks the entry
-        // from signalHistory (e.g. RIDE chop suppression) — so XAU/BTC NAS_SIG conviction
-        // never saw TRv2 entries in chop. 6/12 case: NAS TRv2 LONG fired pre-market while
-        // XAU LLF CALL sat at conv 3/4 — NAS_SIG was the missing +1; XAU fired 40min late
-        // at $4226 (chase) instead of near the $4205 base, and SL'd on the pullback.
+        // CURRENT BEHAVIOR (per #178):
+        // 1. Call enrichSig FIRST (before any side effects).
+        // 2. ALWAYS store + log the signal (preserves #176 analytics requirement).
+        // 3. If enrichSig blocked → tag with enrichBlocked flag, skip notification + trade.
+        //    Cross-asset timestamps are STILL set so NAS_SIG/BTC_SIG still see the attempt
+        //    (per 2026-06-12 fix below).
+        // 4. If enrichSig passed → notify + activate s.trade as before.
+        const enrichPassed = enrichSig(sig);
+
+        // Cross-asset confluence (2026-06-12): set direction timestamps UNCONDITIONALLY so
+        // cross-asset confluence sees this entry even when enrichSig blocks the trade.
+        // Otherwise XAU/BTC NAS_SIG conviction would miss TRv2 attempts in chop.
         try {
           if (sigType === 'call') s.lastCallSignalTs = Date.now();
           else if (sigType === 'put') s.lastPutSignalTs = Date.now();
         } catch (e) { /* never crash entry on bookkeeping */ }
-        // ===== ALWAYS-STORE TRv2 ENTRIES (added 2026-06-15) =====
-        // Previously: if enrichSig blocked (e.g., BTC chop suppression), the signal was NOT
-        // pushed to signalHistory — but the trade was still executed via s.trade above.
-        // This caused signalHistory to under-report TRv2 entries vs actual trades. User
-        // confirmed they want ALL TRv2 entries stored, since the trade IS happening regardless.
-        //
-        // New behavior: always push to s.signals + logSignal. If enrichSig blocked, tag the
-        // entry with `conv.enrichBlocked = true` so analytics can distinguish "fired through
-        // all gates" vs "fired but enrichSig would have blocked it". The trade still executes
-        // either way (consistent with the line 6392 s.trade activation above).
-        const enrichPassed = enrichSig(sig);
+
         if (!enrichPassed) {
-          // Tag the signal as enrichSig-blocked so analytics can filter/distinguish it.
-          // The trade itself is still active — this is informational metadata only.
+          // Tag, store for analytics, but DO NOT activate trade or notify.
           if (!sig.conv) sig.conv = { score: 0, label: 'BLOCKED', factors: [] };
           sig.conv.enrichBlocked = true;
-          log(sym, '📊 TRv2 entry stored with enrichBlocked flag (trade still active, enrichSig would have blocked signalHistory inclusion under old behavior)');
+          log(sym, '🚫 TRv2 entry ' + dir.toUpperCase() + ' BLOCKED by enrichSig @ $' + price.toFixed(2) + ' — no trade activation (stored for analytics only) [#' + s.dailySignalCount + ']');
+          s.signals.push(sig);
+          logSignal(sym, sig);
+          return;
         }
+
+        // enrichSig passed — fire normally
+        log(sym, '🚀 TRv2 ENTRY ' + dir.toUpperCase() + (withMacro ? ' +MACRO' : '') + ' — $' + price.toFixed(2) + ' > EMA $' + tEma.toFixed(2) + ' (+' + spreadPct.toFixed(3) + '%) · ATR $' + trv2Atr.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+        sendPush('🚀 ' + sym + ' ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2), 'signal');
+        s.trade = { active: true, type: sigType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, ts: Date.now(), pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: sl, tp1Price: tp1, tp2Price: tp2, tp3Price: tp3, atr: trv2Atr, bestPrice: price, trailSl: 0 };
         s.signals.push(sig);
         logSignal(sym, sig);
         return;
