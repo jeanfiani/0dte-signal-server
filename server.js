@@ -433,10 +433,56 @@ function loadRollingLevels() {
       }
       // Migration: if old format (rollingHighs/rollingLows arrays), discard — will rebuild from today's session
     });
+    // ===== ASIAN H/L RESTORATION (task #207, added 2026-06-17) =====
+    SYMBOLS.forEach(sym => {
+      if (!data[sym]) return;
+      if (data[sym].asianH_locked !== undefined && data[sym].asianH_locked !== null) {
+        S[sym].asianH_locked = data[sym].asianH_locked;
+      }
+      if (data[sym].asianL_locked !== undefined && data[sym].asianL_locked !== null) {
+        S[sym].asianL_locked = data[sym].asianL_locked;
+      }
+      if (data[sym].asianLockedDate) S[sym].asianLockedDate = data[sym].asianLockedDate;
+      if (typeof data[sym].asianSweepInvalidated === 'boolean') S[sym].asianSweepInvalidated = data[sym].asianSweepInvalidated;
+      if (data[sym].asianAboveSince) S[sym].asianAboveSince = data[sym].asianAboveSince;
+      if (data[sym].asianBelowSince) S[sym].asianBelowSince = data[sym].asianBelowSince;
+    });
     console.log('[' + ts() + '] Rolling levels loaded — XAU: ' + S.XAU.dailyLevels.length + ' days, high:$' + (S.XAU.rollingHigh || 0).toFixed(2) + ' low:$' + (S.XAU.rollingLow === Infinity ? 0 : S.XAU.rollingLow).toFixed(2));
+    SYMBOLS.forEach(sym => {
+      if (S[sym].asianH_locked) {
+        console.log('[' + ts() + '] Asian H/L restored — ' + sym + ': H=$' + S[sym].asianH_locked.toFixed(2) + ' L=$' + S[sym].asianL_locked.toFixed(2) + ' (locked ' + S[sym].asianLockedDate + ')');
+      }
+    });
   } catch (e) {
     console.log('[' + ts() + '] Rolling levels: no data file (will build from scratch)');
   }
+
+  // ===== MANUAL ASIAN H/L SEED FOR 2026-06-17 (task #208, one-time bootstrap) =====
+  // Today's Asian H/L was wiped by mid-day deploys. User-provided values from
+  // their charting platform (chart confirmed Asian range $4318 - $4348 for XAU).
+  // Only applies if no value is currently locked for today (idempotent — if
+  // already restored from disk OR locked normally, this is a no-op).
+  const todayET = todayDateET();
+  const seedValues = {
+    XAU:    { h: 4348,  l: 4318  },
+    BTC:    { h: 66050, l: 65400 },
+    NAS100: { h: 30150, l: 29960 }
+  };
+  Object.keys(seedValues).forEach(sym => {
+    const s = S[sym];
+    if (!s) return;
+    if (s.asianLockedDate === todayET) return; // already locked for today, leave alone
+    const seed = seedValues[sym];
+    s.asianH_locked = seed.h;
+    s.asianL_locked = seed.l;
+    s.asianLockedDate = todayET;
+    s.asianSweepInvalidated = false;
+    s.asianAboveSince = 0;
+    s.asianBelowSince = 0;
+    console.log('[' + ts() + '] 🌱 Asian H/L SEEDED for ' + sym + ': H=$' + seed.h.toFixed(2) + ' L=$' + seed.l.toFixed(2) + ' (date ' + todayET + ', manual override)');
+  });
+  // Save immediately so the seed persists across the next restart
+  try { saveRollingLevels(); } catch (e) {}
 }
 function saveRollingLevels() {
   const data = {};
@@ -446,7 +492,17 @@ function saveRollingLevels() {
       // F1 (2026-06-12): persist macroSnaps so the multi-day/intraday regime gate survives
       // redeploys. In-memory-only snaps meant every deploy blinded the gate for 2h — on
       // 6/12 a ~09:10 deploy let 4 counter-trend QQQ PUTs through on a +1.5% call day.
-      macroSnaps: S[sym].macroSnaps || []
+      macroSnaps: S[sym].macroSnaps || [],
+      // ===== ASIAN H/L PERSISTENCE (task #207, added 2026-06-17) =====
+      // Without this, every server restart wipes Asian H/L tracking until the next
+      // 19:00 ET Asian session begins. 6/17 case: deploys throughout the day left
+      // STRUCT_SWEEP non-functional because asianH_locked/asianL_locked were null.
+      asianH_locked:         S[sym].asianH_locked,
+      asianL_locked:         S[sym].asianL_locked,
+      asianLockedDate:       S[sym].asianLockedDate,
+      asianSweepInvalidated: !!S[sym].asianSweepInvalidated,
+      asianAboveSince:       S[sym].asianAboveSince || 0,
+      asianBelowSince:       S[sym].asianBelowSince || 0
     };
   });
   try { fs.writeFileSync(ROLLING_FILE, JSON.stringify(data, null, 2)); } catch (e) {}
@@ -1611,6 +1667,48 @@ function loadSignalHistory() {
           console.log('[' + ts() + '] ' + sym + ' — restored ' + todaySignals.length + ' signals for today');
         }
       });
+      // ===== DETECTOR COOLDOWN RESTORATION (task #209, added 2026-06-17) =====
+      // Without this, every restart resets every cooldown timestamp to 0, allowing
+      // rapid re-fires. 6/17 case: 4 NAS STRUCT_LIQ_GRAB signals fired in 62 min
+      // (45-min cooldown) because multiple mid-day deploys kept zeroing the timer.
+      //
+      // Scan signalHistory and set each detector's LastTs to the most recent fire
+      // within the last 24h. After restart, in-memory cooldowns match disk reality.
+      const day24Ago = Date.now() - 24 * 60 * 60 * 1000;
+      SYMBOLS.forEach(sym => {
+        const s = S[sym];
+        if (!s) return;
+        const recentSigs = signalHistory.filter(h => h.symbol === sym && h.ts > day24Ago);
+        if (recentSigs.length === 0) return;
+        // Map from signal score → state field that tracks its cooldown
+        const mapping = [
+          { match: /STRUCT_SWEEP/,    field: 'structSweepLastTs',   alsoDir: 'structSweepLastDir' },
+          { match: /STRUCT_OB_FILL/,  field: 'structOBFillLastTs' },
+          { match: /STRUCT_LIQ_GRAB/, field: 'structLiqGrabLastTs' },
+          { match: /STRUCT_VWAP/,     field: 'structVwapLastTs' },
+          { match: /INVERSAL_BREAK/,  field: 'inversalLastTs',      alsoDir: 'inversalLastDir' },
+          { match: /BREAK(?!OUT)/,    field: 'breakLastTs',         alsoDir: 'breakLastDir' },
+          { match: /FAST/,            field: 'fastMoveLastTs',      alsoDir: 'fastLastDir' },
+          { match: /VREV/,            field: 'vrevLastTs' },
+          { match: /TREND|RIDE/,      field: 'trendRideLastTs',     alsoDir: 'trendRideLastDir' },
+          { match: /MFLIP/,           field: 'macroFlipTs' },
+          { match: /SUPER/,           field: 'superFlipTs' },
+          { match: /SQZ/,             field: 'sqzLastFireTs' },
+          { match: /DIV/,             field: 'divLastFireTs' }
+        ];
+        let restored = 0;
+        mapping.forEach(m => {
+          const last = recentSigs.filter(h => m.match.test(h.score || '')).sort((a, b) => b.ts - a.ts)[0];
+          if (last && typeof s[m.field] !== 'undefined') {
+            s[m.field] = last.ts;
+            if (m.alsoDir && last.type) s[m.alsoDir] = last.type;
+            restored++;
+          }
+        });
+        if (restored > 0) {
+          console.log('[' + ts() + '] ' + sym + ' — restored ' + restored + ' detector cooldown timestamps from history');
+        }
+      });
       return; // success — done
     } catch (e) {
       console.log('[' + ts() + '] Signal history load failed from ' + file + ': ' + e.message);
@@ -2651,11 +2749,21 @@ function processPrice(sym, price, hi, lo) {
 
     // ── Phase 3 sweep-state tracking (used by STRUCT_SWEEP / STRUCT_LIQ_GRAB detectors below)
     // Asian H/L sweep tracking: detect when price has breached the locked Asian range
-    // with a buffer (0.05% = ~$2 on XAU $4300, ~$33 on BTC $66k). The detector itself
-    // fires only when price COMES BACK through — this state just records the breach.
-    const sweepBufferPct = 0.0005; // 0.05% — needs to be a "real" sweep, not noise
+    // with a buffer. The detector itself fires only when price COMES BACK through —
+    // this state just records the breach.
+    //
+    // ===== ADAPTIVE BUFFER (task #206, added 2026-06-17) =====
+    // Original fixed 0.05% of price ($2.16 on XAU $4318) was too strict for TIGHT Asian
+    // ranges. 6/17 11:44 GMT+2 case: Asian range was only $6.20, sweep buffer would have
+    // been 35% of the whole range — never triggers. Now we use the SMALLER of:
+    //   - 0.03% of price (~$1.30 XAU, ~$20 BTC, ~$9 NAS)
+    //   - 10% of Asian range
+    // For wide Asian ranges, percent-of-price wins (catches macro-significant sweeps).
+    // For tight Asian ranges, percent-of-range wins (catches structurally-relevant sweeps).
     if (s.asianH_locked && s.asianL_locked) {
-      const buf = s.asianH_locked * sweepBufferPct;
+      const bufByPrice = s.asianL_locked * 0.0003;            // 0.03% of price
+      const bufByRange = (s.asianRange || s.asianH_locked - s.asianL_locked) * 0.10; // 10% of Asian range
+      const buf = Math.min(bufByPrice, bufByRange);
       // Sweep up: price has gone above asianH + buffer
       if (price > s.asianH_locked + buf) {
         if (!s.asianSweptHigh) {
@@ -2745,27 +2853,37 @@ function processPrice(sym, price, hi, lo) {
       s.localLo60min = lo60 === Infinity ? 0 : lo60;
     }
     // Level definitions (collect into a map so we can iterate uniformly)
-    // Buffer: 0.05% for XAU/NAS, 0.08% for BTC — small enough that real sweeps count,
-    // large enough to ignore tick noise.
-    const sweepBufPctIB = isBTC ? 0.0008 : 0.0005;
+    // ===== ADAPTIVE LEVEL-TYPE BUFFER (task #211, added 2026-06-17) =====
+    // 6/17 05:09 XAU OBMIT PUT case: obLo at $4,323.28, price went to $4,322.27 (only $1
+    // below). Old fixed 0.05% buffer = $2.16 → sweep didn't qualify → INVERSAL_BREAK couldn't
+    // catch the failed breakdown. The fix: use TIGHTER buffer for tight intraday levels
+    // (obHi/obLo, localHi/Lo) and WIDER buffer for broad daily/multi-day levels.
+    //
+    // Tight levels (intraday structure): obHi/obLo, localHi60/localLo60 → 0.02% buffer
+    // Broad levels (daily/multi-day):    rolling5d, pdh/pdl, roundNum             → 0.03% buffer
+    // BTC gets wider in both cases due to higher volatility (multiply by 1.5x).
+    const tightBufPct = isBTC ? 0.0003 : 0.0002;   // 0.02% / 0.03% — for OB and local 60min
+    const broadBufPct = isBTC ? 0.0005 : 0.0003;   // 0.03% / 0.05% — for daily levels
     const pdh = (s.dailyLevels && s.dailyLevels.length >= 2) ? s.dailyLevels[s.dailyLevels.length - 1].high : 0;
     const pdl = (s.dailyLevels && s.dailyLevels.length >= 2) ? s.dailyLevels[s.dailyLevels.length - 1].low : 0;
+    // Per-level definitions: [key, price, direction, isTightLevel]
     const lvlDefs = [
-      ['rolling5dHi', s.rollingHigh,                'above'],
-      ['rolling5dLo', s.rollingLow !== Infinity ? s.rollingLow : 0, 'below'],
-      ['pdh',         pdh,                          'above'],
-      ['pdl',         pdl,                          'below'],
-      ['roundNumAbv', s.roundNumLevel ? s.roundNumLevel + (isXAU ? 50 : isBTC ? 1000 : 100) : 0, 'above'],
-      ['roundNumBlw', s.roundNumLevel ? s.roundNumLevel : 0,                                     'below'],
-      ['localHi60',   s.localHi60min,               'above'],
-      ['localLo60',   s.localLo60min,               'below'],
-      ['obHi',        s.obZone ? s.obZone.hi : 0,   'above'],
-      ['obLo',        s.obZone ? s.obZone.lo : 0,   'below']
+      ['rolling5dHi', s.rollingHigh,                'above', false],
+      ['rolling5dLo', s.rollingLow !== Infinity ? s.rollingLow : 0, 'below', false],
+      ['pdh',         pdh,                          'above', false],
+      ['pdl',         pdl,                          'below', false],
+      ['roundNumAbv', s.roundNumLevel ? s.roundNumLevel + (isXAU ? 50 : isBTC ? 1000 : 100) : 0, 'above', false],
+      ['roundNumBlw', s.roundNumLevel ? s.roundNumLevel : 0,                                     'below', false],
+      ['localHi60',   s.localHi60min,               'above', true],
+      ['localLo60',   s.localLo60min,               'below', true],
+      ['obHi',        s.obZone ? s.obZone.hi : 0,   'above', true],
+      ['obLo',        s.obZone ? s.obZone.lo : 0,   'below', true]
     ];
-    for (const [key, levelPrice, side] of lvlDefs) {
+    for (const [key, levelPrice, side, isTight] of lvlDefs) {
       if (!levelPrice || levelPrice <= 0) continue;
       const lv = s.sweptLevels[key];
-      const buf = levelPrice * sweepBufPctIB;
+      const bufPct = isTight ? tightBufPct : broadBufPct;
+      const buf = levelPrice * bufPct;
       if (side === 'above') {
         // Sweep up: price > level + buffer
         if (price > levelPrice + buf) {
@@ -3782,12 +3900,16 @@ function processPrice(sym, price, hi, lo) {
       }
     }
 
-    // ===== LHF/LLF MACD DIRECTION-CONSISTENCY (added 2026-06-16, task #179) =====
+    // ===== LHF/LLF/OBMIT/OBREJ MACD DIRECTION-CONSISTENCY (added 2026-06-16, task #179; extended 2026-06-17 task #210) =====
     // 6/16 11:25 XAU ⬇LHF PUT fired with MACD line at +0.248 (BULLISH momentum) and SL'd
     // for -$7.24/unit. A PUT signal demands declining/negative MACD momentum; with MACD
     // pointing UP, the "fade" is shorting INTO upward momentum — exactly the wrong setup.
     //
-    // Rule for LHF/LHFP/LLF/LLFP fade detectors:
+    // Extended 6/17 (task #210) to OBMIT/OBREJ after 05:09 XAU OBMIT PUT @ MACD +0.026
+    // SL'd for -$5.45/oz. Same root cause: order-block fade detectors also fail when
+    // they fire against the momentum direction.
+    //
+    // Rule for all OB-fade and local-fade detectors (LHF/LHFP/LLF/LLFP/OBMIT/OBREJ):
     //   PUT  → block if macdLine > 0 (require MACD line ≤ 0 OR declining significantly)
     //   CALL → block if macdLine < 0 (require MACD line ≥ 0 OR rising significantly)
     //
@@ -3795,7 +3917,7 @@ function processPrice(sym, price, hi, lo) {
     // sign check. Macd extremity gates handle the "too far" case already; this catches the
     // basic "wrong direction" case. macdL is the MACD LINE (not histogram), already available
     // from the sig object as sig.macd (string) — parse it back.
-    if (/LHF|LLF/.test(tagEarly)) {
+    if (/LHF|LLF|OBMIT|OBREJ/.test(tagEarly)) {
       const sigMacd = parseFloat(sig.macd);
       if (!isNaN(sigMacd)) {
         if (sig.type === 'put' && sigMacd > 0) {
@@ -5626,10 +5748,15 @@ function processPrice(sym, price, hi, lo) {
         } else {
           const sweepDistAbove = s.asianSweepHighPeak - s.asianH_locked;
           const reentryDistRaw = s.asianH_locked - price;
-          // Aggressive mode: 25% of range sweep, 10% of range re-entry
-          // Conservative mode: 25% of range sweep, max(10% of range, 6-pips-eq) re-entry + 2-candle confirm
-          const minSweep = s.asianRange * 0.25;
-          const minReentryAggr = s.asianRange * 0.10;
+          // ===== ADAPTIVE SWEEP DEPTH (task #206, added 2026-06-17) =====
+          // Old: fixed 25% of Asian range. Too strict for tight ranges (6/17 11:44 case:
+          // Asian range $6.20, needed $1.55 depth; actual $1.50 — barely missed).
+          // New: max(15% of range, 0.02% of price). For tight ranges, the 0.02% floor
+          // ensures we require at least some meaningful $-distance regardless of range.
+          // For wide ranges, the 15% scaling still demands a real liquidity grab.
+          const minSweep = Math.max(s.asianRange * 0.15, price * 0.0002);
+          // Re-entry: same logic — adaptive scaling
+          const minReentryAggr = Math.max(s.asianRange * 0.08, price * 0.00015);
           const minReentryCons = Math.max(s.asianRange * 0.10, sixPipsEq);
           const minReentry = isConservativeMode ? minReentryCons : minReentryAggr;
           const candlesOk = isConservativeMode ? candleConfirm(true, false) : true;
@@ -5665,8 +5792,10 @@ function processPrice(sym, price, hi, lo) {
         } else {
           const sweepDistBelow = s.asianL_locked - s.asianSweepLowTrough;
           const reentryDistRaw = price - s.asianL_locked;
-          const minSweep = s.asianRange * 0.25;
-          const minReentryAggr = s.asianRange * 0.10;
+          // ===== ADAPTIVE SWEEP DEPTH (task #206, added 2026-06-17) =====
+          // Symmetric with PUT branch above. See comment there for rationale.
+          const minSweep = Math.max(s.asianRange * 0.15, price * 0.0002);
+          const minReentryAggr = Math.max(s.asianRange * 0.08, price * 0.00015);
           const minReentryCons = Math.max(s.asianRange * 0.10, sixPipsEq);
           const minReentry = isConservativeMode ? minReentryCons : minReentryAggr;
           const candlesOk = isConservativeMode ? candleConfirm(false, true) : true;
