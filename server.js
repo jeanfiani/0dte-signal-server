@@ -366,6 +366,12 @@ SYMBOLS.forEach(sym => {
     asianSweepLowTrough: 0,       // lowest price reached below asianL during sweep
     structSweepLastTs: 0,         // cooldown after STRUCT_SWEEP fires (per side)
     structSweepLastDir: null,
+    // Phase 3.9 (task #205) — Session lock tracking
+    // Track when price first went above/below Asian range — if it stays there >30 min
+    // without returning inside, the Asian setup is invalidated for the rest of the session.
+    asianAboveSince: 0,           // timestamp when price first went above asianH (continuous)
+    asianBelowSince: 0,           // timestamp when price first went below asianL (continuous)
+    asianSweepInvalidated: false, // session lock — set true on clean break, reset at new Asian
     // STRUCT_OB_FILL — deep OB retracement with confirmation
     structOBFillLastTs: 0,        // cooldown after fire
     structOBFillLastObTs: 0,      // ID of last OB we fired on (don't double-fire same OB)
@@ -2538,6 +2544,10 @@ function processPrice(sym, price, hi, lo) {
         s.asianH_locked = s.asianH;
         s.asianL_locked = s.asianL;
         s.asianLockedDate = todayStr;
+        // Reset session lock for the new Asian session (Phase 3.9, task #205)
+        s.asianSweepInvalidated = false;
+        s.asianAboveSince = 0;
+        s.asianBelowSince = 0;
       }
       // After 02:00 ET, start prepping for next Asian window (resets at 19:00 ET)
       if (etMin >= 120 && etMin < 1140) {
@@ -2664,6 +2674,34 @@ function processPrice(sym, price, hi, lo) {
       }
       // Reset sweep flags when locked Asian date changes (new trading day)
       // (Already handled by asianLockedDate change in main Asian block above)
+
+      // === Phase 3.9 — Session lock tracking (task #205) ===
+      // Track continuous time outside Asian range. If price stays above asianH (or below
+      // asianL) for >30 min WITHOUT reverting back inside, the Asian setup is "invalidated"
+      // — clean breakout, not a Judas swing — and STRUCT_SWEEP is locked for the session.
+      // The flag resets when a new Asian session begins (handled in main block above).
+      if (price > s.asianH_locked) {
+        if (s.asianAboveSince === 0) s.asianAboveSince = _now;
+        s.asianBelowSince = 0;
+      } else if (price < s.asianL_locked) {
+        if (s.asianBelowSince === 0) s.asianBelowSince = _now;
+        s.asianAboveSince = 0;
+      } else {
+        // Price back inside range — reset both "since" timestamps
+        s.asianAboveSince = 0;
+        s.asianBelowSince = 0;
+      }
+      // Trigger session lock if either above/below time exceeds 30 min
+      const SESSION_LOCK_MS = 30 * 60 * 1000;
+      if (!s.asianSweepInvalidated) {
+        if (s.asianAboveSince > 0 && (_now - s.asianAboveSince) >= SESSION_LOCK_MS) {
+          s.asianSweepInvalidated = true;
+          log(sym, '🔒 STRUCT_SWEEP session-locked — Asian H $' + s.asianH_locked.toFixed(2) + ' broken cleanly (price held above 30+ min). No more Judas plays this session.');
+        } else if (s.asianBelowSince > 0 && (_now - s.asianBelowSince) >= SESSION_LOCK_MS) {
+          s.asianSweepInvalidated = true;
+          log(sym, '🔒 STRUCT_SWEEP session-locked — Asian L $' + s.asianL_locked.toFixed(2) + ' broken cleanly (price held below 30+ min). No more Judas plays this session.');
+        }
+      }
     }
     // Liquidity pool sweep tracking: detect when nearest pool above/below has been pierced
     if (s.liqPoolsAbove && s.liqPoolsAbove.length > 0) {
@@ -5529,56 +5567,128 @@ function processPrice(sym, price, hi, lo) {
     // the Asian range. Classic SMC Judas swing — the most-traded XAU pattern.
     // Direction: sweep up → PUT (price reversing down after taking liquidity above)
     //            sweep down → CALL (price reversing up after grabbing liquidity below)
-    if (s.asianH_locked && s.asianL_locked && cool3) {
+    //
+    // ===== ENHANCED 2026-06-17 (tasks #203, #204, #205) =====
+    // Based on French XAU trader's disciplined rule:
+    //   "Étape 1: étudier la tendance de fond sur du H4"  (H4 trend)
+    //   "Tendance haussière: Cassure de l'Asian par le Low + Liquidation + 2 closed
+    //    5min candles + 6 pips, SL sur le Low"  (CALL on Asian-low sweep with H4 up)
+    //   "Sinon: cassure par le High → éteindre les écrans"  (otherwise stop trading)
+    //
+    // Improvements:
+    //  #203 — HTF direction match: block CALL if 4h is DOWN, block PUT if 4h is UP
+    //  #204 — Conservative mode (env STRUCT_SWEEP_MODE=conservative): require last 2
+    //         closed 5-min candle closes back inside Asian range + larger re-entry
+    //  #205 — Session lock: if Asian range breaks cleanly (>30 min beyond w/o reversal),
+    //         STRUCT_SWEEP locks for the rest of the session (set via s.asianSweepInvalidated)
+    const STRUCT_SWEEP_MODE = process.env.STRUCT_SWEEP_MODE || 'aggressive';
+    const isConservativeMode = STRUCT_SWEEP_MODE === 'conservative';
+    if (s.asianH_locked && s.asianL_locked && cool3 && !s.asianSweepInvalidated) {
       const sweepCool = now2 - s.structSweepLastTs > 60 * 60 * 1000; // 60min between sweeps
       const sweepWindowMs = 4 * 60 * 60 * 1000; // sweep must have happened in last 4h
+
+      // Conservative mode confirmation helper — checks last 2 closed 5-min candles
+      const candleConfirm = (sideAboveOk, sideBelowOk) => {
+        // sideAboveOk: closes must be ABOVE asianH (for CALL after sweep low)
+        //              wait that's wrong — closes must be BACK INSIDE range
+        // Correctly: for sweep above (PUT), closes must be BELOW asianH (back inside)
+        //            for sweep below (CALL), closes must be ABOVE asianL (back inside)
+        if (!s.atrCandles || s.atrCandles.length < 2) return false;
+        const c1 = s.atrCandles[s.atrCandles.length - 1];  // most recent closed
+        const c2 = s.atrCandles[s.atrCandles.length - 2];  // 2nd most recent closed
+        if (!c1 || !c2 || !c1.c || !c2.c) return false;
+        if (sideAboveOk) {
+          // PUT case: both closes must be BELOW asianH (back inside range)
+          return c1.c < s.asianH_locked && c2.c < s.asianH_locked;
+        } else if (sideBelowOk) {
+          // CALL case: both closes must be ABOVE asianL (back inside range)
+          return c1.c > s.asianL_locked && c2.c > s.asianL_locked;
+        }
+        return false;
+      };
+
+      // Per-instrument "6 pips equivalent" — used by conservative mode for re-entry depth
+      const sixPipsXAU = 2.0;    // ~0.05% of $4300
+      const sixPipsBTC = 30.0;   // ~0.05% of $66k
+      const sixPipsNAS = 15.0;   // ~0.05% of $30k
+      const sixPipsEq = isXAU ? sixPipsXAU : isBTC ? sixPipsBTC : sixPipsNAS;
 
       // Sweep high + reverse → PUT
       if (s.asianSweptHigh && (now2 - s.asianSweepHighTs) <= sweepWindowMs && sweepCool &&
           price < s.asianH_locked && s.structSweepLastDir !== 'put') {
-        // Price is now BACK BELOW the Asian high after having swept above. Reversal.
-        const sweepDistAbove = s.asianSweepHighPeak - s.asianH_locked;
-        const reentryDist = s.asianH_locked - price;
-        // Require meaningful sweep (>= 25% of Asian range) and confirmed re-entry (>= 10% of range below)
-        if (sweepDistAbove >= s.asianRange * 0.25 && reentryDist >= s.asianRange * 0.10) {
-          s.dailySignalCount++;
-          s.lastAT = 'put'; s.nP++;
-          if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
-          s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
-          const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇STRUCT_SWEEP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-          if (!enrichSig(sig)) return;
-          s.signals.push(sig); logSignal(sym, sig);
-          s.trade = buildCfdTrade('put', price, atrVal, sym);
-          attachTpSl(sig, 'put', price, atrVal, sym);
-          s.structSweepLastTs = now2;
-          s.structSweepLastDir = 'put';
-          s.asianSweptHigh = false; // consume the sweep
-          log(sym, '🥷 STRUCT_SWEEP PUT (Judas) — swept Asian high $' + s.asianH_locked.toFixed(2) + ' to peak $' + s.asianSweepHighPeak.toFixed(2) + ' (+$' + sweepDistAbove.toFixed(2) + '), now back below at $' + price.toFixed(2) + ' (-$' + reentryDist.toFixed(2) + ') [#' + s.dailySignalCount + ']');
-          sendPush('🥷 ' + sym + ' STRUCT_SWEEP PUT #' + s.dailySignalCount, 'Asian high swept then reversed — $' + price.toFixed(2), 'signal');
-          return;
+        // === Phase 3.7 HTF direction match — block PUT if 4h is UP (against macro)
+        if (s.htf4h_dir === 'up') {
+          // Reset the sweep flag so we don't keep checking — but don't fire
+          // (we wait until next Asian session for an aligned setup)
+          if (s.asianSweepHighTs && now2 - s.asianSweepHighTs > sweepWindowMs - 60000) {
+            log(sym, '🚫 STRUCT_SWEEP PUT skipped — Asian H swept but 4h trend UP. Setup fights macro (rule: only trade WITH H4 trend).');
+          }
+        } else {
+          const sweepDistAbove = s.asianSweepHighPeak - s.asianH_locked;
+          const reentryDistRaw = s.asianH_locked - price;
+          // Aggressive mode: 25% of range sweep, 10% of range re-entry
+          // Conservative mode: 25% of range sweep, max(10% of range, 6-pips-eq) re-entry + 2-candle confirm
+          const minSweep = s.asianRange * 0.25;
+          const minReentryAggr = s.asianRange * 0.10;
+          const minReentryCons = Math.max(s.asianRange * 0.10, sixPipsEq);
+          const minReentry = isConservativeMode ? minReentryCons : minReentryAggr;
+          const candlesOk = isConservativeMode ? candleConfirm(true, false) : true;
+          if (sweepDistAbove >= minSweep && reentryDistRaw >= minReentry && candlesOk) {
+            s.dailySignalCount++;
+            s.lastAT = 'put'; s.nP++;
+            if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
+            s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
+            const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇STRUCT_SWEEP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+            if (!enrichSig(sig)) return;
+            s.signals.push(sig); logSignal(sym, sig);
+            s.trade = buildCfdTrade('put', price, atrVal, sym);
+            attachTpSl(sig, 'put', price, atrVal, sym);
+            s.structSweepLastTs = now2;
+            s.structSweepLastDir = 'put';
+            s.asianSweptHigh = false; // consume the sweep
+            const modeTag = isConservativeMode ? ' [CONS+2candles]' : '';
+            const htfTag = s.htf4h_dir === 'down' ? ' + 4h DOWN aligned' : ' (4h flat)';
+            log(sym, '🥷 STRUCT_SWEEP PUT (Judas)' + modeTag + htfTag + ' — swept Asian high $' + s.asianH_locked.toFixed(2) + ' to peak $' + s.asianSweepHighPeak.toFixed(2) + ' (+$' + sweepDistAbove.toFixed(2) + '), now back below at $' + price.toFixed(2) + ' (-$' + reentryDistRaw.toFixed(2) + ') [#' + s.dailySignalCount + ']');
+            sendPush('🥷 ' + sym + ' STRUCT_SWEEP PUT #' + s.dailySignalCount, 'Asian high swept then reversed — $' + price.toFixed(2), 'signal');
+            return;
+          }
         }
       }
       // Sweep low + reverse → CALL
       if (s.asianSweptLow && (now2 - s.asianSweepLowTs) <= sweepWindowMs && sweepCool &&
           price > s.asianL_locked && s.structSweepLastDir !== 'call') {
-        const sweepDistBelow = s.asianL_locked - s.asianSweepLowTrough;
-        const reentryDist = price - s.asianL_locked;
-        if (sweepDistBelow >= s.asianRange * 0.25 && reentryDist >= s.asianRange * 0.10) {
-          s.dailySignalCount++;
-          s.lastAT = 'call'; s.nC++;
-          if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
-          s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
-          const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆STRUCT_SWEEP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-          if (!enrichSig(sig)) return;
-          s.signals.push(sig); logSignal(sym, sig);
-          s.trade = buildCfdTrade('call', price, atrVal, sym);
-          attachTpSl(sig, 'call', price, atrVal, sym);
-          s.structSweepLastTs = now2;
-          s.structSweepLastDir = 'call';
-          s.asianSweptLow = false;
-          log(sym, '🥷 STRUCT_SWEEP CALL (Judas) — swept Asian low $' + s.asianL_locked.toFixed(2) + ' to trough $' + s.asianSweepLowTrough.toFixed(2) + ' (-$' + sweepDistBelow.toFixed(2) + '), now back above at $' + price.toFixed(2) + ' (+$' + reentryDist.toFixed(2) + ') [#' + s.dailySignalCount + ']');
-          sendPush('🥷 ' + sym + ' STRUCT_SWEEP CALL #' + s.dailySignalCount, 'Asian low swept then reversed — $' + price.toFixed(2), 'signal');
-          return;
+        // === Phase 3.7 HTF direction match — block CALL if 4h is DOWN (against macro)
+        if (s.htf4h_dir === 'down') {
+          if (s.asianSweepLowTs && now2 - s.asianSweepLowTs > sweepWindowMs - 60000) {
+            log(sym, '🚫 STRUCT_SWEEP CALL skipped — Asian L swept but 4h trend DOWN. Setup fights macro (rule: only trade WITH H4 trend).');
+          }
+        } else {
+          const sweepDistBelow = s.asianL_locked - s.asianSweepLowTrough;
+          const reentryDistRaw = price - s.asianL_locked;
+          const minSweep = s.asianRange * 0.25;
+          const minReentryAggr = s.asianRange * 0.10;
+          const minReentryCons = Math.max(s.asianRange * 0.10, sixPipsEq);
+          const minReentry = isConservativeMode ? minReentryCons : minReentryAggr;
+          const candlesOk = isConservativeMode ? candleConfirm(false, true) : true;
+          if (sweepDistBelow >= minSweep && reentryDistRaw >= minReentry && candlesOk) {
+            s.dailySignalCount++;
+            s.lastAT = 'call'; s.nC++;
+            if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
+            s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
+            const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆STRUCT_SWEEP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+            if (!enrichSig(sig)) return;
+            s.signals.push(sig); logSignal(sym, sig);
+            s.trade = buildCfdTrade('call', price, atrVal, sym);
+            attachTpSl(sig, 'call', price, atrVal, sym);
+            s.structSweepLastTs = now2;
+            s.structSweepLastDir = 'call';
+            s.asianSweptLow = false;
+            const modeTag = isConservativeMode ? ' [CONS+2candles]' : '';
+            const htfTag = s.htf4h_dir === 'up' ? ' + 4h UP aligned' : ' (4h flat)';
+            log(sym, '🥷 STRUCT_SWEEP CALL (Judas)' + modeTag + htfTag + ' — swept Asian low $' + s.asianL_locked.toFixed(2) + ' to trough $' + s.asianSweepLowTrough.toFixed(2) + ' (-$' + sweepDistBelow.toFixed(2) + '), now back above at $' + price.toFixed(2) + ' (+$' + reentryDistRaw.toFixed(2) + ') [#' + s.dailySignalCount + ']');
+            sendPush('🥷 ' + sym + ' STRUCT_SWEEP CALL #' + s.dailySignalCount, 'Asian low swept then reversed — $' + price.toFixed(2), 'signal');
+            return;
+          }
         }
       }
     }
