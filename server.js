@@ -3689,6 +3689,36 @@ function processPrice(sym, price, hi, lo) {
           return false;
         }
       }
+
+      // ── 2.8: STRUCT/INVERSAL RSI direction-consistency (task #202, added 2026-06-17)
+      // Catches "wrong-direction fade" entries — e.g., CALL at RSI 75 chasing an exhausted
+      // bounce. The STRUCT_* / INVERSAL_BREAK detectors are designed to fire AGAINST
+      // exhaustion. Firing IN the direction of exhaustion is the failure mode.
+      //
+      // 6/17 04:08 NAS100 STRUCT_LIQ_GRAB CALL @ RSI 75.7 → SL -$47/contract.
+      // The detector fired because a pool below was swept then price came back above —
+      // structurally valid — BUT by the time price rallied that far, RSI was deeply
+      // overbought. We were buying the top of the bounce.
+      //
+      // Thresholds 72/28 (not 70/30): STRUCT/INVERSAL detectors SHOULD fire near
+      // RSI extremes (that's where structural setups happen). 70/30 would block
+      // legitimate setups. 72/28 still allows the normal "near-extreme" zone but
+      // blocks the disasters above 72 / below 28.
+      if (/STRUCT_SWEEP|STRUCT_LIQ_GRAB|STRUCT_OB_FILL|STRUCT_VWAP|INVERSAL_BREAK/.test(tagP2)) {
+        const rsiP2 = parseFloat(sig.rsi);
+        if (!isNaN(rsiP2)) {
+          if (sig.type === 'call' && rsiP2 > 72) {
+            Object.assign(s, _emitSnapshot);
+            log(sym, '🚫 ' + tagP2 + ' CALL BLOCKED — RSI ' + rsiP2.toFixed(1) + ' > 72 — chasing overbought / exhausted bounce. Wrong-direction fade.');
+            return false;
+          }
+          if (sig.type === 'put' && rsiP2 < 28) {
+            Object.assign(s, _emitSnapshot);
+            log(sym, '🚫 ' + tagP2 + ' PUT BLOCKED — RSI ' + rsiP2.toFixed(1) + ' < 28 — chasing oversold / exhausted drop. Wrong-direction fade.');
+            return false;
+          }
+        }
+      }
     }
     // ===== END PHASE 2 PRE-GATE =====
 
