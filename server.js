@@ -313,6 +313,33 @@ SYMBOLS.forEach(sym => {
     trv2LastSignalTs: 0,       // cooldown: when last entry/reverse signal fired
     trv2Trade: null,           // active trade: { dir:'long'|'short', ep, ts, sl, tp1, tp2, tp3, tp1Hit, tp2Hit, tp3Hit, bestPrice, atr, trailSl }
     trv2CrossCount: 0,         // consecutive candle closes on wrong side of EMA (for exit confirmation)
+    // ===== PHASE 1 INFRASTRUCTURE — STRUCTURAL AWARENESS STATE (added 2026-06-17) =====
+    // No behavior change yet — these fields are populated each tick by Phase 1 code
+    // and consumed by Phase 2 gates / Phase 3 structure-first detectors.
+    // Asian Session H/L Tracker (task #181): 19:00 ET prev day → 02:00 ET today
+    asianH: null,              // highest tick price during current Asian session
+    asianL: null,              // lowest tick price during current Asian session
+    asianRange: 0,             // asianH - asianL (filled at session end)
+    asianH_locked: null,       // locked at session end — used by Phase 3 sweep detection
+    asianL_locked: null,       // locked at session end
+    asianStartTs: 0,           // when current Asian window opened (resets daily)
+    asianLockedDate: null,     // YYYY-MM-DD when locked values were saved (per-day stability)
+    // Killzone Clock (task #182): tagged every tick
+    session: null,             // 'asian' | 'londonKZ' | 'londonOpen' | 'nyAM' | 'nyLunch' | 'nyPM' | 'overnight'
+    inKillzone: false,         // true during londonKZ or nyAM (high-volatility windows)
+    sessionStartTs: 0,         // when current session started
+    // HTF Bias Module (task #183): 1h and 4h trend direction from macroSnaps
+    htf1h_dir: null,           // 'up' | 'down' | 'flat' — 1-hour trend bias
+    htf4h_dir: null,           // 'up' | 'down' | 'flat' — 4-hour trend bias
+    htf1h_strength: 0,         // % change over 1h window
+    htf4h_strength: 0,         // % change over 4h window
+    // VWAP per symbol (task #184): session VWAP, resets at 18:00 ET (new trading day)
+    vwap: null,                // session-anchored VWAP
+    vwapNum: 0,                // numerator: Σ(price × volume_proxy)
+    vwapDen: 0,                // denominator: Σ(volume_proxy)
+    vwapDistPct: 0,            // % distance from VWAP (positive = above, negative = below)
+    vwapDir: null,             // 'above' | 'below' | 'at'
+    vwapAnchorTs: 0,           // when current VWAP session anchored
     // Trade monitor
     trade: { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() }
   };
@@ -916,6 +943,36 @@ function rthEtfFresh() {
   return m >= 570 && m < 990;
 }
 function ts() { return new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: 'America/New_York' }); }
+
+// ===== PHASE 1 INFRASTRUCTURE — STRUCTURAL AWARENESS HELPERS (added 2026-06-17) =====
+// These add data only (no behavior change yet). Phase 2 gates will read this state.
+// Roadmap doc: /docs/signal_system_roadmap.xlsx
+
+// Killzone classifier. Tags every tick with a session label. London KZ (02:00-05:00 ET) and
+// NY AM (08:00-11:00 ET) print 60-70% of intraday range historically. Asian (19:00-02:00 ET)
+// is consolidation. Used by Phase 2 timing gates.
+function getSession(etMin) {
+  // etMin is minutes since midnight ET (0-1439)
+  if (etMin >= 120 && etMin < 300)  return 'londonKZ';     // 02:00-05:00
+  if (etMin >= 300 && etMin < 480)  return 'londonOpen';   // 05:00-08:00
+  if (etMin >= 480 && etMin < 660)  return 'nyAM';         // 08:00-11:00
+  if (etMin >= 660 && etMin < 780)  return 'nyLunch';      // 11:00-13:00
+  if (etMin >= 780 && etMin < 960)  return 'nyPM';         // 13:00-16:00
+  if (etMin >= 960 && etMin < 1140) return 'overnight';    // 16:00-19:00 (post-NY close)
+  return 'asian';                                          // 19:00-02:00 (wraps midnight)
+}
+function isKillzone(etMin) {
+  // True during the two highest-volatility windows of the day
+  return (etMin >= 120 && etMin < 300) || (etMin >= 480 && etMin < 660);
+}
+function isAsianSession(etMin) {
+  // Asian session wraps midnight: 19:00 prev day → 02:00 today
+  return etMin >= 1140 || etMin < 120;
+}
+function nearestRoundLevel(price, increment) {
+  // Returns nearest $50 or $100 level depending on instrument scale
+  return Math.round(price / increment) * increment;
+}
 
 // ===== PUSH TO ALL SUBSCRIBERS =====
 function sendPush(title, body, tag) {
@@ -2240,6 +2297,93 @@ function processPrice(sym, price, hi, lo) {
 
   // Session detection
   const etMin = gET();
+
+  // ===== PHASE 1 INFRASTRUCTURE — STRUCTURAL AWARENESS UPDATES (added 2026-06-17) =====
+  // Runs every tick. Populates s.session, s.asianH/L, s.htf1h_dir, s.vwap. No behavior
+  // change yet — Phase 2 gates will consume these. Roadmap: /docs/signal_system_roadmap.xlsx
+  // Skip for QQQ/SPY for now — focus on MT5 instruments (XAU/BTC/NAS) where this matters most.
+  if (isMT5 && price > 0) {
+    const _now = Date.now();
+    // ── Phase 1.2: Killzone Clock — tag every tick
+    const newSession = getSession(etMin);
+    if (newSession !== s.session) {
+      s.session = newSession;
+      s.sessionStartTs = _now;
+    }
+    s.inKillzone = isKillzone(etMin);
+
+    // ── Phase 1.1: Asian Session H/L Tracker (19:00 ET → 02:00 ET wraps midnight)
+    const inAsian = isAsianSession(etMin);
+    if (inAsian) {
+      // Inside Asian window — update running H/L
+      if (s.asianH === null || price > s.asianH) s.asianH = price;
+      if (s.asianL === null || price < s.asianL) s.asianL = price;
+      s.asianRange = s.asianH - s.asianL;
+      if (s.asianStartTs === 0) s.asianStartTs = _now;
+    } else {
+      // Outside Asian window — lock the values if we just exited
+      // (Asian ends at 02:00 ET; lock once and store with today's date)
+      const todayStr = todayDateET();
+      if (s.asianH !== null && s.asianLockedDate !== todayStr) {
+        s.asianH_locked = s.asianH;
+        s.asianL_locked = s.asianL;
+        s.asianLockedDate = todayStr;
+      }
+      // After 02:00 ET, start prepping for next Asian window (resets at 19:00 ET)
+      if (etMin >= 120 && etMin < 1140) {
+        // Daytime — clear current asianH/L tracking so new Asian session starts fresh at 19:00
+        if (s.asianStartTs > 0) {
+          s.asianH = null;
+          s.asianL = null;
+          s.asianRange = 0;
+          s.asianStartTs = 0;
+        }
+      }
+    }
+
+    // ── Phase 1.3: HTF Bias Module — compute 1h/4h trend from macroSnaps
+    // macroSnaps stores price every 5 min, max 72 entries (6 hours). 12 snaps = 1h, 48 = 4h.
+    if (s.macroSnaps && s.macroSnaps.length >= 12) {
+      const snap1hAgo = s.macroSnaps[Math.max(0, s.macroSnaps.length - 12)];
+      const pct1h = ((price - snap1hAgo.p) / snap1hAgo.p) * 100;
+      s.htf1h_strength = pct1h;
+      // Threshold: 0.1% for XAU (~$4 on $4300), 0.15% for BTC, 0.2% for NAS
+      const htf1hThresh = isXAU ? 0.1 : isBTC ? 0.15 : 0.2;
+      s.htf1h_dir = pct1h > htf1hThresh ? 'up' : pct1h < -htf1hThresh ? 'down' : 'flat';
+    }
+    if (s.macroSnaps && s.macroSnaps.length >= 48) {
+      const snap4hAgo = s.macroSnaps[Math.max(0, s.macroSnaps.length - 48)];
+      const pct4h = ((price - snap4hAgo.p) / snap4hAgo.p) * 100;
+      s.htf4h_strength = pct4h;
+      const htf4hThresh = isXAU ? 0.2 : isBTC ? 0.3 : 0.4;
+      s.htf4h_dir = pct4h > htf4hThresh ? 'up' : pct4h < -htf4hThresh ? 'down' : 'flat';
+    }
+
+    // ── Phase 1.4: Session VWAP — anchored at 18:00 ET (CME daily reset)
+    // For MT5 instruments we don't have true volume, so use tick-frequency as a proxy (each
+    // tick = 1 unit of weight). This is a "tick-VWAP" — close enough for bias detection.
+    // Reset at 18:00 ET each day (new CME trading day).
+    const sessionAnchorHour = 18 * 60; // 18:00 ET in minutes
+    const hoursSinceAnchor = etMin >= sessionAnchorHour
+      ? (etMin - sessionAnchorHour)
+      : (etMin + (1440 - sessionAnchorHour));
+    const anchorMs = _now - (hoursSinceAnchor * 60 * 1000);
+    // If we've crossed the anchor since last update, reset accumulator
+    if (s.vwapAnchorTs === 0 || s.vwapAnchorTs < anchorMs - 60000) {
+      s.vwapNum = 0;
+      s.vwapDen = 0;
+      s.vwapAnchorTs = anchorMs;
+    }
+    s.vwapNum += price * 1; // weight = 1 tick
+    s.vwapDen += 1;
+    if (s.vwapDen > 0) {
+      s.vwap = s.vwapNum / s.vwapDen;
+      s.vwapDistPct = ((price - s.vwap) / s.vwap) * 100;
+      s.vwapDir = s.vwapDistPct > 0.02 ? 'above' : s.vwapDistPct < -0.02 ? 'below' : 'at';
+    }
+  }
+  // ===== END PHASE 1 INFRASTRUCTURE =====
+
   const xauSession = isXAU ? (etMin >= 480 && etMin < 960 ? 'london_ny' : etMin >= 180 && etMin < 480 ? 'london' : 'asia') : '';
   const btcSession = isBTC ? (etMin >= 570 && etMin < 960 ? 'us' : etMin >= 480 && etMin < 570 ? 'pre_us' : etMin >= 60 && etMin < 480 ? 'europe_asia' : 'overnight') : '';
   // NAS100 futures: Sun 6PM - Fri 5PM ET, daily break 5-6PM ET
@@ -8560,6 +8704,35 @@ app.get('/prices', (req, res) => {
       roundNum: s._roundNum || null,
       orderBlocks: s._orderBlocks || [],
       obBreakout: s.obZone ? { dir: s.obZone.dir, hi: +s.obZone.hi.toFixed(2), lo: +s.obZone.lo.toFixed(2), coilHi: +s.obZone.coilHi.toFixed(2), coilLo: +s.obZone.coilLo.toFixed(2), age: Math.round((Date.now() - s.obZone.ts) / 1000), departed: s.obDeparted, fired: s.obFired, mitigated: s.obMitigated } : null,
+      // ===== PHASE 1 INFRASTRUCTURE EXPOSURE (added 2026-06-17) =====
+      // Read-only debug surface for verifying Phase 1 tracking. Dashboards / monitoring can
+      // poll /prices and inspect phase1.{asian, session, htf, vwap} to confirm population
+      // before Phase 2 gates start consuming this state.
+      phase1: (sym === 'XAU' || sym === 'BTC' || sym === 'NAS100') ? {
+        session: s.session || null,
+        inKillzone: !!s.inKillzone,
+        asian: {
+          h: s.asianH ? +s.asianH.toFixed(2) : null,
+          l: s.asianL ? +s.asianL.toFixed(2) : null,
+          range: s.asianRange ? +s.asianRange.toFixed(2) : 0,
+          hLocked: s.asianH_locked ? +s.asianH_locked.toFixed(2) : null,
+          lLocked: s.asianL_locked ? +s.asianL_locked.toFixed(2) : null,
+          lockedDate: s.asianLockedDate || null,
+          ageMin: s.asianStartTs ? Math.round((Date.now() - s.asianStartTs) / 60000) : 0
+        },
+        htf: {
+          h1Dir: s.htf1h_dir || null,
+          h1Pct: +(s.htf1h_strength || 0).toFixed(3),
+          h4Dir: s.htf4h_dir || null,
+          h4Pct: +(s.htf4h_strength || 0).toFixed(3)
+        },
+        vwap: {
+          value: s.vwap ? +s.vwap.toFixed(2) : null,
+          distPct: +(s.vwapDistPct || 0).toFixed(3),
+          dir: s.vwapDir || null,
+          ageMin: s.vwapAnchorTs ? Math.round((Date.now() - s.vwapAnchorTs) / 60000) : 0
+        }
+      } : null,
       macro: (sym === 'XAU' || sym === 'BTC' || sym === 'NAS100') && s.macroSnaps.length >= 2 && s.lastPrice > 0 ? (() => {
         const p = s.lastPrice;
         return {
