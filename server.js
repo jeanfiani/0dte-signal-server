@@ -379,6 +379,25 @@ SYMBOLS.forEach(sym => {
     structVwapLastTs: 0,
     vwapTouchedTs: 0,             // when price last touched VWAP (within 0.05%)
     vwapTouchedSide: null,        // 'above' if touched from above (rejection rally), 'below' if from below
+    // ===== PHASE 3.5 — INVERSAL_BREAK (task #200) — replaces BREAK detector =====
+    // Universal failed-breakout detector. Watches multiple level types simultaneously and
+    // fires opposite-direction on sweep+reversal pattern (Judas swing / stop hunt).
+    sweptLevels: {                // Track sweep state for each level type
+      rolling5dHi: { swept: false, ts: 0, extreme: 0, level: 0 },
+      rolling5dLo: { swept: false, ts: 0, extreme: 0, level: 0 },
+      pdh:         { swept: false, ts: 0, extreme: 0, level: 0 },
+      pdl:         { swept: false, ts: 0, extreme: 0, level: 0 },
+      roundNumAbv: { swept: false, ts: 0, extreme: 0, level: 0 },
+      roundNumBlw: { swept: false, ts: 0, extreme: 0, level: 0 },
+      localHi60:   { swept: false, ts: 0, extreme: 0, level: 0 },
+      localLo60:   { swept: false, ts: 0, extreme: 0, level: 0 },
+      obHi:        { swept: false, ts: 0, extreme: 0, level: 0 },
+      obLo:        { swept: false, ts: 0, extreme: 0, level: 0 }
+    },
+    inversalLastTs: 0,            // cooldown
+    inversalLastDir: null,        // last fire direction (anti-flip)
+    localHi60min: 0,              // computed from recent macroSnaps (12 = 60 min)
+    localLo60min: 0,
     // Trade monitor
     trade: { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() }
   };
@@ -2671,6 +2690,68 @@ function processPrice(sym, price, hi, lo) {
         s.vwapTouchedSide = price >= s.vwap ? 'above' : 'below';
       }
     }
+
+    // ===== INVERSAL_BREAK level-sweep tracking (task #200) =====
+    // For each of 10 level types, track whether price has BREACHED the level
+    // (with a buffer) and capture the extreme reached. The detector below fires
+    // when ANY swept level sees price come back INSIDE.
+    // Local 60-min H/L: computed from last 12 macroSnaps (5-min each = 60 min)
+    if (s.macroSnaps && s.macroSnaps.length >= 6) {
+      const lookback = Math.min(12, s.macroSnaps.length);
+      let hi60 = 0, lo60 = Infinity;
+      for (let i = s.macroSnaps.length - lookback; i < s.macroSnaps.length; i++) {
+        if (s.macroSnaps[i].p > hi60) hi60 = s.macroSnaps[i].p;
+        if (s.macroSnaps[i].p < lo60) lo60 = s.macroSnaps[i].p;
+      }
+      s.localHi60min = hi60;
+      s.localLo60min = lo60 === Infinity ? 0 : lo60;
+    }
+    // Level definitions (collect into a map so we can iterate uniformly)
+    // Buffer: 0.05% for XAU/NAS, 0.08% for BTC — small enough that real sweeps count,
+    // large enough to ignore tick noise.
+    const sweepBufPctIB = isBTC ? 0.0008 : 0.0005;
+    const pdh = (s.dailyLevels && s.dailyLevels.length >= 2) ? s.dailyLevels[s.dailyLevels.length - 1].high : 0;
+    const pdl = (s.dailyLevels && s.dailyLevels.length >= 2) ? s.dailyLevels[s.dailyLevels.length - 1].low : 0;
+    const lvlDefs = [
+      ['rolling5dHi', s.rollingHigh,                'above'],
+      ['rolling5dLo', s.rollingLow !== Infinity ? s.rollingLow : 0, 'below'],
+      ['pdh',         pdh,                          'above'],
+      ['pdl',         pdl,                          'below'],
+      ['roundNumAbv', s.roundNumLevel ? s.roundNumLevel + (isXAU ? 50 : isBTC ? 1000 : 100) : 0, 'above'],
+      ['roundNumBlw', s.roundNumLevel ? s.roundNumLevel : 0,                                     'below'],
+      ['localHi60',   s.localHi60min,               'above'],
+      ['localLo60',   s.localLo60min,               'below'],
+      ['obHi',        s.obZone ? s.obZone.hi : 0,   'above'],
+      ['obLo',        s.obZone ? s.obZone.lo : 0,   'below']
+    ];
+    for (const [key, levelPrice, side] of lvlDefs) {
+      if (!levelPrice || levelPrice <= 0) continue;
+      const lv = s.sweptLevels[key];
+      const buf = levelPrice * sweepBufPctIB;
+      if (side === 'above') {
+        // Sweep up: price > level + buffer
+        if (price > levelPrice + buf) {
+          if (!lv.swept) {
+            lv.swept = true; lv.ts = _now; lv.extreme = price; lv.level = levelPrice;
+          } else if (price > lv.extreme) {
+            lv.extreme = price;
+          }
+        }
+      } else {
+        // Sweep down
+        if (price < levelPrice - buf) {
+          if (!lv.swept) {
+            lv.swept = true; lv.ts = _now; lv.extreme = price; lv.level = levelPrice;
+          } else if (price < lv.extreme) {
+            lv.extreme = price;
+          }
+        }
+      }
+      // Auto-expire sweep flag after 60 minutes of no extension (no longer "recent")
+      if (lv.swept && (_now - lv.ts) > 60 * 60 * 1000) {
+        lv.swept = false; lv.ts = 0; lv.extreme = 0; lv.level = 0;
+      }
+    }
   }
   // ===== END PHASE 1 INFRASTRUCTURE =====
 
@@ -3511,7 +3592,7 @@ function processPrice(sym, price, hi, lo) {
     // we never want to block an exit.
     if (!String(sig.type).startsWith('exit')) {
       const tagP2 = sig.score || '';
-      const isFadeP2 = /VREV|LHF|LLF|OBREJ|OBMIT|STRUCT_SWEEP|STRUCT_LIQ_GRAB|STRUCT_OB_FILL/.test(tagP2);
+      const isFadeP2 = /VREV|LHF|LLF|OBREJ|OBMIT|STRUCT_SWEEP|STRUCT_LIQ_GRAB|STRUCT_OB_FILL|INVERSAL_BREAK/.test(tagP2);
       const isP2Mt5 = isXAU || isBTC || isNAS;
 
       // ── 2.1: News Blackout Gate (task #189)
@@ -3625,7 +3706,7 @@ function processPrice(sym, price, hi, lo) {
     // pattern. Block all other detectors (BREAK, FAST, TREND, RIDE, ATH, ATL, HI, LO,
     // MFLIP, 6/6, DIV, TMIR, etc.).
     if ((isNAS || isBTC || isXAU) && s.chopActive) {
-      const isFadeAllowedInChop = /VREV|LHF|LLF|OBREJ|OBMIT|STRUCT_SWEEP|STRUCT_LIQ_GRAB|STRUCT_OB_FILL/.test(tagEarly);
+      const isFadeAllowedInChop = /VREV|LHF|LLF|OBREJ|OBMIT|STRUCT_SWEEP|STRUCT_LIQ_GRAB|STRUCT_OB_FILL|INVERSAL_BREAK/.test(tagEarly);
       if (!isFadeAllowedInChop) {
         Object.assign(s, _emitSnapshot);
         log(sym, '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' chop mode active (only V-REV / LHF / LLF / OBREJ / OBMIT allowed in chop; other detectors consistently lose in flat range).');
@@ -5629,9 +5710,147 @@ function processPrice(sym, price, hi, lo) {
         return;
       }
     }
+
+    // ── 3.5: INVERSAL_BREAK (task #200) — Universal Failed-Breakout Detector
+    // Replaces the disabled BREAK detector. The trade rationale:
+    //   Traditional BREAK fires WITH the breakout (33-40% win rate in chop — fails as stop-hunt).
+    //   INVERSAL_BREAK fires AGAINST the failed breakout (the high-edge SMC pattern).
+    //
+    // Watches 10 level types in parallel: rolling 5d H/L, PDH/PDL, round numbers above/below,
+    // local 60min H/L, OB top/bottom. State is maintained in s.sweptLevels.
+    //
+    // AGGRESSIVE MODE: fires on first close back inside the level. SL is tight (just beyond
+    // the swept extreme). Tradeoff: more false fires but maximizes the sharp-reversal wins.
+    //
+    // Direction: any UP-sweep that comes back below → PUT. Any DOWN-sweep that comes back
+    // above → CALL. Multiple swept levels boost conviction (multi-level sweep = highest quality).
+    if (cool3 && (now2 - s.inversalLastTs) > 45 * 60 * 1000) {
+      const reentryThr = price * 0.0005; // need re-entry of at least 0.05%
+      const sweepWindow = 30 * 60 * 1000; // only consider sweeps from last 30 min
+
+      // Collect swept-above and swept-below levels that are currently in reversal state
+      const sweptAbove = []; // levels that were swept UP and price is now back BELOW
+      const sweptBelow = []; // levels that were swept DOWN and price is now back ABOVE
+      const lvlKeys = ['rolling5dHi','rolling5dLo','pdh','pdl','roundNumAbv','roundNumBlw','localHi60','localLo60','obHi','obLo'];
+      for (const key of lvlKeys) {
+        const lv = s.sweptLevels[key];
+        if (!lv.swept || lv.level <= 0) continue;
+        if ((now2 - lv.ts) > sweepWindow) continue;
+        // Was this an "above" sweep or "below" sweep?
+        const isAboveSweep = lv.extreme > lv.level;
+        if (isAboveSweep && price < lv.level - reentryThr) {
+          sweptAbove.push({ key, level: lv.level, extreme: lv.extreme, ts: lv.ts });
+        } else if (!isAboveSweep && price > lv.level + reentryThr) {
+          sweptBelow.push({ key, level: lv.level, extreme: lv.extreme, ts: lv.ts });
+        }
+      }
+
+      // Fire if we have at least one valid sweep-reversal in either direction
+      // PUT: sweep above + reversal back below
+      if (sweptAbove.length > 0 && s.inversalLastDir !== 'put') {
+        // Find the highest level swept and the most recent ts (used for SL placement)
+        const topLevel = sweptAbove.reduce((a, b) => a.extreme > b.extreme ? a : b);
+        const fastReversal = (now2 - topLevel.ts) <= 5 * 60 * 1000; // < 5min = sharp = high quality
+        const inKZ = s.inKillzone === true;
+        s.dailySignalCount++;
+        s.lastAT = 'put'; s.nP++;
+        if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
+        s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
+        const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇INVERSAL_BREAK', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        if (!enrichSig(sig)) return;
+        s.signals.push(sig); logSignal(sym, sig);
+        // Custom SL: just above the highest swept extreme (tight, level-based, not ATR-based)
+        const slBuf = (isXAU ? 2 : isBTC ? 25 : 5);
+        const ibSl = topLevel.extreme + slBuf;
+        const slDist = ibSl - price;
+        if (slDist > 0) {
+          const tp1Cap = isXAU ? 5 : isBTC ? 50 : isNAS ? 30 : 0.50;
+          const tp1Dist = Math.min(slDist * 1.5, tp1Cap);
+          const tp1P = price - tp1Dist;
+          const tp2P = price - slDist * 2.5;
+          const tp3P = price - slDist * 4.0;
+          s.trade = buildCfdTrade('put', price, atrVal, sym);
+          s.trade.slPrice = +ibSl.toFixed(2);
+          s.trade.tp1Price = +tp1P.toFixed(2);
+          s.trade.tp2Price = +tp2P.toFixed(2);
+          s.trade.tp3Price = +tp3P.toFixed(2);
+          sig.sl = ibSl.toFixed(2);
+          sig.tp1 = tp1P.toFixed(2);
+          sig.tp2 = tp2P.toFixed(2);
+          sig.tp3 = tp3P.toFixed(2);
+        } else {
+          s.trade = buildCfdTrade('put', price, atrVal, sym);
+          attachTpSl(sig, 'put', price, atrVal, sym);
+        }
+        s.inversalLastTs = now2;
+        s.inversalLastDir = 'put';
+        // Consume the swept levels to prevent re-fire on same sweep
+        for (const sw of sweptAbove) { s.sweptLevels[sw.key].swept = false; }
+        const levelsHit = sweptAbove.map(x => x.key).join(', ');
+        log(sym, '🔄 INVERSAL_BREAK PUT — failed up-breach of ' + sweptAbove.length + ' level(s) [' + levelsHit + '] — peak $' + topLevel.extreme.toFixed(2) + ' (over $' + topLevel.level.toFixed(2) + '), now back to $' + price.toFixed(2) + (fastReversal ? ' · FAST reversal' : '') + (inKZ ? ' · KZ' : '') + ' · SL $' + ibSl.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+        sendPush('🔄 ' + sym + ' INVERSAL_BREAK PUT #' + s.dailySignalCount, sweptAbove.length + ' level(s) failed at $' + topLevel.extreme.toFixed(2) + ', reversing — $' + price.toFixed(2), 'signal');
+        return;
+      }
+      // CALL: sweep below + reversal back above
+      if (sweptBelow.length > 0 && s.inversalLastDir !== 'call') {
+        const botLevel = sweptBelow.reduce((a, b) => a.extreme < b.extreme ? a : b);
+        const fastReversal = (now2 - botLevel.ts) <= 5 * 60 * 1000;
+        const inKZ = s.inKillzone === true;
+        s.dailySignalCount++;
+        s.lastAT = 'call'; s.nC++;
+        if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
+        s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
+        const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆INVERSAL_BREAK', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        if (!enrichSig(sig)) return;
+        s.signals.push(sig); logSignal(sym, sig);
+        const slBuf = (isXAU ? 2 : isBTC ? 25 : 5);
+        const ibSl = botLevel.extreme - slBuf;
+        const slDist = price - ibSl;
+        if (slDist > 0) {
+          const tp1Cap = isXAU ? 5 : isBTC ? 50 : isNAS ? 30 : 0.50;
+          const tp1Dist = Math.min(slDist * 1.5, tp1Cap);
+          const tp1P = price + tp1Dist;
+          const tp2P = price + slDist * 2.5;
+          const tp3P = price + slDist * 4.0;
+          s.trade = buildCfdTrade('call', price, atrVal, sym);
+          s.trade.slPrice = +ibSl.toFixed(2);
+          s.trade.tp1Price = +tp1P.toFixed(2);
+          s.trade.tp2Price = +tp2P.toFixed(2);
+          s.trade.tp3Price = +tp3P.toFixed(2);
+          sig.sl = ibSl.toFixed(2);
+          sig.tp1 = tp1P.toFixed(2);
+          sig.tp2 = tp2P.toFixed(2);
+          sig.tp3 = tp3P.toFixed(2);
+        } else {
+          s.trade = buildCfdTrade('call', price, atrVal, sym);
+          attachTpSl(sig, 'call', price, atrVal, sym);
+        }
+        s.inversalLastTs = now2;
+        s.inversalLastDir = 'call';
+        for (const sw of sweptBelow) { s.sweptLevels[sw.key].swept = false; }
+        const levelsHit = sweptBelow.map(x => x.key).join(', ');
+        log(sym, '🔄 INVERSAL_BREAK CALL — failed down-breach of ' + sweptBelow.length + ' level(s) [' + levelsHit + '] — trough $' + botLevel.extreme.toFixed(2) + ' (under $' + botLevel.level.toFixed(2) + '), now back to $' + price.toFixed(2) + (fastReversal ? ' · FAST reversal' : '') + (inKZ ? ' · KZ' : '') + ' · SL $' + ibSl.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+        sendPush('🔄 ' + sym + ' INVERSAL_BREAK CALL #' + s.dailySignalCount, sweptBelow.length + ' level(s) failed at $' + botLevel.extreme.toFixed(2) + ', reversing — $' + price.toFixed(2), 'signal');
+        return;
+      }
+    }
   }
   // ===== END PHASE 3 STRUCTURE-FIRST DETECTORS =====
 
+  // ╔══════════════════════════════════════════════════════════════════════════════╗
+  // ║  ===== BREAK DETECTOR — DISABLED 2026-06-17 (task #201) =====                ║
+  // ║                                                                              ║
+  // ║  Performance analysis 6/9-6/17 showed BREAK at 33% clean win rate, 50% clean ║
+  // ║  loss rate, ≈$2/oz net P&L over 9 days. 100% of clean losses were FAILED     ║
+  // ║  breakouts (the exact pattern INVERSAL_BREAK trades).                        ║
+  // ║                                                                              ║
+  // ║  INVERSAL_BREAK now fires in the OPPOSITE direction of failed breakouts.    ║
+  // ║                                                                              ║
+  // ║  The coil detection + s._pendingBreakout flag is STILL set by processTicks  ║
+  // ║  (we may want it for other detectors), but the firing logic below is gated. ║
+  // ║  Set BREAK_DETECTOR_ENABLED=true in env to re-enable if needed.              ║
+  // ╚══════════════════════════════════════════════════════════════════════════════╝
+  const BREAK_DETECTOR_ENABLED = process.env.BREAK_DETECTOR_ENABLED === 'true';
   // ===== CONSOLIDATION BREAKOUT DETECTOR (MT5 instruments: XAU + BTC + NAS100) =====
   // Fires INSTANTLY when price escapes a tight range — no lagging indicator delay.
   // This is the fastest signal: catches moves 2-3 min before EMAs/RSI/MACD confirm.
@@ -5642,7 +5861,14 @@ function processPrice(sym, price, hi, lo) {
   // chop-end transitions. Blocking it during chop kills the very pattern we want.
   // Quality is enforced by the detector's own filters (consecutive same-dir cooldown, ROC
   // confirmation, RSI exhaustion at >75 for XAU CALL, MACD-fading check).
-  if (isMT5 && s._pendingBreakout) {
+  if (isMT5 && s._pendingBreakout && !BREAK_DETECTOR_ENABLED) {
+    // BREAK detector disabled — consume the pending flag and log for shadow analysis.
+    const _bo = s._pendingBreakout;
+    s._pendingBreakout = null;
+    log(sym, '⏭️ BREAK ' + _bo.dir.toUpperCase() + ' skipped — detector disabled (task #201). INVERSAL_BREAK active. Coil resolved at $' + price.toFixed(2));
+    // fall through to remaining detectors (we still want everything else to run)
+  }
+  if (isMT5 && s._pendingBreakout && BREAK_DETECTOR_ENABLED) {
     const bo = s._pendingBreakout;
     s._pendingBreakout = null; // consume it
     const cool2 = now2 - s.lastNTs > COOLDOWN_MS;
