@@ -356,6 +356,29 @@ SYMBOLS.forEach(sym => {
     roundNumLevel: null,       // nearest round number ($50 XAU, $1000 BTC, $100 NAS)
     roundNumDist: null,        // absolute distance from current price
     nearRoundNumber: false,    // within proximity threshold (instrument-specific)
+    // ===== PHASE 3 — STRUCTURE-FIRST DETECTORS (added 2026-06-17, tasks #196-#199) =====
+    // STRUCT_SWEEP (Judas Swing) — Asian H/L sweep + reversal
+    asianSweptHigh: false,        // price has breached asianH_locked + buffer
+    asianSweptLow: false,         // price has breached asianL_locked - buffer
+    asianSweepHighTs: 0,          // when high was first swept (used for cooldown after fire)
+    asianSweepLowTs: 0,
+    asianSweepHighPeak: 0,        // peak price reached above asianH during sweep
+    asianSweepLowTrough: 0,       // lowest price reached below asianL during sweep
+    structSweepLastTs: 0,         // cooldown after STRUCT_SWEEP fires (per side)
+    structSweepLastDir: null,
+    // STRUCT_OB_FILL — deep OB retracement with confirmation
+    structOBFillLastTs: 0,        // cooldown after fire
+    structOBFillLastObTs: 0,      // ID of last OB we fired on (don't double-fire same OB)
+    // STRUCT_LIQ_GRAB — liquidity pool sweep + reversal
+    structLiqGrabLastTs: 0,
+    liqSweptAbovePrice: 0,        // most recently swept pool price (above)
+    liqSweptBelowPrice: 0,
+    liqSweptAboveTs: 0,
+    liqSweptBelowTs: 0,
+    // STRUCT_VWAP_BOUNCE — VWAP rejection in HTF direction
+    structVwapLastTs: 0,
+    vwapTouchedTs: 0,             // when price last touched VWAP (within 0.05%)
+    vwapTouchedSide: null,        // 'above' if touched from above (rejection rally), 'below' if from below
     // Trade monitor
     trade: { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() }
   };
@@ -2596,6 +2619,58 @@ function processPrice(sym, price, hi, lo) {
     s.roundNumLevel = nearestRn;
     s.roundNumDist  = Math.abs(price - nearestRn);
     s.nearRoundNumber = s.roundNumDist <= roundProx;
+
+    // ── Phase 3 sweep-state tracking (used by STRUCT_SWEEP / STRUCT_LIQ_GRAB detectors below)
+    // Asian H/L sweep tracking: detect when price has breached the locked Asian range
+    // with a buffer (0.05% = ~$2 on XAU $4300, ~$33 on BTC $66k). The detector itself
+    // fires only when price COMES BACK through — this state just records the breach.
+    const sweepBufferPct = 0.0005; // 0.05% — needs to be a "real" sweep, not noise
+    if (s.asianH_locked && s.asianL_locked) {
+      const buf = s.asianH_locked * sweepBufferPct;
+      // Sweep up: price has gone above asianH + buffer
+      if (price > s.asianH_locked + buf) {
+        if (!s.asianSweptHigh) {
+          s.asianSweptHigh = true;
+          s.asianSweepHighTs = _now;
+        }
+        if (price > s.asianSweepHighPeak) s.asianSweepHighPeak = price;
+      }
+      // Sweep down
+      if (price < s.asianL_locked - buf) {
+        if (!s.asianSweptLow) {
+          s.asianSweptLow = true;
+          s.asianSweepLowTs = _now;
+        }
+        if (s.asianSweepLowTrough === 0 || price < s.asianSweepLowTrough) s.asianSweepLowTrough = price;
+      }
+      // Reset sweep flags when locked Asian date changes (new trading day)
+      // (Already handled by asianLockedDate change in main Asian block above)
+    }
+    // Liquidity pool sweep tracking: detect when nearest pool above/below has been pierced
+    if (s.liqPoolsAbove && s.liqPoolsAbove.length > 0) {
+      const nearestAbove = s.liqPoolsAbove[0];
+      // If we've now risen past it, mark as swept
+      if (price > nearestAbove.price && s.liqSweptAbovePrice !== nearestAbove.price) {
+        s.liqSweptAbovePrice = nearestAbove.price;
+        s.liqSweptAboveTs = _now;
+      }
+    }
+    if (s.liqPoolsBelow && s.liqPoolsBelow.length > 0) {
+      const nearestBelow = s.liqPoolsBelow[0];
+      if (price < nearestBelow.price && s.liqSweptBelowPrice !== nearestBelow.price) {
+        s.liqSweptBelowPrice = nearestBelow.price;
+        s.liqSweptBelowTs = _now;
+      }
+    }
+    // VWAP touch detection: within 0.05% of VWAP counts as a touch
+    if (s.vwap) {
+      const vwapDist = Math.abs(price - s.vwap);
+      const vwapTouchThr = s.vwap * 0.0005;
+      if (vwapDist <= vwapTouchThr && _now - s.vwapTouchedTs > 60000) {
+        s.vwapTouchedTs = _now;
+        s.vwapTouchedSide = price >= s.vwap ? 'above' : 'below';
+      }
+    }
   }
   // ===== END PHASE 1 INFRASTRUCTURE =====
 
@@ -3436,7 +3511,7 @@ function processPrice(sym, price, hi, lo) {
     // we never want to block an exit.
     if (!String(sig.type).startsWith('exit')) {
       const tagP2 = sig.score || '';
-      const isFadeP2 = /VREV|LHF|LLF|OBREJ|OBMIT/.test(tagP2);
+      const isFadeP2 = /VREV|LHF|LLF|OBREJ|OBMIT|STRUCT_SWEEP|STRUCT_LIQ_GRAB|STRUCT_OB_FILL/.test(tagP2);
       const isP2Mt5 = isXAU || isBTC || isNAS;
 
       // ── 2.1: News Blackout Gate (task #189)
@@ -3550,7 +3625,7 @@ function processPrice(sym, price, hi, lo) {
     // pattern. Block all other detectors (BREAK, FAST, TREND, RIDE, ATH, ATL, HI, LO,
     // MFLIP, 6/6, DIV, TMIR, etc.).
     if ((isNAS || isBTC || isXAU) && s.chopActive) {
-      const isFadeAllowedInChop = /VREV|LHF|LLF|OBREJ|OBMIT/.test(tagEarly);
+      const isFadeAllowedInChop = /VREV|LHF|LLF|OBREJ|OBMIT|STRUCT_SWEEP|STRUCT_LIQ_GRAB|STRUCT_OB_FILL/.test(tagEarly);
       if (!isFadeAllowedInChop) {
         Object.assign(s, _emitSnapshot);
         log(sym, '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' chop mode active (only V-REV / LHF / LLF / OBREJ / OBMIT allowed in chop; other detectors consistently lose in flat range).');
@@ -5318,6 +5393,244 @@ function processPrice(sym, price, hi, lo) {
       }
     }
   }
+
+  // ╔══════════════════════════════════════════════════════════════════════════════╗
+  // ║  ===== PHASE 3 — STRUCTURE-FIRST DETECTORS (added 2026-06-17) =====          ║
+  // ║  Tasks #196 (SWEEP) / #197 (OB_FILL) / #198 (LIQ_GRAB) / #199 (VWAP_BOUNCE)  ║
+  // ║                                                                              ║
+  // ║  These are the OFFENSIVE side of the redesign — they generate trade signals  ║
+  // ║  from STRUCTURE (Asian H/L sweeps, OB fills, liquidity grabs, VWAP bounces). ║
+  // ║  Mainstream XAU traders use these as PRIMARY entry triggers, with macro /    ║
+  // ║  correlation as confluence. We do the opposite today — Phase 3 inverts that. ║
+  // ║                                                                              ║
+  // ║  All 4 detectors:                                                            ║
+  // ║   - run on MT5 instruments (XAU/BTC/NAS) only                                ║
+  // ║   - tag signals with STRUCT_* prefix so they're easy to filter in analytics  ║
+  // ║   - go through enrichSig like all other signals — Phase 2 gates still apply  ║
+  // ║   - have a 30-60 min cooldown to prevent cluster fires                       ║
+  // ║   - use ATR-based SL/TP via buildCfdTrade() for consistency                  ║
+  // ╚══════════════════════════════════════════════════════════════════════════════╝
+  if (isMT5) {
+    const cool3 = now2 - s.lastNTs > COOLDOWN_MS;
+
+    // ── 3.1: STRUCT_SWEEP — Asian H/L Sweep + Reversal (Judas Swing)
+    // Setup: price breached Asian high (or low) within last 4 hours, now coming back inside
+    // the Asian range. Classic SMC Judas swing — the most-traded XAU pattern.
+    // Direction: sweep up → PUT (price reversing down after taking liquidity above)
+    //            sweep down → CALL (price reversing up after grabbing liquidity below)
+    if (s.asianH_locked && s.asianL_locked && cool3) {
+      const sweepCool = now2 - s.structSweepLastTs > 60 * 60 * 1000; // 60min between sweeps
+      const sweepWindowMs = 4 * 60 * 60 * 1000; // sweep must have happened in last 4h
+
+      // Sweep high + reverse → PUT
+      if (s.asianSweptHigh && (now2 - s.asianSweepHighTs) <= sweepWindowMs && sweepCool &&
+          price < s.asianH_locked && s.structSweepLastDir !== 'put') {
+        // Price is now BACK BELOW the Asian high after having swept above. Reversal.
+        const sweepDistAbove = s.asianSweepHighPeak - s.asianH_locked;
+        const reentryDist = s.asianH_locked - price;
+        // Require meaningful sweep (>= 25% of Asian range) and confirmed re-entry (>= 10% of range below)
+        if (sweepDistAbove >= s.asianRange * 0.25 && reentryDist >= s.asianRange * 0.10) {
+          s.dailySignalCount++;
+          s.lastAT = 'put'; s.nP++;
+          if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
+          s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
+          const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇STRUCT_SWEEP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+          if (!enrichSig(sig)) return;
+          s.signals.push(sig); logSignal(sym, sig);
+          s.trade = buildCfdTrade('put', price, atrVal, sym);
+          attachTpSl(sig, 'put', price, atrVal, sym);
+          s.structSweepLastTs = now2;
+          s.structSweepLastDir = 'put';
+          s.asianSweptHigh = false; // consume the sweep
+          log(sym, '🥷 STRUCT_SWEEP PUT (Judas) — swept Asian high $' + s.asianH_locked.toFixed(2) + ' to peak $' + s.asianSweepHighPeak.toFixed(2) + ' (+$' + sweepDistAbove.toFixed(2) + '), now back below at $' + price.toFixed(2) + ' (-$' + reentryDist.toFixed(2) + ') [#' + s.dailySignalCount + ']');
+          sendPush('🥷 ' + sym + ' STRUCT_SWEEP PUT #' + s.dailySignalCount, 'Asian high swept then reversed — $' + price.toFixed(2), 'signal');
+          return;
+        }
+      }
+      // Sweep low + reverse → CALL
+      if (s.asianSweptLow && (now2 - s.asianSweepLowTs) <= sweepWindowMs && sweepCool &&
+          price > s.asianL_locked && s.structSweepLastDir !== 'call') {
+        const sweepDistBelow = s.asianL_locked - s.asianSweepLowTrough;
+        const reentryDist = price - s.asianL_locked;
+        if (sweepDistBelow >= s.asianRange * 0.25 && reentryDist >= s.asianRange * 0.10) {
+          s.dailySignalCount++;
+          s.lastAT = 'call'; s.nC++;
+          if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
+          s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
+          const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆STRUCT_SWEEP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+          if (!enrichSig(sig)) return;
+          s.signals.push(sig); logSignal(sym, sig);
+          s.trade = buildCfdTrade('call', price, atrVal, sym);
+          attachTpSl(sig, 'call', price, atrVal, sym);
+          s.structSweepLastTs = now2;
+          s.structSweepLastDir = 'call';
+          s.asianSweptLow = false;
+          log(sym, '🥷 STRUCT_SWEEP CALL (Judas) — swept Asian low $' + s.asianL_locked.toFixed(2) + ' to trough $' + s.asianSweepLowTrough.toFixed(2) + ' (-$' + sweepDistBelow.toFixed(2) + '), now back above at $' + price.toFixed(2) + ' (+$' + reentryDist.toFixed(2) + ') [#' + s.dailySignalCount + ']');
+          sendPush('🥷 ' + sym + ' STRUCT_SWEEP CALL #' + s.dailySignalCount, 'Asian low swept then reversed — $' + price.toFixed(2), 'signal');
+          return;
+        }
+      }
+    }
+
+    // ── 3.2: STRUCT_OB_FILL — Deep OB Retracement + Reversal
+    // Setup: price has retraced >= 60% into a valid OB zone (s.obZone) AND is now reversing
+    // out of the zone in the OB's direction. Stronger than first-touch OBREJ/OBMIT because
+    // it requires deep fill + confirmation.
+    if (s.obZone && cool3 && (now2 - s.structOBFillLastTs) > 60 * 60 * 1000 &&
+        s.structOBFillLastObTs !== s.obZone.ts &&
+        s.obZone.hi > s.obZone.lo &&
+        !s.obFired && !s.obMitigated) {
+      const obHi = s.obZone.hi;
+      const obLo = s.obZone.lo;
+      const obDir = s.obZone.dir; // 'bull' or 'bear'
+      // Check if price is currently INSIDE the OB
+      const insideOb = price >= obLo && price <= obHi;
+      if (insideOb) {
+        // Compute retracement depth (how deep into the OB price has gone)
+        let retracePct = 0;
+        if (obDir === 'bull') {
+          // Bullish OB sits BELOW current trend — price retracing DOWN. 100% at lo, 0% at hi.
+          retracePct = ((obHi - price) / (obHi - obLo)) * 100;
+        } else {
+          // Bearish OB sits ABOVE — price retracing UP. 100% at hi, 0% at lo.
+          retracePct = ((price - obLo) / (obHi - obLo)) * 100;
+        }
+        // Need: deep fill (>=60%) AND momentum reversing out of zone in OB direction
+        if (retracePct >= 60) {
+          // Bullish OB → CALL; momentum confirm: price ticking up + MACD hist rising
+          if (obDir === 'bull' && roc3 > 0 && macdHist > -0.05 * Math.abs(macdL || 1)) {
+            s.dailySignalCount++;
+            s.lastAT = 'call'; s.nC++;
+            if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
+            s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
+            const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆STRUCT_OB_FILL', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+            if (!enrichSig(sig)) return;
+            s.signals.push(sig); logSignal(sym, sig);
+            s.trade = buildCfdTrade('call', price, atrVal, sym);
+            attachTpSl(sig, 'call', price, atrVal, sym);
+            s.structOBFillLastTs = now2;
+            s.structOBFillLastObTs = s.obZone.ts;
+            log(sym, '🎯 STRUCT_OB_FILL CALL — ' + retracePct.toFixed(0) + '% into bullish OB $' + obLo.toFixed(2) + '-$' + obHi.toFixed(2) + ', momentum reversing up · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
+            sendPush('🎯 ' + sym + ' STRUCT_OB_FILL CALL #' + s.dailySignalCount, 'Deep fill (' + retracePct.toFixed(0) + '%) of bullish OB — $' + price.toFixed(2), 'signal');
+            return;
+          }
+          // Bearish OB → PUT
+          if (obDir === 'bear' && roc3 < 0 && macdHist < 0.05 * Math.abs(macdL || 1)) {
+            s.dailySignalCount++;
+            s.lastAT = 'put'; s.nP++;
+            if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
+            s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
+            const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇STRUCT_OB_FILL', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+            if (!enrichSig(sig)) return;
+            s.signals.push(sig); logSignal(sym, sig);
+            s.trade = buildCfdTrade('put', price, atrVal, sym);
+            attachTpSl(sig, 'put', price, atrVal, sym);
+            s.structOBFillLastTs = now2;
+            s.structOBFillLastObTs = s.obZone.ts;
+            log(sym, '🎯 STRUCT_OB_FILL PUT — ' + retracePct.toFixed(0) + '% into bearish OB $' + obLo.toFixed(2) + '-$' + obHi.toFixed(2) + ', momentum reversing down · ROC ' + roc3.toFixed(3) + '% [#' + s.dailySignalCount + ']');
+            sendPush('🎯 ' + sym + ' STRUCT_OB_FILL PUT #' + s.dailySignalCount, 'Deep fill (' + retracePct.toFixed(0) + '%) of bearish OB — $' + price.toFixed(2), 'signal');
+            return;
+          }
+        }
+      }
+    }
+
+    // ── 3.3: STRUCT_LIQ_GRAB — Liquidity Pool Sweep + Reversal
+    // Setup: a liquidity pool (2+ equal highs/lows from macroSnaps) just got swept (price
+    // went through it) AND price is now reversing back through the level. Classic SMC
+    // stop-hunt pattern.
+    if (cool3 && (now2 - s.structLiqGrabLastTs) > 45 * 60 * 1000) {
+      // Pool ABOVE was just swept and price is back below → PUT
+      if (s.liqSweptAbovePrice > 0 && (now2 - s.liqSweptAboveTs) <= 20 * 60 * 1000 &&
+          price < s.liqSweptAbovePrice) {
+        // Need meaningful re-entry (>= 0.05% below the pool)
+        const reentry = (s.liqSweptAbovePrice - price) / s.liqSweptAbovePrice;
+        if (reentry >= 0.0005) {
+          s.dailySignalCount++;
+          s.lastAT = 'put'; s.nP++;
+          if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
+          s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
+          const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇STRUCT_LIQ_GRAB', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+          if (!enrichSig(sig)) return;
+          s.signals.push(sig); logSignal(sym, sig);
+          s.trade = buildCfdTrade('put', price, atrVal, sym);
+          attachTpSl(sig, 'put', price, atrVal, sym);
+          s.structLiqGrabLastTs = now2;
+          s.liqSweptAbovePrice = 0; // consume
+          log(sym, '🪤 STRUCT_LIQ_GRAB PUT — pool above $' + (s.liqSweptAbovePrice || 0).toFixed(2) + ' swept then reversed, now $' + price.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+          sendPush('🪤 ' + sym + ' STRUCT_LIQ_GRAB PUT #' + s.dailySignalCount, 'Liquidity above grabbed then reversed — $' + price.toFixed(2), 'signal');
+          return;
+        }
+      }
+      // Pool BELOW was just swept and price is back above → CALL
+      if (s.liqSweptBelowPrice > 0 && (now2 - s.liqSweptBelowTs) <= 20 * 60 * 1000 &&
+          price > s.liqSweptBelowPrice) {
+        const reentry = (price - s.liqSweptBelowPrice) / s.liqSweptBelowPrice;
+        if (reentry >= 0.0005) {
+          s.dailySignalCount++;
+          s.lastAT = 'call'; s.nC++;
+          if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
+          s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
+          const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆STRUCT_LIQ_GRAB', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+          if (!enrichSig(sig)) return;
+          s.signals.push(sig); logSignal(sym, sig);
+          s.trade = buildCfdTrade('call', price, atrVal, sym);
+          attachTpSl(sig, 'call', price, atrVal, sym);
+          s.structLiqGrabLastTs = now2;
+          s.liqSweptBelowPrice = 0;
+          log(sym, '🪤 STRUCT_LIQ_GRAB CALL — pool below $' + (s.liqSweptBelowPrice || 0).toFixed(2) + ' swept then reversed, now $' + price.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+          sendPush('🪤 ' + sym + ' STRUCT_LIQ_GRAB CALL #' + s.dailySignalCount, 'Liquidity below grabbed then reversed — $' + price.toFixed(2), 'signal');
+          return;
+        }
+      }
+    }
+
+    // ── 3.4: STRUCT_VWAP_BOUNCE — VWAP Touch + Bounce in HTF Direction
+    // Setup: price recently touched VWAP (within 0.05%) and is now bouncing away in the
+    // direction of the 1h HTF trend. Mean-reversion within a trending session — buy the
+    // dip / sell the rip relative to session anchor.
+    if (s.vwap && s.vwapTouchedTs > 0 && cool3 &&
+        (now2 - s.structVwapLastTs) > 45 * 60 * 1000 &&
+        (now2 - s.vwapTouchedTs) <= 15 * 60 * 1000 && s.htf1h_dir) {
+      const vwapDistNow = (price - s.vwap) / s.vwap;
+      // CALL: touched VWAP from above (or below), now bouncing up in uptrend
+      if (s.htf1h_dir === 'up' && vwapDistNow >= 0.0008 && s.vwapTouchedSide === 'below') {
+        // We dipped to VWAP and now bouncing up — buy the dip
+        s.dailySignalCount++;
+        s.lastAT = 'call'; s.nC++;
+        if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
+        s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
+        const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆STRUCT_VWAP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        if (!enrichSig(sig)) return;
+        s.signals.push(sig); logSignal(sym, sig);
+        s.trade = buildCfdTrade('call', price, atrVal, sym);
+        attachTpSl(sig, 'call', price, atrVal, sym);
+        s.structVwapLastTs = now2;
+        s.vwapTouchedTs = 0;
+        log(sym, '📊 STRUCT_VWAP CALL — VWAP $' + s.vwap.toFixed(2) + ' touched, bouncing up in 1h uptrend ' + s.htf1h_strength.toFixed(2) + '%, now $' + price.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+        sendPush('📊 ' + sym + ' STRUCT_VWAP CALL #' + s.dailySignalCount, 'VWAP bounce in uptrend — $' + price.toFixed(2), 'signal');
+        return;
+      }
+      // PUT: touched VWAP from below (or above), now bouncing down in downtrend
+      if (s.htf1h_dir === 'down' && vwapDistNow <= -0.0008 && s.vwapTouchedSide === 'above') {
+        s.dailySignalCount++;
+        s.lastAT = 'put'; s.nP++;
+        if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
+        s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
+        const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇STRUCT_VWAP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        if (!enrichSig(sig)) return;
+        s.signals.push(sig); logSignal(sym, sig);
+        s.trade = buildCfdTrade('put', price, atrVal, sym);
+        attachTpSl(sig, 'put', price, atrVal, sym);
+        s.structVwapLastTs = now2;
+        s.vwapTouchedTs = 0;
+        log(sym, '📊 STRUCT_VWAP PUT — VWAP $' + s.vwap.toFixed(2) + ' touched, rolling down in 1h downtrend ' + s.htf1h_strength.toFixed(2) + '%, now $' + price.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+        sendPush('📊 ' + sym + ' STRUCT_VWAP PUT #' + s.dailySignalCount, 'VWAP rejection in downtrend — $' + price.toFixed(2), 'signal');
+        return;
+      }
+    }
+  }
+  // ===== END PHASE 3 STRUCTURE-FIRST DETECTORS =====
 
   // ===== CONSOLIDATION BREAKOUT DETECTOR (MT5 instruments: XAU + BTC + NAS100) =====
   // Fires INSTANTLY when price escapes a tight range — no lagging indicator delay.
