@@ -340,6 +340,22 @@ SYMBOLS.forEach(sym => {
     vwapDistPct: 0,            // % distance from VWAP (positive = above, negative = below)
     vwapDir: null,             // 'above' | 'below' | 'at'
     vwapAnchorTs: 0,           // when current VWAP session anchored
+    // Liquidity Pool Detector (task #185): equal H/L within 0.1% = stop pool
+    liqPoolsAbove: [],         // [{price, touches, ageMin}] sorted nearest-first
+    liqPoolsBelow: [],         // [{price, touches, ageMin}] sorted nearest-first
+    liqPoolsTs: 0,             // last computation timestamp (rate-limited)
+    // Premium/Discount Zone Tracker (task #186)
+    rangeZone: null,           // 'premium' (top 30%) | 'equilibrium' (middle 40%) | 'discount' (bottom 30%)
+    rangePosPct: null,         // 0-100, position within active range
+    rangeRef: null,            // 'asian' | 'rolling' — which range was used
+    rangeRefHi: null,          // the high used for the calc
+    rangeRefLo: null,          // the low used for the calc
+    // Economic Calendar / News Blackout (task #187): set globally by pollEconomicCalendar
+    newsBlackout: { active: false, eventName: null, minutesUntil: null, impact: null, eventTs: 0 },
+    // Round Number Tracker enhancement (task #188)
+    roundNumLevel: null,       // nearest round number ($50 XAU, $1000 BTC, $100 NAS)
+    roundNumDist: null,        // absolute distance from current price
+    nearRoundNumber: false,    // within proximity threshold (instrument-specific)
     // Trade monitor
     trade: { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() }
   };
@@ -880,6 +896,93 @@ if (TRUMP_FEED_URL) {
   setInterval(pollTrumpFeed, TRUMP_POLL_INTERVAL_MS);     // then on the configured interval
 }
 
+// ===== PHASE 1.7 — ECONOMIC CALENDAR FEED (added 2026-06-17, task #187) =====
+// Polls Finnhub's economic calendar for high-impact USD events (NFP, CPI, FOMC, Fed
+// Chair speeches). Tracks the next event's time and current blackout status. Phase 2
+// gates will read s.newsBlackout.active to block entries 15min before/30min after.
+// Finnhub endpoint: /calendar/economic?from=YYYY-MM-DD&to=YYYY-MM-DD (free tier OK)
+const NEWS_BLACKOUT_BEFORE_MIN = 15;   // block entries this many min BEFORE event
+const NEWS_BLACKOUT_AFTER_MIN  = 30;   // block entries this many min AFTER event
+let _econCalCache = { events: [], lastFetchTs: 0 };
+async function pollEconomicCalendar() {
+  try {
+    const today    = new Date().toISOString().slice(0, 10);
+    const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+    const url = 'https://finnhub.io/api/v1/calendar/economic?from=' + today + '&to=' + tomorrow + '&token=' + API;
+    const r = await fetch(url);
+    if (!r.ok) {
+      // 403 likely means free tier doesn't include this endpoint — fail silently
+      if (r.status === 403 || r.status === 401) {
+        console.log('[' + ts() + '] Economic calendar: Finnhub access denied (' + r.status + '). Endpoint may require paid tier.');
+      }
+      return;
+    }
+    const d = await r.json();
+    if (!d || !d.economicCalendar) return;
+    // Keep only US events with high impact OR keyword match for known market-movers
+    const keywords = ['nfp', 'non-farm', 'cpi', 'fomc', 'fed funds', 'fed rate', 'interest rate decision', 'powell', 'jerome powell', 'ppi', 'gdp', 'unemployment', 'retail sales'];
+    const usdEvents = (d.economicCalendar || [])
+      .filter(e => e && (e.country === 'US' || e.country === 'USD'))
+      .filter(e => {
+        const hi = (e.impact || '').toLowerCase() === 'high';
+        const ev = (e.event || '').toLowerCase();
+        const kw = keywords.some(k => ev.includes(k));
+        return hi || kw;
+      })
+      .map(e => {
+        // Finnhub returns time as "YYYY-MM-DD HH:MM:SS" — assume UTC
+        const tStr = (e.time || '').replace(' ', 'T') + 'Z';
+        const eventTs = new Date(tStr).getTime();
+        return { event: e.event, time: e.time, impact: e.impact, ts: isNaN(eventTs) ? 0 : eventTs };
+      })
+      .filter(e => e.ts > 0 && e.ts > (Date.now() - NEWS_BLACKOUT_AFTER_MIN * 60000)) // keep recent past too (still in blackout)
+      .sort((a, b) => a.ts - b.ts);
+    _econCalCache = { events: usdEvents, lastFetchTs: Date.now() };
+    if (usdEvents.length > 0) {
+      const next = usdEvents[0];
+      const minsUntil = Math.round((next.ts - Date.now()) / 60000);
+      console.log('[' + ts() + '] Economic calendar: ' + usdEvents.length + ' events tracked. Next: ' + next.event + ' in ' + minsUntil + 'min (' + (next.impact || 'unknown') + ' impact).');
+    }
+  } catch (e) {
+    console.log('[' + ts() + '] Economic calendar poll failed: ' + e.message);
+  }
+}
+// Apply blackout state to all symbols based on cached events. Runs every 30 sec.
+function applyEconomicCalendarBlackout() {
+  const now = Date.now();
+  const events = _econCalCache.events || [];
+  // Find the most relevant event: nearest one within blackout window, or the next future event
+  let active = false, eventName = null, minutesUntil = null, impact = null, eventTs = 0;
+  for (const e of events) {
+    const minsUntil = (e.ts - now) / 60000;
+    if (minsUntil >= -NEWS_BLACKOUT_AFTER_MIN && minsUntil <= NEWS_BLACKOUT_BEFORE_MIN) {
+      active = true; eventName = e.event; minutesUntil = Math.round(minsUntil); impact = e.impact; eventTs = e.ts;
+      break;
+    }
+  }
+  // If no event in blackout, report next future event for visibility
+  if (!active) {
+    for (const e of events) {
+      if (e.ts > now) {
+        eventName = e.event;
+        minutesUntil = Math.round((e.ts - now) / 60000);
+        impact = e.impact;
+        eventTs = e.ts;
+        break;
+      }
+    }
+  }
+  SYMBOLS.forEach(sym => {
+    const s = S[sym];
+    if (!s) return;
+    s.newsBlackout = { active, eventName, minutesUntil, impact, eventTs };
+  });
+}
+// Initial fetch and recurring schedule
+setTimeout(pollEconomicCalendar, 5000);                  // first fetch 5s after startup
+setInterval(pollEconomicCalendar, 10 * 60 * 1000);       // refresh full calendar every 10 min
+setInterval(applyEconomicCalendarBlackout, 30 * 1000);   // recompute blackout state every 30 sec
+
 // ===== DXY STATE (for XAU inverse correlation) =====
 let dxyPrice = 0, dxyPrices = [], dxyPrevEma5 = null, dxyPrevEma13 = null;
 let dxyRoc3 = 0, dxyDir = 'neutral'; // 'up' = bearish gold, 'down' = bullish gold
@@ -972,6 +1075,71 @@ function isAsianSession(etMin) {
 function nearestRoundLevel(price, increment) {
   // Returns nearest $50 or $100 level depending on instrument scale
   return Math.round(price / increment) * increment;
+}
+
+// Liquidity Pool Detector (task #185).
+// Scans macroSnaps (5-min price history) for local peaks and troughs, then groups
+// near-equal levels (within thresholdPct%) into "pools". A pool of 2+ touches at a
+// similar price is where retail stops cluster — those levels get swept frequently.
+// Returns { above: [...], below: [...] } sorted nearest-first.
+function detectLiquidityPools(macroSnaps, currentPrice, thresholdPct) {
+  if (!macroSnaps || macroSnaps.length < 7) return { above: [], below: [] };
+  const ws = 3; // window: 3 snaps each side = 15 min — defines a local peak/trough
+  const peaks = [];
+  const troughs = [];
+  for (let i = ws; i < macroSnaps.length - ws; i++) {
+    const p = macroSnaps[i].p;
+    if (!p) continue;
+    let isPeak = true, isTrough = true;
+    for (let j = i - ws; j <= i + ws; j++) {
+      if (j === i) continue;
+      if (macroSnaps[j].p > p) isPeak = false;
+      if (macroSnaps[j].p < p) isTrough = false;
+      if (!isPeak && !isTrough) break;
+    }
+    if (isPeak)  peaks.push({ price: p, ts: macroSnaps[i].ts });
+    if (isTrough) troughs.push({ price: p, ts: macroSnaps[i].ts });
+  }
+  const threshold = currentPrice * (thresholdPct / 100); // e.g. 0.1% → currentPrice * 0.001
+  const pools = [];
+  // Cluster all extremes (peaks + troughs) by price proximity
+  const all = peaks.concat(troughs).sort((a, b) => a.price - b.price);
+  let cluster = [];
+  function flush() {
+    if (cluster.length >= 2) {
+      const avgPrice = cluster.reduce((s, x) => s + x.price, 0) / cluster.length;
+      const maxTs = Math.max.apply(null, cluster.map(x => x.ts));
+      pools.push({
+        price: +avgPrice.toFixed(2),
+        touches: cluster.length,
+        ageMin: Math.round((Date.now() - maxTs) / 60000)
+      });
+    }
+  }
+  for (const ex of all) {
+    if (cluster.length === 0 || ex.price - cluster[cluster.length - 1].price <= threshold) {
+      cluster.push(ex);
+    } else {
+      flush();
+      cluster = [ex];
+    }
+  }
+  flush();
+  const above = pools.filter(p => p.price > currentPrice).sort((a, b) => a.price - b.price);
+  const below = pools.filter(p => p.price < currentPrice).sort((a, b) => b.price - a.price);
+  return { above: above.slice(0, 3), below: below.slice(0, 3) };
+}
+
+// Premium/Discount Zone (task #186). Given a range [lo..hi] and current price, returns
+// which third the price is in. Used by Phase 2 timing gates ("don't long the premium").
+function computeRangeZone(price, hi, lo) {
+  if (!hi || !lo || hi <= lo || !price) return { zone: null, posPct: null };
+  const pos = (price - lo) / (hi - lo);
+  const posPct = +(pos * 100).toFixed(1);
+  let zone = 'equilibrium';
+  if (pos < 0.3) zone = 'discount';
+  else if (pos > 0.7) zone = 'premium';
+  return { zone, posPct };
 }
 
 // ===== PUSH TO ALL SUBSCRIBERS =====
@@ -2381,6 +2549,53 @@ function processPrice(sym, price, hi, lo) {
       s.vwapDistPct = ((price - s.vwap) / s.vwap) * 100;
       s.vwapDir = s.vwapDistPct > 0.02 ? 'above' : s.vwapDistPct < -0.02 ? 'below' : 'at';
     }
+
+    // ── Phase 1.5: Liquidity Pool Detector — rate-limited (every 60 sec, expensive scan)
+    // 0.1% threshold for XAU (~$4 on $4300), 0.08% BTC (~$50 on $66k), 0.05% NAS (~$15 on $30k).
+    if (_now - s.liqPoolsTs > 60000 && s.macroSnaps && s.macroSnaps.length >= 7) {
+      const thresholdPct = isXAU ? 0.1 : isBTC ? 0.08 : 0.05;
+      const pools = detectLiquidityPools(s.macroSnaps, price, thresholdPct);
+      s.liqPoolsAbove = pools.above;
+      s.liqPoolsBelow = pools.below;
+      s.liqPoolsTs = _now;
+    }
+
+    // ── Phase 1.6: Premium/Discount Zone — prefer Asian range, fall back to rolling
+    // Asian locked H/L is most respected by gold traders. After Asian: use today's range.
+    let zoneHi = null, zoneLo = null, zoneRef = null;
+    if (s.asianH_locked && s.asianL_locked && s.asianRange > 0) {
+      zoneHi = s.asianH_locked;
+      zoneLo = s.asianL_locked;
+      zoneRef = 'asian';
+    } else if (s.asianH && s.asianL && s.asianRange > 0) {
+      // Asian session in progress
+      zoneHi = s.asianH;
+      zoneLo = s.asianL;
+      zoneRef = 'asian_live';
+    } else if (s.rollingHigh > 0 && s.rollingLow > 0 && s.rollingLow !== Infinity) {
+      zoneHi = s.rollingHigh;
+      zoneLo = s.rollingLow;
+      zoneRef = 'rolling';
+    }
+    if (zoneHi && zoneLo) {
+      const zoneCalc = computeRangeZone(price, zoneHi, zoneLo);
+      s.rangeZone = zoneCalc.zone;
+      s.rangePosPct = zoneCalc.posPct;
+      s.rangeRef = zoneRef;
+      s.rangeRefHi = zoneHi;
+      s.rangeRefLo = zoneLo;
+    }
+
+    // ── Phase 1.8: Round Number Tracker (extended from XAU-only to all MT5)
+    // XAU: $50 levels with $5 proximity (~0.12%)
+    // BTC: $1000 levels with $100 proximity (~0.15%)
+    // NAS: $100 levels with $10 proximity (~0.03%)
+    const roundIncr  = isXAU ? 50 : isBTC ? 1000 : 100;
+    const roundProx  = isXAU ? 5  : isBTC ? 100  : 10;
+    const nearestRn  = nearestRoundLevel(price, roundIncr);
+    s.roundNumLevel = nearestRn;
+    s.roundNumDist  = Math.abs(price - nearestRn);
+    s.nearRoundNumber = s.roundNumDist <= roundProx;
   }
   // ===== END PHASE 1 INFRASTRUCTURE =====
 
@@ -2538,7 +2753,24 @@ function processPrice(sym, price, hi, lo) {
       // XAU-specific: DXY (24h FX — always live); TLT/SLV/GDX only count while US RTH is
       // open (R1 fix 2026-06-11 — frozen overnight directions were inflating conviction).
       // This also propagates to macroAlignedFor()/contra-blocks, which read conv scores.
-      if ((isCall && dxyDir === 'down') || (!isCall && dxyDir === 'up')) { sc++; factors.push('DXY'); }
+      //
+      // ===== DXY RE-WEIGHTING for XAU (added 2026-06-17, task #195, Phase 2.7) =====
+      // Per XAU trader consensus research: "DXY correlation is real but unreliable intraday.
+      // Best practice: use DXY as confluence/confirmation, never as a standalone trigger."
+      // Previously DXY was a discrete +1 factor like any other. This let conv stack like
+      // [MACRO + ROC×3 + DXY] = 3 conv where DXY did 1/3 of the work — too much weight on
+      // a notoriously drift-prone correlation. Now DXY only counts when at least 2 OTHER
+      // XAU-specific factors already agree — making it confluence, not trigger.
+      const xauOtherFactors = ['MACRO','STRUCT','ROC×3','SLV','GDX','TLT','OB','OB-flip','NAS_SIG','BTC_SIG'];
+      const dxyAgree = (isCall && dxyDir === 'down') || (!isCall && dxyDir === 'up');
+      if (dxyAgree) {
+        // Count current XAU-specific factors already in the stack
+        const currentOtherCount = factors.filter(f => xauOtherFactors.indexOf(f) !== -1).length;
+        if (currentOtherCount >= 2) {
+          sc++; factors.push('DXY');
+        }
+        // else: silently dropped — DXY alone isn't enough conviction for XAU
+      }
       if (rthEtfFresh()) {
         if ((isCall && tltDir === 'up') || (!isCall && tltDir === 'down')) { sc++; factors.push('TLT'); }
         if (slvPrice > 0 && ((isCall && slvDir === 'up') || (!isCall && slvDir === 'down'))) { sc++; factors.push('SLV'); }
@@ -3185,6 +3417,124 @@ function processPrice(sym, price, hi, lo) {
         }
       }
     }
+
+    // ===== PHASE 2 — UNIVERSAL PRE-GATE (added 2026-06-17, tasks #189-#194) =====
+    // Structural/timing/location/quality gates that fire BEFORE the chop block and most
+    // detector-specific checks. Consumes Phase 1 state (s.session, s.asianH, s.htf1h_dir,
+    // s.rangeZone, s.liqPools, s.newsBlackout). These gates implement the "levels-first"
+    // methodology that mainstream XAU traders actually use.
+    //
+    // Order matters — most-defensive gates fire first:
+    //   1. News blackout (kill switch)
+    //   2. HTF bias agreement (macro structural)
+    //   3. Killzone window (timing)
+    //   4. Premium/discount zone (location, chop only)
+    //   5. Range-extremity (location, always)
+    //   6. OB 50% retracement (quality, OB detectors only)
+    //
+    // Exit signals (sig.type starts with 'exit') are EXEMPT from all Phase 2 gates —
+    // we never want to block an exit.
+    if (!String(sig.type).startsWith('exit')) {
+      const tagP2 = sig.score || '';
+      const isFadeP2 = /VREV|LHF|LLF|OBREJ|OBMIT/.test(tagP2);
+      const isP2Mt5 = isXAU || isBTC || isNAS;
+
+      // ── 2.1: News Blackout Gate (task #189)
+      // Block ALL entries when within 15min before / 30min after high-impact USD event.
+      // s.newsBlackout populated by pollEconomicCalendar (Phase 1.7).
+      if (s.newsBlackout && s.newsBlackout.active) {
+        Object.assign(s, _emitSnapshot);
+        const nb = s.newsBlackout;
+        log(sym, '📰 ' + tagP2 + ' ' + sig.type.toUpperCase() + ' BLOCKED — news blackout: ' + (nb.eventName || 'unknown event') + ' in ' + (nb.minutesUntil != null ? nb.minutesUntil + 'min' : '?') + ' (impact: ' + (nb.impact || '?') + ').');
+        return false;
+      }
+
+      // ── 2.2: HTF Bias Agreement Gate (task #190)
+      // Block signals fighting BOTH the 1h AND 4h trend. Single-tf disagreement is OK
+      // (caught by existing regime gate); double-disagreement is the high-conviction trap
+      // that conviction scoring can't see. Only applied when both HTF reads are available.
+      if (isP2Mt5 && s.htf1h_dir && s.htf4h_dir) {
+        const isCall_p2 = sig.type === 'call';
+        const fightsH1 = (isCall_p2 && s.htf1h_dir === 'down') || (!isCall_p2 && s.htf1h_dir === 'up');
+        const fightsH4 = (isCall_p2 && s.htf4h_dir === 'down') || (!isCall_p2 && s.htf4h_dir === 'up');
+        // Fade detectors are EXEMPT — they're designed to fade local moves against HTF
+        if (fightsH1 && fightsH4 && !isFadeP2) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '📈 ' + tagP2 + ' ' + sig.type.toUpperCase() + ' BLOCKED — fights BOTH 1h (' + s.htf1h_dir + ' ' + s.htf1h_strength.toFixed(2) + '%) AND 4h (' + s.htf4h_dir + ' ' + s.htf4h_strength.toFixed(2) + '%) HTF trend. Double-disagreement is the trap.');
+          return false;
+        }
+      }
+
+      // ── 2.3: Killzone Window Gate (task #191)
+      // In chop, outside London KZ (02:00-05:00 ET) + NY AM (08:00-11:00 ET): only fades.
+      // Killzones print 60-70% of intraday range. Trend signals outside KZ in chop are
+      // structurally low-quality (they fire in low-vol consolidation that mean-reverts).
+      if (isP2Mt5 && s.chopActive && !s.inKillzone && !isFadeP2) {
+        Object.assign(s, _emitSnapshot);
+        log(sym, '🕐 ' + tagP2 + ' ' + sig.type.toUpperCase() + ' BLOCKED — outside Killzone (session: ' + (s.session || '?') + ') + chop active. Non-fade detectors restricted to London KZ / NY AM in chop.');
+        return false;
+      }
+
+      // ── 2.4: Premium/Discount Zone Gate (task #192) — chop only
+      // In chop with a defined range (Asian or rolling), don't long the top, don't short
+      // the bottom. This enforces "buy low, sell high" structurally — the inverse of the
+      // 6/15-16 XAU losses where we kept shorting $4,307 and longing $4,325.
+      // Fade detectors are EXEMPT — they're designed to fade extremes.
+      if (isP2Mt5 && s.chopActive && s.rangeZone && !isFadeP2) {
+        if (sig.type === 'call' && s.rangeZone === 'premium') {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🏔️ ' + tagP2 + ' CALL BLOCKED — premium zone (' + s.rangePosPct.toFixed(0) + '% of ' + s.rangeRef + ' range $' + s.rangeRefLo.toFixed(2) + '-$' + s.rangeRefHi.toFixed(2) + '). Buying the top in chop.');
+          return false;
+        }
+        if (sig.type === 'put' && s.rangeZone === 'discount') {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🏕️ ' + tagP2 + ' PUT BLOCKED — discount zone (' + s.rangePosPct.toFixed(0) + '% of ' + s.rangeRef + ' range $' + s.rangeRefLo.toFixed(2) + '-$' + s.rangeRefHi.toFixed(2) + '). Shorting the bottom in chop.');
+          return false;
+        }
+      }
+
+      // ── 2.5: Range-Extremity Guard (task #193) — defense-in-depth, always-on for non-fades
+      // Even outside chop, non-fade detectors firing in the top/bottom 15% of any defined
+      // range are usually chasing exhaustion. Catches cases where chop flag hasn't yet
+      // activated but price is at a structural extreme.
+      if (isP2Mt5 && s.rangePosPct !== null && !isFadeP2) {
+        const TOP_PCT = 85;    // top 15%
+        const BOT_PCT = 15;    // bottom 15%
+        if (sig.type === 'call' && s.rangePosPct >= TOP_PCT) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🎯 ' + tagP2 + ' CALL BLOCKED — range-extremity guard: ' + s.rangePosPct.toFixed(0) + '% of ' + s.rangeRef + ' range. Top 15% reserved for fade detectors.');
+          return false;
+        }
+        if (sig.type === 'put' && s.rangePosPct <= BOT_PCT) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🎯 ' + tagP2 + ' PUT BLOCKED — range-extremity guard: ' + s.rangePosPct.toFixed(0) + '% of ' + s.rangeRef + ' range. Bottom 15% reserved for fade detectors.');
+          return false;
+        }
+      }
+
+      // ── 2.6: OB 50% Retracement Rule (task #194)
+      // OBMIT/OBREJ require price has retraced at least 50% into the OB zone before firing.
+      // First-touch OB tests bounce too weakly — wait for deep retracement which confirms
+      // institutional interest. Uses existing s.obZone tracking.
+      if (/OBMIT|OBREJ/.test(tagP2) && s.obZone && s.obZone.hi > s.obZone.lo) {
+        const obMid = (s.obZone.hi + s.obZone.lo) / 2;
+        // Check current price retracement depth into OB
+        let retracePct = 0;
+        if (s.obZone.dir === 'bull') {
+          // Bullish OB below — price retracing DOWN into it. 100% = at lo, 0% = at hi.
+          retracePct = ((s.obZone.hi - price) / (s.obZone.hi - s.obZone.lo)) * 100;
+        } else if (s.obZone.dir === 'bear') {
+          // Bearish OB above — price retracing UP into it. 100% = at hi, 0% = at lo.
+          retracePct = ((price - s.obZone.lo) / (s.obZone.hi - s.obZone.lo)) * 100;
+        }
+        if (retracePct < 50) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🧱 ' + tagP2 + ' ' + sig.type.toUpperCase() + ' BLOCKED — OB retracement only ' + retracePct.toFixed(0) + '% (<50%). Weak first-touch test — wait for deeper fill.');
+          return false;
+        }
+      }
+    }
+    // ===== END PHASE 2 PRE-GATE =====
 
     // ===== CHOP SUPPRESSION — NAS + BTC + XAU (extended 2026-06-16 to XAU) =====
     // Original 5/18: 4 of 5 NAS RIDE losses + 1 BREAK loss during NAS chop $28800-29150.
@@ -8731,7 +9081,25 @@ app.get('/prices', (req, res) => {
           distPct: +(s.vwapDistPct || 0).toFixed(3),
           dir: s.vwapDir || null,
           ageMin: s.vwapAnchorTs ? Math.round((Date.now() - s.vwapAnchorTs) / 60000) : 0
-        }
+        },
+        liqPools: {
+          above: s.liqPoolsAbove || [],
+          below: s.liqPoolsBelow || [],
+          ageSec: s.liqPoolsTs ? Math.round((Date.now() - s.liqPoolsTs) / 1000) : null
+        },
+        range: {
+          zone: s.rangeZone || null,
+          posPct: s.rangePosPct,
+          ref: s.rangeRef || null,
+          hi: s.rangeRefHi ? +s.rangeRefHi.toFixed(2) : null,
+          lo: s.rangeRefLo ? +s.rangeRefLo.toFixed(2) : null
+        },
+        roundNum: {
+          level: s.roundNumLevel,
+          dist: s.roundNumDist ? +s.roundNumDist.toFixed(2) : null,
+          near: !!s.nearRoundNumber
+        },
+        news: s.newsBlackout || null
       } : null,
       macro: (sym === 'XAU' || sym === 'BTC' || sym === 'NAS100') && s.macroSnaps.length >= 2 && s.lastPrice > 0 ? (() => {
         const p = s.lastPrice;
