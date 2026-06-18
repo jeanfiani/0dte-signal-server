@@ -2476,7 +2476,12 @@ function processPrice(sym, price, hi, lo) {
   // factor #156, TP1 BE-trail scratch protection) addresses the original loss-cascade pattern.
   // User judgment: TRv2's averaged-EMA + ATR-sized targets fit BTC's clean directional legs
   // better than fragmented BREAKOUT/FAST/TREND entries.
-  if (isNAS || isBTC) {
+  // TRv2 candle building — extended to XAU 2026-06-18 (task #213) to address
+  // the structural gap where XAU had no trend-continuation detector. The drop
+  // from $4310 → $4268 on 6/18 morning fired ZERO signals because all XAU
+  // detectors are fade/reversal-only. TRv2's averaged-EMA + ATR trend rider
+  // is the right tool for sustained directional moves on XAU's $4000 scale.
+  if (isNAS || isBTC || isXAU) {
     if (!s.trv2CurCandle) {
       s.trv2CurCandle = { o: price, h: price, l: price, c: price, startTs: Date.now(), ticks: 1 };
     } else {
@@ -7338,17 +7343,20 @@ function processPrice(sym, price, hi, lo) {
   // BTC re-enabled 2026-05-25 (was disabled after 0/6 -$872 on 5/6) — cascade limit, EMA
   // dedupe, conv maturity factor, and TP1 BE-trail scratch protection now prevent the
   // original loss-cascade pattern. User assessment: TRv2 fits BTC's clean directional legs.
-  if ((isNAS || isBTC) && s.trv2TrendEma !== null && s.trv2Candles.length >= 30) {
+  // TRv2 detector — extended to XAU 2026-06-18 (task #213).
+  // XAU-specific constants: minSpreadPct 0.06% (~$2.5 on $4300 price), ATR fallback $3
+  // (typical XAU 1-min candle range). These match BTC's relative scale, not absolute.
+  if ((isNAS || isBTC || isXAU) && s.trv2TrendEma !== null && s.trv2Candles.length >= 30) {
     const tEma = s.trv2TrendEma;
     const spread = Math.abs(price - tEma);
     const spreadPct = (spread / tEma) * 100;
-    const minSpreadPct = isBTC ? 0.08 : 0.06;
+    const minSpreadPct = isBTC ? 0.08 : isXAU ? 0.06 : 0.06;  // NAS uses 0.06, XAU same
     const priceAbove = price > tEma;
     const priceBelow = price < tEma;
     const now3 = Date.now();
 
     // --- Calculate ATR from recent 1-min candles ---
-    let trv2Atr = isBTC ? 120 : 30;
+    let trv2Atr = isBTC ? 120 : isXAU ? 3 : 30;  // XAU 1-min ATR ~$3; NAS ~$30; BTC ~$120
     if (s.trv2Candles.length >= 10) {
       const recentC = s.trv2Candles.slice(-10);
       const ranges = recentC.map(c => c.h - c.l);
@@ -8345,8 +8353,11 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
-  // === FIRE SIGNALS (0DTE indicator engine — QQQ/SPY/XAU/LABU only) ===
-  // BTC/NAS100 use TRv2 trend-following system exclusively — block base engine
+  // === FIRE SIGNALS (0DTE indicator engine — QQQ/SPY/XAU only) ===
+  // BTC/NAS100 use TRv2 EXCLUSIVELY — block base engine for them.
+  // XAU (task #213, 2026-06-18): runs BOTH base engine (LHFP/LLFP/STRUCT_*/OBREJ/etc.)
+  // AND TRv2 in parallel. The base engine catches fade/reversal patterns; TRv2 catches
+  // sustained trend continuations that the fade detectors miss (e.g., 6/18 $50 down move).
   if (isBTC || isNAS) {
     // Don't fire 6/6 indicator signals for BTC/NAS100 — TRv2 handles them
     return;
@@ -9925,7 +9936,7 @@ app.get('/prices', (req, res) => {
         };
       })() : null,
       // TRv2 trend-following data (BTC/NAS100 only)
-      trv2: (sym === 'BTC' || sym === 'NAS100') ? {
+      trv2: (sym === 'BTC' || sym === 'NAS100' || sym === 'XAU') ? {
         trendEma: s.trv2TrendEma ? +s.trv2TrendEma.toFixed(2) : null,
         ema15: s.trv2Ema15 ? +s.trv2Ema15.toFixed(2) : null,
         ema20: s.trv2Ema20 ? +s.trv2Ema20.toFixed(2) : null,
