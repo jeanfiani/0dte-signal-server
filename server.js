@@ -78,8 +78,11 @@ const REV_MIN_HOLD_MS = 180000;
 const MAX_SIG = 10;
 // MT5 safety valve (added 2026-06-11, audit v2 A1). MT5 stays deliberately loose —
 // 24h markets need freedom — but a runaway day no longer gets unlimited signals.
-// Only trips on genuinely bad days (20+). Override via env MAX_SIG_MT5.
-const MAX_SIG_MT5 = parseInt(process.env.MAX_SIG_MT5 || '20', 10);
+// Raised 20→35 on 2026-06-19 (Phase 3.19) — XAU hit the 20 cap by 10:00 ET on a
+// moderately active day, missed entire $4150→$4183 spike. 35 still trips on
+// genuinely runaway days but leaves headroom for STRUCT_LIQ_GRAB + RIDE + OBREJ
+// to all fire across XAU/BTC/NAS during US session. Override via env MAX_SIG_MT5.
+const MAX_SIG_MT5 = parseInt(process.env.MAX_SIG_MT5 || '35', 10);
 const THR = 6;
 const ROC_THR = 0.018;
 const EQ_ROC_GATE = 0.030; // Hard ROC gate for equities — ROC-3 must confirm direction
@@ -6005,6 +6008,16 @@ function processPrice(sym, price, hi, lo) {
         // Need meaningful re-entry (>= 0.05% below the pool)
         const reentry = (s.liqSweptAbovePrice - price) / s.liqSweptAbovePrice;
         if (reentry >= 0.0005) {
+          // ===== PHASE 3.19 SPAM FIX (added 2026-06-19, task #219) =====
+          // Set the 45-min cooldown + consume the swept-pool BEFORE enrichSig. Previously
+          // these only fired on enrichSig pass, so a blocked setup would re-evaluate true
+          // on EVERY subsequent tick — log showed 339 STRUCT_LIQ_GRAB attempts in one
+          // 6-min window when the daily cap was reached. Setting them upfront means a
+          // blocked setup gets one log line then sleeps for 45 min. The same setup
+          // re-emerging later (new sweep, new reversal) gets a fresh chance.
+          const sweptAbove = s.liqSweptAbovePrice; // capture for log before clearing
+          s.structLiqGrabLastTs = now2;
+          s.liqSweptAbovePrice = 0; // consume sweep state regardless of enrichSig outcome
           s.dailySignalCount++;
           s.lastAT = 'put'; s.nP++;
           if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
@@ -6014,9 +6027,7 @@ function processPrice(sym, price, hi, lo) {
           s.signals.push(sig); logSignal(sym, sig);
           s.trade = buildCfdTrade('put', price, atrVal, sym);
           attachTpSl(sig, 'put', price, atrVal, sym);
-          s.structLiqGrabLastTs = now2;
-          s.liqSweptAbovePrice = 0; // consume
-          log(sym, '🪤 STRUCT_LIQ_GRAB PUT — pool above $' + (s.liqSweptAbovePrice || 0).toFixed(2) + ' swept then reversed, now $' + price.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+          log(sym, '🪤 STRUCT_LIQ_GRAB PUT — pool above $' + sweptAbove.toFixed(2) + ' swept then reversed, now $' + price.toFixed(2) + ' [#' + s.dailySignalCount + ']');
           sendPush('🪤 ' + sym + ' STRUCT_LIQ_GRAB PUT #' + s.dailySignalCount, 'Liquidity above grabbed then reversed — $' + price.toFixed(2), 'signal');
           return;
         }
@@ -6026,6 +6037,10 @@ function processPrice(sym, price, hi, lo) {
           price > s.liqSweptBelowPrice) {
         const reentry = (price - s.liqSweptBelowPrice) / s.liqSweptBelowPrice;
         if (reentry >= 0.0005) {
+          // Phase 3.19 spam fix — see PUT branch above for full reasoning.
+          const sweptBelow = s.liqSweptBelowPrice;
+          s.structLiqGrabLastTs = now2;
+          s.liqSweptBelowPrice = 0;
           s.dailySignalCount++;
           s.lastAT = 'call'; s.nC++;
           if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
@@ -6035,9 +6050,7 @@ function processPrice(sym, price, hi, lo) {
           s.signals.push(sig); logSignal(sym, sig);
           s.trade = buildCfdTrade('call', price, atrVal, sym);
           attachTpSl(sig, 'call', price, atrVal, sym);
-          s.structLiqGrabLastTs = now2;
-          s.liqSweptBelowPrice = 0;
-          log(sym, '🪤 STRUCT_LIQ_GRAB CALL — pool below $' + (s.liqSweptBelowPrice || 0).toFixed(2) + ' swept then reversed, now $' + price.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+          log(sym, '🪤 STRUCT_LIQ_GRAB CALL — pool below $' + sweptBelow.toFixed(2) + ' swept then reversed, now $' + price.toFixed(2) + ' [#' + s.dailySignalCount + ']');
           sendPush('🪤 ' + sym + ' STRUCT_LIQ_GRAB CALL #' + s.dailySignalCount, 'Liquidity below grabbed then reversed — $' + price.toFixed(2), 'signal');
           return;
         }
@@ -10228,6 +10241,29 @@ app.get('/signals', (req, res) => {
   }
   // Summary stats
   const dates = [...new Set(filtered.map(h => h.date))].sort();
+  const symbols = [...new Set(filtered.map(h => h.symbol))].sort();
+  const bySymbol = {};
+  symbols.forEach(sym => { bySymbol[sym] = filtered.filter(h => h.symbol === sym).length; });
+  res.json({
+    total: filtered.length,
+    dates: dates,
+    bySymbol: bySymbol,
+    signals: filtered,
+    historyAge: signalHistory.length > 0 ? signalHistory[0].date : null,
+    totalStored: signalHistory.length
+  });
+});
+
+// ===== SERVER LISTEN (restored 2026-06-19, task #220) =====
+// File was truncated at /signals endpoint, lost the app.listen() call too.
+app.listen(PORT, () => {
+  console.log('[STARTUP] Server listening on port ' + PORT);
+});
+(PORT, () => {
+  console.log('[STARTUP] Server listening on port ' + PORT);
+  console.log('[STARTUP] Dashboard: http://localhost:' + PORT + '/');
+  console.log('[STARTUP] Signal history API: /signals?symbol=XAU&days=1');
+});te))].sort();
   const symbols = [...new Set(filtered.map(h => h.symbol))].sort();
   const bySymbol = {};
   symbols.forEach(sym => { bySymbol[sym] = filtered.filter(h => h.symbol === sym).length; });
