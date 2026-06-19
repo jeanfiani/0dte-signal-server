@@ -3814,18 +3814,49 @@ function processPrice(sym, price, hi, lo) {
       // Even outside chop, non-fade detectors firing in the top/bottom 15% of any defined
       // range are usually chasing exhaustion. Catches cases where chop flag hasn't yet
       // activated but price is at a structural extreme.
+      //
+      // ===== PHASE 3.16 — REGIME-AWARE EXTREMITY (added 2026-06-19, task #216) =====
+      // In a clearly directional multi-day regime, "the wrong extreme" is actually trend
+      // continuation, not exhaustion. PUT at the bottom of a 5-day downtrend isn't
+      // "shorting the low" — it's joining the trend. CALL at the top of a 5-day uptrend
+      // likewise.
+      //
+      // 6/18 case: XAU TRv2 RIDE PUTs blocked at the bottom 15% during a clear bear regime.
+      // Two of them (12:18 @ $4226, 12:51 @ $4217) would have hit TP1 as XAU continued
+      // $4226 → $4144. Net cost: ~2 missed TP1 winners. Meanwhile every blocked CALL on
+      // the same day would have lost (-$330+ avoided) — so CALL blocks were correct, only
+      // the PUT side was over-strict.
+      //
+      // Rule: in a STRONG (strength=2) or WEAK (strength=1) directional regime, allow
+      // trend-continuation entries at the matching extremity. Counter-trend entries at
+      // the wrong extremity stay blocked (those are exhaustion chases).
+      //
+      // Reads sig._regime annotation set by the earlier multi-day regime gate (line 3384).
+      // If regime data is unavailable (regime === undefined), falls back to the original
+      // symmetric behavior — safer default.
       if (isP2Mt5 && s.rangePosPct !== null && !isFadeP2) {
         const TOP_PCT = 85;    // top 15%
         const BOT_PCT = 15;    // bottom 15%
+        const regime = sig._regime;
+        const isBearRegime = regime && regime.dir === 'bear' && regime.strength >= 1;
+        const isBullRegime = regime && regime.dir === 'bull' && regime.strength >= 1;
         if (sig.type === 'call' && s.rangePosPct >= TOP_PCT) {
-          Object.assign(s, _emitSnapshot);
-          log(sym, '🎯 ' + tagP2 + ' CALL BLOCKED — range-extremity guard: ' + s.rangePosPct.toFixed(0) + '% of ' + s.rangeRef + ' range. Top 15% reserved for fade detectors.');
-          return false;
+          if (isBullRegime) {
+            log(sym, '↪️ ' + tagP2 + ' CALL EXEMPT (range-extremity) — ' + s.rangePosPct.toFixed(0) + '% of ' + s.rangeRef + ' range BUT BULL regime (' + regime.window + ' ' + (regime.netChgPct >= 0 ? '+' : '') + regime.netChgPct + '%, strength ' + regime.strength + '). Top extremity = trend continuation in bull regime.');
+          } else {
+            Object.assign(s, _emitSnapshot);
+            log(sym, '🎯 ' + tagP2 + ' CALL BLOCKED — range-extremity guard: ' + s.rangePosPct.toFixed(0) + '% of ' + s.rangeRef + ' range. Top 15% reserved for fade detectors' + (regime ? ' (regime: ' + regime.dir + ' s' + regime.strength + ')' : ' (no regime data)') + '.');
+            return false;
+          }
         }
         if (sig.type === 'put' && s.rangePosPct <= BOT_PCT) {
-          Object.assign(s, _emitSnapshot);
-          log(sym, '🎯 ' + tagP2 + ' PUT BLOCKED — range-extremity guard: ' + s.rangePosPct.toFixed(0) + '% of ' + s.rangeRef + ' range. Bottom 15% reserved for fade detectors.');
-          return false;
+          if (isBearRegime) {
+            log(sym, '↪️ ' + tagP2 + ' PUT EXEMPT (range-extremity) — ' + s.rangePosPct.toFixed(0) + '% of ' + s.rangeRef + ' range BUT BEAR regime (' + regime.window + ' ' + (regime.netChgPct >= 0 ? '+' : '') + regime.netChgPct + '%, strength ' + regime.strength + '). Bottom extremity = trend continuation in bear regime.');
+          } else {
+            Object.assign(s, _emitSnapshot);
+            log(sym, '🎯 ' + tagP2 + ' PUT BLOCKED — range-extremity guard: ' + s.rangePosPct.toFixed(0) + '% of ' + s.rangeRef + ' range. Bottom 15% reserved for fade detectors' + (regime ? ' (regime: ' + regime.dir + ' s' + regime.strength + ')' : ' (no regime data)') + '.');
+            return false;
+          }
         }
       }
 
@@ -3878,6 +3909,79 @@ function processPrice(sym, price, hi, lo) {
             log(sym, '🚫 ' + tagP2 + ' PUT BLOCKED — RSI ' + rsiP2.toFixed(1) + ' < 28 — chasing oversold / exhausted drop. Wrong-direction fade.');
             return false;
           }
+        }
+      }
+
+      // ===== PHASE 3.17 / FIX B — INVERSAL_BREAK RSI 35/65 TIGHTER FLOOR (added 2026-06-19, task #217) =====
+      // INVERSAL_BREAK fires on FAILED breakouts — by definition implying momentum is
+      // already reversing. Firing INVERSAL_BREAK at exhausted RSI is the worst-case
+      // setup: the reversal that the detector is trying to ride has already played out
+      // and we're entering at the turning point of the turning point.
+      //
+      // Phase 2.8 above blocks the STRUCT/INVERSAL family at 72/28. INVERSAL_BREAK
+      // alone gets a tighter 65/35 floor because:
+      //
+      // 6/18 02:40 NAS INVERSAL_BREAK PUT @ RSI 30.0 → SL -$60/contract.
+      // RSI 30.0 was 2 points inside Phase 2.8's no-fire zone (< 28) so it slipped
+      // through. With this tighter floor (PUT requires RSI ≥ 35, CALL requires
+      // RSI ≤ 65), it would have been blocked.
+      //
+      // Other STRUCT detectors (SWEEP, LIQ_GRAB, OB_FILL, VWAP) stay at 72/28 — they
+      // benefit from firing closer to extremes because they have structural anchors
+      // (sweep level, liquidity pool, OB zone). INVERSAL_BREAK has no such anchor —
+      // it's pure momentum reversal logic, so it needs the wider safety margin.
+      if (/INVERSAL_BREAK/.test(tagP2)) {
+        const rsiP2 = parseFloat(sig.rsi);
+        if (!isNaN(rsiP2)) {
+          if (sig.type === 'call' && rsiP2 > 65) {
+            Object.assign(s, _emitSnapshot);
+            log(sym, '🚫 ' + tagP2 + ' CALL BLOCKED — INVERSAL_BREAK RSI ' + rsiP2.toFixed(1) + ' > 65 (tighter floor than other STRUCTs). Failed-breakout CALL at overbought is chasing exhaustion.');
+            return false;
+          }
+          if (sig.type === 'put' && rsiP2 < 35) {
+            Object.assign(s, _emitSnapshot);
+            log(sym, '🚫 ' + tagP2 + ' PUT BLOCKED — INVERSAL_BREAK RSI ' + rsiP2.toFixed(1) + ' < 35 (tighter floor than other STRUCTs). Failed-breakout PUT at oversold is chasing exhaustion.');
+            return false;
+          }
+        }
+      }
+
+      // ===== PHASE 3.18 / FIX C — STRUCT_LIQ_GRAB HTF/REGIME GATE (added 2026-06-19, task #218) =====
+      // STRUCT_LIQ_GRAB is in the isFadeP2 regex (line 3756), which exempts it from the
+      // Phase 2.2 HTF Bias Agreement Gate. That exemption made sense for pure fades
+      // (LHF/LLF/OBREJ are designed to counter local moves), but STRUCT_LIQ_GRAB is more
+      // structural — it fires when a liquidity pool gets swept then price reclaims the
+      // level. On RANGING days, that's a legitimate reversal pattern. On strongly
+      // TRENDING days, the same setup is just a stop-hunt that resolves IN the trend's
+      // direction — and we're betting against the trend.
+      //
+      // 6/18 08:48 BTC STRUCT_LIQ_GRAB CALL @ $64,282 → SL -$306/unit.
+      //   - BTC was in a multi-day BEAR regime (5-day net -2.5%)
+      //   - HTF 1h: down, HTF 4h: down
+      //   - The grab structurally valid (a pool below got swept then reclaimed)
+      //   - BUT the reclaim was a dead-cat bounce; trend resumed within an hour.
+      //
+      // Rule: STRUCT_LIQ_GRAB now requires EITHER:
+      //   (a) Multi-day regime supports its direction (bull regime → CALL OK; bear → PUT OK)
+      //   (b) At least one HTF (1h or 4h) supports its direction
+      //   (c) Both HTFs read "neutral" (no clear directional bias)
+      // Block only when ALL three conditions fail — i.e., directional regime AGAINST and
+      // BOTH HTFs against. That's the strongest possible "fighting the tide" signal.
+      if (/STRUCT_LIQ_GRAB/.test(tagP2)) {
+        const isCallLG = sig.type === 'call';
+        const regimeLG = sig._regime;
+        const regimeAgainst = regimeLG && regimeLG.strength >= 1 &&
+                              ((isCallLG && regimeLG.dir === 'bear') ||
+                               (!isCallLG && regimeLG.dir === 'bull'));
+        const h1Against = s.htf1h_dir && ((isCallLG && s.htf1h_dir === 'down') || (!isCallLG && s.htf1h_dir === 'up'));
+        const h4Against = s.htf4h_dir && ((isCallLG && s.htf4h_dir === 'down') || (!isCallLG && s.htf4h_dir === 'up'));
+        // Block ONLY when regime is directionally against AND both HTFs are against.
+        // If either HTF is neutral/missing or regime is neutral/missing, we let it through —
+        // the existing Phase 2.8 RSI gate is the secondary safety net.
+        if (regimeAgainst && h1Against && h4Against) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🌪️ ' + tagP2 + ' ' + sig.type.toUpperCase() + ' BLOCKED — STRUCT_LIQ_GRAB fights regime ' + regimeLG.dir + '(' + regimeLG.netChgPct + '%) + HTF1h ' + s.htf1h_dir + ' + HTF4h ' + s.htf4h_dir + '. Liq grab against all 3 tides = dead-cat bounce setup.');
+          return false;
         }
       }
     }
