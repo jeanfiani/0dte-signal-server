@@ -1658,6 +1658,19 @@ function loadSignalHistory() {
       signalHistory = (raw || []).filter(h => h.ts > cutoff);
       console.log('[' + ts() + '] Signal history loaded — ' + signalHistory.length + ' signals (last 7 days) from ' + (file === HISTORY_FILE ? 'primary' : 'BACKUP (.bak)'));
       // Also restore per-symbol s.signals for today
+      // ===== PHASE 3.21 RESTORATION FIX (added 2026-06-19, task #221) =====
+      // Previously: dailySignalCount = todaySignals.length — but signalHistory contains
+      // BLOCKED TRv2 entries (per task #176 "Always store TRv2 entries regardless of
+      // enrichSig block"). Every Railway redeploy inflated the count by the number of
+      // blocked attempts, eventually tripping the daily cap on perfectly fine days.
+      //
+      // 6/19 case: XAU had ~4 real fires + many blocked RIDE attempts. Each redeploy
+      // restored count = ~20 even though actual fires were ~4. Cap tripped, bot went
+      // silent for the rest of the day.
+      //
+      // Fix: count only entries that actually FIRED (no enrichBlocked flag). The
+      // s.signals array still contains everything (for analytics + UI), but the cap-
+      // counter reflects reality.
       const today = todayDateET();
       SYMBOLS.forEach(sym => {
         const todaySignals = signalHistory.filter(h => h.date === today && h.symbol === sym);
@@ -1666,8 +1679,14 @@ function loadSignalHistory() {
             type: h.type, time: h.time, price: h.price, score: h.score,
             rsi: h.rsi, macd: h.macd, roc: h.roc, num: h.num, conv: h.conv || null
           }));
-          S[sym].dailySignalCount = todaySignals.length;
-          console.log('[' + ts() + '] ' + sym + ' — restored ' + todaySignals.length + ' signals for today');
+          // Count only signals that actually fired — exclude enrichBlocked entries.
+          // Blocked TRv2 entries have conv.enrichBlocked = true OR conv.label = 'BLOCKED'.
+          const firedCount = todaySignals.filter(h =>
+            !(h.conv && (h.conv.enrichBlocked === true || h.conv.label === 'BLOCKED'))
+          ).length;
+          const blockedCount = todaySignals.length - firedCount;
+          S[sym].dailySignalCount = firedCount;
+          console.log('[' + ts() + '] ' + sym + ' — restored ' + firedCount + ' fired + ' + blockedCount + ' blocked = ' + todaySignals.length + ' total for today');
         }
       });
       // ===== DETECTOR COOLDOWN RESTORATION (task #209, added 2026-06-17) =====
@@ -10224,7 +10243,7 @@ app.get('/signals', (req, res) => {
   if (req.query.date) {
     filtered = filtered.filter(h => h.date === req.query.date);
   }
-  // Filter by last N days
+   // Filter by last N days
   if (req.query.days) {
     const daysMs = parseInt(req.query.days) * 24 * 60 * 60 * 1000;
     const cutoff = Date.now() - daysMs;
@@ -10254,9 +10273,11 @@ app.get('/signals', (req, res) => {
   });
 });
 
-// ===== SERVER LISTEN (restored 2026-06-19, task #220) =====
-// File was truncated at /signals endpoint, lost the app.listen() call too.
+// ===== SERVER LISTEN (restored 2026-06-19, tasks #220, #221) =====
 app.listen(PORT, () => {
+  console.log('[STARTUP] Server listening on port ' + PORT);
+});
+ {
   console.log('[STARTUP] Server listening on port ' + PORT);
 });
 (PORT, () => {
