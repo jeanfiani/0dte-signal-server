@@ -4302,18 +4302,29 @@ function processPrice(sym, price, hi, lo) {
       log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' active-trade reversal allowed — conv ' + conv.score + '/7 + macro stably ' + sig.type.toUpperCase() + '-aligned. ' + s.trade.type.toUpperCase() + ' trade (' + tradeAgeMin + 'min) is genuinely reversing.');
     }
 
-    // ===== BTC WEEKEND PUT-ONLY GATE (added 2026-05-16) =====
-    // 52-week analysis showed BTC weekends are CALL-skewed overall (57.7% CALL) but the
-    // recent 6-month regime (Nov 2025 → May 2026) is 58% PUT-favorable with bigger PUT
-    // magnitudes (-1.83% vs +1.50%). Decision: allow PUT signals on weekends, block CALL
-    // entirely. The hard weekend block at processTicks level was lifted; this is the
-    // direction-aware enforcement. CALL signals at low-liquidity weekend chop have poor
-    // risk/reward — wait until Mon open instead.
-    if (isBTC && s._weekendBtcPutOnly && sig.type === 'call') {
-      Object.assign(s, _emitSnapshot);
-      log(sym, '🚫 ' + tagEarly + ' CALL BLOCKED — BTC weekend PUT-only mode (recent 6mo regime: 58% PUT-favorable, weekend CALL setups have poor R:R).');
-      return false;
-    }
+    // ===== BTC WEEKEND PUT-ONLY GATE — REMOVED 2026-06-21 (Phase 3.26, task #226) =====
+    // The gate was added 2026-05-16 based on a Nov 2025 → May 2026 sample where BTC weekends
+    // were 58% PUT-favorable. Regime has since flipped bullish.
+    //
+    // Sat 6/20 evidence: BTC closed HIGHER (+$200) but bot fired 8 PUTs (net ~-$250) and
+    // missed the obvious CALL entries. Sun 6/21 early: BTC rallied $63,920 → $64,260 with
+    // bot silent on the long side.
+    //
+    // The multi-day regime gate (line ~4111) already filters counter-trend in strong
+    // regimes (requires conv 6 STRONG / conv 5 WEAK against direction). Phase 2.2 HTF Bias
+    // Agreement also blocks "fighting both 1h and 4h" entries. Those adapt automatically
+    // to regime shifts; a hardcoded direction lock does not.
+    //
+    // Original gate (removed):
+    //   if (isBTC && s._weekendBtcPutOnly && sig.type === 'call') {
+    //     Object.assign(s, _emitSnapshot);
+    //     log(sym, '🚫 ' + tagEarly + ' CALL BLOCKED — BTC weekend PUT-only mode ...');
+    //     return false;
+    //   }
+    //
+    // The s._weekendBtcPutOnly flag is still computed (line ~4756) and surfaced in /status
+    // for diagnostics. If a future bear regime returns, we can reactivate this block as a
+    // one-liner, or convert it to a conviction-gated rule (e.g. weekend CALL requires conv 5+).
 
     // ===== MACRO-FLIP COOLDOWN (added 2026-05-13) =====
     // Caught 5/13 10:32 ATL CALL @ conv 6 HIGH SL'd 32 min after PUT alignment ended. The
