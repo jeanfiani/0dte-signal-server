@@ -9281,6 +9281,24 @@ function connectFinnhub() {
   }
 }
 
+// ===== PHASE 3.34 — INITIAL FINNHUB WS CONNECT (added 2026-06-22, task #234) =====
+// CRITICAL BUG FIX: connectFinnhub() was defined with full reconnect logic but never
+// initially called. All references to it were setTimeout retries from WITHIN the
+// function itself — so the chain never started.
+//
+// Result: WebSocket state stayed "NULL" forever, reconnects: 0, QQQ/SPY always $0.
+// Started today's day with QQQ/SPY completely silent because the bot never tried to
+// connect to Finnhub.
+//
+// Fix: invoke connectFinnhub() once on startup. The function self-handles market-hour
+// gating + reconnect backoff, so this single call kicks off the persistent loop.
+if (API) {
+  console.log('[STARTUP] Initiating Finnhub WebSocket connection...');
+  connectFinnhub();
+} else {
+  console.warn('[STARTUP] FINNHUB_API_KEY not set — QQQ/SPY price feed disabled.');
+}
+
 // Process ticks — QQQ/SPY every 3s, XAU every 1s (MT5 feeds at 1s)
 function processTicks(symbols) {
   symbols.forEach(sym => {
