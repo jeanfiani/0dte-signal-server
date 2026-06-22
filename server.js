@@ -3844,14 +3844,29 @@ function processPrice(sym, price, hi, lo) {
         }
       }
 
-      // ── 2.3: Killzone Window Gate (task #191)
+      // ── 2.3: Killzone Window Gate (task #191) — UPDATED 2026-06-22 with Phase 3.37 conv override
       // In chop, outside London KZ (02:00-05:00 ET) + NY AM (08:00-11:00 ET): only fades.
       // Killzones print 60-70% of intraday range. Trend signals outside KZ in chop are
       // structurally low-quality (they fire in low-vol consolidation that mean-reverts).
+      //
+      // ===== PHASE 3.37 OVERRIDE (added 2026-06-22, task #238) =====
+      // Conv ≥ 5 (HIGH tier) override: when cross-asset confluence is HIGH and all factors
+      // agree, the directional thesis is strong enough to override the time-of-day chop rule.
+      // 6/22 case: BTC RIDE PUT conv 5 HIGH at 14:26 (all cross-asset PUT-aligned) blocked
+      // by chop+nyPM rule. NAS RIDE CALL conv 8 HIGH at 14:16 same problem.
+      //
+      // Trade management for override signals is HANDLED IN TRv2 ENTRY (line ~7896) using
+      // tighter SL/TP multipliers — smaller risk, faster BE-trail — to manage the elevated
+      // chop reversal risk.
       if (isP2Mt5 && s.chopActive && !s.inKillzone && !isFadeP2) {
-        Object.assign(s, _emitSnapshot);
-        log(sym, '🕐 ' + tagP2 + ' ' + sig.type.toUpperCase() + ' BLOCKED — outside Killzone (session: ' + (s.session || '?') + ') + chop active. Non-fade detectors restricted to London KZ / NY AM in chop.');
-        return false;
+        const convForKZOverride = sig.conv ? sig.conv.score : convictionFor(sig.type).score;
+        if (convForKZOverride < 5) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🕐 ' + tagP2 + ' ' + sig.type.toUpperCase() + ' BLOCKED — outside Killzone (session: ' + (s.session || '?') + ') + chop active, conv ' + convForKZOverride + '/5 needed for override. Non-fade detectors restricted to London KZ / NY AM in chop.');
+          return false;
+        }
+        // High-conv signal passed override — log the bypass for visibility
+        log(sym, '↪️ ' + tagP2 + ' ' + sig.type.toUpperCase() + ' KILLZONE OVERRIDE — conv ' + convForKZOverride + '/5+ allowed despite chop+outside-KZ (' + (s.session || '?') + '). Tighter TP/SL applied.');
       }
 
       // ── 2.4: Premium/Discount Zone Gate (task #192) — chop only
@@ -7957,10 +7972,26 @@ function processPrice(sym, price, hi, lo) {
         // TP1 min floor (updated 2026-05-25): $5 was too small for NAS at $29k+ (only 0.017%
         // of price). Raised to $30 so even low-ATR TRv2 entries have a meaningful first
         // target. XAU/BTC keep $5 (proportional to their price levels).
+        //
+        // ===== PHASE 3.37 — TIGHTER TP/SL IN CHOP+OUTSIDE-KZ OVERRIDE (added 2026-06-22, task #238) =====
+        // When TRv2 fires in chop+outside-killzone via the conv 5+ override (Phase 2.3),
+        // the reversal risk is elevated. Tighter SL + closer TPs:
+        //   • SL: 1.5× ATR instead of 2× — smaller loss when wrong
+        //   • TP1: 1× ATR instead of 1.5× — locks BE-trail faster (NAS: 2× instead of 3×)
+        //   • TP2/TP3: ~60% of normal — captures the chop bounce but doesn't expect runaway
+        //   • Floor: smaller too — proportional reduction
+        const isChopOverride = s.chopActive && !s.inKillzone;
         const entMults = isNAS
-          ? { sl: 2, t1: 3, t2: 6, t3: 12 }
-          : { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
-        const tp1Floor = isNAS ? 30 : 5;
+          ? (isChopOverride
+              ? { sl: 1.5, t1: 2, t2: 4, t3: 8 }          // NAS chop override
+              : { sl: 2,   t1: 3, t2: 6, t3: 12 })        // NAS normal
+          : (isChopOverride
+              ? { sl: 1.5, t1: 1,   t2: 1.75, t3: 2.5 }   // XAU/BTC chop override
+              : { sl: 2,   t1: 1.5, t2: 2.5,  t3: 4 });   // XAU/BTC normal
+        const tp1Floor = isNAS ? (isChopOverride ? 20 : 30) : (isChopOverride ? 3 : 5);
+        if (isChopOverride) {
+          log(sym, '🌊 TRv2 CHOP-OVERRIDE TPs — tighter SL/TPs applied (chop+outside-KZ, conv 5+).');
+        }
         const sl = dir === 'long' ? price - Math.max(trv2Atr * entMults.sl, 5) : price + Math.max(trv2Atr * entMults.sl, 5);
         // ===== PHASE 3.28 — Fix TP2/TP3 < TP1 bug (added 2026-06-22, task #228) =====
         // Previously TP1 had a Math.max(...,tp1Floor) clamp but TP2/TP3 used raw
@@ -10329,7 +10360,7 @@ app.get('/signals/csv/:date', (req, res) => {
   }
 });
 
-// Signal history — full JSON API (7-day persistent store) — must be LAST (catch-all for /signals)
+// Signal history — full JSON API (7-day persistent store)
 app.get('/signals', (req, res) => {
   let filtered = signalHistory;
   if (req.query.symbol) {
@@ -10341,7 +10372,7 @@ app.get('/signals', (req, res) => {
   }
   if (req.query.days) {
     const daysMs = parseInt(req.query.days) * 24 * 60 * 60 * 1000;
-cutoff = Date.now() - daysMs;
+    const cutoff = Date.now() - daysMs;
     filtered = filtered.filter(h => h.ts > cutoff);
   }
   if (req.query.type) {
