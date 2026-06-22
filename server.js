@@ -1881,6 +1881,46 @@ function saveBlockedOutcomes() {
   }
 }
 
+// ===== PHASE 3.32 + 3.33 — LOAD ALL PERSISTENCE FILES ON STARTUP (added 2026-06-22, tasks #232/#233) =====
+// CRITICAL BUG FIX: All these load functions were defined but never invoked. Every
+// server restart began with empty state, then the autosaves (60s later) wrote that
+// empty state to disk — destroying ALL prior data on every Railway redeploy.
+//
+// The Railway volume was working correctly the whole time — the code just never asked
+// it for data on boot. Now we load everything in the correct order.
+//
+// Order matters:
+//   1. loadRollingLevels — restores Asian H/L, daily ATH/ATL, macroSnaps (regime data)
+//   2. loadTrv2State — restores any active TRv2 trade so it's not orphaned
+//   3. loadTrumpState — restores Trump factor cache (avoid re-classifying old tweets)
+//   4. loadSignalHistory — restores signals + per-symbol s.signals + cooldown timestamps
+//   5. loadBlockedOutcomes — restores shadow-fire analytics
+try {
+  loadRollingLevels();   // Asian H/L, ATH/ATL, daily levels, macroSnaps (6h of 5-min data)
+} catch (e) {
+  console.error('[STARTUP] loadRollingLevels threw — starting fresh:', e.message);
+}
+try {
+  loadTrv2State();       // Active TRv2 trades + EMA candle buffers
+} catch (e) {
+  console.error('[STARTUP] loadTrv2State threw — starting fresh:', e.message);
+}
+try {
+  loadTrumpState();      // Trump factor cache
+} catch (e) {
+  console.error('[STARTUP] loadTrumpState threw — starting fresh:', e.message);
+}
+try {
+  loadSignalHistory();   // 7-day signal store + per-symbol s.signals + detector cooldowns
+} catch (e) {
+  console.error('[STARTUP] loadSignalHistory threw — starting fresh:', e.message);
+}
+try {
+  loadBlockedOutcomes(); // Shadow-fire analytics (30-day window)
+} catch (e) {
+  console.error('[STARTUP] loadBlockedOutcomes threw — starting fresh:', e.message);
+}
+
 // Periodic backup save — every 60 seconds, catches snapshot updates and outcome changes
 // that may not trigger an explicit save through logSignal or updateSignalOutcome.
 setInterval(() => {
@@ -10283,7 +10323,7 @@ app.get('/signals', (req, res) => {
   }
   if (req.query.days) {
     const daysMs = parseInt(req.query.days) * 24 * 60 * 60 * 1000;
-    const cutoff = Date.now() - daysMs;
+cutoff = Date.now() - daysMs;
     filtered = filtered.filter(h => h.ts > cutoff);
   }
   if (req.query.type) {
