@@ -4753,22 +4753,18 @@ function processPrice(sym, price, hi, lo) {
   if (isXAU) {
     if (etMin >= 1020 && etMin < 1080) return; // XAU closed 5-6 PM ET
   } else if (isBTC) {
-    // BTC trades 24/7 but weekends are ultra-thin liquidity. Previously hard-blocked all
-    // signals Sat/Sun. Updated 2026-05-16 after 52-week analysis showed:
-    //   • Full year: 57.7% CALL weekends / 42.3% PUT (slightly CALL-biased overall)
-    //   • Last 6 months (Nov 2025 → May 2026): 57.7% PUT / 42.3% CALL with -16.56%
-    //     cumulative; PUT moves average -1.83% vs CALL +1.50% (bigger downside swings)
-    //   • Top 5 PUT weekends ranged -3.18% to -8.5%; top 5 CALL +2.43% to +3.10%
-    // Decision: allow BTC PUT signals on weekends (with normal macro/STRUCT/conviction
-    // gates handling quality). Keep blocking BTC CALL signals on weekends — recent regime
-    // is PUT-favorable and CALL setups would need to overcome lower frequency + smaller
-    // magnitude. Sets a flag that enrichSig() reads to block CALL emits.
+    // BTC trades 24/7. Weekend gate history:
+    //   • 2026-05-16 task #100: After 52-week analysis, blocked CALL/allowed PUT on weekends
+    //     based on Nov 2025 → May 2026 sample showing 58% PUT-favorable regime.
+    //   • 2026-06-21 task #226 (Phase 3.26): GATE REMOVED. Sat 6/20 BTC closed +$200 but
+    //     bot fired 8 PUTs (-$250 net). The multi-day regime gate + HTF Bias Agreement gate
+    //     now handle direction-bias adaptively, so the hardcoded weekend PUT-only lock is
+    //     no longer needed. CALLs are allowed on weekends if conv/HTF/regime confirm.
+    //
+    // The flag below is preserved for /status diagnostics — it indicates "is it weekend?"
+    // not "is CALL blocked?". The companion 10-min log message has been retired.
     const dow = gETDow();
-    s._weekendBtcPutOnly = (dow === 0 || dow === 6);
-    if (s._weekendBtcPutOnly && now2 - (s.weekendBlockLogTs || 0) > 600000) {
-      log(sym, '⏸ Weekend mode: BTC CALL signals blocked Sat/Sun (PUT-only — last 6mo 58% PUT-favorable, low-liquidity chop on CALL setups).');
-      s.weekendBlockLogTs = now2;
-    }
+    s._weekendBtcPutOnly = (dow === 0 || dow === 6); // legacy name, retained for /status
   } else if (isNAS) {
     // NAS100 futures: Sun 6PM - Fri 5PM ET, daily break 5-6PM ET (1020-1080 min)
     if (etMin >= 1020 && etMin < 1080) return; // NAS100 closed 5-6 PM ET
@@ -6146,8 +6142,26 @@ function processPrice(sym, price, hi, lo) {
     // Direction: any UP-sweep that comes back below → PUT. Any DOWN-sweep that comes back
     // above → CALL. Multiple swept levels boost conviction (multi-level sweep = highest quality).
     if (cool3 && (now2 - s.inversalLastTs) > 45 * 60 * 1000) {
-      const reentryThr = price * 0.0005; // need re-entry of at least 0.05%
-      const sweepWindow = 30 * 60 * 1000; // only consider sweeps from last 30 min
+      // ===== PHASE 3.31 — ADAPTIVE PARAMETERS FOR LOW-ATR (added 2026-06-22, task #231) =====
+      // Default sweep window (30 min) and reentry threshold (0.05%) were calibrated for
+      // NAS/BTC. On slow XAU days (ATR ~$1.5), the sweep state expires before price has
+      // time to reverse cleanly through the level.
+      //
+      // 6/22 case: XAU swept $4,200 round number ~05:00 ET (peaked at $4,212), but
+      // didn't come back below until ~10:00 ET — 5 hours later. With the 30-min window
+      // the sweep state was already cleared, so INVERSAL_BREAK PUT never fired during
+      // what was a clear -$26 reversal.
+      //
+      // Fix: in low-ATR conditions (XAU < $2.5, BTC < $50, NAS < $12), extend sweep
+      // window to 90 min and loosen reentry threshold to 0.03%. Normal-ATR markets
+      // keep the original 30 min / 0.05% (no behavior change for BTC/NAS in active sessions).
+      const lowAtrMode = (isXAU && atrVal < 2.5) || (isBTC && atrVal < 50) || (isNAS && atrVal < 12);
+      const reentryThr = price * (lowAtrMode ? 0.0003 : 0.0005);
+      const sweepWindow = lowAtrMode ? 90 * 60 * 1000 : 30 * 60 * 1000;
+      if (lowAtrMode && (!s._inversalAdaptiveLogTs || now2 - s._inversalAdaptiveLogTs > 1800000)) {
+        log(sym, '🐌 INVERSAL_BREAK adaptive mode — low ATR ($' + atrVal.toFixed(2) + '), window 90min / reentry 0.03%.');
+        s._inversalAdaptiveLogTs = now2;
+      }
 
       // Collect swept-above and swept-below levels that are currently in reversal state
       const sweptAbove = []; // levels that were swept UP and price is now back BELOW
@@ -7688,9 +7702,13 @@ function processPrice(sym, price, hi, lo) {
               : { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
             const revTp1Floor = isNAS ? 30 : 5;
             const revSl = revDir === 'long' ? price - Math.max(trv2Atr * revMults.sl, 5) : price + Math.max(trv2Atr * revMults.sl, 5);
-            const revTp1 = revDir === 'long' ? price + Math.max(trv2Atr * revMults.t1, revTp1Floor) : price - Math.max(trv2Atr * revMults.t1, revTp1Floor);
-            const revTp2 = revDir === 'long' ? price + trv2Atr * revMults.t2 : price - trv2Atr * revMults.t2;
-            const revTp3 = revDir === 'long' ? price + trv2Atr * revMults.t3 : price - trv2Atr * revMults.t3;
+            // Phase 3.28 — apply same TP-ordering fix as the entry path above (see line ~7884).
+            const revTp1Dist = Math.max(trv2Atr * revMults.t1, revTp1Floor);
+            const revTp2Dist = Math.max(trv2Atr * revMults.t2, revTp1Dist * (revMults.t2 / revMults.t1));
+            const revTp3Dist = Math.max(trv2Atr * revMults.t3, revTp1Dist * (revMults.t3 / revMults.t1));
+            const revTp1 = revDir === 'long' ? price + revTp1Dist : price - revTp1Dist;
+            const revTp2 = revDir === 'long' ? price + revTp2Dist : price - revTp2Dist;
+            const revTp3 = revDir === 'long' ? price + revTp3Dist : price - revTp3Dist;
 
             s.trv2Trade = { dir: revDir, ep: price, ts: now3, sl: revSl, tp1: revTp1, tp2: revTp2, tp3: revTp3, tp1Hit: false, tp2Hit: false, tp3Hit: false, bestPrice: price, atr: trv2Atr, trailSl: 0, isCfd: true };
             s.trv2Dir = revDir;
@@ -7870,6 +7888,25 @@ function processPrice(sym, price, hi, lo) {
           log(sym, '🏔️ TRv2 LONG BLOCKED — fresh local high set ' + minsAgo + 'min ago at $' + s.rollingHigh.toFixed(2) + ' (buying-the-top pattern). 15min cooldown.');
           return;
         }
+        // ===== PHASE 3.30 — SAME-DIRECTION SL LOCKOUT (added 2026-06-22, task #230) =====
+        // After a TRv2 SL on this symbol+direction, block new same-direction TRv2 entries
+        // for 30 min. The existing cascadeActive_E gate above counts 2+ SLs in any direction
+        // and is too lax for the single-direction whipsaw pattern.
+        //
+        // 6/22 case: XAU CALL SL'd at 08:22, then 3 more CALL RIDEs fired at 09:48 / 10:09
+        // / 10:47 — same direction, slightly worse prices, same setup that just failed.
+        // The doubling-down pattern is what kills runs of "the bot is right about direction
+        // but every entry hits the next pullback".
+        //
+        // Uses s.trv2SlHistory which is already populated at the SL hit sites (lines ~7553,
+        // ~7568, ~7601, ~7631). Each entry has { ts, dir, price, ema, spreadPct }.
+        const SAME_DIR_SL_COOL_MS = 30 * 60 * 1000;
+        const sameDirRecentSl = s.trv2SlHistory.find(h => h.dir === dir && (now3 - h.ts) < SAME_DIR_SL_COOL_MS);
+        if (sameDirRecentSl) {
+          const minsAgo = Math.round((now3 - sameDirRecentSl.ts) / 60000);
+          log(sym, '🛑 TRv2 ' + dir.toUpperCase() + ' BLOCKED — same-direction SL ' + minsAgo + 'min ago @ $' + sameDirRecentSl.price.toFixed(2) + '. 30min lockout breaks the whipsaw doubling-down pattern.');
+          return;
+        }
         // TP/SL policy: SL=2×ATR (always tight), TPs differ by symbol.
         // NAS (extended 2026-05-25 to match buildCfdTrade NAS extension from task #102):
         //   NAS futures produce clean directional legs that the default 1.5/2.5/4× was cutting
@@ -7885,11 +7922,29 @@ function processPrice(sym, price, hi, lo) {
           : { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
         const tp1Floor = isNAS ? 30 : 5;
         const sl = dir === 'long' ? price - Math.max(trv2Atr * entMults.sl, 5) : price + Math.max(trv2Atr * entMults.sl, 5);
-        const tp1 = dir === 'long' ? price + Math.max(trv2Atr * entMults.t1, tp1Floor) : price - Math.max(trv2Atr * entMults.t1, tp1Floor);
-        const tp2 = dir === 'long' ? price + trv2Atr * entMults.t2 : price - trv2Atr * entMults.t2;
-        const tp3 = dir === 'long' ? price + trv2Atr * entMults.t3 : price - trv2Atr * entMults.t3;
+        // ===== PHASE 3.28 — Fix TP2/TP3 < TP1 bug (added 2026-06-22, task #228) =====
+        // Previously TP1 had a Math.max(...,tp1Floor) clamp but TP2/TP3 used raw
+        // ATR multipliers. On low-ATR XAU entries (ATR=1.38), TP1 hit the $5 floor
+        // while TP2 (raw 1.38×2.5 = $3.44) and TP3 (1.38×4 = $5.52) ended up
+        // BELOW or barely above TP1 — broken ordering.
+        //
+        // Fix: compute TP1's actual distance after the floor, then ensure TP2/TP3
+        // are at least TP1's distance scaled by their respective multipliers.
+        // This preserves the intended 1.5:2.5:4 ratio between TP1/TP2/TP3 even
+        // when the floor kicks in.
+        const tp1Dist = Math.max(trv2Atr * entMults.t1, tp1Floor);
+        const tp2Dist = Math.max(trv2Atr * entMults.t2, tp1Dist * (entMults.t2 / entMults.t1));
+        const tp3Dist = Math.max(trv2Atr * entMults.t3, tp1Dist * (entMults.t3 / entMults.t1));
+        const tp1 = dir === 'long' ? price + tp1Dist : price - tp1Dist;
+        const tp2 = dir === 'long' ? price + tp2Dist : price - tp2Dist;
+        const tp3 = dir === 'long' ? price + tp3Dist : price - tp3Dist;
 
-        s.trv2Trade = { dir: dir, ep: price, ts: now3, sl: sl, tp1: tp1, tp2: tp2, tp3: tp3, tp1Hit: false, tp2Hit: false, tp3Hit: false, bestPrice: price, atr: trv2Atr, trailSl: 0, isCfd: true };
+        // ===== PHASE 3.29 — s.trv2Trade now set AFTER enrichSig passes (added 2026-06-22, task #229) =====
+        // Previously: s.trv2Trade was populated here, BEFORE enrichSig could block the signal.
+        // When blocked, the trade object stayed in memory and the TP1/TP2/TP3 hit checker
+        // (line ~7510) fired sendPush() notifications for entries that were supposedly
+        // blocked. User received "🎯 XAU TP1 HIT" notifications for a blocked CALL.
+        // The trv2Trade setup is now deferred to the enrichPassed branch below.
         s.trv2Dir = dir;
         s.trv2DirTs = now3;
         s.trv2LastSignalTs = now3;
@@ -7948,6 +8003,9 @@ function processPrice(sym, price, hi, lo) {
         }
 
         // enrichSig passed — fire normally
+        // Phase 3.29: trv2Trade is set HERE (was previously up at line ~7905 before
+        // enrichSig). This ensures the TP1/TP2/TP3 hit tracker only watches real entries.
+        s.trv2Trade = { dir: dir, ep: price, ts: now3, sl: sl, tp1: tp1, tp2: tp2, tp3: tp3, tp1Hit: false, tp2Hit: false, tp3Hit: false, bestPrice: price, atr: trv2Atr, trailSl: 0, isCfd: true };
         log(sym, '🚀 TRv2 ENTRY ' + dir.toUpperCase() + (withMacro ? ' +MACRO' : '') + ' — $' + price.toFixed(2) + ' > EMA $' + tEma.toFixed(2) + ' (+' + spreadPct.toFixed(3) + '%) · ATR $' + trv2Atr.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('🚀 ' + sym + ' ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2), 'signal');
         s.trade = { active: true, type: sigType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, ts: Date.now(), pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: sl, tp1Price: tp1, tp2Price: tp2, tp3Price: tp3, atr: trv2Atr, bestPrice: price, trailSl: 0 };
@@ -10213,63 +10271,28 @@ app.get('/signals/csv/:date', (req, res) => {
   }
 });
 
-// Manual CSV backup trigger — POST yesterday's (or any date's) CSV to BACKUP_WEBHOOK_URL on demand
-// Lightly protected: requires the ADMIN_TOKEN env var to be supplied via ?token= query param.
-// If ADMIN_TOKEN is unset the endpoint is disabled.
-app.post('/admin/backup/:date', async (req, res) => {
-  const adminToken = process.env.ADMIN_TOKEN;
-  if (!adminToken) return res.status(503).json({ error: 'ADMIN_TOKEN not configured — endpoint disabled' });
-  if (req.query.token !== adminToken) return res.status(401).json({ error: 'Invalid or missing token' });
-  const dateStr = req.params.date;
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return res.status(400).json({ error: 'Use YYYY-MM-DD format' });
-  const result = await backupCsvForDate(dateStr);
-  if (result.ok) res.json({ ok: true, ...result });
-  else res.status(500).json({ ok: false, ...result });
-});
-
-// Signal history — specific date (JSON)
-app.get('/signals/:date', (req, res) => {
-  const dateStr = req.params.date;
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return res.status(400).json({ error: 'Use YYYY-MM-DD format' });
-  const dateSigs = signalHistory.filter(h => h.date === dateStr);
-  if (dateSigs.length === 0) return res.status(404).json({ error: 'No signals for ' + dateStr, hint: 'History covers last 7 days only' });
-  const bySymbol = {};
-  SYMBOLS.forEach(sym => {
-    const symSigs = dateSigs.filter(h => h.symbol === sym);
-    if (symSigs.length > 0) bySymbol[sym] = symSigs.length;
-  });
-  res.json({ date: dateStr, total: dateSigs.length, bySymbol: bySymbol, signals: dateSigs });
-});
-
 // Signal history — full JSON API (7-day persistent store) — must be LAST (catch-all for /signals)
-// GET /signals?symbol=BTC&date=2026-05-03&days=3&type=call
 app.get('/signals', (req, res) => {
   let filtered = signalHistory;
-  // Filter by symbol
   if (req.query.symbol) {
     const sym = req.query.symbol.toUpperCase();
     filtered = filtered.filter(h => h.symbol === sym);
   }
-  // Filter by date (exact)
   if (req.query.date) {
     filtered = filtered.filter(h => h.date === req.query.date);
   }
-   // Filter by last N days
   if (req.query.days) {
     const daysMs = parseInt(req.query.days) * 24 * 60 * 60 * 1000;
     const cutoff = Date.now() - daysMs;
     filtered = filtered.filter(h => h.ts > cutoff);
   }
-  // Filter by signal type (call/put)
   if (req.query.type) {
     filtered = filtered.filter(h => h.type === req.query.type.toLowerCase());
   }
-  // Filter by score (e.g. RIDE, MFLIP, TREND, 6/6, ⬇HI, etc.)
   if (req.query.score) {
     const scoreQ = req.query.score.toUpperCase();
     filtered = filtered.filter(h => h.score && h.score.toUpperCase().includes(scoreQ));
   }
-  // Summary stats
   const dates = [...new Set(filtered.map(h => h.date))].sort();
   const symbols = [...new Set(filtered.map(h => h.symbol))].sort();
   const bySymbol = {};
@@ -10284,7 +10307,7 @@ app.get('/signals', (req, res) => {
   });
 });
 
-// ===== SERVER LISTEN (restored 2026-06-19, tasks #220, #221) =====
+// ===== SERVER LISTEN =====
 app.listen(PORT, () => {
   console.log('[STARTUP] Server listening on port ' + PORT);
 });
