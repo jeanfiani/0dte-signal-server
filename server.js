@@ -4061,6 +4061,31 @@ function processPrice(sym, price, hi, lo) {
           return false;
         }
       }
+
+      // ===== PHASE 3.39 / OBREJ HTF GATE (added 2026-06-23, task #240) =====
+      // OBREJ is currently in isFadeP2 regex — exempt from Phase 2.2 HTF Bias Agreement.
+      // That exemption made sense for true fades (LHF/LLF — small local-extreme fades),
+      // but OBREJ fades INSTITUTIONAL order blocks which are themselves directional
+      // structures. Per SMC research (tradelikemaster.com, fxnx.com, dailypriceaction.com):
+      //   • OBs WITH HTF confluence: 65-75% win rate (tradeable edge)
+      //   • OBs WITHOUT HTF confluence: ~50% — coin flip
+      //   • OBs AGAINST HTF: <40% — explicit "common mistake to avoid"
+      //
+      // 6/22 evidence: 2 of 2 resolved XAU OBREJ CALLs fired into clear bearish HTF
+      // (XAU was dropping from $4,212 → $4,116). Both SL'd.
+      //
+      // Rule: block OBREJ only when fighting BOTH 1h AND 4h (worst case). If either
+      // HTF is neutral/missing or aligned, OBREJ still fires. Same pattern as Phase 3.18.
+      if (/OBREJ/.test(tagP2) && s.htf1h_dir && s.htf4h_dir) {
+        const isCallOb = sig.type === 'call';
+        const fightsH1_OB = (isCallOb && s.htf1h_dir === 'down') || (!isCallOb && s.htf1h_dir === 'up');
+        const fightsH4_OB = (isCallOb && s.htf4h_dir === 'down') || (!isCallOb && s.htf4h_dir === 'up');
+        if (fightsH1_OB && fightsH4_OB) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🧱 ' + tagP2 + ' ' + sig.type.toUpperCase() + ' BLOCKED — OBREJ fights both HTFs (1h=' + s.htf1h_dir + ', 4h=' + s.htf4h_dir + '). Counter-HTF OB rejection has ~50% win rate per SMC research; against both HTFs it drops to <40%.');
+          return false;
+        }
+      }
     }
     // ===== END PHASE 2 PRE-GATE =====
 
@@ -10352,7 +10377,6 @@ app.get('/signals/csv/:date', (req, res) => {
       const p30 = fmtPx(snaps.p30m), d30 = fmtDelta(snaps.p30m);
       enrichedRows.push(line + ',' + tp1 + ',' + tp2 + ',' + tp3 + ',' + sl + ',' + final + ',' + p5 + ',' + d5 + ',' + p15 + ',' + d15 + ',' + p30 + ',' + d30);
     }
-    res.header('Content-Type', 'text/csv');
     res.send(enrichedHeader + '\n' + enrichedRows.join('\n') + (enrichedRows.length ? '\n' : ''));
   } catch (e) {
     console.error('[' + ts() + '] CSV export error for ' + dateStr + ': ' + e.message);
