@@ -9348,6 +9348,11 @@ function connectFinnhub() {
             const sym = t.s; if (!SYMBOLS.includes(sym)) return;
             S[sym].lastPrice = t.p;
             S[sym].tickBuf.push({ p: t.p });
+            // ===== PHASE 3.43 — PER-SYMBOL LAST-TRADE TIMESTAMP (added 2026-06-24, task #245) =====
+            // Track when each symbol last received a tick from Finnhub, so we can detect
+            // "symbol subscribed but Finnhub not sending data" cases (e.g. QQQ stuck at $0
+            // while SPY updates). Surfaces in /status and /wsdebug.
+            S[sym].lastTradeTs = Date.now();
             // ===== PHASE 3.41 — VOLUME CAPTURE (added 2026-06-24, task #243) =====
             // Finnhub trade ticks include 'v' (volume). Accumulate into 1-min buckets,
             // keep rolling window of last 20 buckets. Used by convictionFor() to add
@@ -9366,8 +9371,23 @@ function connectFinnhub() {
               s.volCurBucket += v;
             }
           });
+        } else if (msg.type === 'error') {
+          // ===== PHASE 3.43 — SURFACE FINNHUB ERRORS (added 2026-06-24, task #245) =====
+          // Previously: any non-trade message was silently swallowed by the empty catch.
+          // Result: when Finnhub rejected a subscribe (e.g. "Symbol not supported on your
+          // plan" or "Subscription expired"), the bot stayed silently broken with no logs.
+          // Now: errors are explicitly logged AND tracked in wsEvents for /wsdebug.
+          const errMsg = msg.msg || JSON.stringify(msg);
+          console.error('[' + ts() + '] Finnhub ERROR: ' + errMsg);
+          wsLog('FINNHUB_ERROR: ' + errMsg);
+        } else if (msg.type && msg.type !== 'ping') {
+          // Log any other unexpected message types (sub responses, etc.) for visibility
+          wsLog('MSG type=' + msg.type + ' ' + JSON.stringify(msg).substring(0, 120));
         }
-      } catch (e) {}
+      } catch (e) {
+        // PHASE 3.43 — log parse errors too instead of silently swallowing
+        wsLog('PARSE_ERR: ' + (e.message || 'unknown') + ' raw=' + String(data).substring(0, 80));
+      }
     });
 
     ws.on('unexpected-response', (req, res) => {
@@ -10394,6 +10414,10 @@ app.get('/status', (req, res) => {
     const s = S[sym];
     status[sym] = {
       price: s.lastPrice,
+      // PHASE 3.43 — surface per-symbol last-tick age. If WS is OPEN but lastTickAgeSec
+      // keeps climbing for one symbol while others tick normally, we have a symbol-level
+      // subscribe issue (not a global connection issue).
+      lastTickAgeSec: s.lastTradeTs ? Math.round((Date.now() - s.lastTradeTs) / 1000) : null,
       signals: s.dailySignalCount,
       chopActive: s.chopActive,
       trade: s.trade.active ? { type: s.trade.type, ep: s.trade.ep, t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl } : null,
@@ -10408,6 +10432,63 @@ app.get('/status', (req, res) => {
   const sinceLastPong = wsLastPong > 0 ? ((Date.now() - wsLastPong) / 1000).toFixed(0) + 's' : 'never';
   const wsInfo = { state: wsState, reconnects: wsReconnects, backoff: wsBackoff, uptime: wsUptime(), lastPong: sinceLastPong, sessionAge: wsOpenedAt > 0 ? ((Date.now() - wsOpenedAt) / 1000).toFixed(0) + 's' : 'disconnected', lastClose: { code: wsLastCloseCode, reason: wsLastCloseReason, sessionSec: wsLastSessionDuration } };
   res.json({ running: ws && ws.readyState === 1, vix: vixV, subscribers: subscriptions.length, ws: wsInfo, symbols: status });
+});
+
+// ===== PHASE 3.43 — WS DEBUG + ADMIN RE-SUBSCRIBE (added 2026-06-24, task #245) =====
+// Triggered by QQQ stuck at $0 while SPY tickle normally. Two endpoints:
+//   GET  /wsdebug      — dump wsEvents log (last 50 OPEN/CLOSE/ERROR/MSG entries)
+//   POST /admin/resub  — force unsubscribe + resubscribe both Finnhub symbols
+// /admin/resub requires ADMIN_KEY env var to match ?key= query param (light protection;
+// rotate via Railway dashboard if leaked). On hit, sends {type:'unsubscribe',symbol:X}
+// then a {type:'subscribe',symbol:X} for QQQ and SPY in sequence.
+app.get('/wsdebug', (req, res) => {
+  res.json({
+    wsState: ws ? ['CONNECTING','OPEN','CLOSING','CLOSED'][ws.readyState] : 'NULL',
+    reconnects: wsReconnects,
+    backoff: wsBackoff,
+    uptime: wsUptime(),
+    lastPongSec: wsLastPong > 0 ? Math.round((Date.now() - wsLastPong) / 1000) : null,
+    sessionAgeSec: wsOpenedAt > 0 ? Math.round((Date.now() - wsOpenedAt) / 1000) : null,
+    lastTickAgeSec: SYMBOLS.reduce((o, sym) => {
+      o[sym] = S[sym].lastTradeTs ? Math.round((Date.now() - S[sym].lastTradeTs) / 1000) : null;
+      return o;
+    }, {}),
+    events: wsEvents.slice(-50)
+  });
+});
+
+app.get('/admin/resub', (req, res) => {
+  // Light auth — require ?key=<ADMIN_KEY> matching env var
+  const adminKey = process.env.ADMIN_KEY || '';
+  if (adminKey && req.query.key !== adminKey) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  if (!ws || ws.readyState !== 1) {
+    return res.status(503).json({ error: 'ws not open', state: ws ? ws.readyState : 'null' });
+  }
+  const targets = [SYMBOLS[0], SYMBOLS[1]]; // QQQ, SPY
+  const result = { sent: [] };
+  try {
+    targets.forEach(sym => {
+      ws.send(JSON.stringify({ type: 'unsubscribe', symbol: sym }));
+      result.sent.push('unsub ' + sym);
+    });
+    setTimeout(() => {
+      try {
+        targets.forEach(sym => {
+          ws.send(JSON.stringify({ type: 'subscribe', symbol: sym }));
+        });
+        console.log('[' + ts() + '] /admin/resub — resubscribed: ' + targets.join(', '));
+        wsLog('ADMIN_RESUB ' + targets.join(','));
+      } catch (e) {
+        console.error('[' + ts() + '] resub re-subscribe error: ' + e.message);
+      }
+    }, 500);
+    result.scheduledResubMs = 500;
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Signal history — today shortcut (JSON) — must be before /:date to avoid matching "today" as date param
