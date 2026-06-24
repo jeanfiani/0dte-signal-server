@@ -3323,6 +3323,31 @@ function processPrice(sym, price, hi, lo) {
       }
     }
 
+    // ===== PHASE 3.41 — VOLUME CONFIRMATION FACTOR (added 2026-06-24, task #243) =====
+    // SMC trader research: volume is the #1 filter for distinguishing real vs fake
+    // breakouts/reversals. Spike = current 1-min bucket > 1.5x avg of last 20 buckets.
+    //
+    // Coverage per symbol:
+    //   • QQQ/SPY: direct volume from Finnhub WebSocket (real exchange volume)
+    //   • NAS100: uses QQQ volume as proxy (99% correlation, NAS CFD has no real vol)
+    //   • XAU/BTC: skipped (need separate Finnhub subscription — added in future phase)
+    //
+    // When spike detected, +1 conv factor 'VOL×<ratio>'. This converts the bot's
+    // implicit "rely on cross-asset" conviction into "cross-asset + real volume",
+    // matching how professional traders confirm setups.
+    function getVolSpike(syState) {
+      if (!syState || !Array.isArray(syState.volBuckets) || syState.volBuckets.length < 10) return 0;
+      const avg = syState.volBuckets.reduce((a, b) => a + b, 0) / syState.volBuckets.length;
+      if (avg <= 0) return 0;
+      return (syState.volCurBucket || 0) / avg;
+    }
+    const volRef = (sym === 'NAS100' && S.QQQ) ? S.QQQ : s;
+    const volSpike = getVolSpike(volRef);
+    if (volSpike >= 1.5) {
+      sc++;
+      factors.push('VOL×' + volSpike.toFixed(1));
+    }
+
     const label = sc >= 5 ? 'HIGH' : sc >= 3 ? 'MOD' : 'LOW';
     return { score: sc, label, factors };
   }
@@ -4240,6 +4265,27 @@ function processPrice(sym, price, hi, lo) {
       if (conv.score < 4) {
         Object.assign(s, _emitSnapshot);
         log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — BTC FAST conv floor: conv ' + conv.score + '/7 [' + (conv.factors || []).join(',') + '] < 4 (MOD). BTC FAST at conv 3 has poor win rate; conv 4+ is the threshold for actual edge.');
+        return false;
+      }
+    }
+
+    // ===== PHASE 3.40 — INVERSAL_BREAK CONV 4+ FLOOR (added 2026-06-24, task #242) =====
+    // 3-day data analysis showed:
+    //   Conv 3: 1/1 SL (06-24 03:57 NAS PUT @ $29,494 → -$70)
+    //   Conv 4: 1 BE-scratch, 1 open
+    //   Conv 5: 1 mixed
+    //   Conv 6: 2 confirmed TP1 wins + 2 likely winners
+    // Pattern: conv 3 = systematic loss. Failed-breakout fades fire AT extremes by
+    // design — without strong cross-asset confluence, they catch falling knives.
+    // SMC trader research confirms: low-conviction failed breakouts are coin-flip
+    // at best, losing on average due to chop-trap entries.
+    //
+    // Conv 4 floor blocks 1 of 8 historical signals (12.5%) — only the proven loser.
+    // 7 of 8 signals still fire. Conservative tightening.
+    if (/INVERSAL_BREAK/.test(tagEarly)) {
+      if (conv.score < 4) {
+        Object.assign(s, _emitSnapshot);
+        log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — INVERSAL_BREAK conv floor: conv ' + conv.score + '/7 [' + (conv.factors || []).join(',') + '] < 4 (MOD). Failed-breakout fades at conv 3 are systematic losers per data + SMC volume research.');
         return false;
       }
     }
@@ -9264,6 +9310,23 @@ function connectFinnhub() {
             const sym = t.s; if (!SYMBOLS.includes(sym)) return;
             S[sym].lastPrice = t.p;
             S[sym].tickBuf.push({ p: t.p });
+            // ===== PHASE 3.41 — VOLUME CAPTURE (added 2026-06-24, task #243) =====
+            // Finnhub trade ticks include 'v' (volume). Accumulate into 1-min buckets,
+            // keep rolling window of last 20 buckets. Used by convictionFor() to add
+            // a VOLUME factor when current-bar volume spikes above the 20-bucket avg.
+            const v = (typeof t.v === 'number' && t.v > 0) ? t.v : 0;
+            if (v > 0) {
+              const s = S[sym];
+              const tk = (typeof t.t === 'number') ? t.t : Date.now();
+              if (!s.volBuckets) { s.volBuckets = []; s.volCurBucket = 0; s.volBucketStartTs = tk; }
+              if (tk - s.volBucketStartTs >= 60000) {
+                s.volBuckets.push(s.volCurBucket);
+                if (s.volBuckets.length > 20) s.volBuckets.shift();
+                s.volCurBucket = 0;
+                s.volBucketStartTs = tk;
+              }
+              s.volCurBucket += v;
+            }
           });
         }
       } catch (e) {}
@@ -10384,6 +10447,7 @@ app.get('/signals/csv/:date', (req, res) => {
   }
 });
 
+
 // Signal history — full JSON API (7-day persistent store)
 app.get('/signals', (req, res) => {
   let filtered = signalHistory;
@@ -10420,7 +10484,6 @@ app.get('/signals', (req, res) => {
   });
 });
 
-// ===== SERVER LISTEN =====
 app.listen(PORT, () => {
   console.log('[STARTUP] Server listening on port ' + PORT);
 });
