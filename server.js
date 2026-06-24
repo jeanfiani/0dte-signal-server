@@ -8003,16 +8003,54 @@ function processPrice(sym, price, hi, lo) {
         // Guard 3: Fresh-extreme guard (15 min) — don't fire TRv2 at a freshly-set local
         // extreme. SHORT at a fresh local low or LONG at a fresh local high is the
         // "selling-the-bottom / buying-the-top" anti-pattern.
+        //
+        // ===== PHASE 3.42 — REGIME-AWARE EXEMPTION (added 2026-06-24, task #244) =====
+        // In a confirmed multi-day directional regime, fresh-extreme same-direction
+        // entries are TREND CONTINUATION, not knife-catching. 6/24 evidence:
+        //   • XAU down $180 over 2 days (clear bear) — 11+ SHORT entries blocked in 19s
+        //     because XAU was making new lows continuously. Bot wanted to ride trend.
+        //   • NAS bouncing — LONG entries blocked at fresh highs despite bull recovery.
+        // Same regime-aware pattern as Phase 3.16 / 3.18 / 3.39.
         const FRESH_EXTREME_COOL_MS = 15 * 60 * 1000;
+        const _trendContinuation = (function (direction) {
+          let regimeChgPct = null;
+          if (s.dailyLevels && s.dailyLevels.length >= 5) {
+            const oldest = s.dailyLevels[0];
+            if (oldest && oldest.high > 0 && oldest.low > 0) {
+              const mid = (oldest.high + oldest.low) / 2;
+              regimeChgPct = ((price - mid) / mid) * 100;
+            }
+          }
+          if (regimeChgPct === null && s.macroSnaps && s.macroSnaps.length > 0) {
+            const oldestS = s.macroSnaps[0];
+            const ageH = (Date.now() - oldestS.ts) / 3600000;
+            if (ageH >= 24 && oldestS.p > 0) {
+              regimeChgPct = ((price - oldestS.p) / oldestS.p) * 100;
+            }
+          }
+          if (regimeChgPct === null) return false;
+          const weak = isXAU ? 1.0 : isBTC ? 2.5 : isNAS ? 1.5 : 0.5;
+          if (direction === 'short' && regimeChgPct <= -weak) return { regimeChgPct: regimeChgPct, dir: 'bear' };
+          if (direction === 'long' && regimeChgPct >= weak) return { regimeChgPct: regimeChgPct, dir: 'bull' };
+          return false;
+        })(dir);
         if (dir === 'short' && s.rollingLowUpdateTs && (now3 - s.rollingLowUpdateTs) < FRESH_EXTREME_COOL_MS) {
           const minsAgo = Math.round((now3 - s.rollingLowUpdateTs) / 60000);
-          log(sym, '🏔️ TRv2 SHORT BLOCKED — fresh local low set ' + minsAgo + 'min ago at $' + s.rollingLow.toFixed(2) + ' (selling-the-bottom pattern). 15min cooldown.');
-          return;
+          if (_trendContinuation) {
+            log(sym, '↪️ TRv2 SHORT — fresh local low ' + minsAgo + 'min ago BUT bear regime continuation (' + _trendContinuation.regimeChgPct.toFixed(2) + '%). Allowed (Phase 3.42).');
+          } else {
+            log(sym, '🏔️ TRv2 SHORT BLOCKED — fresh local low set ' + minsAgo + 'min ago at $' + s.rollingLow.toFixed(2) + ' (selling-the-bottom pattern). 15min cooldown.');
+            return;
+          }
         }
         if (dir === 'long' && s.rollingHighUpdateTs && (now3 - s.rollingHighUpdateTs) < FRESH_EXTREME_COOL_MS) {
           const minsAgo = Math.round((now3 - s.rollingHighUpdateTs) / 60000);
-          log(sym, '🏔️ TRv2 LONG BLOCKED — fresh local high set ' + minsAgo + 'min ago at $' + s.rollingHigh.toFixed(2) + ' (buying-the-top pattern). 15min cooldown.');
-          return;
+          if (_trendContinuation) {
+            log(sym, '↪️ TRv2 LONG — fresh local high ' + minsAgo + 'min ago BUT bull regime continuation (' + _trendContinuation.regimeChgPct.toFixed(2) + '%). Allowed (Phase 3.42).');
+          } else {
+            log(sym, '🏔️ TRv2 LONG BLOCKED — fresh local high set ' + minsAgo + 'min ago at $' + s.rollingHigh.toFixed(2) + ' (buying-the-top pattern). 15min cooldown.');
+            return;
+          }
         }
         // ===== PHASE 3.30 — SAME-DIRECTION SL LOCKOUT (added 2026-06-22, task #230) =====
         // After a TRv2 SL on this symbol+direction, block new same-direction TRv2 entries
@@ -10430,7 +10468,6 @@ app.get('/signals/csv/:date', (req, res) => {
       else               final = 'Open';
       // Post-signal price snapshots. Delta is positive = profitable (price moved in signal direction).
       // For CALL: delta = priceN - entryPrice. For PUT: delta = entryPrice - priceN.
-      const snaps = entry && entry.priceSnaps ? entry.priceSnaps : {};
       const entryPx = parseFloat(price);
       const sign = (type === 'call') ? 1 : -1;
       const fmtPx = (v) => (v == null ? '' : v.toFixed(2));
@@ -10440,13 +10477,13 @@ app.get('/signals/csv/:date', (req, res) => {
       const p30 = fmtPx(snaps.p30m), d30 = fmtDelta(snaps.p30m);
       enrichedRows.push(line + ',' + tp1 + ',' + tp2 + ',' + tp3 + ',' + sl + ',' + final + ',' + p5 + ',' + d5 + ',' + p15 + ',' + d15 + ',' + p30 + ',' + d30);
     }
+    res.header('Content-Type', 'text/csv');
     res.send(enrichedHeader + '\n' + enrichedRows.join('\n') + (enrichedRows.length ? '\n' : ''));
   } catch (e) {
     console.error('[' + ts() + '] CSV export error for ' + dateStr + ': ' + e.message);
     res.status(500).json({ error: 'Failed to read/enrich CSV: ' + e.message });
   }
 });
-
 
 // Signal history — full JSON API (7-day persistent store)
 app.get('/signals', (req, res) => {
