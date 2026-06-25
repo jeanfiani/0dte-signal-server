@@ -3415,9 +3415,43 @@ function processPrice(sym, price, hi, lo) {
     // the cap. Exit signals are never blocked. dailySignalCount is usually incremented
     // pre-gate, so `>` (not `>=`) and the _emitSnapshot rollback keeps the count latched.
     if (isMT5 && !String(sig.type).startsWith('exit') && s.dailySignalCount > MAX_SIG_MT5) {
-      Object.assign(s, _emitSnapshot);
-      log(sym, '🚫 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' BLOCKED — MT5 daily signal cap (' + MAX_SIG_MT5 + ') reached. Set env MAX_SIG_MT5 to change.');
-      return false;
+      // ===== PHASE 3.46 — STRONG-REGIME CAP BYPASS (added 2026-06-25, task #247) =====
+      // On 06-24 XAU hit cap at 36 then blocked 4+ clean PUT winners during a $64 bear day.
+      // If regime is STRONG + sig direction aligns + trend-aligned tag, bypass cap up to 2x.
+      let _capBypass = false;
+      try {
+        if (s.dailySignalCount <= MAX_SIG_MT5 * 2) {
+          let chgPctCap = null;
+          if (s.dailyLevels && s.dailyLevels.length >= 5) {
+            const oldestCap = s.dailyLevels[0];
+            if (oldestCap && oldestCap.high > 0 && oldestCap.low > 0) {
+              const midCap = (oldestCap.high + oldestCap.low) / 2;
+              chgPctCap = ((price - midCap) / midCap) * 100;
+            }
+          }
+          if (chgPctCap === null && s.macroSnaps && s.macroSnaps.length > 0) {
+            const oldCapSnap = s.macroSnaps[0];
+            const ageHCap = (Date.now() - oldCapSnap.ts) / 3600000;
+            if (ageHCap >= 24 && oldCapSnap.p > 0) chgPctCap = ((price - oldCapSnap.p) / oldCapSnap.p) * 100;
+          }
+          if (chgPctCap !== null) {
+            const strongCap = isXAU ? 2.0 : isBTC ? 5.0 : isNAS ? 3.0 : 1.0;
+            const sigDirCap = sig.type === 'call' ? 1 : sig.type === 'put' ? -1 : 0;
+            const regimeDirCap = chgPctCap >= strongCap ? 1 : chgPctCap <= -strongCap ? -1 : 0;
+            const tagCap = sig.score || '';
+            const trendAlignedTag = /RIDE|MACRO|STRUCT/.test(tagCap);
+            if (regimeDirCap !== 0 && sigDirCap === regimeDirCap && trendAlignedTag) {
+              _capBypass = true;
+              log(sym, '↪️ ' + tagCap + ' ' + sig.type.toUpperCase() + ' — MT5 cap (' + MAX_SIG_MT5 + ') reached BUT strong ' + (regimeDirCap > 0 ? 'bull' : 'bear') + ' regime (' + chgPctCap.toFixed(2) + '%) + aligned trend tag. Allowed (Phase 3.46). #' + s.dailySignalCount);
+            }
+          }
+        }
+      } catch (e) {}
+      if (!_capBypass) {
+        Object.assign(s, _emitSnapshot);
+        log(sym, '🚫 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' BLOCKED — MT5 daily signal cap (' + MAX_SIG_MT5 + ') reached. Set env MAX_SIG_MT5 to change.');
+        return false;
+      }
     }
 
     // ===== MULTI-DAY REGIME GATE — ALL INSTRUMENTS (extended 2026-05-20) =====
@@ -7982,7 +8016,40 @@ function processPrice(sym, price, hi, lo) {
         const trv2EntryType = dir === 'long' ? 'call' : 'put';
         const trv2Conv = convictionFor(trv2EntryType);
         const TRv2_MIN_CONV = 5;
-        if (trv2Conv.score < TRv2_MIN_CONV) {
+        // ===== PHASE 3.47 — REGIME+VOL CONV EXEMPTION (added 2026-06-25, task #247) =====
+        // On 06-24 morning, 5+ NAS TRv2 SHORTs blocked at conv 2/5 during confirmed bear
+        // continuation (XAU -180, NAS -200). Lower conv floor to 3 when regime+VOL agree.
+        let _trv2ConvFloor = TRv2_MIN_CONV;
+        let _trv2Exempt = null;
+        try {
+          const tcvf = (trv2Conv.factors || []).find(f => /^VOL×/.test(f));
+          const tcvs = tcvf ? parseFloat(tcvf.split('×')[1]) : 0;
+          let trChg = null;
+          if (s.dailyLevels && s.dailyLevels.length >= 5) {
+            const oTR = s.dailyLevels[0];
+            if (oTR && oTR.high > 0 && oTR.low > 0) {
+              trChg = ((price - (oTR.high + oTR.low) / 2) / ((oTR.high + oTR.low) / 2)) * 100;
+            }
+          }
+          if (trChg === null && s.macroSnaps && s.macroSnaps.length > 0) {
+            const oSnTR = s.macroSnaps[0];
+            const ahTR = (Date.now() - oSnTR.ts) / 3600000;
+            if (ahTR >= 24 && oSnTR.p > 0) trChg = ((price - oSnTR.p) / oSnTR.p) * 100;
+          }
+          const wkTR = isXAU ? 1.0 : isBTC ? 2.5 : isNAS ? 1.5 : 0.5;
+          const trAligned = trChg !== null && ((dir === 'short' && trChg <= -wkTR) || (dir === 'long' && trChg >= wkTR));
+          if (tcvs >= 4.0) {
+            _trv2ConvFloor = 4;
+            _trv2Exempt = 'VOL×' + tcvs.toFixed(1) + ' >=4.0 strong-volume override';
+          } else if (trAligned && tcvs >= 2.5) {
+            _trv2ConvFloor = 3;
+            _trv2Exempt = 'regime ' + trChg.toFixed(2) + '% + VOL×' + tcvs.toFixed(1);
+          }
+        } catch (e) {}
+        if (_trv2Exempt && trv2Conv.score >= _trv2ConvFloor && trv2Conv.score < TRv2_MIN_CONV) {
+          log(sym, '↪️ TRv2 ' + dir.toUpperCase() + ' — conv ' + trv2Conv.score + '/' + TRv2_MIN_CONV + ' BELOW normal floor but ' + _trv2Exempt + ' bypasses. Allowed (Phase 3.47).');
+        }
+        if (trv2Conv.score < _trv2ConvFloor) {
           log(sym, '🎯 TRv2 ' + dir.toUpperCase() + ' BLOCKED — conv ' + trv2Conv.score + '/' + TRv2_MIN_CONV + ' (factors: ' + (trv2Conv.factors.join(',') || 'none') + '). TRv2 needs HIGH conv tier (5+/7).');
           return;
         }
@@ -8028,7 +8095,15 @@ function processPrice(sym, price, hi, lo) {
               regimeChgPct = ((price - oldestS.p) / oldestS.p) * 100;
             }
           }
-          if (regimeChgPct === null) return false;
+        // ===== PHASE 3.45 — VOL>=3.0 BYPASS (added 2026-06-25, task #247) =====
+        // Heavy-volume break of local extreme usually starts extension, not top/bottom.
+        // 06-25 09:30 NAS PUT VOL×9.1 caught a 757-pt drop. VOL>=3.0 bypasses fresh-extreme.
+        const _teVolFactor = ((trv2Conv && trv2Conv.factors) || []).find(f => /^VOL×/.test(f));
+        const _teVolSpike = _teVolFactor ? parseFloat(_teVolFactor.split('×')[1]) : 0;
+        if (_teVolSpike >= 3.0) {
+          return { regimeChgPct: regimeChgPct === null ? 0 : regimeChgPct, dir: direction === 'short' ? 'bear' : 'bull', volBypass: _teVolSpike };
+        }
+                  if (regimeChgPct === null) return false;
           const weak = isXAU ? 1.0 : isBTC ? 2.5 : isNAS ? 1.5 : 0.5;
           if (direction === 'short' && regimeChgPct <= -weak) return { regimeChgPct: regimeChgPct, dir: 'bear' };
           if (direction === 'long' && regimeChgPct >= weak) return { regimeChgPct: regimeChgPct, dir: 'bull' };
@@ -8037,7 +8112,7 @@ function processPrice(sym, price, hi, lo) {
         if (dir === 'short' && s.rollingLowUpdateTs && (now3 - s.rollingLowUpdateTs) < FRESH_EXTREME_COOL_MS) {
           const minsAgo = Math.round((now3 - s.rollingLowUpdateTs) / 60000);
           if (_trendContinuation) {
-            log(sym, '↪️ TRv2 SHORT — fresh local low ' + minsAgo + 'min ago BUT bear regime continuation (' + _trendContinuation.regimeChgPct.toFixed(2) + '%). Allowed (Phase 3.42).');
+            log(sym, '↪️ TRv2 SHORT — fresh local low ' + minsAgo + 'min ago BUT ' + (_trendContinuation.volBypass ? ('VOL×' + _trendContinuation.volBypass.toFixed(1) + ' bypass (Phase 3.45)') : ('bear regime continuation (' + _trendContinuation.regimeChgPct.toFixed(2) + '%) (Phase 3.42)')) + '. Allowed.');
           } else {
             log(sym, '🏔️ TRv2 SHORT BLOCKED — fresh local low set ' + minsAgo + 'min ago at $' + s.rollingLow.toFixed(2) + ' (selling-the-bottom pattern). 15min cooldown.');
             return;
@@ -8046,7 +8121,7 @@ function processPrice(sym, price, hi, lo) {
         if (dir === 'long' && s.rollingHighUpdateTs && (now3 - s.rollingHighUpdateTs) < FRESH_EXTREME_COOL_MS) {
           const minsAgo = Math.round((now3 - s.rollingHighUpdateTs) / 60000);
           if (_trendContinuation) {
-            log(sym, '↪️ TRv2 LONG — fresh local high ' + minsAgo + 'min ago BUT bull regime continuation (' + _trendContinuation.regimeChgPct.toFixed(2) + '%). Allowed (Phase 3.42).');
+            log(sym, '↪️ TRv2 LONG — fresh local high ' + minsAgo + 'min ago BUT ' + (_trendContinuation.volBypass ? ('VOL×' + _trendContinuation.volBypass.toFixed(1) + ' bypass (Phase 3.45)') : ('bull regime continuation (' + _trendContinuation.regimeChgPct.toFixed(2) + '%) (Phase 3.42)')) + '. Allowed.');
           } else {
             log(sym, '🏔️ TRv2 LONG BLOCKED — fresh local high set ' + minsAgo + 'min ago at $' + s.rollingHigh.toFixed(2) + ' (buying-the-top pattern). 15min cooldown.');
             return;
@@ -9294,21 +9369,35 @@ function connectFinnhub() {
       // Reset backoff on successful connect — keep 5s minimum to respect Finnhub rate limits
       wsBackoff = 5000;
 
-      // Subscribe with stagger — large data burst on QQQ+SPY can overwhelm connection
+      // ===== PHASE 3.44 — DEFENSIVE SUBSCRIBE STAGGER (added 2026-06-24, task #246) =====
+      // Previously: QQQ sub fired 0ms after open (no buffer for Finnhub's router to be
+      // ready), SPY 3s later. Result: QQQ subscribe was apparently being dropped, leaving
+      // QQQ stuck at $0 while SPY ticked normally.
+      // Fix: stagger BOTH subscribes with deliberate delays (1500ms QQQ, 3500ms SPY) so
+      // neither hits Finnhub at handshake-edge time. Also resubscribe both in keepalive
+      // (not just QQQ) to keep both symbols actively asserted.
       try {
-        ws.send(JSON.stringify({ type: 'subscribe', symbol: SYMBOLS[0] }));
-        console.log('[' + ts() + '] Subscribed to: ' + SYMBOLS[0]);
+        setTimeout(() => {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'subscribe', symbol: SYMBOLS[0] }));
+            console.log('[' + ts() + '] Subscribed to: ' + SYMBOLS[0]);
+            wsLog('SUB ' + SYMBOLS[0]);
+          }
+        }, 1500);
         setTimeout(() => {
           if (ws && ws.readyState === WebSocket.OPEN && SYMBOLS.length > 1) {
             ws.send(JSON.stringify({ type: 'subscribe', symbol: SYMBOLS[1] }));
             console.log('[' + ts() + '] Subscribed to: ' + SYMBOLS[1]);
+            wsLog('SUB ' + SYMBOLS[1]);
           }
-        }, 3000);
+        }, 3500);
       } catch (e) {
         console.error('[' + ts() + '] Subscribe error: ' + e.message);
       }
 
       // Start ping/pong heartbeat every 20s + Finnhub-level keepalive
+      // PHASE 3.44 — keepalive now asserts BOTH symbols (not just SYMBOLS[0]). If a stuck
+      // symbol exists, the periodic resend pokes Finnhub to re-establish the stream.
       wsPingInterval = setInterval(() => {
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
         // Check if we got a pong recently (within 45s)
@@ -9321,11 +9410,49 @@ function connectFinnhub() {
         }
         try {
           ws.ping();
-          // Also send Finnhub-level subscribe as application-layer keepalive
-          // This generates real WS data frames that proxies (Railway) recognize as activity
+          // Re-assert subscription for BOTH Finnhub symbols. Generates WS data frames
+          // (proxies treat as activity) AND nudges Finnhub if either stream went silent.
           ws.send(JSON.stringify({ type: 'subscribe', symbol: SYMBOLS[0] }));
+          if (SYMBOLS.length > 1) {
+            ws.send(JSON.stringify({ type: 'subscribe', symbol: SYMBOLS[1] }));
+          }
         } catch (e) {}
       }, 20000);
+
+      // ===== PHASE 3.44 — STUCK-SYMBOL AUTO-RECOVERY (added 2026-06-24, task #246) =====
+      // If a Finnhub symbol shows no ticks for 90s while WS is OPEN and the OTHER symbol
+      // tick normally, automatically fire unsubscribe → resubscribe to wake it up.
+      // Self-healing for the QQQ-stuck-at-$0 scenario without needing /admin/resub.
+      // Runs every 30s, only during market window (avoids unnecessary churn at night).
+      setInterval(() => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        if (!isMarketWindow()) return;
+        const now = Date.now();
+        // Need WS to have been up ≥ 60s before considering a symbol "stuck"
+        if (!wsOpenedAt || (now - wsOpenedAt) < 60000) return;
+        const finnhubSyms = [SYMBOLS[0], SYMBOLS[1]];
+        const ages = finnhubSyms.map(sym => ({
+          sym,
+          age: S[sym].lastTradeTs ? (now - S[sym].lastTradeTs) : Infinity
+        }));
+        // Only act if there's an asymmetry: one symbol ticking <30s ago, other >90s
+        const minAge = Math.min(...ages.map(a => a.age));
+        if (minAge > 30000) return; // both are stale — likely market quiet, don't churn
+        ages.forEach(({ sym, age }) => {
+          if (age > 90000) {
+            console.log('[' + ts() + '] AUTO-RECOVER ' + sym + ' — no ticks for ' + Math.round(age / 1000) + 's, while peer tick <30s. Resubscribing.');
+            wsLog('AUTO_RECOVER ' + sym + ' age=' + Math.round(age / 1000) + 's');
+            try {
+              ws.send(JSON.stringify({ type: 'unsubscribe', symbol: sym }));
+              setTimeout(() => {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({ type: 'subscribe', symbol: sym }));
+                }
+              }, 500);
+            } catch (e) {}
+          }
+        });
+      }, 30000);
     });
 
     ws.on('pong', () => {
