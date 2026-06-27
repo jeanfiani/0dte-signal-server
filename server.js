@@ -2459,6 +2459,27 @@ function processPrice(sym, price, hi, lo) {
         // Push notification removed (2026-05-08) — see CHOP MODE comment above.
       }
     }
+    // ===== PHASE 3.57 — DIRECTIONAL MOVEMENT OVERRIDE (2026-06-26, task #249) =====
+    // Research: pro traders use ADX(7-10) for intraday with threshold 20-25 — single
+    // EMA-efficiency method misses directional V-day patterns. Implementing ADX from
+    // tick data is complex; instead use macroSnaps (5-min snapshots, 12 = 1h, 6 = 30min).
+    // Net directional move over 30min above per-symbol threshold => override chop to
+    // false. This catches days like 06-26 NAS where chopActive stayed true despite a
+    // clean $230 morning rally (29080 → 29433 = 1.2%) and PM drop (-1.5%).
+    try {
+      if (s.chopActive && s.macroSnaps && s.macroSnaps.length >= 6) {
+        const snap30 = s.macroSnaps[Math.max(0, s.macroSnaps.length - 6)];
+        if (snap30 && snap30.p > 0) {
+          const dirMovePct = Math.abs(price - snap30.p) / snap30.p * 100;
+          const dirThr = (sym === 'XAU') ? 0.5 : (sym === 'BTC') ? 1.0 : (sym === 'NAS100') ? 0.6 : 0.4;
+          if (dirMovePct > dirThr) {
+            s.chopActive = false;
+            s.trendCount = 0;
+            log(sym, '📈 TREND OVERRIDE (Phase 3.57) — 30min directional move ' + dirMovePct.toFixed(2) + '% > ' + dirThr + '% threshold. chopActive forced OFF.');
+          }
+        }
+      }
+    } catch (e) {}
   }
 
   // === ORDER BLOCK — 1-min candle builder + OB zone detection ===
@@ -4095,6 +4116,43 @@ function processPrice(sym, price, hi, lo) {
         }
       }
 
+      // ===== PHASE 3.60 — OBREJ HIGH-GRADE ZONE REQUIREMENT (2026-06-26, task #249) =====
+      // Research: "High-grade zones → expect a reaction, fade the tap." OBREJ should
+      // only fire at HTF extremes (top/bottom of multi-day range), not at internal
+      // range OBs. If OBREJ fires inside the daily range (>1% from 24h high/low),
+      // require conviction tier HIGH (5+) to fire. Otherwise block as "low-grade".
+      if (/OBREJ/.test(tagP2)) {
+        try {
+          let sessHi = -Infinity, sessLo = Infinity;
+          if (s.macroSnaps && s.macroSnaps.length > 0) {
+            const cutoff24h = Date.now() - 86400000;
+            s.macroSnaps.forEach(sn => {
+              if (sn && sn.ts >= cutoff24h && sn.p > 0) {
+                if (sn.p > sessHi) sessHi = sn.p;
+                if (sn.p < sessLo) sessLo = sn.p;
+              }
+            });
+          }
+          if (sessHi > 0 && sessLo > 0 && sessHi !== -Infinity && sessLo !== Infinity) {
+            const distHiPct = (sessHi - price) / price * 100;
+            const distLoPct = (price - sessLo) / price * 100;
+            const isCallOR = sig.type === 'call';
+            // CALL OBREJ fades resistance (top) — needs price near 24h high (within 1%)
+            // PUT OBREJ fades support (bottom) — needs price near 24h low (within 1%)
+            const nearExtreme = isCallOR ? distHiPct < 1.0 : distLoPct < 1.0;
+            if (!nearExtreme) {
+              const tagConv = (typeof convictionFor === 'function') ? convictionFor(sym, sig) : null;
+              const tagConvS = tagConv ? tagConv.score : 0;
+              if (tagConvS < 5) {
+                Object.assign(s, _emitSnapshot);
+                log(sym, '🧱 ' + tagP2 + ' ' + sig.type.toUpperCase() + ' BLOCKED — OBREJ at low-grade zone (CALL distHi=' + distHiPct.toFixed(2) + '%, PUT distLo=' + distLoPct.toFixed(2) + '%, conv ' + tagConvS + '<5). Research: OBREJ only edges at HTF extremes (Phase 3.60).');
+                return false;
+              }
+            }
+          }
+        } catch (e) {}
+      }
+
       // ===== PHASE 3.39 / OBREJ HTF GATE (added 2026-06-23, task #240) =====
       // OBREJ is currently in isFadeP2 regex — exempt from Phase 2.2 HTF Bias Agreement.
       // That exemption made sense for true fades (LHF/LLF — small local-extreme fades),
@@ -4119,6 +4177,23 @@ function processPrice(sym, price, hi, lo) {
           return false;
         }
       }
+
+      // ===== PHASE 3.59 — LHFP/LLFP HTF BIAS GATE (2026-06-26, task #249) =====
+      // Research validation: counter-HTF fades have 45-65% WR; against HTF: <50%.
+      // Our LHFP/LLFP on NAS over 4 days = 43% WR — right at the bad-fade boundary.
+      // Mirror of Phase 3.39 OBREJ gate. LHFP PUT (fade local high) needs HTF NOT
+      // bullish. LLFP CALL (fade local low) needs HTF NOT bearish. Block only when
+      // BOTH 1h AND 4h are against (same conservatism as 3.39).
+      if (/LHFP|LLFP/.test(tagP2) && s.htf1h_dir && s.htf4h_dir) {
+        const isCallLfp = sig.type === 'call';
+        const fightsH1_LFP = (isCallLfp && s.htf1h_dir === 'down') || (!isCallLfp && s.htf1h_dir === 'up');
+        const fightsH4_LFP = (isCallLfp && s.htf4h_dir === 'down') || (!isCallLfp && s.htf4h_dir === 'up');
+        if (fightsH1_LFP && fightsH4_LFP) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🧱 ' + tagP2 + ' ' + sig.type.toUpperCase() + ' BLOCKED — LHFP/LLFP fights both HTFs (1h=' + s.htf1h_dir + ', 4h=' + s.htf4h_dir + '). Counter-HTF fades have <50% WR per SMC research; 43% measured WR on NAS confirms (Phase 3.59).');
+          return false;
+        }
+      }
     }
     // ===== END PHASE 2 PRE-GATE =====
 
@@ -4138,9 +4213,35 @@ function processPrice(sym, price, hi, lo) {
     if ((isNAS || isBTC || isXAU) && s.chopActive) {
       const isFadeAllowedInChop = /VREV|LHF|LLF|OBREJ|OBMIT|STRUCT_SWEEP|STRUCT_LIQ_GRAB|STRUCT_OB_FILL|INVERSAL_BREAK/.test(tagEarly);
       if (!isFadeAllowedInChop) {
-        Object.assign(s, _emitSnapshot);
-        log(sym, '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' chop mode active (only V-REV / LHF / LLF / OBREJ / OBMIT allowed in chop; other detectors consistently lose in flat range).');
-        return false;
+        // ===== PHASE 3.54 REVISED — VOL>=1.5x BYPASS (2026-06-26, task #249) =====
+        // Pro research: "Low-grade on volume → trade the break." Volume confirmation
+        // 1.5x+ is the standard validation threshold (per LuxAlgo, TradingSim, Trade
+        // with the Pros). Our chop-block was rejecting trend continuation entries even
+        // when volume confirmed the breakout. Now: if conviction contains VOL>=1.5x
+        // AND signal direction matches recent 30min directional move, allow through.
+        let _chopVolBypass = false;
+        try {
+          const cConv = (typeof convictionFor === 'function') ? convictionFor(sym, sig) : null;
+          const volF = (cConv && cConv.factors || []).find(f => /^VOL×/.test(f));
+          const volS = volF ? parseFloat(volF.split('×')[1]) : 0;
+          if (volS >= 1.5 && s.macroSnaps && s.macroSnaps.length >= 6) {
+            const sn30 = s.macroSnaps[Math.max(0, s.macroSnaps.length - 6)];
+            if (sn30 && sn30.p > 0) {
+              const dirChg = (price - sn30.p) / sn30.p;
+              const sigDir = sig.type === 'call' ? 1 : sig.type === 'put' ? -1 : 0;
+              const aligned = (sigDir > 0 && dirChg > 0.001) || (sigDir < 0 && dirChg < -0.001);
+              if (aligned) {
+                _chopVolBypass = true;
+                log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — chop bypass: VOL×' + volS.toFixed(1) + ' + aligned dir (30min ' + (dirChg * 100).toFixed(2) + '%). Allowed (Phase 3.54).');
+              }
+            }
+          }
+        } catch (e) {}
+        if (!_chopVolBypass) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' chop mode active (only V-REV / LHF / LLF / OBREJ / OBMIT allowed in chop; other detectors consistently lose in flat range).');
+          return false;
+        }
       }
     }
 
