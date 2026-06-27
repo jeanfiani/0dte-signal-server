@@ -83,6 +83,13 @@ const MAX_SIG = 10;
 // genuinely runaway days but leaves headroom for STRUCT_LIQ_GRAB + RIDE + OBREJ
 // to all fire across XAU/BTC/NAS during US session. Override via env MAX_SIG_MT5.
 const MAX_SIG_MT5 = parseInt(process.env.MAX_SIG_MT5 || '35', 10);
+
+// ===== PHASE 3.61 — BTC FINNHUB CRYPTO SYMBOL (2026-06-27, task #250) =====
+// Finnhub's standard format for crypto is 'EXCHANGE:PAIR'. Defaults to Binance BTCUSDT
+// (highest volume globally). Coinbase/Kraken alternatives selectable via env. Used by
+// the WS subscribe loop + message handler. BTC PRICE remains sourced from MT5 — Finnhub
+// crypto is consumed for VOLUME ONLY (populates S.BTC.volBuckets for VOL× conviction).
+const BTC_FH_SYMBOL = process.env.BTC_FH_SYMBOL || 'BINANCE:BTCUSDT';
 const THR = 6;
 const ROC_THR = 0.018;
 const EQ_ROC_GATE = 0.030; // Hard ROC gate for equities — ROC-3 must confirm direction
@@ -2471,7 +2478,11 @@ function processPrice(sym, price, hi, lo) {
         const snap30 = s.macroSnaps[Math.max(0, s.macroSnaps.length - 6)];
         if (snap30 && snap30.p > 0) {
           const dirMovePct = Math.abs(price - snap30.p) / snap30.p * 100;
-          const dirThr = (sym === 'XAU') ? 0.5 : (sym === 'BTC') ? 1.0 : (sym === 'NAS100') ? 0.6 : 0.4;
+          // PHASE 3.62 — BTC threshold lowered 1.0 → 0.7 (2026-06-27, task #251).
+          // On 06-26 BTC rallied $1,300 / +2.2% in a day (~0.55% per 30min on average).
+          // 1.0% threshold missed most of those windows. 0.7% catches more legitimate
+          // trend periods without firing on every minor wiggle.
+          const dirThr = (sym === 'XAU') ? 0.5 : (sym === 'BTC') ? 0.7 : (sym === 'NAS100') ? 0.6 : 0.4;
           if (dirMovePct > dirThr) {
             s.chopActive = false;
             s.trendCount = 0;
@@ -4237,7 +4248,44 @@ function processPrice(sym, price, hi, lo) {
             }
           }
         } catch (e) {}
-        if (!_chopVolBypass) {
+        // ===== PHASE 3.63 — BTC MILD-CHOP RIDE BYPASS (2026-06-27, task #251) =====
+        // Even when Phase 3.54 VOL bypass doesn't trigger (e.g. VOL data still warming up
+        // on BTC after Phase 3.61, or VOL spike below 1.5x), BTC has a "mild chop" gray
+        // zone where 60min range is 0.5-1.5% — not pure trend, not dead chop. RIDE entries
+        // with conv >= 6 (HIGH+) in this zone are usually directional continuation, not
+        // mean-reversion. Allow them if direction aligns with 60min movement direction.
+        let _btcMildChopBypass = false;
+        if (!_chopVolBypass && sym === 'BTC' && /RIDE/.test(tagEarly)) {
+          try {
+            if (s.macroSnaps && s.macroSnaps.length >= 12) {
+              const sn60 = s.macroSnaps[Math.max(0, s.macroSnaps.length - 12)];
+              if (sn60 && sn60.p > 0) {
+                const recentSnaps = s.macroSnaps.slice(-12);
+                let mn = Infinity, mx = -Infinity;
+                recentSnaps.forEach(sn => {
+                  if (sn && sn.p > 0) {
+                    if (sn.p < mn) mn = sn.p;
+                    if (sn.p > mx) mx = sn.p;
+                  }
+                });
+                const rangePct = (mx > 0 && mn !== Infinity) ? (mx - mn) / mn * 100 : 0;
+                const isMildChop = rangePct >= 0.5 && rangePct <= 1.5;
+                if (isMildChop) {
+                  const cBtc = (typeof convictionFor === 'function') ? convictionFor(sym, sig) : null;
+                  const cBtcS = cBtc ? cBtc.score : 0;
+                  const netDir = (price - sn60.p) / sn60.p;
+                  const sigD = sig.type === 'call' ? 1 : sig.type === 'put' ? -1 : 0;
+                  const aligned63 = (sigD > 0 && netDir > 0.002) || (sigD < 0 && netDir < -0.002);
+                  if (cBtcS >= 6 && aligned63) {
+                    _btcMildChopBypass = true;
+                    log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — BTC mild-chop bypass (Phase 3.63): 60min range ' + rangePct.toFixed(2) + '% + conv ' + cBtcS + ' + aligned dir (' + (netDir * 100).toFixed(2) + '%). Allowed.');
+                  }
+                }
+              }
+            }
+          } catch (e) {}
+        }
+        if (!_chopVolBypass && !_btcMildChopBypass) {
           Object.assign(s, _emitSnapshot);
           log(sym, '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' chop mode active (only V-REV / LHF / LLF / OBREJ / OBMIT allowed in chop; other detectors consistently lose in flat range).');
           return false;
@@ -9466,6 +9514,15 @@ function connectFinnhub() {
             wsLog('SUB ' + SYMBOLS[1]);
           }
         }, 3500);
+        // ===== PHASE 3.61 — BTC CRYPTO VOLUME SUBSCRIBE (2026-06-27, task #250) =====
+        // Subscribe BTC at 5500ms (after QQQ + SPY) for volume-only ingestion.
+        setTimeout(() => {
+          if (ws && ws.readyState === WebSocket.OPEN && BTC_FH_SYMBOL) {
+            ws.send(JSON.stringify({ type: 'subscribe', symbol: BTC_FH_SYMBOL }));
+            console.log('[' + ts() + '] Subscribed to: ' + BTC_FH_SYMBOL + ' (BTC volume only)');
+            wsLog('SUB ' + BTC_FH_SYMBOL);
+          }
+        }, 5500);
       } catch (e) {
         console.error('[' + ts() + '] Subscribe error: ' + e.message);
       }
@@ -9490,6 +9547,10 @@ function connectFinnhub() {
           ws.send(JSON.stringify({ type: 'subscribe', symbol: SYMBOLS[0] }));
           if (SYMBOLS.length > 1) {
             ws.send(JSON.stringify({ type: 'subscribe', symbol: SYMBOLS[1] }));
+          }
+          // PHASE 3.61 — also re-assert BTC crypto subscription
+          if (BTC_FH_SYMBOL) {
+            ws.send(JSON.stringify({ type: 'subscribe', symbol: BTC_FH_SYMBOL }));
           }
         } catch (e) {}
       }, 20000);
@@ -9547,14 +9608,30 @@ function connectFinnhub() {
         const msg = JSON.parse(data);
         if (msg.type === 'trade' && msg.data) {
           msg.data.forEach(t => {
-            const sym = t.s; if (!SYMBOLS.includes(sym)) return;
-            S[sym].lastPrice = t.p;
-            S[sym].tickBuf.push({ p: t.p });
-            // ===== PHASE 3.43 — PER-SYMBOL LAST-TRADE TIMESTAMP (added 2026-06-24, task #245) =====
-            // Track when each symbol last received a tick from Finnhub, so we can detect
-            // "symbol subscribed but Finnhub not sending data" cases (e.g. QQQ stuck at $0
-            // while SPY updates). Surfaces in /status and /wsdebug.
-            S[sym].lastTradeTs = Date.now();
+            const tFh = t.s;
+            // ===== PHASE 3.61 — BTC CRYPTO VOLUME-ONLY ROUTING (2026-06-27, task #250) =====
+            // If the tick is from Finnhub's BTC crypto symbol (BINANCE:BTCUSDT etc.),
+            // route to S.BTC.volBuckets for volume tracking ONLY. BTC price stays with MT5.
+            // Skip lastPrice / tickBuf / lastTradeTs (those are MT5-driven for BTC).
+            let sym = tFh;
+            let btcVolumeOnly = false;
+            if (tFh === BTC_FH_SYMBOL) {
+              sym = 'BTC';
+              btcVolumeOnly = true;
+            }
+            if (!SYMBOLS.includes(sym)) return;
+            if (!btcVolumeOnly) {
+              S[sym].lastPrice = t.p;
+              S[sym].tickBuf.push({ p: t.p });
+              // ===== PHASE 3.43 — PER-SYMBOL LAST-TRADE TIMESTAMP (added 2026-06-24, task #245) =====
+              // Track when each symbol last received a tick from Finnhub, so we can detect
+              // "symbol subscribed but Finnhub not sending data" cases (e.g. QQQ stuck at $0
+              // while SPY updates). Surfaces in /status and /wsdebug.
+              S[sym].lastTradeTs = Date.now();
+            } else {
+              // For BTC, only track volume freshness for diagnostics
+              S[sym].lastBtcVolTs = Date.now();
+            }
             // ===== PHASE 3.41 — VOLUME CAPTURE (added 2026-06-24, task #243) =====
             // Finnhub trade ticks include 'v' (volume). Accumulate into 1-min buckets,
             // keep rolling window of last 20 buckets. Used by convictionFor() to add
