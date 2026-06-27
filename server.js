@@ -3414,45 +3414,19 @@ function processPrice(sym, price, hi, lo) {
     // early return in processPrice) so TRv2 trade management and exits keep running after
     // the cap. Exit signals are never blocked. dailySignalCount is usually incremented
     // pre-gate, so `>` (not `>=`) and the _emitSnapshot rollback keeps the count latched.
-    if (isMT5 && !String(sig.type).startsWith('exit') && s.dailySignalCount > MAX_SIG_MT5) {
-      // ===== PHASE 3.46 — STRONG-REGIME CAP BYPASS (added 2026-06-25, task #247) =====
-      // On 06-24 XAU hit cap at 36 then blocked 4+ clean PUT winners during a $64 bear day.
-      // If regime is STRONG + sig direction aligns + trend-aligned tag, bypass cap up to 2x.
-      let _capBypass = false;
-      try {
-        if (s.dailySignalCount <= MAX_SIG_MT5 * 2) {
-          let chgPctCap = null;
-          if (s.dailyLevels && s.dailyLevels.length >= 5) {
-            const oldestCap = s.dailyLevels[0];
-            if (oldestCap && oldestCap.high > 0 && oldestCap.low > 0) {
-              const midCap = (oldestCap.high + oldestCap.low) / 2;
-              chgPctCap = ((price - midCap) / midCap) * 100;
-            }
-          }
-          if (chgPctCap === null && s.macroSnaps && s.macroSnaps.length > 0) {
-            const oldCapSnap = s.macroSnaps[0];
-            const ageHCap = (Date.now() - oldCapSnap.ts) / 3600000;
-            if (ageHCap >= 24 && oldCapSnap.p > 0) chgPctCap = ((price - oldCapSnap.p) / oldCapSnap.p) * 100;
-          }
-          if (chgPctCap !== null) {
-            const strongCap = isXAU ? 2.0 : isBTC ? 5.0 : isNAS ? 3.0 : 1.0;
-            const sigDirCap = sig.type === 'call' ? 1 : sig.type === 'put' ? -1 : 0;
-            const regimeDirCap = chgPctCap >= strongCap ? 1 : chgPctCap <= -strongCap ? -1 : 0;
-            const tagCap = sig.score || '';
-            const trendAlignedTag = /RIDE|MACRO|STRUCT/.test(tagCap);
-            if (regimeDirCap !== 0 && sigDirCap === regimeDirCap && trendAlignedTag) {
-              _capBypass = true;
-              log(sym, '↪️ ' + tagCap + ' ' + sig.type.toUpperCase() + ' — MT5 cap (' + MAX_SIG_MT5 + ') reached BUT strong ' + (regimeDirCap > 0 ? 'bull' : 'bear') + ' regime (' + chgPctCap.toFixed(2) + '%) + aligned trend tag. Allowed (Phase 3.46). #' + s.dailySignalCount);
-            }
-          }
-        }
-      } catch (e) {}
-      if (!_capBypass) {
-        Object.assign(s, _emitSnapshot);
-        log(sym, '🚫 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' BLOCKED — MT5 daily signal cap (' + MAX_SIG_MT5 + ') reached. Set env MAX_SIG_MT5 to change.');
-        return false;
-      }
-    }
+    // ===== PHASE 3.52 — MT5 DAILY SIGNAL CAP REMOVED (2026-06-26, task #248) =====
+    // Removed: previously `if (s.dailySignalCount > MAX_SIG_MT5) return false;`
+    // (with Phase 3.46 strong-regime bypass). Problem: dailySignalCount increments
+    // for shadow-blocked signals too, so routine chop activity burns budget and
+    // blocks real trades. 06-26 example: by 08:00 ET XAU was at num:36 from shadow
+    // blocks, then blocked 7 legitimate reversal PUTs as XAU rolled over from $4094
+    // to $4065. Five of those PUTs went the correct direction at 30min.
+    // New design: per-symbol gates (chop, regime, conv tier, killzone, same-dir
+    // cooldown, fresh-extreme guard, OB proximity, range-extremity) are sufficient
+    // to prevent runaway. The daily cap is a redundant safety net that punishes
+    // legitimate trend continuation and reversal trades. If a runaway emerges, the
+    // chop circuit breaker and same-dir cooldowns will catch it. MAX_SIG_MT5 env
+    // variable preserved for potential future re-introduction.
 
     // ===== MULTI-DAY REGIME GATE — ALL INSTRUMENTS (extended 2026-05-20) =====
     // Previously MT5-only inside enrichSig's MT5-conditional body. Today's QQQ/SPY data
