@@ -90,6 +90,13 @@ const MAX_SIG_MT5 = parseInt(process.env.MAX_SIG_MT5 || '35', 10);
 // the WS subscribe loop + message handler. BTC PRICE remains sourced from MT5 — Finnhub
 // crypto is consumed for VOLUME ONLY (populates S.BTC.volBuckets for VOL× conviction).
 const BTC_FH_SYMBOL = process.env.BTC_FH_SYMBOL || 'BINANCE:BTCUSDT';
+
+// ===== PHASE 3.64 + 3.65 — FMP (FinancialModelingPrep) INTEGRATION (2026-06-28) =====
+// Free tier: ~250 calls/day. Treasury polls every 6h (4 calls/day). BTC news polls
+// every 30min (~48 calls/day). Total ~52/day << 250 quota.
+const FMP_API_KEY = process.env.FMP_API_KEY || '';
+let fmpTreasury = null;
+let fmpBtcNews = null;
 const THR = 6;
 const ROC_THR = 0.018;
 const EQ_ROC_GATE = 0.030; // Hard ROC gate for equities — ROC-3 must confirm direction
@@ -1006,8 +1013,96 @@ async function pollTrumpFeed() {
 }
 
 if (TRUMP_FEED_URL) {
-  setTimeout(pollTrumpFeed, 10000);                       // first poll 10s after startup
-  setInterval(pollTrumpFeed, TRUMP_POLL_INTERVAL_MS);     // then on the configured interval
+  setTimeout(pollTrumpFeed, 10000);
+  setInterval(pollTrumpFeed, TRUMP_POLL_INTERVAL_MS);
+}
+
+// ===== PHASE 3.64 — FMP TREASURY RATES POLLER (2026-06-28, task #252) =====
+async function pollFmpTreasury() {
+  if (!FMP_API_KEY) return;
+  try {
+    const today = new Date();
+    const fromDate = new Date(today.getTime() - 10 * 86400000);
+    const toStr = today.toISOString().slice(0, 10);
+    const fromStr = fromDate.toISOString().slice(0, 10);
+    const url = 'https://financialmodelingprep.com/api/v4/treasury?from=' + fromStr + '&to=' + toStr + '&apikey=' + FMP_API_KEY;
+    const https = require('https');
+    const body = await new Promise((resolve, reject) => {
+      const req = https.get(url, (res) => {
+        if (res.statusCode >= 400) return reject(new Error('HTTP ' + res.statusCode));
+        let chunks = '';
+        res.on('data', c => chunks += c);
+        res.on('end', () => resolve(chunks));
+      });
+      req.on('error', reject);
+      req.setTimeout(15000, () => { req.destroy(new Error('timeout')); });
+    });
+    const arr = JSON.parse(body);
+    if (!Array.isArray(arr) || arr.length === 0) return;
+    arr.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+    const history = arr.slice(0, 7).map(r => ({ date: r.date, y2: r.year2, y10: r.year10, y30: r.year30 }));
+    let y10_chg_3d = null;
+    if (history.length >= 3 && history[0].y10 != null && history[2].y10 != null) {
+      y10_chg_3d = history[0].y10 - history[2].y10;
+    }
+    fmpTreasury = { history: history, lastPollTs: Date.now(), y10_chg_3d: y10_chg_3d };
+    log('XAU', '💰 FMP Treasury: y10 ' + (history[0].y10 != null ? history[0].y10.toFixed(2) : '?') + '% (3d chg ' + (y10_chg_3d != null ? (y10_chg_3d >= 0 ? '+' : '') + y10_chg_3d.toFixed(3) : '?') + ')');
+  } catch (e) {
+    console.error('[' + ts() + '] FMP treasury poll failed:', e.message);
+  }
+}
+
+// ===== PHASE 3.65 — FMP BTC NEWS SENTIMENT POLLER (2026-06-28, task #252) =====
+const FMP_NEWS_BULL_KW = /\b(rally|rallies|rallied|surge|surged|breakout|breaks out|ATH|all-time high|accumulation|bullish|gains|rises|jumps|soars|skyrocket|moonshot|uptrend|bull run)\b/i;
+const FMP_NEWS_BEAR_KW = /\b(crash|crashes|crashed|dump|dumped|dumping|sell-off|selloff|liquidation|bearish|plunge|tumble|tanks|correction|drop|drops|falls|slide|slumps|downtrend|capitulation)\b/i;
+async function pollFmpBtcNews() {
+  if (!FMP_API_KEY) return;
+  try {
+    const url = 'https://financialmodelingprep.com/api/v4/crypto_news?limit=20&apikey=' + FMP_API_KEY;
+    const https = require('https');
+    const body = await new Promise((resolve, reject) => {
+      const req = https.get(url, (res) => {
+        if (res.statusCode >= 400) return reject(new Error('HTTP ' + res.statusCode));
+        let chunks = '';
+        res.on('data', c => chunks += c);
+        res.on('end', () => resolve(chunks));
+      });
+      req.on('error', reject);
+      req.setTimeout(15000, () => { req.destroy(new Error('timeout')); });
+    });
+    const arr = JSON.parse(body);
+    if (!Array.isArray(arr) || arr.length === 0) return;
+    const btcItems = arr.filter(it => {
+      const sym = (it.symbol || '').toUpperCase();
+      const title = (it.title || '') + ' ' + (it.text || '').slice(0, 200);
+      return sym.indexOf('BTC') === 0 || /\bbitcoin\b|\bBTC\b/i.test(title);
+    }).slice(0, 15);
+    if (btcItems.length === 0) {
+      log('BTC', '📰 FMP news: no BTC items');
+      return;
+    }
+    let bullScore = 0, bearScore = 0;
+    btcItems.forEach(it => {
+      const txtBody = (it.title || '') + ' ' + (it.text || '').slice(0, 500);
+      if (FMP_NEWS_BULL_KW.test(txtBody)) bullScore++;
+      if (FMP_NEWS_BEAR_KW.test(txtBody)) bearScore++;
+    });
+    const net = bullScore + bearScore > 0 ? (bullScore - bearScore) / (bullScore + bearScore) : 0;
+    fmpBtcNews = { sentiment: net, bullScore: bullScore, bearScore: bearScore, itemCount: btcItems.length, headlines: btcItems.slice(0, 3).map(it => it.title), lastPollTs: Date.now() };
+    log('BTC', '📰 FMP News: sentiment ' + (net >= 0 ? '+' : '') + net.toFixed(2) + ' (bull ' + bullScore + ' / bear ' + bearScore + ' / ' + btcItems.length + ' items)');
+  } catch (e) {
+    console.error('[' + ts() + '] FMP BTC news poll failed:', e.message);
+  }
+}
+
+if (FMP_API_KEY) {
+  setTimeout(pollFmpTreasury, 15000);
+  setInterval(pollFmpTreasury, 6 * 3600 * 1000);
+  setTimeout(pollFmpBtcNews, 20000);
+  setInterval(pollFmpBtcNews, 30 * 60 * 1000);
+  console.log('[STARTUP] FMP pollers scheduled (treasury 6hr, BTC news 30min)');
+} else {
+  console.log('[STARTUP] FMP_API_KEY not set — Phase 3.64/3.65 disabled');
 }
 
 // ===== PHASE 1.7 — ECONOMIC CALENDAR FEED (added 2026-06-17, task #187) =====
@@ -3161,6 +3256,16 @@ function processPrice(sym, price, hi, lo) {
     }
 
     if (isXAU) {
+      // ===== PHASE 3.64 — XAU TREASURY RATE FACTOR (2026-06-28, task #252) =====
+      // 10y yield 3-day delta: falling rates = gold bullish (CALL); rising = bearish (PUT).
+      // Threshold: 5bps over 3 days. fmpTreasury polled by Phase 3.64 background task.
+      try {
+        if (fmpTreasury && fmpTreasury.y10_chg_3d != null) {
+          const y10ChgBps = fmpTreasury.y10_chg_3d * 100;
+          if (isCall && y10ChgBps <= -5) { sc++; factors.push('RATES_DROP'); }
+          else if (!isCall && y10ChgBps >= 5) { sc++; factors.push('RATES_RISE'); }
+        }
+      } catch (e) {}
       // XAU-specific: DXY (24h FX — always live); TLT/SLV/GDX only count while US RTH is
       // open (R1 fix 2026-06-11 — frozen overnight directions were inflating conviction).
       // This also propagates to macroAlignedFor()/contra-blocks, which read conv scores.
@@ -3380,6 +3485,17 @@ function processPrice(sym, price, hi, lo) {
       factors.push('VOL×' + volSpike.toFixed(1));
     }
 
+    // ===== PHASE 3.65 — BTC NEWS SENTIMENT FACTOR (2026-06-28, task #252) =====
+    // BTC_NEWS_POS when sentiment > +0.3 and signal is CALL; BTC_NEWS_NEG when < -0.3 and PUT.
+    if (sym === 'BTC') {
+      try {
+        if (fmpBtcNews && typeof fmpBtcNews.sentiment === 'number' && fmpBtcNews.itemCount >= 3) {
+          const senti = fmpBtcNews.sentiment;
+          if (isCall && senti >= 0.3) { sc++; factors.push('BTC_NEWS_POS'); }
+          else if (!isCall && senti <= -0.3) { sc++; factors.push('BTC_NEWS_NEG'); }
+        }
+      } catch (e) {}
+    }
     const label = sc >= 5 ? 'HIGH' : sc >= 3 ? 'MOD' : 'LOW';
     return { score: sc, label, factors };
   }
