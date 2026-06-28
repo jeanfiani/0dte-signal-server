@@ -1229,6 +1229,37 @@ function calcATR(highs, lows, closes, period) {
   }
   return atr / period;
 }
+// ===== PHASE 3.66 — RECENCY OVERRIDE HELPER (2026-06-28, task #253) =====
+// Multi-day regime gates lock to BULL/BEAR direction once dailyLevels updates at
+// midnight UTC. They can't see today's intraday action. This helper checks last
+// 24h move via macroSnaps and downgrades regime to neutral when today contradicts.
+// Example: Friday rally sets BULL; Saturday/Sunday drift down should downgrade
+// regime to neutral so PUT signals can fire instead of being blocked all weekend.
+function applyRecencyOverride(s, sym, regimeDir, regimeStrength) {
+  try {
+    if (!regimeDir || regimeDir === 'neutral') return { dir: regimeDir, strength: regimeStrength };
+    if (!s.macroSnaps || s.macroSnaps.length < 12) return { dir: regimeDir, strength: regimeStrength };
+    // Use ~24h window if available, fall back to 6h window. macroSnaps are 5-min apart.
+    let snapIdx;
+    if (s.macroSnaps.length >= 288) snapIdx = s.macroSnaps.length - 288; // 24h
+    else if (s.macroSnaps.length >= 72) snapIdx = s.macroSnaps.length - 72; // 6h
+    else snapIdx = 0;
+    const oldestSn = s.macroSnaps[snapIdx];
+    if (!oldestSn || !oldestSn.p || oldestSn.p <= 0) return { dir: regimeDir, strength: regimeStrength };
+    const curPrice = (s.lastPrice && s.lastPrice > 0) ? s.lastPrice : oldestSn.p;
+    const recentPct = ((curPrice - oldestSn.p) / oldestSn.p) * 100;
+    // Per-symbol recency threshold
+    const recThr = sym === 'XAU' ? 0.8 : sym === 'BTC' ? 1.0 : sym === 'NAS100' ? 0.8 : 0.5;
+    if (regimeDir === 'bull' && recentPct <= -recThr) {
+      return { dir: 'neutral', strength: 0, downgrade: 'bull→neutral recent ' + recentPct.toFixed(2) + '%' };
+    }
+    if (regimeDir === 'bear' && recentPct >= recThr) {
+      return { dir: 'neutral', strength: 0, downgrade: 'bear→neutral recent +' + recentPct.toFixed(2) + '%' };
+    }
+  } catch (e) {}
+  return { dir: regimeDir, strength: regimeStrength };
+}
+
 function calcEfficiency(arr) {
   if (arr.length < 10) return 1;
   const hi = Math.max(...arr), lo = Math.min(...arr), net = hi - lo;
@@ -3624,6 +3655,15 @@ function processPrice(sym, price, hi, lo) {
         else if (regimeNetChgPctRG <= -strongThr) { regimeDirRG = 'bear'; regimeStrengthRG = 2; }
         else if (regimeNetChgPctRG >=  weakThr) { regimeDirRG = 'bull'; regimeStrengthRG = 1; }
         else if (regimeNetChgPctRG <= -weakThr) { regimeDirRG = 'bear'; regimeStrengthRG = 1; }
+        // PHASE 3.66 — recency override
+        {
+          const _rec = applyRecencyOverride(s, sym, regimeDirRG, regimeStrengthRG);
+          if (_rec.downgrade) {
+            log(sym, '↪️ Multi-day regime ' + _rec.downgrade + ' (Phase 3.66)');
+            regimeDirRG = _rec.dir;
+            regimeStrengthRG = _rec.strength;
+          }
+        }
 
         sig._regime = { dir: regimeDirRG, strength: regimeStrengthRG, netChgPct: +regimeNetChgPctRG.toFixed(2), window: regimeWindowLabelRG };
 
@@ -4643,6 +4683,14 @@ function processPrice(sym, price, hi, lo) {
       else if (regimeNetChgPct <= -strongThr) { regimeDir = 'bear'; regimeStrength = 2; }
       else if (regimeNetChgPct >=  weakThr) { regimeDir = 'bull'; regimeStrength = 1; }
       else if (regimeNetChgPct <= -weakThr) { regimeDir = 'bear'; regimeStrength = 1; }
+      // PHASE 3.66 — recency override (second occurrence)
+      {
+        const _rec2 = applyRecencyOverride(s, sym, regimeDir, regimeStrength);
+        if (_rec2.downgrade) {
+          regimeDir = _rec2.dir;
+          regimeStrength = _rec2.strength;
+        }
+      }
 
       // Annotate for diagnostics
       sig._regime = { dir: regimeDir, strength: regimeStrength, netChgPct: +regimeNetChgPct.toFixed(2), window: regimeWindowLabel };
@@ -10557,6 +10605,14 @@ app.get('/state/:sym', (req, res) => {
       else if (regimeNetChgPct <= -strongThr) { regimeDir = 'bear'; regimeStrength = 2; }
       else if (regimeNetChgPct >=  weakThr) { regimeDir = 'bull'; regimeStrength = 1; }
       else if (regimeNetChgPct <= -weakThr) { regimeDir = 'bear'; regimeStrength = 1; }
+      // PHASE 3.66 — recency override (second occurrence)
+      {
+        const _rec2 = applyRecencyOverride(s, sym, regimeDir, regimeStrength);
+        if (_rec2.downgrade) {
+          regimeDir = _rec2.dir;
+          regimeStrength = _rec2.strength;
+        }
+      }
     }
   }
 
