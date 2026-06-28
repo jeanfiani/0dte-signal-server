@@ -2621,12 +2621,13 @@ function processPrice(sym, price, hi, lo) {
             // Bullish displacement → last bearish candle before it = demand zone (bullish OB)
             if (bullDisp && prev.c < prev.o) {
               s.orderBlocks.push({ type: 'bull', hi: prev.h, lo: prev.l, ts: prev.ts, mitigated: false });
-              log(sym, '🟩 BULLISH OB formed: $' + prev.lo.toFixed(2) + ' - $' + prev.hi.toFixed(2) + ' (demand zone)');
+              // BUGFIX (2026-06-28): candles use prev.l/prev.h, not prev.lo/prev.hi.
+              log(sym, '🟩 BULLISH OB formed: $' + prev.l.toFixed(2) + ' - $' + prev.h.toFixed(2) + ' (demand zone)');
             }
             // Bearish displacement → last bullish candle before it = supply zone (bearish OB)
             if (bearDisp && prev.c > prev.o) {
               s.orderBlocks.push({ type: 'bear', hi: prev.h, lo: prev.l, ts: prev.ts, mitigated: false });
-              log(sym, '🟥 BEARISH OB formed: $' + prev.lo.toFixed(2) + ' - $' + prev.hi.toFixed(2) + ' (supply zone)');
+              log(sym, '🟥 BEARISH OB formed: $' + prev.l.toFixed(2) + ' - $' + prev.h.toFixed(2) + ' (supply zone)');
             }
           }
         }
