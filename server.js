@@ -4547,7 +4547,45 @@ function processPrice(sym, price, hi, lo) {
             }
           } catch (e) {}
         }
-        if (!_chopVolBypass && !_btcMildChopBypass && !_xauMetalsBypass) {
+        // ===== PHASE 3.70 — NAS/BTC CROSS-ASSET CONFLUENCE CHOP BYPASS (2026-06-29, task #258) =====
+        // Extends Phase 3.69 (XAU metals) to NAS and BTC with per-symbol factor sets:
+        //   NAS100: >= 3 of {SPY, QQQ, DXY, BTC, QQQ_SIG, TRUMP}
+        //   BTC:    >= 3 of {SPY, QQQ, DXY, NAS}
+        // Stricter conv floor (>=6) than 3.69's >=5 since BTC/NAS chop is more dangerous.
+        // 06-29 misses that would have fired:
+        //   NAS 11:37 conv 7 RIDE @ 29,522 (caught $29,522 → $29,783 = +$261)
+        //   BTC 13:13 conv 6 RIDE @ 60,271 + VOL×1.7 (caught the 59K → 60.5K reverse)
+        //   BTC 12:40 conv 6 RIDE @ 59,724
+        let _crossAssetBypass = false;
+        if (!_chopVolBypass && !_btcMildChopBypass && !_xauMetalsBypass && /RIDE/.test(tagEarly) && (sym === 'NAS100' || sym === 'BTC')) {
+          try {
+            const cCA = (typeof convictionFor === 'function') ? convictionFor(sig.type) : null;
+            const cCAS = cCA ? cCA.score : 0;
+            const cCAF = cCA ? (cCA.factors || []) : [];
+            const factorSet = sym === 'NAS100'
+              ? ['SPY', 'QQQ', 'DXY', 'BTC', 'QQQ_SIG', 'TRUMP']
+              : ['SPY', 'QQQ', 'DXY', 'NAS'];
+            const matchCount = factorSet.filter(f => cCAF.indexOf(f) !== -1).length;
+            const requiredMatch = sym === 'NAS100' ? 3 : 3;
+            if (cCAS >= 6 && matchCount >= requiredMatch) {
+              // Direction alignment check using macroSnaps
+              if (s.macroSnaps && s.macroSnaps.length >= 6) {
+                const sn30c = s.macroSnaps[Math.max(0, s.macroSnaps.length - 6)];
+                if (sn30c && sn30c.p > 0) {
+                  const dirChgC = (price - sn30c.p) / sn30c.p;
+                  const sigDC = sig.type === 'call' ? 1 : sig.type === 'put' ? -1 : 0;
+                  const alignedC = (sigDC > 0 && dirChgC > 0.001) || (sigDC < 0 && dirChgC < -0.001);
+                  if (alignedC) {
+                    _crossAssetBypass = true;
+                    const matched = factorSet.filter(f => cCAF.indexOf(f) !== -1).join(',');
+                    log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — ' + sym + ' cross-asset confluence bypass (Phase 3.70): conv ' + cCAS + ' + ' + matchCount + '/' + factorSet.length + ' factors (' + matched + ') + aligned dir (' + (dirChgC * 100).toFixed(2) + '%). Allowed.');
+                  }
+                }
+              }
+            }
+          } catch (e) {}
+        }
+        if (!_chopVolBypass && !_btcMildChopBypass && !_xauMetalsBypass && !_crossAssetBypass) {
           Object.assign(s, _emitSnapshot);
           log(sym, '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' chop mode active (only V-REV / LHF / LLF / OBREJ / OBMIT allowed in chop; other detectors consistently lose in flat range).');
           return false;
