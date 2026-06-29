@@ -528,15 +528,24 @@ function seedDailyLevels() {
   Object.keys(DAILY_SEED_VALUES).forEach(sym => {
     const s = S[sym];
     if (!s) return;
-    if (Array.isArray(s.dailyLevels) && s.dailyLevels.length > 0) {
-      console.log('[' + ts() + '] 📅 ' + sym + ' dailyLevels already has ' + s.dailyLevels.length + ' entries — skipping seed');
+    s.dailyLevels = Array.isArray(s.dailyLevels) ? s.dailyLevels : [];
+    // PHASE 3.68c — MERGE missing historical entries instead of overwriting.
+    // Phase 3.67 self-populating adds today's entry; we only want to add the
+    // HISTORICAL days that aren't already present. Match by date.
+    const existingDates = new Set(s.dailyLevels.map(d => d.date));
+    const toAdd = DAILY_SEED_VALUES[sym].filter(d => !existingDates.has(d.date));
+    if (toAdd.length === 0) {
+      console.log('[' + ts() + '] 📅 ' + sym + ' dailyLevels already has all seed dates (' + s.dailyLevels.length + ' entries) — no merge needed');
       return;
     }
-    s.dailyLevels = DAILY_SEED_VALUES[sym].slice();
+    s.dailyLevels = s.dailyLevels.concat(toAdd);
+    // Sort by date ascending, then keep last 5 (most recent)
+    s.dailyLevels.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+    if (s.dailyLevels.length > 5) s.dailyLevels = s.dailyLevels.slice(-5);
     s.rollingHigh = Math.max(...s.dailyLevels.map(d => d.high));
     s.rollingLow  = Math.min(...s.dailyLevels.map(d => d.low));
     seededCount++;
-    console.log('[' + ts() + '] 🌱 ' + sym + ' dailyLevels SEEDED: ' + s.dailyLevels.length + ' days, rolling H:$' + s.rollingHigh.toFixed(2) + ' L:$' + s.rollingLow.toFixed(2));
+    console.log('[' + ts() + '] 🌱 ' + sym + ' dailyLevels MERGED: +' + toAdd.length + ' historical, total ' + s.dailyLevels.length + ' days, rolling H:$' + s.rollingHigh.toFixed(2) + ' L:$' + s.rollingLow.toFixed(2));
   });
   if (seededCount > 0) {
     try { saveRollingLevels(); console.log('[' + ts() + '] 💾 Seed persisted to disk'); } catch (e) {}
@@ -576,9 +585,11 @@ setInterval(saveRollingLevels, 300000);
 // dailyLevels has data, this becomes a no-op.
 setInterval(() => {
   try {
-    const needsSeed = ['XAU', 'BTC'].some(sym => S[sym] && (!Array.isArray(S[sym].dailyLevels) || S[sym].dailyLevels.length === 0));
+    // PHASE 3.68c — periodic check now triggers when dailyLevels has fewer than 5 entries
+    // (missing historical days). Phase 3.67 adds today, so length 1-4 means historical missing.
+    const needsSeed = ['XAU', 'BTC'].some(sym => S[sym] && (!Array.isArray(S[sym].dailyLevels) || S[sym].dailyLevels.length < 5));
     if (needsSeed) {
-      console.log('[' + ts() + '] 🔁 Phase 3.68b safety re-seed triggered (dailyLevels empty)');
+      console.log('[' + ts() + '] 🔁 Phase 3.68c safety re-seed triggered (dailyLevels < 5 days)');
       seedDailyLevels();
     }
   } catch (e) {
