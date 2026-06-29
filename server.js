@@ -10393,6 +10393,35 @@ setInterval(fetchGDX, 15000);
 let _lastResetDate = todayDateET();
 setInterval(() => {
   const today = todayDateET();
+
+  // ===== PHASE 3.67 — SELF-POPULATING DAILY LEVELS (2026-06-29, task #254) =====
+  // Bug: previous design only pushed today's H/L to dailyLevels when the date
+  // CHANGED while the server was running. Every deploy reset _lastResetDate to
+  // today, so the trigger never fired across multi-deploy days. Result on 06-29:
+  // dailyLevels=[] for XAU → multi-day regime gate offline → Phase 3.16, 3.18,
+  // 3.42, 3.66 all skip.
+  // Fix: every 30s, upsert today's entry from live sessionHigh/sessionLow. Past
+  // days are preserved. Rolling H/L recomputed. Date-change full reset below
+  // continues to handle EMA/VWAP/RSI resets for the new day.
+  SYMBOLS.forEach(symLP => {
+    const sLP = S[symLP];
+    if (!sLP || sLP.sessionHigh === -Infinity || sLP.sessionLow === Infinity) return;
+    sLP.dailyLevels = sLP.dailyLevels || [];
+    const todayEntry = sLP.dailyLevels.find(d => d.date === today);
+    if (todayEntry) {
+      todayEntry.high = Math.max(todayEntry.high, sLP.sessionHigh);
+      todayEntry.low = Math.min(todayEntry.low, sLP.sessionLow);
+    } else {
+      sLP.dailyLevels.push({ high: sLP.sessionHigh, low: sLP.sessionLow, date: today });
+      if (sLP.dailyLevels.length > 5) sLP.dailyLevels = sLP.dailyLevels.slice(-5);
+      console.log('[' + ts() + '] 📅 ' + symLP + ' dailyLevels: added today ' + today + ' (' + sLP.dailyLevels.length + '/5 days)');
+    }
+    if (sLP.dailyLevels.length > 0) {
+      sLP.rollingHigh = Math.max(...sLP.dailyLevels.map(d => d.high));
+      sLP.rollingLow = Math.min(...sLP.dailyLevels.map(d => d.low));
+    }
+  });
+
   if (today !== _lastResetDate) {
     _lastResetDate = today;
     console.log('[' + ts() + '] Daily reset — new date: ' + today);
