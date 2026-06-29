@@ -569,6 +569,23 @@ function saveRollingLevels() {
 // Save rolling levels every 5 minutes
 setInterval(saveRollingLevels, 300000);
 
+// ===== PHASE 3.68b — PERIODIC SAFETY RE-SEED (2026-06-29, task #256) =====
+// Brute-force: every 5 min, check if XAU/BTC dailyLevels is still empty. If yes,
+// re-run seed. This handles the case where startup seed didn't fire for any reason
+// (deploy issue, load order, persistence file overwrite, etc.). Idempotent — once
+// dailyLevels has data, this becomes a no-op.
+setInterval(() => {
+  try {
+    const needsSeed = ['XAU', 'BTC'].some(sym => S[sym] && (!Array.isArray(S[sym].dailyLevels) || S[sym].dailyLevels.length === 0));
+    if (needsSeed) {
+      console.log('[' + ts() + '] 🔁 Phase 3.68b safety re-seed triggered (dailyLevels empty)');
+      seedDailyLevels();
+    }
+  } catch (e) {
+    console.error('[' + ts() + '] Safety re-seed error: ' + e.message);
+  }
+}, 300000);
+
 // F1 (2026-06-12): seed the equity regime at boot. macroSnaps are now persisted, but on a
 // cold start (or after >6h offline, e.g. overnight) the regime gate would still be blind
 // for 2h. Seed QQQ/SPY with the previous close from Finnhub, backdated 2.5h, so the gate
@@ -11011,6 +11028,31 @@ app.get('/admin/resub', (req, res) => {
     }, 500);
     result.scheduledResubMs = 500;
     res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== PHASE 3.68b — FORCE-SEED ADMIN ENDPOINT (2026-06-29, task #256) =====
+// Manually trigger dailyLevels seed without restarting. Use when /state shows
+// dailyLevels.count=0 and you want to fix it without a redeploy.
+//   GET /admin/seed-daily-levels?key=<ADMIN_KEY>
+app.get('/admin/seed-daily-levels', (req, res) => {
+  const adminKey = process.env.ADMIN_KEY || '';
+  if (adminKey && req.query.key !== adminKey) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const before = {};
+  ['XAU', 'BTC', 'NAS100'].forEach(sym => {
+    before[sym] = (S[sym] && S[sym].dailyLevels) ? S[sym].dailyLevels.length : 0;
+  });
+  try {
+    seedDailyLevels();
+    const after = {};
+    ['XAU', 'BTC', 'NAS100'].forEach(sym => {
+      after[sym] = (S[sym] && S[sym].dailyLevels) ? S[sym].dailyLevels.length : 0;
+    });
+    res.json({ ok: true, before: before, after: after });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
