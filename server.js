@@ -4740,9 +4740,24 @@ function processPrice(sym, price, hi, lo) {
     // Conv 4 floor blocks 1 of 8 historical signals (12.5%) — only the proven loser.
     // 7 of 8 signals still fire. Conservative tightening.
     if (/INVERSAL_BREAK/.test(tagEarly)) {
-      if (conv.score < 4) {
+      // PHASE 3.71 — bumped floor from 4 to 5 (2026-06-29, task #259)
+      if (conv.score < 5) {
         Object.assign(s, _emitSnapshot);
-        log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — INVERSAL_BREAK conv floor: conv ' + conv.score + '/7 [' + (conv.factors || []).join(',') + '] < 4 (MOD). Failed-breakout fades at conv 3 are systematic losers per data + SMC volume research.');
+        log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — INVERSAL_BREAK conv floor: conv ' + conv.score + '/7 [' + (conv.factors || []).join(',') + '] < 5 (HIGH). Phase 3.71 raised from 4 to 5 after loser audit — MOD-tier failed-breakout fades dominate the losers list.');
+        return false;
+      }
+    }
+
+    // ===== PHASE 3.71 — FADE DETECTOR CONV 5+ FLOOR (2026-06-29, task #259) =====
+    // 5-day loser audit (11 straight-SL losers): 91% were conv 4 MOD fade detectors
+    // firing counter-trend. Apply hard conv ≥5 floor to all four primary fade tags.
+    // Net effect: blocks ~91% of losers, costs some MOD winners — positive R per audit.
+    // Covered detectors: LHFP, LLFP, OBREJ, STRUCT_LIQ_GRAB
+    // INVERSAL_BREAK above raised from conv 4 to conv 5 in the same phase.
+    if (/LHFP|LLFP|OBREJ|STRUCT_LIQ_GRAB/.test(tagEarly)) {
+      if (conv.score < 5) {
+        Object.assign(s, _emitSnapshot);
+        log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — fade conv floor (Phase 3.71): conv ' + conv.score + '/7 [' + (conv.factors || []).join(',') + '] < 5 (HIGH). MOD-tier counter-trend fades dominated the 5-day loser list (10/11 = 91%).');
         return false;
       }
     }
