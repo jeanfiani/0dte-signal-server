@@ -4514,7 +4514,40 @@ function processPrice(sym, price, hi, lo) {
             }
           } catch (e) {}
         }
-        if (!_chopVolBypass && !_btcMildChopBypass) {
+        // ===== PHASE 3.69 — XAU METALS-CONFLUENCE CHOP BYPASS (2026-06-29, task #257) =====
+        // XAU has no volume data so Phase 3.54 VOL bypass never fires. But XAU has
+        // its own equivalent: cross-asset metals confluence (DXY, TLT, SLV, GDX).
+        // When 3+ of the 4 metals factors agree with the signal direction at conv>=5,
+        // that's "smart-money confirmation" similar to a volume spike in equities.
+        // Real example: 06-29 13:45 XAU PUT @ $4021.70 had conv 6 with all 4 metals
+        // (DXY+TLT+SLV+GDX) and XAU rolled over $5 in 30min — that signal would have
+        // been a winner but got blocked. This bypass allows it.
+        let _xauMetalsBypass = false;
+        if (!_chopVolBypass && !_btcMildChopBypass && sym === 'XAU' && /RIDE/.test(tagEarly)) {
+          try {
+            const cXau = (typeof convictionFor === 'function') ? convictionFor(sym === 'QQQ' ? 'call' : (sig.type === 'call' ? 'call' : 'put')) : null;
+            const cXauS = cXau ? cXau.score : 0;
+            const cXauF = cXau ? (cXau.factors || []) : [];
+            const metalsSet = ['DXY', 'TLT', 'SLV', 'GDX'];
+            const metalsCount = metalsSet.filter(m => cXauF.indexOf(m) !== -1).length;
+            if (cXauS >= 5 && metalsCount >= 3) {
+              // Direction alignment check using macroSnaps (30min ≈ 6 snaps of 5min)
+              if (s.macroSnaps && s.macroSnaps.length >= 6) {
+                const sn30x = s.macroSnaps[Math.max(0, s.macroSnaps.length - 6)];
+                if (sn30x && sn30x.p > 0) {
+                  const dirChgX = (price - sn30x.p) / sn30x.p;
+                  const sigDX = sig.type === 'call' ? 1 : sig.type === 'put' ? -1 : 0;
+                  const alignedX = (sigDX > 0 && dirChgX > 0.001) || (sigDX < 0 && dirChgX < -0.001);
+                  if (alignedX) {
+                    _xauMetalsBypass = true;
+                    log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — XAU metals-confluence bypass (Phase 3.69): conv ' + cXauS + ' + ' + metalsCount + '/4 metals (' + metalsSet.filter(m => cXauF.indexOf(m) !== -1).join(',') + ') + aligned dir (' + (dirChgX * 100).toFixed(2) + '%). Allowed.');
+                  }
+                }
+              }
+            }
+          } catch (e) {}
+        }
+        if (!_chopVolBypass && !_btcMildChopBypass && !_xauMetalsBypass) {
           Object.assign(s, _emitSnapshot);
           log(sym, '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' chop mode active (only V-REV / LHF / LLF / OBREJ / OBMIT allowed in chop; other detectors consistently lose in flat range).');
           return false;
