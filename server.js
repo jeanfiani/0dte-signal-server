@@ -501,6 +501,48 @@ function loadRollingLevels() {
   // Save immediately so the seed persists across the next restart
   try { saveRollingLevels(); } catch (e) {}
 }
+// ===== PHASE 3.68 — MANUAL DAILY LEVELS SEED (2026-06-29, task #255) =====
+// One-time bootstrap of dailyLevels for symbols missing 5 days of history.
+// Sourced from FMP free-tier (GCUSD for XAU proxy, BTCUSD direct). NAS100 omitted —
+// no free-tier source; will self-populate via Phase 3.67 over 5 days. Idempotent:
+// only seeds if a symbol's dailyLevels is currently empty. Saves immediately so
+// the seed persists across the next restart.
+function seedDailyLevels() {
+  const DAILY_SEED_VALUES = {
+    XAU: [
+      { date: '2026-06-24', high: 4132.40, low: 3975.70 },
+      { date: '2026-06-25', high: 4060.00, low: 3976.30 },
+      { date: '2026-06-26', high: 4111.50, low: 3998.10 },
+      { date: '2026-06-27', high: 4102.90, low: 4062.60 },
+      { date: '2026-06-28', high: 4102.90, low: 4062.60 }
+    ],
+    BTC: [
+      { date: '2026-06-24', high: 63156.34, low: 59010.74 },
+      { date: '2026-06-25', high: 61868.39, low: 58000.00 },
+      { date: '2026-06-26', high: 60660.00, low: 58243.36 },
+      { date: '2026-06-27', high: 60838.92, low: 59765.10 },
+      { date: '2026-06-28', high: 60455.00, low: 58810.11 }
+    ]
+  };
+  let seededCount = 0;
+  Object.keys(DAILY_SEED_VALUES).forEach(sym => {
+    const s = S[sym];
+    if (!s) return;
+    if (Array.isArray(s.dailyLevels) && s.dailyLevels.length > 0) {
+      console.log('[' + ts() + '] 📅 ' + sym + ' dailyLevels already has ' + s.dailyLevels.length + ' entries — skipping seed');
+      return;
+    }
+    s.dailyLevels = DAILY_SEED_VALUES[sym].slice();
+    s.rollingHigh = Math.max(...s.dailyLevels.map(d => d.high));
+    s.rollingLow  = Math.min(...s.dailyLevels.map(d => d.low));
+    seededCount++;
+    console.log('[' + ts() + '] 🌱 ' + sym + ' dailyLevels SEEDED: ' + s.dailyLevels.length + ' days, rolling H:$' + s.rollingHigh.toFixed(2) + ' L:$' + s.rollingLow.toFixed(2));
+  });
+  if (seededCount > 0) {
+    try { saveRollingLevels(); console.log('[' + ts() + '] 💾 Seed persisted to disk'); } catch (e) {}
+  }
+}
+
 function saveRollingLevels() {
   const data = {};
   SYMBOLS.forEach(sym => {
@@ -2030,6 +2072,8 @@ function saveBlockedOutcomes() {
 //   5. loadBlockedOutcomes — restores shadow-fire analytics
 try {
   loadRollingLevels();   // Asian H/L, ATH/ATL, daily levels, macroSnaps (6h of 5-min data)
+  // PHASE 3.68 — seed dailyLevels if missing (idempotent)
+  try { seedDailyLevels(); } catch (e) { console.error('[STARTUP] seedDailyLevels error: ' + e.message); }
 } catch (e) {
   console.error('[STARTUP] loadRollingLevels threw — starting fresh:', e.message);
 }
