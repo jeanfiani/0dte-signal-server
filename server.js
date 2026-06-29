@@ -4169,15 +4169,27 @@ function processPrice(sym, price, hi, lo) {
       // 6/15-16 XAU losses where we kept shorting $4,307 and longing $4,325.
       // Fade detectors are EXEMPT — they're designed to fade extremes.
       if (isP2Mt5 && s.chopActive && s.rangeZone && !isFadeP2) {
+        // PHASE 3.72 — conv ≥6 bypasses premium/discount zone gate (2026-06-29, task #260)
+        // 5-day audit: 0 straight-SL losers at conv 6+. Quality gates that filter location
+        // (top/bottom of range) become noise at HIGH conviction — the cross-asset confluence
+        // already validates the entry.
         if (sig.type === 'call' && s.rangeZone === 'premium') {
-          Object.assign(s, _emitSnapshot);
-          log(sym, '🏔️ ' + tagP2 + ' CALL BLOCKED — premium zone (' + s.rangePosPct.toFixed(0) + '% of ' + s.rangeRef + ' range $' + s.rangeRefLo.toFixed(2) + '-$' + s.rangeRefHi.toFixed(2) + '). Buying the top in chop.');
-          return false;
+          if (conv && conv.score >= 6) {
+            log(sym, '↪️ ' + tagP2 + ' CALL EXEMPT (premium zone) — conv ' + conv.score + '/7 HIGH bypasses zone gate (Phase 3.72). Buying premium with cross-asset confirmation.');
+          } else {
+            Object.assign(s, _emitSnapshot);
+            log(sym, '🏔️ ' + tagP2 + ' CALL BLOCKED — premium zone (' + s.rangePosPct.toFixed(0) + '% of ' + s.rangeRef + ' range $' + s.rangeRefLo.toFixed(2) + '-$' + s.rangeRefHi.toFixed(2) + '). Buying the top in chop.');
+            return false;
+          }
         }
         if (sig.type === 'put' && s.rangeZone === 'discount') {
-          Object.assign(s, _emitSnapshot);
-          log(sym, '🏕️ ' + tagP2 + ' PUT BLOCKED — discount zone (' + s.rangePosPct.toFixed(0) + '% of ' + s.rangeRef + ' range $' + s.rangeRefLo.toFixed(2) + '-$' + s.rangeRefHi.toFixed(2) + '). Shorting the bottom in chop.');
-          return false;
+          if (conv && conv.score >= 6) {
+            log(sym, '↪️ ' + tagP2 + ' PUT EXEMPT (discount zone) — conv ' + conv.score + '/7 HIGH bypasses zone gate (Phase 3.72). Shorting discount with cross-asset confirmation.');
+          } else {
+            Object.assign(s, _emitSnapshot);
+            log(sym, '🏕️ ' + tagP2 + ' PUT BLOCKED — discount zone (' + s.rangePosPct.toFixed(0) + '% of ' + s.rangeRef + ' range $' + s.rangeRefLo.toFixed(2) + '-$' + s.rangeRefHi.toFixed(2) + '). Shorting the bottom in chop.');
+            return false;
+          }
         }
       }
 
@@ -4211,9 +4223,13 @@ function processPrice(sym, price, hi, lo) {
         const regime = sig._regime;
         const isBearRegime = regime && regime.dir === 'bear' && regime.strength >= 1;
         const isBullRegime = regime && regime.dir === 'bull' && regime.strength >= 1;
+        // PHASE 3.72 — conv ≥6 also bypasses range-extremity (2026-06-29, task #260)
+        const _highConvExempt = conv && conv.score >= 6;
         if (sig.type === 'call' && s.rangePosPct >= TOP_PCT) {
           if (isBullRegime) {
             log(sym, '↪️ ' + tagP2 + ' CALL EXEMPT (range-extremity) — ' + s.rangePosPct.toFixed(0) + '% of ' + s.rangeRef + ' range BUT BULL regime (' + regime.window + ' ' + (regime.netChgPct >= 0 ? '+' : '') + regime.netChgPct + '%, strength ' + regime.strength + '). Top extremity = trend continuation in bull regime.');
+          } else if (_highConvExempt) {
+            log(sym, '↪️ ' + tagP2 + ' CALL EXEMPT (range-extremity) — conv ' + conv.score + '/7 HIGH bypasses extremity gate (Phase 3.72). Cross-asset confluence validates the entry.');
           } else {
             Object.assign(s, _emitSnapshot);
             log(sym, '🎯 ' + tagP2 + ' CALL BLOCKED — range-extremity guard: ' + s.rangePosPct.toFixed(0) + '% of ' + s.rangeRef + ' range. Top 15% reserved for fade detectors' + (regime ? ' (regime: ' + regime.dir + ' s' + regime.strength + ')' : ' (no regime data)') + '.');
@@ -4223,6 +4239,8 @@ function processPrice(sym, price, hi, lo) {
         if (sig.type === 'put' && s.rangePosPct <= BOT_PCT) {
           if (isBearRegime) {
             log(sym, '↪️ ' + tagP2 + ' PUT EXEMPT (range-extremity) — ' + s.rangePosPct.toFixed(0) + '% of ' + s.rangeRef + ' range BUT BEAR regime (' + regime.window + ' ' + (regime.netChgPct >= 0 ? '+' : '') + regime.netChgPct + '%, strength ' + regime.strength + '). Bottom extremity = trend continuation in bear regime.');
+          } else if (_highConvExempt) {
+            log(sym, '↪️ ' + tagP2 + ' PUT EXEMPT (range-extremity) — conv ' + conv.score + '/7 HIGH bypasses extremity gate (Phase 3.72). Cross-asset confluence validates the entry.');
           } else {
             Object.assign(s, _emitSnapshot);
             log(sym, '🎯 ' + tagP2 + ' PUT BLOCKED — range-extremity guard: ' + s.rangePosPct.toFixed(0) + '% of ' + s.rangeRef + ' range. Bottom 15% reserved for fade detectors' + (regime ? ' (regime: ' + regime.dir + ' s' + regime.strength + ')' : ' (no regime data)') + '.');
