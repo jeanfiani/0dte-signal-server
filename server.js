@@ -341,6 +341,17 @@ SYMBOLS.forEach(sym => {
     asianL_locked: null,       // locked at session end
     asianStartTs: 0,           // when current Asian window opened (resets daily)
     asianLockedDate: null,     // YYYY-MM-DD when locked values were saved (per-day stability)
+    // ===== PHASE 3.73 — INITIAL BALANCE (IB) TRACKER (2026-06-29, task #261) =====
+    // Pro futures concept: 9:30-10:30 ET defines daily IB range. Breakouts have high WR.
+    // Applies to NAS100/QQQ/SPY only (RTH-driven). Reset daily at midnight ET.
+    ibHi: null,                 // highest tick during IB window (9:30-10:30 ET)
+    ibLo: null,                 // lowest tick during IB window
+    ibLockedHi: null,           // locked at 10:30 ET, used for breakout detection
+    ibLockedLo: null,
+    ibLockedDate: null,         // YYYY-MM-DD when IB was locked
+    ibStartTs: 0,               // when current IB window started
+    ibCallFired: false,         // CALL breakout already fired today (1 per direction/day)
+    ibPutFired: false,
     // Killzone Clock (task #182): tagged every tick
     session: null,             // 'asian' | 'londonKZ' | 'londonOpen' | 'nyAM' | 'nyLunch' | 'nyPM' | 'overnight'
     inKillzone: false,         // true during londonKZ or nyAM (high-volatility windows)
@@ -2953,6 +2964,43 @@ function processPrice(sym, price, hi, lo) {
           s.asianL = null;
           s.asianRange = 0;
           s.asianStartTs = 0;
+        }
+      }
+    }
+
+    // ===== PHASE 3.73 — INITIAL BALANCE (IB) TRACKING (2026-06-29, task #261) =====
+    // RTH IB window: 9:30-10:30 ET (etMin 570-630). Applies to NAS100/QQQ/SPY only.
+    // Track high/low during the window, lock at 10:30, reset at midnight ET.
+    if (sym === 'NAS100' || sym === 'QQQ' || sym === 'SPY') {
+      const todayStrIB = todayDateET();
+      const inIBWindow = etMin >= 570 && etMin <= 630;
+      if (inIBWindow) {
+        // New day? Reset IB state
+        if (s.ibLockedDate !== todayStrIB && s.ibStartTs === 0) {
+          s.ibHi = price;
+          s.ibLo = price;
+          s.ibStartTs = _now;
+          s.ibCallFired = false;
+          s.ibPutFired = false;
+        } else {
+          if (s.ibHi === null || price > s.ibHi) s.ibHi = price;
+          if (s.ibLo === null || price < s.ibLo) s.ibLo = price;
+        }
+      } else if (etMin > 630 && etMin < 960) {
+        // After 10:30 and before 16:00 — lock IB if not yet done for today
+        if (s.ibLockedDate !== todayStrIB && s.ibHi !== null && s.ibLo !== null) {
+          s.ibLockedHi = s.ibHi;
+          s.ibLockedLo = s.ibLo;
+          s.ibLockedDate = todayStrIB;
+          log(sym, '📐 IB locked for ' + todayStrIB + ': H=$' + s.ibLockedHi.toFixed(2) + ' L=$' + s.ibLockedLo.toFixed(2) + ' range=$' + (s.ibLockedHi - s.ibLockedLo).toFixed(2));
+        }
+      } else if (etMin < 570 || etMin >= 1140) {
+        // Pre-IB window or overnight — reset tracking for next day
+        if (s.ibStartTs > 0 && s.ibLockedDate === todayStrIB) {
+          // already locked, ready for next day
+          s.ibHi = null;
+          s.ibLo = null;
+          s.ibStartTs = 0;
         }
       }
     }
@@ -6705,6 +6753,53 @@ function processPrice(sym, price, hi, lo) {
           return;
         }
       }
+
+    // ===== PHASE 3.73 — IB BREAKOUT DETECTOR (2026-06-29, task #261) =====
+    // After 10:30 ET, fire CALL on first break above IB high, PUT on first break below IB low.
+    // Requires: IB locked for today, volume spike confirmation (VOL >= 1.5x), idempotent.
+    if ((sym === 'NAS100' || sym === 'QQQ' || sym === 'SPY') && s.ibLockedDate === todayDateET() && s.ibLockedHi && s.ibLockedLo) {
+      const _ibVolOk = (function() {
+        const volRefSym = (sym === 'NAS100' && S.QQQ) ? S.QQQ : s;
+        if (!Array.isArray(volRefSym.volBuckets) || volRefSym.volBuckets.length < 10) return true;
+        const avgV = volRefSym.volBuckets.reduce((a,b) => a+b, 0) / volRefSym.volBuckets.length;
+        if (avgV <= 0) return true;
+        const curV = volRefSym.volCurBucket || 0;
+        return (curV / avgV) >= 1.5;
+      })();
+      if (!s.ibCallFired && price > s.ibLockedHi && _ibVolOk) {
+        s.ibCallFired = true;
+        s.dailySignalCount++;
+        s.lastAT = 'call'; s.nC++;
+        if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
+        s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
+        const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆IB_BREAKOUT', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        if (enrichSig(sig)) {
+          s.signals.push(sig); logSignal(sym, sig);
+          s.trade = buildCfdTrade('call', price, atrVal, sym);
+          attachTpSl(sig, 'call', price, atrVal, sym);
+          log(sym, '📐 IB_BREAKOUT CALL — broke above IB high $' + s.ibLockedHi.toFixed(2) + ' (now $' + price.toFixed(2) + ') [#' + s.dailySignalCount + ']');
+          sendPush('📐 ' + sym + ' IB_BREAKOUT CALL #' + s.dailySignalCount, 'Broke above IB high $' + s.ibLockedHi.toFixed(2), 'signal');
+          return;
+        }
+      }
+      if (!s.ibPutFired && price < s.ibLockedLo && _ibVolOk) {
+        s.ibPutFired = true;
+        s.dailySignalCount++;
+        s.lastAT = 'put'; s.nP++;
+        if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
+        s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
+        const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇IB_BREAKOUT', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        if (enrichSig(sig)) {
+          s.signals.push(sig); logSignal(sym, sig);
+          s.trade = buildCfdTrade('put', price, atrVal, sym);
+          attachTpSl(sig, 'put', price, atrVal, sym);
+          log(sym, '📐 IB_BREAKOUT PUT — broke below IB low $' + s.ibLockedLo.toFixed(2) + ' (now $' + price.toFixed(2) + ') [#' + s.dailySignalCount + ']');
+          sendPush('📐 ' + sym + ' IB_BREAKOUT PUT #' + s.dailySignalCount, 'Broke below IB low $' + s.ibLockedLo.toFixed(2), 'signal');
+          return;
+        }
+      }
+    }
+
     }
 
     // ── 3.4: STRUCT_VWAP_BOUNCE — VWAP Touch + Bounce in HTF Direction
