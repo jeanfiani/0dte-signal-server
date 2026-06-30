@@ -3845,6 +3845,39 @@ function processPrice(sym, price, hi, lo) {
       }
     }
 
+    // ===== PHASE 3.81 (2026-06-30) — CONV-UPFRONT + REGIME/HTF BYPASS =====
+    // Two changes to support better analytics + reduce false blocks on regime-aligned signals.
+    //
+    // (A) Compute conv ONCE up front so every later block path has sig.conv populated for
+    //     analytics. Previously conv was computed at the bottom of enrichSig, so signals
+    //     blocked by RSI exhaustion / repeat-loss / etc. showed the placeholder
+    //     {score:0, label:'BLOCKED', factors:[]} despite having real conviction at trigger.
+    //     The regime gate above already sets sig.conv for counter-regime MT5 — preserve it.
+    //
+    // (B) Compute a "soft-gates bypass" flag based on 3-factor confluence:
+    //         (i)  multi-day regime aligned with signal direction (WEAK or STRONG)
+    //         (ii) 1h HTF direction aligned with signal direction
+    //         (iii) conviction ≥ 5 HIGH
+    //     When all 3 hold, the signal is on a confirmed trend (not chop) and the soft
+    //     enrichSig gates (RSI exhaustion, Premium/Discount zone, Range-extremity guard)
+    //     are too defensive — they're designed for chop filtering. Per the 2026-06-29/30
+    //     audit, 9 winners were blocked by these gates while only 5 losers were correctly
+    //     blocked. The 9 winners all had multi-day-regime + 1h-HTF + conv≥5 alignment.
+    //     Hard gates (HTF agreement, news blackout, OB hard-block) stay active regardless.
+    if (!sig.conv || typeof sig.conv.score !== 'number') {
+      sig.conv = convictionFor(sig.type);
+    }
+    let phase381Bypass = false;
+    if (isMT5 && sig.conv && sig.conv.score >= 5 && sig._regime && sig._regime.dir !== 'neutral') {
+      const isCallB81 = sig.type === 'call';
+      const regimeAlignedB81 = (sig._regime.dir === 'bull' && isCallB81) ||
+                               (sig._regime.dir === 'bear' && !isCallB81);
+      const htf1hB81 = s.htf1h_dir;
+      const htfAlignedB81 = (htf1hB81 === 'up' && isCallB81) ||
+                            (htf1hB81 === 'down' && !isCallB81);
+      if (regimeAlignedB81 && htfAlignedB81) phase381Bypass = true;
+    }
+
     // ===== SPY DEMOTED TO INDICATOR-ONLY (added 2026-05-22) =====
     // Yesterday's 5/21 audit: SPY went 0/4 across all signals (3 PUT SL'd, 1 CALL SL'd)
     // while QQQ went 2/3 on identical setups (both winners were QQQ PUTs at 11:00 and 13:22).
@@ -3961,12 +3994,21 @@ function processPrice(sym, price, hi, lo) {
       const isFadeAtExtreme = /HI|LO|ATH|ATL|DIV|SWEEP/.test(tagX) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tagX);
       if (!isFadeAtExtreme) {
         if (sig.type === 'put' && typeof rsiV === 'number' && rsiV < 35) {
-          log(sym, '🛑 ' + tagX + ' PUT BLOCKED — XAU RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' < 35 (oversold). No PUT at the bottom regardless of conviction — macro factors lag price exhaustion.');
-          return false;
+          // PHASE 3.81 bypass — regime+1h+conv5 alignment proves the trend is real, not exhausted
+          if (phase381Bypass) {
+            log(sym, '↪️ ' + tagX + ' PUT Phase 3.81 — RSI exhaustion gate bypassed (RSI ' + rsiV.toFixed(1) + ', regime ' + sig._regime.dir + ', 1h ' + s.htf1h_dir + ', conv ' + sig.conv.score + ').');
+          } else {
+            log(sym, '🛑 ' + tagX + ' PUT BLOCKED — XAU RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' < 35 (oversold). No PUT at the bottom regardless of conviction — macro factors lag price exhaustion.');
+            return false;
+          }
         }
         if (sig.type === 'call' && typeof rsiV === 'number' && rsiV > 65) {
-          log(sym, '🛑 ' + tagX + ' CALL BLOCKED — XAU RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' > 65 (overbought). No CALL at the top regardless of conviction — macro factors lag price exhaustion.');
-          return false;
+          if (phase381Bypass) {
+            log(sym, '↪️ ' + tagX + ' CALL Phase 3.81 — RSI exhaustion gate bypassed (RSI ' + rsiV.toFixed(1) + ', regime ' + sig._regime.dir + ', 1h ' + s.htf1h_dir + ', conv ' + sig.conv.score + ').');
+          } else {
+            log(sym, '🛑 ' + tagX + ' CALL BLOCKED — XAU RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' > 65 (overbought). No CALL at the top regardless of conviction — macro factors lag price exhaustion.');
+            return false;
+          }
         }
       } else {
         // ===== DIRECTION-AWARE FADE EXEMPTION (R3 fix 2026-06-11, ports the QQQ fix) =====
@@ -4004,8 +4046,8 @@ function processPrice(sym, price, hi, lo) {
       }
     }
 
-    const conv = convictionFor(sig.type);
-    sig.conv = conv;
+    // PHASE 3.81 — conv was computed up-top into sig.conv; reuse it (was: const conv = convictionFor(sig.type)).
+    const conv = sig.conv;
 
     const tagEarly = sig.score || '';
     const isFadeEarly = /ATH|ATL|HI|LO|DIV/.test(tagEarly) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tagEarly);
@@ -4254,6 +4296,8 @@ function processPrice(sym, price, hi, lo) {
         if (sig.type === 'call' && s.rangeZone === 'premium') {
           if (conv && conv.score >= 6) {
             log(sym, '↪️ ' + tagP2 + ' CALL EXEMPT (premium zone) — conv ' + conv.score + '/7 HIGH bypasses zone gate (Phase 3.72). Buying premium with cross-asset confirmation.');
+          } else if (phase381Bypass) {
+            log(sym, '↪️ ' + tagP2 + ' CALL EXEMPT (premium zone) — Phase 3.81 bypass (regime ' + sig._regime.dir + ' + 1h ' + s.htf1h_dir + ' + conv ' + conv.score + ').');
           } else {
             Object.assign(s, _emitSnapshot);
             log(sym, '🏔️ ' + tagP2 + ' CALL BLOCKED — premium zone (' + s.rangePosPct.toFixed(0) + '% of ' + s.rangeRef + ' range $' + s.rangeRefLo.toFixed(2) + '-$' + s.rangeRefHi.toFixed(2) + '). Buying the top in chop.');
@@ -4263,6 +4307,8 @@ function processPrice(sym, price, hi, lo) {
         if (sig.type === 'put' && s.rangeZone === 'discount') {
           if (conv && conv.score >= 6) {
             log(sym, '↪️ ' + tagP2 + ' PUT EXEMPT (discount zone) — conv ' + conv.score + '/7 HIGH bypasses zone gate (Phase 3.72). Shorting discount with cross-asset confirmation.');
+          } else if (phase381Bypass) {
+            log(sym, '↪️ ' + tagP2 + ' PUT EXEMPT (discount zone) — Phase 3.81 bypass (regime ' + sig._regime.dir + ' + 1h ' + s.htf1h_dir + ' + conv ' + conv.score + ').');
           } else {
             Object.assign(s, _emitSnapshot);
             log(sym, '🏕️ ' + tagP2 + ' PUT BLOCKED — discount zone (' + s.rangePosPct.toFixed(0) + '% of ' + s.rangeRef + ' range $' + s.rangeRefLo.toFixed(2) + '-$' + s.rangeRefHi.toFixed(2) + '). Shorting the bottom in chop.');
