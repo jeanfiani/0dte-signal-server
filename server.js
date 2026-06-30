@@ -7687,16 +7687,20 @@ function processPrice(sym, price, hi, lo) {
               log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — Option B++ no confluence within $' + confBuf + ' (need $50-round / 60m H-L / active OB)');
             }
           }
-          // Gate 3 — Volume spike (Phase 3.75): real participation, not thin drift.
-          // Requires Finnhub WS XAU volume (Phase 3.75 — paid tier OANDA:XAU_USD by default).
-          // Uses the same getVolSpike() infrastructure as conviction VOL× factor.
-          // Threshold 1.5× = same as conviction factor (consistent definition of "spike").
-          // FALLBACK: if volBuckets not yet populated (<10 buckets after WS connect, or
-          // Finnhub permission issue), fall back to the prior 1-min candle direction check
-          // so XAU FAST still functions if the Finnhub feed isn't delivering volume.
+          // Gate 3 — Real participation check (Phase 3.75 + Phase 3.78 burst proxy).
+          // PRIMARY: volume spike (Phase 3.75) if Finnhub WS XAU volume buckets populated.
+          // FALLBACK: price-burst intensity proxy (Phase 3.78) — ATR-normalized 3-min range.
+          //   Reason: spot gold (OANDA/FXCM forex) doesn't deliver trade events on standard
+          //   Finnhub paid tiers (subscribes silently, never ticks). COMEX:GC1! is rejected
+          //   as invalid. Without real volume, the only data we have is price action itself.
+          //   The burst-intensity proxy computes how "explosive" the 3-min move was relative
+          //   to typical 3-min volatility (proxied by 0.6 × ATR-14). Real institutional bursts
+          //   show range ≥ 1.5× typical; thin drifts / fakeouts stay below.
+          //   This achieves the same fakeout-filtering goal as real volume without dependency.
           if (fmXauConvOk && fmXauConflOk) {
             const haveVolData = Array.isArray(s.volBuckets) && s.volBuckets.length >= 10;
             if (haveVolData) {
+              // PRIMARY — real volume spike check (Phase 3.75)
               const avgVol = s.volBuckets.reduce((a, b) => a + b, 0) / s.volBuckets.length;
               const curVol = s.volCurBucket || 0;
               const volRatio = avgVol > 0 ? curVol / avgVol : 0;
@@ -7704,14 +7708,20 @@ function processPrice(sym, price, hi, lo) {
                 fmXauCandleOk = false;
                 log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — Option B++ volume spike ' + volRatio.toFixed(2) + 'x < 1.5x (thin participation — likely fakeout)');
               }
-            } else if (Array.isArray(s.obCandles) && s.obCandles.length > 0) {
-              // FALLBACK: volume data not yet available, use 1-min candle direction
-              const lc = s.obCandles[s.obCandles.length - 1];
-              if (lc && typeof lc.o === 'number' && typeof lc.c === 'number') {
-                const candleOk = (fmDir === 'put') ? (lc.c <= lc.o) : (lc.c >= lc.o);
-                if (!candleOk) {
+            } else {
+              // PHASE 3.78 FALLBACK — price-burst intensity proxy (no volume data needed)
+              if (fmSnaps.length >= 6 && atrVal > 0) {
+                let bsHi = -Infinity, bsLo = Infinity;
+                for (const sn of fmSnaps) {
+                  if (sn.p > bsHi) bsHi = sn.p;
+                  if (sn.p < bsLo) bsLo = sn.p;
+                }
+                const winRange = bsHi - bsLo;
+                const typicalRange = atrVal * 0.6; // ATR-14 is ~5-min equivalent; ×0.6 ≈ 3-min
+                const burstRatio = typicalRange > 0 ? winRange / typicalRange : 0;
+                if (burstRatio < 1.5) {
                   fmXauCandleOk = false;
-                  log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — Option B++ last 1-min candle does not confirm (vol-data fallback: o=$' + lc.o.toFixed(2) + ' c=$' + lc.c.toFixed(2) + ')');
+                  log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — Phase 3.78 burst intensity ' + burstRatio.toFixed(2) + 'x < 1.5x typical (range $' + winRange.toFixed(2) + ' vs ATR×0.6 $' + typicalRange.toFixed(2) + ' — thin drift, likely fakeout)');
                 }
               }
             }
