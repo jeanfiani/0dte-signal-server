@@ -4052,19 +4052,34 @@ function processPrice(sym, price, hi, lo) {
         const inDownSession = sessionPct <= ctDownThr;
         const inUpSession   = sessionPct >= ctUpThr;
         const CT_MIN_CONV = 6;
-        if (sig.type === 'call' && inDownSession && conv.score < CT_MIN_CONV) {
+        // ===== PHASE 3.80b — RIDE/RIDE+MACRO HTF-reversal override (2026-06-30) =====
+        // RIDE was hit hardest by this gate on 2026-06-30: 5 conv-5 HIGH RIDE/RIDE+MACRO
+        // signals all blocked because they were "counter-trend" against the 4h session,
+        // even though the 1h HTF had already flipped to match the signal direction —
+        // the true setup is "session reversal in progress", not "fighting the trend".
+        // Allow RIDE/RIDE+MACRO at conv ≥ 5 when 1h HTF has flipped to match signal.
+        // Stays blocked at conv < 5 (real chase) or when 1h still fighting signal (no reversal yet).
+        const isRideTag = /RIDE/.test(tagEarly);
+        const ride1hReversalOk = isRideTag && conv.score >= 5 && (
+          (sig.type === 'call' && s.htf1h_dir === 'up') ||
+          (sig.type === 'put'  && s.htf1h_dir === 'down')
+        );
+        if (sig.type === 'call' && inDownSession && conv.score < CT_MIN_CONV && !ride1hReversalOk) {
           Object.assign(s, _emitSnapshot);
           log(sym, '🌊 ' + tagEarly + ' CALL BLOCKED — counter-trend in DOWN session ('
             + sessionPct.toFixed(2) + '% over ' + Math.round(refAgeMs / 60000) + 'min, conv '
-            + conv.score + '/' + CT_MIN_CONV + ' required). Fresh-extreme fades exempt.');
+            + conv.score + '/' + CT_MIN_CONV + ' required). Fresh-extreme fades exempt; RIDE needs 1h-up+conv5 (Phase 3.80b).');
           return false;
         }
-        if (sig.type === 'put' && inUpSession && conv.score < CT_MIN_CONV) {
+        if (sig.type === 'put' && inUpSession && conv.score < CT_MIN_CONV && !ride1hReversalOk) {
           Object.assign(s, _emitSnapshot);
           log(sym, '🌊 ' + tagEarly + ' PUT BLOCKED — counter-trend in UP session (+'
             + sessionPct.toFixed(2) + '% over ' + Math.round(refAgeMs / 60000) + 'min, conv '
-            + conv.score + '/' + CT_MIN_CONV + ' required). Fresh-extreme fades exempt.');
+            + conv.score + '/' + CT_MIN_CONV + ' required). Fresh-extreme fades exempt; RIDE needs 1h-down+conv5 (Phase 3.80b).');
           return false;
+        }
+        if (ride1hReversalOk) {
+          log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' Phase 3.80b override — session counter-trend gate bypassed (RIDE conv ' + conv.score + ' + 1h HTF flipped ' + s.htf1h_dir + ').');
         }
       }
     }
