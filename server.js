@@ -11188,6 +11188,38 @@ app.get('/prices', (req, res) => {
       : 0;
     const volRatio = volAvg > 0 ? volCur / volAvg : 0;
     const volSpike = volRatio >= 1.5;
+
+    // ===== PHASE 3.78b — ATR-BURST INTENSITY (2026-06-30) =====
+    // For symbols without real Finnhub volume (XAU especially), expose ATR-normalized
+    // 3-min range as a burst-intensity proxy. Same data the FAST gate uses.
+    // Compute 3-min window range from vrevSnaps (rolling tick buffer used by FAST).
+    let atrBurst = null;
+    try {
+      const atrNow = s._atr || 0;
+      const snapsForBurst = Array.isArray(s.vrevSnaps) ? s.vrevSnaps : [];
+      const winMs = 180000; // 3 min
+      const cutoff = Date.now() - winMs;
+      let winHi = -Infinity, winLo = Infinity, snapCount = 0;
+      for (const sn of snapsForBurst) {
+        if (!sn || typeof sn.p !== 'number' || sn.ts < cutoff) continue;
+        if (sn.p > winHi) winHi = sn.p;
+        if (sn.p < winLo) winLo = sn.p;
+        snapCount++;
+      }
+      if (atrNow > 0 && snapCount >= 3 && isFinite(winHi) && isFinite(winLo)) {
+        const range3m = winHi - winLo;
+        const typical3m = atrNow * 0.6; // ATR-14 ~5-min equivalent; ×0.6 ≈ 3-min
+        const burstRatio = typical3m > 0 ? range3m / typical3m : 0;
+        atrBurst = {
+          range3m: +range3m.toFixed(2),
+          atr: +atrNow.toFixed(2),
+          typical3m: +typical3m.toFixed(2),
+          ratio: +burstRatio.toFixed(2),
+          spike: burstRatio >= 1.5,
+          snaps: snapCount
+        };
+      }
+    } catch (e) {}
     data[sym] = {
       price: s.lastPrice,
       ind: s._ind || null,
@@ -11202,7 +11234,7 @@ app.get('/prices', (req, res) => {
       vwap: s._vwap || 0,
       chopActive: s.chopActive,
       dailySignalCount: s.dailySignalCount,
-      // PHASE 3.77 — volume bucket data for live dashboard display
+      // PHASE 3.77 + 3.78b — volume + ATR-burst data for live dashboard display
       vol: {
         cur: Math.round(volCur),
         avg: Math.round(volAvg),
@@ -11211,7 +11243,9 @@ app.get('/prices', (req, res) => {
         buckets: volBucketsArr.slice(-20).map(v => Math.round(v)),
         bucketCount: volBucketsArr.length,
         proxy: (sym === 'NAS100' && S.QQQ) ? 'QQQ' : null,
-        lastTs: volSrc.lastBtcVolTs || volSrc.lastXauVolTs || volSrc.lastTradeTs || 0
+        lastTs: volSrc.lastBtcVolTs || volSrc.lastXauVolTs || volSrc.lastTradeTs || 0,
+        // PHASE 3.78b — ATR-burst proxy (used when real volume unavailable, e.g. XAU)
+        atrBurst: atrBurst
       },
       signals: s.signals.slice(-20),
       trade: s.trade.active ? {
