@@ -91,6 +91,14 @@ const MAX_SIG_MT5 = parseInt(process.env.MAX_SIG_MT5 || '35', 10);
 // crypto is consumed for VOLUME ONLY (populates S.BTC.volBuckets for VOL× conviction).
 const BTC_FH_SYMBOL = process.env.BTC_FH_SYMBOL || 'BINANCE:BTCUSDT';
 
+// ===== PHASE 3.75 — XAU FINNHUB FOREX SYMBOL (2026-06-30, task #246) =====
+// Spot gold via Finnhub paid tier. Mirrors BTC pattern: XAU PRICE stays sourced from MT5,
+// Finnhub forex feed is consumed for VOLUME ONLY (populates S.XAU.volBuckets). Used by
+// FAST detector Option B++ Gate 3 to confirm institutional participation vs thin drift.
+// OANDA is the most common spot-gold source on Finnhub; alternatives: FXCM:XAU/USD,
+// COMEX:GC1! (futures, real lot volume but different contract). Selectable via env.
+const XAU_FH_SYMBOL = process.env.XAU_FH_SYMBOL || 'OANDA:XAU_USD';
+
 // ===== PHASE 3.64 + 3.65 — FMP (FinancialModelingPrep) INTEGRATION (2026-06-28) =====
 // Free tier: ~250 calls/day. Treasury polls every 6h (4 calls/day). BTC news polls
 // every 30min (~48 calls/day). Total ~52/day << 250 quota.
@@ -7679,14 +7687,32 @@ function processPrice(sym, price, hi, lo) {
               log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — Option B++ no confluence within $' + confBuf + ' (need $50-round / 60m H-L / active OB)');
             }
           }
-          // Gate 3 — Confirmation candle: last closed 1-min candle in signal direction.
-          if (fmXauConvOk && fmXauConflOk && Array.isArray(s.obCandles) && s.obCandles.length > 0) {
-            const lc = s.obCandles[s.obCandles.length - 1];
-            if (lc && typeof lc.o === 'number' && typeof lc.c === 'number') {
-              const candleOk = (fmDir === 'put') ? (lc.c <= lc.o) : (lc.c >= lc.o);
-              if (!candleOk) {
+          // Gate 3 — Volume spike (Phase 3.75): real participation, not thin drift.
+          // Requires Finnhub WS XAU volume (Phase 3.75 — paid tier OANDA:XAU_USD by default).
+          // Uses the same getVolSpike() infrastructure as conviction VOL× factor.
+          // Threshold 1.5× = same as conviction factor (consistent definition of "spike").
+          // FALLBACK: if volBuckets not yet populated (<10 buckets after WS connect, or
+          // Finnhub permission issue), fall back to the prior 1-min candle direction check
+          // so XAU FAST still functions if the Finnhub feed isn't delivering volume.
+          if (fmXauConvOk && fmXauConflOk) {
+            const haveVolData = Array.isArray(s.volBuckets) && s.volBuckets.length >= 10;
+            if (haveVolData) {
+              const avgVol = s.volBuckets.reduce((a, b) => a + b, 0) / s.volBuckets.length;
+              const curVol = s.volCurBucket || 0;
+              const volRatio = avgVol > 0 ? curVol / avgVol : 0;
+              if (volRatio < 1.5) {
                 fmXauCandleOk = false;
-                log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — Option B++ last 1-min candle does not confirm (o=$' + lc.o.toFixed(2) + ' c=$' + lc.c.toFixed(2) + ')');
+                log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — Option B++ volume spike ' + volRatio.toFixed(2) + 'x < 1.5x (thin participation — likely fakeout)');
+              }
+            } else if (Array.isArray(s.obCandles) && s.obCandles.length > 0) {
+              // FALLBACK: volume data not yet available, use 1-min candle direction
+              const lc = s.obCandles[s.obCandles.length - 1];
+              if (lc && typeof lc.o === 'number' && typeof lc.c === 'number') {
+                const candleOk = (fmDir === 'put') ? (lc.c <= lc.o) : (lc.c >= lc.o);
+                if (!candleOk) {
+                  fmXauCandleOk = false;
+                  log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — Option B++ last 1-min candle does not confirm (vol-data fallback: o=$' + lc.o.toFixed(2) + ' c=$' + lc.c.toFixed(2) + ')');
+                }
               }
             }
           }
@@ -10036,6 +10062,17 @@ function connectFinnhub() {
             wsLog('SUB ' + BTC_FH_SYMBOL);
           }
         }, 5500);
+        // ===== PHASE 3.75 — XAU FOREX VOLUME SUBSCRIBE (2026-06-30, task #246) =====
+        // Subscribe XAU forex symbol at 7500ms (after BTC) for volume-only ingestion.
+        // Requires Finnhub paid tier (forex WS access). If symbol invalid/no permission,
+        // Finnhub will surface error via the existing PHASE 3.43 error logger.
+        setTimeout(() => {
+          if (ws && ws.readyState === WebSocket.OPEN && XAU_FH_SYMBOL) {
+            ws.send(JSON.stringify({ type: 'subscribe', symbol: XAU_FH_SYMBOL }));
+            console.log('[' + ts() + '] Subscribed to: ' + XAU_FH_SYMBOL + ' (XAU volume only)');
+            wsLog('SUB ' + XAU_FH_SYMBOL);
+          }
+        }, 7500);
       } catch (e) {
         console.error('[' + ts() + '] Subscribe error: ' + e.message);
       }
@@ -10064,6 +10101,10 @@ function connectFinnhub() {
           // PHASE 3.61 — also re-assert BTC crypto subscription
           if (BTC_FH_SYMBOL) {
             ws.send(JSON.stringify({ type: 'subscribe', symbol: BTC_FH_SYMBOL }));
+          }
+          // PHASE 3.75 — also re-assert XAU forex subscription
+          if (XAU_FH_SYMBOL) {
+            ws.send(JSON.stringify({ type: 'subscribe', symbol: XAU_FH_SYMBOL }));
           }
         } catch (e) {}
       }, 20000);
@@ -10123,17 +10164,21 @@ function connectFinnhub() {
           msg.data.forEach(t => {
             const tFh = t.s;
             // ===== PHASE 3.61 — BTC CRYPTO VOLUME-ONLY ROUTING (2026-06-27, task #250) =====
-            // If the tick is from Finnhub's BTC crypto symbol (BINANCE:BTCUSDT etc.),
-            // route to S.BTC.volBuckets for volume tracking ONLY. BTC price stays with MT5.
-            // Skip lastPrice / tickBuf / lastTradeTs (those are MT5-driven for BTC).
+            // ===== PHASE 3.75 — XAU FOREX VOLUME-ONLY ROUTING (2026-06-30, task #246) =====
+            // If the tick is from Finnhub's BTC crypto symbol or XAU forex symbol,
+            // route to S.{sym}.volBuckets for volume tracking ONLY. Price stays with MT5.
+            // Skip lastPrice / tickBuf / lastTradeTs (those are MT5-driven for BTC/XAU).
             let sym = tFh;
-            let btcVolumeOnly = false;
+            let volumeOnly = false;
             if (tFh === BTC_FH_SYMBOL) {
               sym = 'BTC';
-              btcVolumeOnly = true;
+              volumeOnly = true;
+            } else if (tFh === XAU_FH_SYMBOL) {
+              sym = 'XAU';
+              volumeOnly = true;
             }
             if (!SYMBOLS.includes(sym)) return;
-            if (!btcVolumeOnly) {
+            if (!volumeOnly) {
               S[sym].lastPrice = t.p;
               S[sym].tickBuf.push({ p: t.p });
               // ===== PHASE 3.43 — PER-SYMBOL LAST-TRADE TIMESTAMP (added 2026-06-24, task #245) =====
@@ -10142,8 +10187,9 @@ function connectFinnhub() {
               // while SPY updates). Surfaces in /status and /wsdebug.
               S[sym].lastTradeTs = Date.now();
             } else {
-              // For BTC, only track volume freshness for diagnostics
-              S[sym].lastBtcVolTs = Date.now();
+              // For BTC/XAU, only track volume freshness for diagnostics
+              if (sym === 'BTC') S[sym].lastBtcVolTs = Date.now();
+              else if (sym === 'XAU') S[sym].lastXauVolTs = Date.now();
             }
             // ===== PHASE 3.41 — VOLUME CAPTURE (added 2026-06-24, task #243) =====
             // Finnhub trade ticks include 'v' (volume). Accumulate into 1-min buckets,
