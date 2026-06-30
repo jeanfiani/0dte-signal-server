@@ -91,13 +91,20 @@ const MAX_SIG_MT5 = parseInt(process.env.MAX_SIG_MT5 || '35', 10);
 // crypto is consumed for VOLUME ONLY (populates S.BTC.volBuckets for VOL× conviction).
 const BTC_FH_SYMBOL = process.env.BTC_FH_SYMBOL || 'BINANCE:BTCUSDT';
 
-// ===== PHASE 3.75 — XAU FINNHUB FOREX SYMBOL (2026-06-30, task #246) =====
+// ===== PHASE 3.75 + 3.79 — XAU FINNHUB FOREX SYMBOL (2026-06-30) =====
 // Spot gold via Finnhub paid tier. Mirrors BTC pattern: XAU PRICE stays sourced from MT5,
-// Finnhub forex feed is consumed for VOLUME ONLY (populates S.XAU.volBuckets). Used by
-// FAST detector Option B++ Gate 3 to confirm institutional participation vs thin drift.
-// OANDA is the most common spot-gold source on Finnhub; alternatives: FXCM:XAU/USD,
-// COMEX:GC1! (futures, real lot volume but different contract). Selectable via env.
-const XAU_FH_SYMBOL = process.env.XAU_FH_SYMBOL || 'OANDA:XAU_USD';
+// Finnhub forex feed would be consumed for VOLUME ONLY (populates S.XAU.volBuckets).
+// Used by FAST detector Option B++ Gate 3 to confirm institutional participation.
+//
+// PHASE 3.79 (2026-06-30, task #250): Default is now EMPTY (no XAU subscribe). Testing
+// showed OANDA:XAU_USD and FXCM:XAU/USD subscribe silently (no FINNHUB_ERROR) but never
+// deliver trade events — spot gold has no centralized order book to source volume from.
+// COMEX:GC1! returns "Invalid symbol" on standard paid tiers. Subscribing to a dead feed
+// also appears to compete with BTC for a tier-limited WS subscription slot, causing
+// BTC volume to silently break. Default empty = no XAU subscribe = no slot waste.
+// Phase 3.78 burst-intensity proxy handles XAU FAST gate without needing volume data.
+// To re-enable: set XAU_FH_SYMBOL env var on Railway to a working symbol.
+const XAU_FH_SYMBOL = process.env.XAU_FH_SYMBOL || '';
 
 // ===== PHASE 3.64 + 3.65 — FMP (FinancialModelingPrep) INTEGRATION (2026-06-28) =====
 // Free tier: ~250 calls/day. Treasury polls every 6h (4 calls/day). BTC news polls
@@ -6154,9 +6161,16 @@ function processPrice(sym, price, hi, lo) {
       }
     }
     const lhfPutObOk = lhfPutObZoneOk || lhfPutObArrayOk;
+    // ===== PHASE 3.80 — HTF-reversal override (2026-06-30) =====
+    // After sharp directional moves, macro EMA lags but 1h HTF flips first. If 1h has flipped
+    // to fade direction AND conviction ≥ 5 HIGH (cross-asset confirms), allow the LHF fade.
+    // Catches today's pattern: morning rally, 1h turns down before macro EMA catches up;
+    // bot detects LHF PUT setup with conv 5+ HIGH but gets killed by macro lag.
+    const lhfPutHtfReversalOk = (s.htf1h_dir === 'down' && convictionFor('put').score >= 5);
     const lhfPutMacroOk  = macroAlignedFor('put') ||
       (s.fullConvSincePut > 0 && (tSoftMacro - s.fullConvSincePut) >= SOFT_MACRO_STABLE_MS && convictionFor('put').score >= SOFT_MACRO_THR) ||
-      lhfPutObOk;
+      lhfPutObOk ||
+      lhfPutHtfReversalOk;
     const lhfPutFlipOk   = flipCoolFor('put');
     const lhfPutWinOk    = winProtectDir !== 'call';
     if (lhfPutTimingOk && lhfPutDistOk && lhfPutRangeOk && lhfPutCoolOk &&
@@ -6203,7 +6217,7 @@ function processPrice(sym, price, hi, lo) {
     } else if (lhfPutTimingOk && lhfPutDistOk && lhfPutRangeOk && lhfPutCoolOk) {
       // Log near-misses so we can audit how often the gates block real setups
       let reason;
-      if (!lhfPutMacroOk) reason = 'macro not PUT-aligned (need strict 6+/7@5min OR soft 5+/7@2min)';
+      if (!lhfPutMacroOk) reason = 'macro not PUT-aligned (need strict 6+/7@5min OR soft 5+/7@2min OR Phase 3.80: 1h-down + conv≥5)';
       else if (!lhfPutRsiOk) reason = 'RSI ' + rsiV.toFixed(1) + ' outside 35-60';
       else if (!lhfPutMacdOk) reason = 'MACD not compressing bearish (line ' + macdL.toFixed(3) + ' vs sig ' + macdS.toFixed(3) + ', hist ' + macdHist.toFixed(3) + ')';
       else if (!lhfPutRocOk) reason = 'ROC ' + roc3.toFixed(3) + '% > +0.10% — price thrusting up, not fading (R4)';
@@ -6256,9 +6270,16 @@ function processPrice(sym, price, hi, lo) {
       }
     }
     const llfCallObOk = llfCallObZoneOk || llfCallObArrayOk;
+    // ===== PHASE 3.80 — HTF-reversal override (2026-06-30) =====
+    // Mirrors LHF PUT override. After sharp drop, macro EMA stays bearish but 1h HTF turns
+    // up first as the bounce develops. If 1h is UP AND conviction ≥ 5 HIGH, allow LLF CALL.
+    // This was the dominant block today (07:48-08:09 ET): dozens of LLF CALL macro-blocks
+    // per minute as the bot tried to fade the bounce off $4028, all rejected by macro lag.
+    const llfCallHtfReversalOk = (s.htf1h_dir === 'up' && convictionFor('call').score >= 5);
     const llfCallMacroOk  = macroAlignedFor('call') ||
       (s.fullConvSinceCall > 0 && (tSoftMacro - s.fullConvSinceCall) >= SOFT_MACRO_STABLE_MS && convictionFor('call').score >= SOFT_MACRO_THR) ||
-      llfCallObOk;
+      llfCallObOk ||
+      llfCallHtfReversalOk;
     const llfCallFlipOk   = flipCoolFor('call');
     const llfCallWinOk    = winProtectDir !== 'put';
     if (llfCallTimingOk && llfCallDistOk && llfCallRangeOk && llfCallCoolOk &&
@@ -6300,7 +6321,7 @@ function processPrice(sym, price, hi, lo) {
       }
     } else if (llfCallTimingOk && llfCallDistOk && llfCallRangeOk && llfCallCoolOk) {
       let reason;
-      if (!llfCallMacroOk) reason = 'macro not CALL-aligned (need strict 6+/7@5min OR soft 5+/7@2min)';
+      if (!llfCallMacroOk) reason = 'macro not CALL-aligned (need strict 6+/7@5min OR soft 5+/7@2min OR Phase 3.80: 1h-up + conv≥5)';
       else if (!llfCallRsiOk) reason = 'RSI ' + rsiV.toFixed(1) + ' outside 40-65';
       else if (!llfCallMacdOk) reason = 'MACD not compressing bullish (line ' + macdL.toFixed(3) + ' vs sig ' + macdS.toFixed(3) + ', hist ' + macdHist.toFixed(3) + ')';
       else if (!llfCallRocOk) reason = 'ROC ' + roc3.toFixed(3) + '% < -0.10% — price thrusting down, not fading (R4)';
