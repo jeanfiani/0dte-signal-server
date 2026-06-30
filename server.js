@@ -11130,6 +11130,18 @@ app.get('/prices', (req, res) => {
   const data = {};
   SYMBOLS.forEach(sym => {
     const s = S[sym];
+    // ===== PHASE 3.77 — VOLUME DATA FOR DASHBOARDS (2026-06-30, task #247) =====
+    // Expose volume bucket data so each bot page can render a live VOL widget for
+    // manual trade-management decisions (e.g. hold vs scratch when participation fades).
+    // For NAS100, use QQQ as the volume proxy (same convention as Phase 3.41 conv factor).
+    const volSrc = (sym === 'NAS100' && S.QQQ) ? S.QQQ : s;
+    const volCur = volSrc.volCurBucket || 0;
+    const volBucketsArr = Array.isArray(volSrc.volBuckets) ? volSrc.volBuckets : [];
+    const volAvg = volBucketsArr.length > 0
+      ? volBucketsArr.reduce((a, b) => a + b, 0) / volBucketsArr.length
+      : 0;
+    const volRatio = volAvg > 0 ? volCur / volAvg : 0;
+    const volSpike = volRatio >= 1.5;
     data[sym] = {
       price: s.lastPrice,
       ind: s._ind || null,
@@ -11144,6 +11156,17 @@ app.get('/prices', (req, res) => {
       vwap: s._vwap || 0,
       chopActive: s.chopActive,
       dailySignalCount: s.dailySignalCount,
+      // PHASE 3.77 — volume bucket data for live dashboard display
+      vol: {
+        cur: Math.round(volCur),
+        avg: Math.round(volAvg),
+        ratio: +volRatio.toFixed(2),
+        spike: volSpike,
+        buckets: volBucketsArr.slice(-20).map(v => Math.round(v)),
+        bucketCount: volBucketsArr.length,
+        proxy: (sym === 'NAS100' && S.QQQ) ? 'QQQ' : null,
+        lastTs: volSrc.lastBtcVolTs || volSrc.lastXauVolTs || volSrc.lastTradeTs || 0
+      },
       signals: s.signals.slice(-20),
       trade: s.trade.active ? {
         active: true, type: s.trade.type, ep: s.trade.ep,
