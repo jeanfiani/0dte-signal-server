@@ -7393,17 +7393,23 @@ function processPrice(sym, price, hi, lo) {
   // range can BE the moment chop ends. The new MACD-extremity gate (XAU ±1.0, BTC ±100,
   // NAS ±25) already prevents FAST from firing into exhausted moves — chop block was redundant.
   //
-  // FAST DISABLED FOR XAU (trial, 2026-05-18): 4 resolved FAST signals on XAU last 3 days
-  // produced 1 TP1→SL (~+$5) and 3 full SLs (~-$30) = net -$25. The detector keeps catching
-  // micro-spike tops/bottoms on XAU which then immediately mean-revert. Multiple iterations
-  // of RSI/MACD/chase-the-bottom gates couldn't fix the structural mismatch between FAST's
-  // "$5 momentum continuation" design and XAU's mean-reverting micro-character. Trial period:
-  // few days. If win rate on remaining detectors (BREAK / TREND / ATH / ATL / HI / LO / VREV
-  // chop-blocked) doesn't improve, re-enable. FAST stays active for BTC (1/1 TP3 in sample)
-  // and NAS100 (small sample, structurally different — futures momentum sustains better).
-  if (isXAU) {
-    // Skip FAST detector entirely for XAU. Other detectors below still evaluate.
-  } else
+  // PHASE 3.74 (2026-06-30) — FAST RE-ENABLED FOR XAU with Option B++ anti-knife gates.
+  // Original disable (Phase 3.117, 2026-05-18): 4 resolved FAST signals on XAU last 3 days
+  // produced 1 TP1→SL (~+$5) and 3 full SLs (~-$30) = net -$25. FAST kept catching micro-spike
+  // tops/bottoms which mean-reverted. Phase 3.74 layers 4 anti-knife gates on top of existing
+  // FAST gates (XAU only — BTC/NAS unchanged):
+  //   1. Conviction ≥ 5 HIGH (no MOD-tier knife setups).
+  //   2. Expanded confluence: within $5 of $50-round OR 60-min H/L OR active OB boundary
+  //      (catches structural levels beyond just round numbers).
+  //   3. Confirmation candle: last closed 1-min candle direction matches signal (distinguishes
+  //      failed-retest from mid-burst falling knife).
+  //   4. HTF agreement: block only when fighting BOTH 1h AND 4h bias (allows one disagreement).
+  // Plus an XAU-specific Option B++ RSI band (PUT 38-60, CALL 40-62) — wider than the BTC/NAS
+  // 37-45/57-63 sweet spot to allow mid-momentum entries (failed-retest after capitulation,
+  // early rally from consolidation top). Validated against user chart 2026-06-30: blocks
+  // the falling knife during capitulation, allows the $3975 PUT failed-retest and the $3980
+  // CALL rally early entry. Existing FAST gates (chase-the-bottom guard, flip-cool, MACD-direction,
+  // gap-from-last, room-to-grow/sell, round-resistance) all still apply on top.
   if (isMT5 && s.vrevSnaps.length >= 20 && cool && (now2 - s.fastMoveLastTs > 600000)) {
     const fmWindow = 180000; // 3-minute lookback
     const fmSnaps = s.vrevSnaps.filter(sn => sn.ts > now2 - fmWindow);
@@ -7476,13 +7482,25 @@ function processPrice(sym, price, hi, lo) {
         // The fmBreakConfirmed relaxation (round-number break in progress) still bypasses these.
         const fmRsiPutMax = fmBreakConfirmed ? 85 : 45;
         const fmRsiCallMin = fmBreakConfirmed ? 15 : 57;
-        const fmRsiOk = (fmDir === 'put' && rsiV > fmRsiFloorPut && rsiV < fmRsiPutMax)
-                     || (fmDir === 'call' && rsiV < fmRsiCeilCall && rsiV > fmRsiCallMin);
-        if (!fmRsiOk) {
-          const need = (fmDir === 'put')
-                      ? fmRsiFloorPut + '-' + fmRsiPutMax + (fmBreakConfirmed ? ' (round-break relaxed)' : ' (winners-only: PUT needs RSI<45)')
-                      : fmRsiCallMin + '-' + fmRsiCeilCall + (fmBreakConfirmed ? ' (round-break relaxed)' : ' (winners-only: CALL needs RSI>55)');
-          log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — RSI ' + rsiV.toFixed(1) + ' outside ' + need);
+        // PHASE 3.74 — XAU uses Option B++ band (PUT 38-60, CALL 40-62) — wider than BTC/NAS
+        // sweet-spot to allow mid-decline / early-rally entries. BTC/NAS keep tight winners-only.
+        let fmRsiOk;
+        if (isXAU) {
+          fmRsiOk = (fmDir === 'put' && rsiV >= 38 && rsiV <= 60)
+                 || (fmDir === 'call' && rsiV >= 40 && rsiV <= 62);
+          if (!fmRsiOk) {
+            const bandX = fmDir === 'put' ? '38-60' : '40-62';
+            log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — XAU Option B++ RSI ' + rsiV.toFixed(1) + ' outside ' + bandX);
+          }
+        } else {
+          fmRsiOk = (fmDir === 'put' && rsiV > fmRsiFloorPut && rsiV < fmRsiPutMax)
+                 || (fmDir === 'call' && rsiV < fmRsiCeilCall && rsiV > fmRsiCallMin);
+          if (!fmRsiOk) {
+            const need = (fmDir === 'put')
+                        ? fmRsiFloorPut + '-' + fmRsiPutMax + (fmBreakConfirmed ? ' (round-break relaxed)' : ' (winners-only: PUT needs RSI<45)')
+                        : fmRsiCallMin + '-' + fmRsiCeilCall + (fmBreakConfirmed ? ' (round-break relaxed)' : ' (winners-only: CALL needs RSI>55)');
+            log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — RSI ' + rsiV.toFixed(1) + ' outside ' + need);
+          }
         }
         // ROC gate (tightened 2026-05-11): require meaningful directional momentum, not just
         // any non-zero tick. Previous threshold of 0 let -0.001% ROC pass. New: ±0.02% minimum.
@@ -7625,7 +7643,66 @@ function processPrice(sym, price, hi, lo) {
           }
         }
 
-        if (fmRecentTpSlOk && fmRsiOk && fmRocOk && fmMacdOk && fmGapOk && fmRoomOk && fmRoundOk && flipCoolFor(fmDir) && (winProtectDir === null || winProtectDir === fmDir)) {
+        // ===== PHASE 3.74 — XAU OPTION B++ ANTI-KNIFE GATES =====
+        // Four gates layered on existing FAST. Apply only to XAU. BTC/NAS unchanged.
+        let fmXauConvOk = true, fmXauConflOk = true, fmXauCandleOk = true, fmXauHtfOk = true;
+        if (isXAU) {
+          // Gate 1 — Conviction ≥ 5 HIGH. Blocks MOD-tier knife setups.
+          let convB = 0;
+          try { const cb = convictionFor(fmDir); convB = (cb && typeof cb.score === 'number') ? cb.score : 0; } catch(e) { convB = 0; }
+          if (convB < 5) {
+            fmXauConvOk = false;
+            log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — Option B++ conv ' + convB + ' < 5 (HIGH only; MOD-tier rejected as knife-prone)');
+          }
+          // Gate 2 — Confluence within $5 of $50-round / 60-min H-L / active OB boundary.
+          if (fmXauConvOk) {
+            const confBuf = 5.0;
+            let confluenceOk = false;
+            const nearestR50 = Math.round(price / 50) * 50;
+            if (Math.abs(price - nearestR50) <= confBuf) confluenceOk = true;
+            if (!confluenceOk && s.atrCandles && s.atrCandles.length >= 12) {
+              const last12fb = s.atrCandles.slice(-12);
+              const hi60m = Math.max(...last12fb.map(c => c.h));
+              const lo60m = Math.min(...last12fb.map(c => c.l));
+              if (Math.abs(price - hi60m) <= confBuf || Math.abs(price - lo60m) <= confBuf) confluenceOk = true;
+            }
+            if (!confluenceOk && Array.isArray(s.orderBlocks) && s.orderBlocks.length > 0) {
+              for (const ob of s.orderBlocks) {
+                if (ob && !ob.mitigated && typeof ob.hi === 'number' && typeof ob.lo === 'number' &&
+                    (Math.abs(price - ob.hi) <= confBuf || Math.abs(price - ob.lo) <= confBuf)) {
+                  confluenceOk = true; break;
+                }
+              }
+            }
+            if (!confluenceOk) {
+              fmXauConflOk = false;
+              log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — Option B++ no confluence within $' + confBuf + ' (need $50-round / 60m H-L / active OB)');
+            }
+          }
+          // Gate 3 — Confirmation candle: last closed 1-min candle in signal direction.
+          if (fmXauConvOk && fmXauConflOk && Array.isArray(s.obCandles) && s.obCandles.length > 0) {
+            const lc = s.obCandles[s.obCandles.length - 1];
+            if (lc && typeof lc.o === 'number' && typeof lc.c === 'number') {
+              const candleOk = (fmDir === 'put') ? (lc.c <= lc.o) : (lc.c >= lc.o);
+              if (!candleOk) {
+                fmXauCandleOk = false;
+                log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — Option B++ last 1-min candle does not confirm (o=$' + lc.o.toFixed(2) + ' c=$' + lc.c.toFixed(2) + ')');
+              }
+            }
+          }
+          // Gate 4 — HTF agreement: block only when fighting BOTH 1h AND 4h.
+          if (fmXauConvOk && fmXauConflOk && fmXauCandleOk && s.htf1h_dir && s.htf4h_dir) {
+            const isCallB = fmDir === 'call';
+            const fightsH1 = (isCallB && s.htf1h_dir === 'down') || (!isCallB && s.htf1h_dir === 'up');
+            const fightsH4 = (isCallB && s.htf4h_dir === 'down') || (!isCallB && s.htf4h_dir === 'up');
+            if (fightsH1 && fightsH4) {
+              fmXauHtfOk = false;
+              log(sym, '⚡ FAST ' + fmDir.toUpperCase() + ' BLOCKED — Option B++ fights BOTH HTFs (1h=' + s.htf1h_dir + ', 4h=' + s.htf4h_dir + ')');
+            }
+          }
+        }
+
+        if (fmRecentTpSlOk && fmRsiOk && fmRocOk && fmMacdOk && fmGapOk && fmRoomOk && fmRoundOk && fmXauConvOk && fmXauConflOk && fmXauCandleOk && fmXauHtfOk && flipCoolFor(fmDir) && (winProtectDir === null || winProtectDir === fmDir)) {
           s.fastMoveLastTs = now2;
           s.fastLastDir = fmDir; // for 30-min opposite-direction flip-cool
           s.lastAT = fmDir; if (fmDir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
