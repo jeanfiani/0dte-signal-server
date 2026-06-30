@@ -9995,15 +9995,13 @@ function isMarketWindow() {
 }
 
 function connectFinnhub() {
-  // Don't connect outside market hours — saves Finnhub quota, avoids reconnect spam
-  if (!isMarketWindow()) {
-    const retryMs = 120000; // Check again in 2 minutes
-    console.log('[' + ts() + '] Market closed — skipping WS connect, retry in 2m');
-    wsLog('SKIP market closed');
-    setTimeout(connectFinnhub, retryMs);
-    return;
-  }
-
+  // PHASE 3.76 (2026-06-30) — Removed isMarketWindow() gate. Was Mon-Fri 08:00-18:00 ET
+  // which blocked WS during off-hours, but BTC trades 24/7 and XAU spot trades 24/5.
+  // Without the gate, the WS stays connected whenever the server is running, so BTC and
+  // XAU volume buckets populate around the clock. Cost impact: minimal — Finnhub WS doesn't
+  // count against REST quota, and we already subscribe to only 4 symbols. The stuck-symbol
+  // auto-recovery loop (below) keeps its market-window check since it only monitors QQQ/SPY.
+  //
   // Don't reconnect if we already have a live connection
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
