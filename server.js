@@ -5336,9 +5336,36 @@ function processPrice(sym, price, hi, lo) {
     if (isStructureReq) {
       const hasStruct = conv.factors && conv.factors.indexOf('STRUCT') !== -1;
       if (!hasStruct) {
-        Object.assign(s, _emitSnapshot);
-        log(sym, '🚫 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — missing STRUCT factor. Price structure not aligned with signal direction (3-day loser audit: 5/8 XAU losers missing STRUCT, 3/3 XAU winners had it).');
-        return false;
+        // ===== PHASE 3.86 — STRUCT bypass for high-conv confluence (2026-07-01) =====
+        // At reversal points, price structure hasn't flipped yet — but if 7+ other conv
+        // factors align (including asset-specific institutional signals), the signal is
+        // legitimately confirmed by OTHER means. Missed 07-01 12:32 XAU PUT: conv 7 with
+        // SLV+GDX+DXY metals full confluence, BURST×1.9, TRUMP — would've been the day's
+        // best (price ran $4077 → $4064 in the hours after) but blocked here.
+        //
+        // Bypass criteria (must satisfy ALL for the direction):
+        //   XAU:  conv ≥ 7 AND SLV in factors AND GDX in factors (metals full confluence)
+        //   BTC:  conv ≥ 7 AND (NAS or NAS_SIG or BTC_SIG in factors)
+        //   NAS:  conv ≥ 7 AND (BTC or BTC_SIG or NAS_SIG in factors)
+        // Higher conv threshold than the standard 5/6 tiers reserves this for exceptional
+        // setups only. Won't fire on run-of-the-mill conv-5 chases without STRUCT.
+        let structBypass = false;
+        const cvScoreSB = conv.score || 0;
+        const facSB = conv.factors || [];
+        if (isXAU && cvScoreSB >= 7 && facSB.indexOf('SLV') !== -1 && facSB.indexOf('GDX') !== -1) {
+          structBypass = true;
+        } else if (isBTC && cvScoreSB >= 7 && (facSB.indexOf('NAS') !== -1 || facSB.indexOf('NAS_SIG') !== -1 || facSB.indexOf('BTC_SIG') !== -1)) {
+          structBypass = true;
+        } else if (isNAS && cvScoreSB >= 7 && (facSB.indexOf('BTC') !== -1 || facSB.indexOf('BTC_SIG') !== -1 || facSB.indexOf('NAS_SIG') !== -1)) {
+          structBypass = true;
+        }
+        if (structBypass) {
+          log(sym, '↪️ ' + tag + ' ' + sig.type.toUpperCase() + ' Phase 3.86 — STRUCT-required bypassed (conv ' + cvScoreSB + ' + asset-specific confluence: [' + facSB.join(',') + ']).');
+        } else {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🚫 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — missing STRUCT factor. Price structure not aligned with signal direction (3-day loser audit: 5/8 XAU losers missing STRUCT, 3/3 XAU winners had it).');
+          return false;
+        }
       }
     }
 
@@ -9014,10 +9041,13 @@ function processPrice(sym, price, hi, lo) {
         //   • TP2/TP3: ~60% of normal — captures the chop bounce but doesn't expect runaway
         //   • Floor: smaller too — proportional reduction
         const isChopOverride = s.chopActive && !s.inKillzone;
+        // ===== PHASE 3.85 (2026-07-01) — NAS TP2/TP3 tightened =====
+        // 7-day audit: 0 TP3 hits in 27 fired NAS trades. Old TP2:6× TP3:12× unreachable.
+        // Tightened to TP2:4× TP3:6×. Chop override reduced proportionally.
         const entMults = isNAS
           ? (isChopOverride
-              ? { sl: 1.5, t1: 2, t2: 4, t3: 8 }          // NAS chop override
-              : { sl: 2,   t1: 3, t2: 6, t3: 12 })        // NAS normal
+              ? { sl: 1.5, t1: 2, t2: 3, t3: 5 }          // NAS chop override (Phase 3.85: was 2/4/8)
+              : { sl: 2,   t1: 3, t2: 4, t3: 6 })         // NAS normal (Phase 3.85: was 3/6/12)
           : (isChopOverride
               ? { sl: 1.5, t1: 1,   t2: 1.75, t3: 2.5 }   // XAU/BTC chop override
               : { sl: 2,   t1: 1.5, t2: 2.5,  t3: 4 });   // XAU/BTC normal
@@ -9838,13 +9868,15 @@ function buildCfdTrade(type, price, atr, sym) {
   const isNAS = sym === 'NAS100';
   // Per-instrument TP/SL policy (multiples of ATR).
   // Default (XAU, BTC): SL=2×, TP1=1.5×, TP2=2.5×, TP3=4×.
-  // NAS (updated 2026-05-16): NAS futures show much cleaner directional legs than XAU/BTC
-  // — e.g., 5/15 $29400→$29000 was a clean $400 leg with minimal counter-spikes. Old TPs cut
-  // winners at ~$38/$75/$120 (with ATR~25). New TPs at 3/6/12× ATR capture the full leg.
-  // SL stays tight at 2× ATR — NAS doesn't spike against you the way XAU/BTC do, so wider
-  // SLs aren't needed for survival, and tight SLs keep the per-trade risk small.
+  // NAS (updated 2026-05-16, retightened 2026-07-01): NAS futures show cleaner directional
+  // legs than XAU/BTC, but the original 3/6/12 multipliers were too ambitious in practice.
+  // 7-day audit (Phase 3.85): 27 fired NAS trades → 6 TP1 wins, ZERO TP3 hits, 6 losses.
+  // Every winner exited at TP1 or reversed to SL — TP2/TP3 were unreachable on typical legs.
+  // Tightened to 3/4/6× ATR. Keeps TP1 the same (50% hit rate works), makes TP2 hittable
+  // on any decent continuation, TP3 achievable on real trend days without needing $400 legs.
+  // SL stays tight at 2× ATR — same rationale as before.
   const mults = isNAS
-    ? { sl: 2, t1: 3, t2: 6, t3: 12 }
+    ? { sl: 2, t1: 3, t2: 4, t3: 6 }
     : { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
   // Minimum $5 for SL and TP1 — prevents noise-level levels during low-ATR periods
   // XAU max $10 cap — keeps risk tight on gold's typical ATR range
