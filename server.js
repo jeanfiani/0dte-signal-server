@@ -3650,6 +3650,52 @@ function processPrice(sym, price, hi, lo) {
     if (volSpike >= 1.5) {
       sc++;
       factors.push('VOL×' + volSpike.toFixed(1));
+    } else {
+      // ===== PHASE 3.84 — VOL/BURST LOOSE TIER (2026-07-01) =====
+      // Original VOL× requires spike >= 1.5×. Add a softer +1 when ratio is >= 1.0
+      // (above-average participation, not necessarily a spike). Applied when real vol
+      // is unavailable using the ATR-burst proxy (same infrastructure as Phase 3.78).
+      // Doesn't double-count: only fires if VOL× above didn't already fire.
+      if (volSpike >= 1.0) {
+        sc++;
+        factors.push('VOL≥1×' + volSpike.toFixed(1));
+      } else {
+        // Fallback: ATR-burst proxy for symbols without real volume (XAU especially)
+        try {
+          if (isMT5 && typeof atrVal === 'number' && atrVal > 0 && Array.isArray(s.vrevSnaps)) {
+            const bCutoff = Date.now() - 180000; // 3-min window
+            let bHi = -Infinity, bLo = Infinity, bN = 0;
+            for (const sn of s.vrevSnaps) {
+              if (!sn || typeof sn.p !== 'number' || sn.ts < bCutoff) continue;
+              if (sn.p > bHi) bHi = sn.p;
+              if (sn.p < bLo) bLo = sn.p;
+              bN++;
+            }
+            if (bN >= 3 && isFinite(bHi) && isFinite(bLo)) {
+              const burstR = (bHi - bLo) / (atrVal * 0.6);
+              if (burstR >= 1.0) {
+                sc++;
+                factors.push('BURST×' + burstR.toFixed(1));
+              }
+            }
+          }
+        } catch (e) {}
+      }
+    }
+
+    // ===== PHASE 3.83 — HTF CONFLUENCE FACTOR (2026-07-01) =====
+    // When both 1h AND 4h HTF align with signal direction, +1 conv factor 'HTF×2'.
+    // Works 24/5 (derived from price EMA, no RTH dependency). Fills the overnight
+    // conv shortage when SLV/GDX/TLT are gated off (rthEtfFresh returns false).
+    // Requires BOTH timeframes to prevent single-flip games — genuine confluence.
+    if (isMT5 && s.htf1h_dir && s.htf4h_dir) {
+      const isCallH = isCall;
+      const h1AlignedH = (isCallH && s.htf1h_dir === 'up') || (!isCallH && s.htf1h_dir === 'down');
+      const h4AlignedH = (isCallH && s.htf4h_dir === 'up') || (!isCallH && s.htf4h_dir === 'down');
+      if (h1AlignedH && h4AlignedH) {
+        sc++;
+        factors.push('HTF×2');
+      }
     }
 
     // ===== PHASE 3.65 — BTC NEWS SENTIMENT FACTOR (2026-06-28, task #252) =====
