@@ -202,6 +202,11 @@ SYMBOLS.forEach(sym => {
     obCandles: [],       // [{o, h, l, c, ts}] — completed 1-min candles (last 60)
     obCurCandle: null,   // current building candle {o, h, l, c, startTs, ticks}
     orderBlocks: [],     // [{type:'bull'|'bear', hi, lo, ts, mitigated:false}] — active OB zones
+    // PHASE 3.87 — CHoCH (Change of Character) reversal detection state
+    chochSwingHi: [],    // [{price, ts, i}] — confirmed swing highs (last 10), i = candle index
+    chochSwingLo: [],    // [{price, ts, i}] — confirmed swing lows
+    chochLastPutTs: 0,   // last CHoCH bearish fire (5-min cooldown)
+    chochLastCallTs: 0,  // last CHoCH bullish fire
     // Macro trend — 5-min snapshots for 6-hour rolling window (XAU only)
     // Sustained momentum tracking — overrides blowoff lock when trend is real
     sustainedDir: null,    // 'call' or 'put' — current sustained direction
@@ -5933,7 +5938,39 @@ function processPrice(sym, price, hi, lo) {
     if (obBoost > 0) { if (cS >= pS) cS += obBoost; else pS += obBoost; }
     if (obBoost < 0) { if (cS >= pS) cS += obBoost; else pS += obBoost; } // obBoost is negative
   }
-  s._orderBlocks = isXAU ? s.orderBlocks.filter(ob => !ob.mitigated) : [];
+  s._orderBlocks = isMT5 ? s.orderBlocks.filter(ob => !ob.mitigated) : [];
+  // ===== PHASE 3.25b — POPULATE s.obZone FROM LATEST UNMITIGATED OB (2026-07-01) =====
+  // The dashboard OB Monitor panel reads /prices.obBreakout which came from s.obZone.
+  // s.obZone was only set by the (now-disabled) BREAK detector, so the panel showed
+  // "NONE" indefinitely. Now populate s.obZone from the most recent unmitigated entry
+  // in s.orderBlocks[] (Phase 3.2 displacement candle detection). Universal for MT5.
+  if (isMT5 && s._orderBlocks && s._orderBlocks.length > 0) {
+    const latestOb = s._orderBlocks[s._orderBlocks.length - 1];
+    // Map: bull OB (demand zone below) → dir 'call'; bear OB (supply above) → dir 'put'
+    const obDir = latestOb.type === 'bull' ? 'call' : 'put';
+    // Check if price departed the zone (has moved beyond +/-1.5 buffer since OB formed)
+    const obDepBuf = isXAU ? 1.5 : isBTC ? 50 : isNAS ? 10 : 1;
+    const departed = latestOb.type === 'bull' ? (price > latestOb.hi + obDepBuf) : (price < latestOb.lo - obDepBuf);
+    s.obZone = {
+      dir: obDir,
+      hi: latestOb.hi,
+      lo: latestOb.lo,
+      mid: (latestOb.hi + latestOb.lo) / 2,
+      coilHi: latestOb.hi,
+      coilLo: latestOb.lo,
+      ts: latestOb.ts,
+      breakPrice: latestOb.hi
+    };
+    s.obDeparted = departed;
+    s.obFired = false;
+    s.obMitigated = latestOb.mitigated || false;
+  } else if (isMT5 && (!s._orderBlocks || s._orderBlocks.length === 0)) {
+    // No OBs currently — clear the zone so dashboard shows NONE
+    s.obZone = null;
+    s.obDeparted = false;
+    s.obFired = false;
+    s.obMitigated = false;
+  }
 
   // Session High/Low Proximity
   if (s.sessionHigh > -Infinity && s.openPrice) {
@@ -6949,6 +6986,153 @@ function processPrice(sym, price, hi, lo) {
           return;
         }
       }
+
+    // ===== PHASE 3.87 — CHoCH (CHANGE OF CHARACTER) REVERSAL DETECTOR (2026-07-01) =====
+    // Detects trend reversals using SMC/ICT methodology: when the structural pattern of
+    // higher-highs/higher-lows breaks. This is the "confirmation" pros wait for after a
+    // sweep — much more reliable than firing at the exact extreme.
+    //
+    // Swing detection: 5-candle pivot on 1-min. Candle at index [n-3] is a swing high if
+    // its high > highs of [n-1, n-2, n-4, n-5]. Symmetric for lows.
+    //
+    // Bearish CHoCH (PUT):
+    //   1. Two most recent swing highs: H2 (newest) < H1 (previous) = LOWER HIGH
+    //   2. There's a swing low L1 between them (the pullback low of the failed rally)
+    //   3. Current price breaks BELOW L1 by a buffer = trend structure broken
+    //   → Fire PUT at the break. SL above H2.
+    //
+    // Bullish CHoCH (CALL):
+    //   Mirror: L2 > L1 = HIGHER LOW; break above intermediate H1 → CALL.
+    //
+    // Cooldown: 5 min per direction to prevent spam.
+    if (isMT5 && Array.isArray(s.obCandles) && s.obCandles.length >= 5) {
+      // Detect new confirmed swing (candle at index -3, needs 2 candles both sides).
+      const obcC = s.obCandles;
+      const cnt = obcC.length;
+      const pivotIdx = cnt - 3;
+      if (pivotIdx >= 2) {
+        const p = obcC[pivotIdx];
+        const highs4 = [obcC[pivotIdx-2].h, obcC[pivotIdx-1].h, obcC[pivotIdx+1].h, obcC[pivotIdx+2].h];
+        const lows4  = [obcC[pivotIdx-2].l, obcC[pivotIdx-1].l, obcC[pivotIdx+1].l, obcC[pivotIdx+2].l];
+        const isSwHi = p.h > Math.max(...highs4);
+        const isSwLo = p.l < Math.min(...lows4);
+        // Avoid double-adding: only record if this pivot ts is newer than last recorded
+        if (isSwHi) {
+          const last = s.chochSwingHi[s.chochSwingHi.length - 1];
+          if (!last || last.ts !== p.ts) {
+            s.chochSwingHi.push({ price: p.h, ts: p.ts, i: pivotIdx });
+            if (s.chochSwingHi.length > 10) s.chochSwingHi.shift();
+          }
+        }
+        if (isSwLo) {
+          const last = s.chochSwingLo[s.chochSwingLo.length - 1];
+          if (!last || last.ts !== p.ts) {
+            s.chochSwingLo.push({ price: p.l, ts: p.ts, i: pivotIdx });
+            if (s.chochSwingLo.length > 10) s.chochSwingLo.shift();
+          }
+        }
+      }
+
+      // Now check for CHoCH break using latest swings + current price
+      const shArr = s.chochSwingHi;
+      const slArr = s.chochSwingLo;
+      const chochBuf = isXAU ? 1.0 : isBTC ? 40 : isNAS ? 6 : 0.5;
+      const chochCoolMs = 5 * 60 * 1000;
+      const nowCh = Date.now();
+
+      // Bearish CHoCH — PUT
+      if (shArr.length >= 2 && slArr.length >= 1 && (nowCh - s.chochLastPutTs) >= chochCoolMs) {
+        const H2 = shArr[shArr.length - 1];
+        const H1 = shArr[shArr.length - 2];
+        // Lower high: H2.price < H1.price
+        if (H2.price < H1.price && H2.ts > H1.ts) {
+          // Find swing low between H1 and H2
+          const midLo = slArr.filter(l => l.ts > H1.ts && l.ts < H2.ts).sort((a,b) => a.price - b.price)[0];
+          if (midLo && price < midLo.price - chochBuf) {
+            // Gate: RSI not extreme (below 25 = too oversold to short)
+            if (rsiV > 25 && rsiV < 75) {
+              // Conv check
+              const chConv = convictionFor('put');
+              if (chConv.score >= 4) {
+                s.chochLastPutTs = nowCh;
+                s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
+                if (s.lastSignalDir === 'call') s.lastReversalTs = nowCh;
+                s.lastSignalDir = 'put'; s.lastSignalTs = nowCh; s.lastNTs = nowCh;
+                const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇CHoCH', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+                if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
+                if (isMT5) {
+                  // Tight SL above H2 (failed higher high) with small buffer
+                  const chSl = H2.price + chochBuf;
+                  const slDist = chSl - price;
+                  if (slDist > 0) {
+                    const tp1P = price - slDist * 1.5;
+                    const tp2P = price - slDist * 2.5;
+                    const tp3P = price - slDist * 4.0;
+                    s.trade = buildCfdTrade('put', price, atrVal, sym);
+                    s.trade.slPrice = +chSl.toFixed(2);
+                    s.trade.tp1Price = +tp1P.toFixed(2);
+                    s.trade.tp2Price = +tp2P.toFixed(2);
+                    s.trade.tp3Price = +tp3P.toFixed(2);
+                    sig.sl = chSl.toFixed(2);
+                    sig.tp1 = tp1P.toFixed(2);
+                    sig.tp2 = tp2P.toFixed(2);
+                    sig.tp3 = tp3P.toFixed(2);
+                  }
+                }
+                log(sym, '🔄 CHoCH PUT — lower-high $' + H2.price.toFixed(2) + ' < $' + H1.price.toFixed(2) + ' + break below intermediate low $' + midLo.price.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+                sendPush('🔄 ' + sym + ' CHoCH PUT #' + s.dailySignalCount, 'Change of character bearish · $' + price.toFixed(2), 'signal');
+                return;
+              }
+            }
+          }
+        }
+      }
+
+      // Bullish CHoCH — CALL
+      if (slArr.length >= 2 && shArr.length >= 1 && (nowCh - s.chochLastCallTs) >= chochCoolMs) {
+        const L2 = slArr[slArr.length - 1];
+        const L1 = slArr[slArr.length - 2];
+        // Higher low: L2.price > L1.price
+        if (L2.price > L1.price && L2.ts > L1.ts) {
+          // Find swing high between L1 and L2
+          const midHi = shArr.filter(h => h.ts > L1.ts && h.ts < L2.ts).sort((a,b) => b.price - a.price)[0];
+          if (midHi && price > midHi.price + chochBuf) {
+            if (rsiV > 25 && rsiV < 75) {
+              const chConv = convictionFor('call');
+              if (chConv.score >= 4) {
+                s.chochLastCallTs = nowCh;
+                s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
+                if (s.lastSignalDir === 'put') s.lastReversalTs = nowCh;
+                s.lastSignalDir = 'call'; s.lastSignalTs = nowCh; s.lastNTs = nowCh;
+                const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆CHoCH', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+                if (!enrichSig(sig)) return; s.signals.push(sig); logSignal(sym, sig);
+                if (isMT5) {
+                  const chSl = L2.price - chochBuf;
+                  const slDist = price - chSl;
+                  if (slDist > 0) {
+                    const tp1P = price + slDist * 1.5;
+                    const tp2P = price + slDist * 2.5;
+                    const tp3P = price + slDist * 4.0;
+                    s.trade = buildCfdTrade('call', price, atrVal, sym);
+                    s.trade.slPrice = +chSl.toFixed(2);
+                    s.trade.tp1Price = +tp1P.toFixed(2);
+                    s.trade.tp2Price = +tp2P.toFixed(2);
+                    s.trade.tp3Price = +tp3P.toFixed(2);
+                    sig.sl = chSl.toFixed(2);
+                    sig.tp1 = tp1P.toFixed(2);
+                    sig.tp2 = tp2P.toFixed(2);
+                    sig.tp3 = tp3P.toFixed(2);
+                  }
+                }
+                log(sym, '🔄 CHoCH CALL — higher-low $' + L2.price.toFixed(2) + ' > $' + L1.price.toFixed(2) + ' + break above intermediate high $' + midHi.price.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+                sendPush('🔄 ' + sym + ' CHoCH CALL #' + s.dailySignalCount, 'Change of character bullish · $' + price.toFixed(2), 'signal');
+                return;
+              }
+            }
+          }
+        }
+      }
+    }
 
     // ===== PHASE 3.73 — IB BREAKOUT DETECTOR (2026-06-29, task #261) =====
     // After 10:30 ET, fire CALL on first break above IB high, PUT on first break below IB low.
