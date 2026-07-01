@@ -6223,11 +6223,30 @@ function processPrice(sym, price, hi, lo) {
     }
     const lhfPutObOk = lhfPutObZoneOk || lhfPutObArrayOk;
     // ===== PHASE 3.80 — HTF-reversal override (2026-06-30) =====
-    // After sharp directional moves, macro EMA lags but 1h HTF flips first. If 1h has flipped
-    // to fade direction AND conviction ≥ 5 HIGH (cross-asset confirms), allow the LHF fade.
-    // Catches today's pattern: morning rally, 1h turns down before macro EMA catches up;
-    // bot detects LHF PUT setup with conv 5+ HIGH but gets killed by macro lag.
-    const lhfPutHtfReversalOk = (s.htf1h_dir === 'down' && convictionFor('put').score >= 5);
+    // ===== PHASE 3.82 — SLOW-DRIFT EXTENSION (2026-07-01) =====
+    // Original: 1h HTF must be 'down' AND conv≥5.
+    // Extension: also accept 1h='flat' when multi-day regime is aligned with signal
+    // direction (WEAK or STRONG). Catches slow-drift trends where each hour is too
+    // small to trigger 1h='down' but the cumulative move is real and multi-day-confirmed.
+    // 07-01 case: $50 XAU drop over 11h — 1h_dir stayed 'flat' during consolidation
+    // between drop segments, blocking all LHF PUT signals.
+    let _lhfPutRegimeAligned = false;
+    try {
+      if (s.dailyLevels && s.dailyLevels.length >= 5 && s.dailyLevels[0].high > 0 && s.dailyLevels[0].low > 0) {
+        const oldMidLhf = (s.dailyLevels[0].high + s.dailyLevels[0].low) / 2;
+        const chgPctLhf = ((price - oldMidLhf) / oldMidLhf) * 100;
+        _lhfPutRegimeAligned = chgPctLhf <= -1.0; // WEAK BEAR = -1.0% or stronger for XAU
+      } else if (s.macroSnaps && s.macroSnaps.length > 0) {
+        const oldSnLhf = s.macroSnaps[0];
+        const ahLhf = (Date.now() - oldSnLhf.ts) / 3600000;
+        if (ahLhf >= 24 && oldSnLhf.p > 0) {
+          const chgPctLhf = ((price - oldSnLhf.p) / oldSnLhf.p) * 100;
+          _lhfPutRegimeAligned = chgPctLhf <= -1.0;
+        }
+      }
+    } catch (e) {}
+    const lhfPutHtfReversalOk = (s.htf1h_dir === 'down' && convictionFor('put').score >= 5) ||
+                                (s.htf1h_dir === 'flat' && _lhfPutRegimeAligned && convictionFor('put').score >= 5);
     const lhfPutMacroOk  = macroAlignedFor('put') ||
       (s.fullConvSincePut > 0 && (tSoftMacro - s.fullConvSincePut) >= SOFT_MACRO_STABLE_MS && convictionFor('put').score >= SOFT_MACRO_THR) ||
       lhfPutObOk ||
@@ -6332,11 +6351,25 @@ function processPrice(sym, price, hi, lo) {
     }
     const llfCallObOk = llfCallObZoneOk || llfCallObArrayOk;
     // ===== PHASE 3.80 — HTF-reversal override (2026-06-30) =====
-    // Mirrors LHF PUT override. After sharp drop, macro EMA stays bearish but 1h HTF turns
-    // up first as the bounce develops. If 1h is UP AND conviction ≥ 5 HIGH, allow LLF CALL.
-    // This was the dominant block today (07:48-08:09 ET): dozens of LLF CALL macro-blocks
-    // per minute as the bot tried to fade the bounce off $4028, all rejected by macro lag.
-    const llfCallHtfReversalOk = (s.htf1h_dir === 'up' && convictionFor('call').score >= 5);
+    // ===== PHASE 3.82 — SLOW-DRIFT EXTENSION (2026-07-01) =====
+    // Mirrors LHF PUT: also accept 1h='flat' when multi-day regime aligned BULL AND conv≥5.
+    let _llfCallRegimeAligned = false;
+    try {
+      if (s.dailyLevels && s.dailyLevels.length >= 5 && s.dailyLevels[0].high > 0 && s.dailyLevels[0].low > 0) {
+        const oldMidLlf = (s.dailyLevels[0].high + s.dailyLevels[0].low) / 2;
+        const chgPctLlf = ((price - oldMidLlf) / oldMidLlf) * 100;
+        _llfCallRegimeAligned = chgPctLlf >= 1.0; // WEAK BULL = +1.0% or stronger
+      } else if (s.macroSnaps && s.macroSnaps.length > 0) {
+        const oldSnLlf = s.macroSnaps[0];
+        const ahLlf = (Date.now() - oldSnLlf.ts) / 3600000;
+        if (ahLlf >= 24 && oldSnLlf.p > 0) {
+          const chgPctLlf = ((price - oldSnLlf.p) / oldSnLlf.p) * 100;
+          _llfCallRegimeAligned = chgPctLlf >= 1.0;
+        }
+      }
+    } catch (e) {}
+    const llfCallHtfReversalOk = (s.htf1h_dir === 'up' && convictionFor('call').score >= 5) ||
+                                 (s.htf1h_dir === 'flat' && _llfCallRegimeAligned && convictionFor('call').score >= 5);
     const llfCallMacroOk  = macroAlignedFor('call') ||
       (s.fullConvSinceCall > 0 && (tSoftMacro - s.fullConvSinceCall) >= SOFT_MACRO_STABLE_MS && convictionFor('call').score >= SOFT_MACRO_THR) ||
       llfCallObOk ||
@@ -8798,6 +8831,22 @@ function processPrice(sym, price, hi, lo) {
           } else if (trAligned && tcvs >= 2.5) {
             _trv2ConvFloor = 3;
             _trv2Exempt = 'regime ' + trChg.toFixed(2) + '% + VOL×' + tcvs.toFixed(1);
+          } else if (trAligned && !tcvs) {
+            // ===== PHASE 3.82 — REGIME-ALIGNED CONV FLOOR (2026-07-01) =====
+            // For XAU (and any symbol without volume data), lower TRv2 conv floor to 4
+            // when multi-day regime is aligned with signal direction AND core factors are
+            // present (MACRO + ROC×3). Catches slow-drift trends where the bot's other
+            // detectors don't trigger and conv is stuck at 4 (MACRO+ROC×3+STRUCT+DXY).
+            // 07-01 case: $50 XAU drop → TRv2 blocked 38x at conv 4/5 during confirmed
+            // WEAK BEAR multi-day regime. All 4 factors were the "right" factors for a
+            // trend continuation; the missing 5th was cross-asset (NAS/BTC) which is often
+            // uncorrelated with metals during trend continuations.
+            const hasMacro = (trv2Conv.factors || []).includes('MACRO');
+            const hasRoc = (trv2Conv.factors || []).some(f => /^ROC/.test(f));
+            if (hasMacro && hasRoc) {
+              _trv2ConvFloor = 4;
+              _trv2Exempt = 'regime ' + trChg.toFixed(2) + '% + MACRO + ROC (Phase 3.82 — no-vol regime-aligned override)';
+            }
           }
         } catch (e) {}
         if (_trv2Exempt && trv2Conv.score >= _trv2ConvFloor && trv2Conv.score < TRv2_MIN_CONV) {
