@@ -11850,6 +11850,44 @@ app.post('/feed', (req, res) => {
   res.json({ ok: true, sym, price: p, samples: S[sym].prices.length });
 });
 
+// ===== BATCHED FEED ENDPOINT (added 2026-07-03) =====
+// The bridge was POSTing each symbol separately (~3 req/s, ~260k/day from one home IP) —
+// enough to trip edge rate-limiting, which killed the feed twice on 7/02. This endpoint
+// accepts all symbols in ONE request: { ticks: [{sym, price, high, low}, ...] }.
+// Same validation as /feed, applied per tick; invalid ticks are skipped, not fatal.
+app.post('/feed/batch', (req, res) => {
+  const ticks = req.body && Array.isArray(req.body.ticks) ? req.body.ticks : null;
+  if (!ticks || ticks.length === 0) return res.status(400).json({ error: 'Missing ticks array' });
+  const PRICE_RANGES_B = { XAU: [1000, 10000], BTC: [10000, 500000], NAS100: [10000, 50000], QQQ: [100, 1000], SPY: [100, 1000] };
+  const results = [];
+  for (const t of ticks.slice(0, 10)) {
+    try {
+      const sym = t && t.sym;
+      if (!sym || !S[sym]) { results.push({ sym: sym || '?', ok: false, err: 'unknown symbol' }); continue; }
+      const p = parseFloat(t.price), h = parseFloat(t.high) || p, l = parseFloat(t.low) || p;
+      if (isNaN(p) || p <= 0) { results.push({ sym, ok: false, err: 'invalid price' }); continue; }
+      const range = PRICE_RANGES_B[sym];
+      if (range && (p < range[0] || p > range[1])) { results.push({ sym, ok: false, err: 'out of range' }); continue; }
+      if (S[sym].lastPrice > 0) {
+        const isMT5b = sym === 'XAU' || sym === 'BTC' || sym === 'NAS100';
+        const maxJump = isMT5b ? 10 : 5;
+        const pctChange = Math.abs(p - S[sym].lastPrice) / S[sym].lastPrice * 100;
+        if (pctChange > maxJump) { results.push({ sym, ok: false, err: 'jump too large' }); continue; }
+      }
+      S[sym].lastPrice = p;
+      S[sym].tickBuf.push({ p, h, l });
+      S[sym].lastFeedTs = Date.now();
+      if (S[sym]._feedStale) {
+        S[sym]._feedStale = false;
+        console.log('[' + ts() + '] [FEED] ✅ ' + sym + ' feed RECOVERED (batch) — ticks flowing again @ $' + p);
+        try { sendPush('✅ ' + sym + ' FEED RECOVERED', 'Ticks flowing again @ $' + p, 'exit'); } catch (e) {}
+      }
+      results.push({ sym, ok: true });
+    } catch (e) { results.push({ sym: (t && t.sym) || '?', ok: false, err: 'exception' }); }
+  }
+  res.json({ ok: true, results });
+});
+
 // ===== FEED STALENESS WATCHDOG (added 2026-07-02) =====
 // The MT5 EA posts every 1s. Twice today (07:50 and 10:28 UTC) all symbols went silent
 // simultaneously (VPS/terminal-side outage) and the server had NO log of it — signals
