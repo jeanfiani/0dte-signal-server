@@ -4868,9 +4868,21 @@ function processPrice(sym, price, hi, lo) {
                   const dirChgX = (price - sn30x.p) / sn30x.p;
                   const sigDX = sig.type === 'call' ? 1 : sig.type === 'put' ? -1 : 0;
                   const alignedX = (sigDX > 0 && dirChgX > 0.001) || (sigDX < 0 && dirChgX < -0.001);
-                  if (alignedX) {
+                  // ===== PHASE 3.90 — ELITE-FRESH TIER (added 2026-07-02) =====
+                  // 3.69's 0.10% alignment floor blocks the BEST entries for being too early:
+                  // 7/02 12:07 PUT conv 9 + 4/4 metals was -0.08% into the leg → blocked → leg
+                  // ran -$22. 7-day audit of chop-blocked conv≥7 RIDEs: 6 winners all entered
+                  // FRESH; all 5 losers entered extended (move >0.35% spent or RSI chasing —
+                  // incl. a conv-9 CALL at RSI 63.2 after +$25/20min, -$9.6). So: conv ≥9 with
+                  // ALL 4 metals may fire from 0.02% alignment, but ONLY while fresh:
+                  // move <0.35% spent AND RSI not chasing (CALL ≤63 / PUT ≥33).
+                  const eliteFreshX = cXauS >= 9 && metalsCount >= 4 && typeof rsiV === 'number' &&
+                    ((sigDX > 0 && dirChgX > 0.0002 && dirChgX < 0.0035 && rsiV <= 63) ||
+                     (sigDX < 0 && dirChgX < -0.0002 && dirChgX > -0.0035 && rsiV >= 33));
+                  if (alignedX || eliteFreshX) {
                     _xauMetalsBypass = true;
-                    log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — XAU metals-confluence bypass (Phase 3.69): conv ' + cXauS + ' + ' + metalsCount + '/4 metals (' + metalsSet.filter(m => cXauF.indexOf(m) !== -1).join(',') + ') + aligned dir (' + (dirChgX * 100).toFixed(2) + '%). Allowed.');
+                    const tierX = alignedX ? 'Phase 3.69' : 'Phase 3.90 ELITE-FRESH';
+                    log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — XAU metals-confluence bypass (' + tierX + '): conv ' + cXauS + ' + ' + metalsCount + '/4 metals (' + metalsSet.filter(m => cXauF.indexOf(m) !== -1).join(',') + ') + dir ' + (dirChgX * 100).toFixed(2) + '% · RSI ' + rsiV.toFixed(1) + '. Allowed.');
                   }
                 }
               }
