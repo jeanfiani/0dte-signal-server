@@ -4105,8 +4105,11 @@ function processPrice(sym, price, hi, lo) {
       const ecTag = relaxedExemptCandidate ? ' [EXEMPT-CANDIDATE dormant: conv ' + sig.conv.score + ' + 1h ' + s.htf1h_dir + ', regime not aligned]' : '';
       if (!isFadeAtExtreme) {
         if (sig.type === 'put' && typeof rsiV === 'number' && rsiV < 35) {
-          // PHASE 3.81 bypass — regime+1h+conv5 alignment proves the trend is real, not exhausted
-          if (phase381Bypass) {
+          // PHASE 3.81 bypass — regime+1h+conv5 alignment proves the trend is real, not exhausted.
+          // CHoCH excluded (2026-07-02): 3.81 justifies bypassing exhaustion for trend-CONTINUATION
+          // detectors; CHoCH is a REVERSAL detector — its 7/02 first fire rode the bypass to a
+          // -$14 top-buy at RSI 74. Reversal signals never get the exhaustion bypass.
+          if (phase381Bypass && !/CHoCH/.test(tagX)) {
             log(sym, '↪️ ' + tagX + ' PUT Phase 3.81 — RSI exhaustion gate bypassed (RSI ' + rsiV.toFixed(1) + ', regime ' + sig._regime.dir + ', 1h ' + s.htf1h_dir + ', conv ' + sig.conv.score + ').');
           } else {
             log(sym, '🛑 ' + tagX + ' PUT BLOCKED — XAU RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' < 35 (oversold). No PUT at the bottom regardless of conviction — macro factors lag price exhaustion.' + ecTag);
@@ -4114,7 +4117,8 @@ function processPrice(sym, price, hi, lo) {
           }
         }
         if (sig.type === 'call' && typeof rsiV === 'number' && rsiV > 65) {
-          if (phase381Bypass) {
+          // CHoCH excluded from 3.81 bypass (2026-07-02) — see PUT branch comment above
+          if (phase381Bypass && !/CHoCH/.test(tagX)) {
             log(sym, '↪️ ' + tagX + ' CALL Phase 3.81 — RSI exhaustion gate bypassed (RSI ' + rsiV.toFixed(1) + ', regime ' + sig._regime.dir + ', 1h ' + s.htf1h_dir + ', conv ' + sig.conv.score + ').');
           } else {
             log(sym, '🛑 ' + tagX + ' CALL BLOCKED — XAU RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' > 65 (overbought). No CALL at the top regardless of conviction — macro factors lag price exhaustion.' + ecTag);
@@ -7109,11 +7113,32 @@ function processPrice(sym, price, hi, lo) {
           // Find swing low between H1 and H2
           const midLo = slArr.filter(l => l.ts > H1.ts && l.ts < H2.ts).sort((a,b) => a.price - b.price)[0];
           if (midLo && price < midLo.price - chochBuf) {
-            // Gate: RSI not extreme (below 25 = too oversold to short)
-            if (rsiV > 25 && rsiV < 75) {
+            // ===== PRIOR-TREND REQUIREMENT (added 2026-07-02) =====
+            // A change of character needs a character to change FROM. Bearish CHoCH is only
+            // valid if the market was making HIGHER highs into H1 (uptrend) before printing
+            // the lower high H2. Without this, CHoCH degenerates into a breakdown-chaser.
+            // First live fire (7/02 09:47 CALL @ $4139.90, top of a +$75 parabolic day,
+            // RSI 74.2 → SL -$14.14) fired WITH the trend at the extreme — exactly this bug.
+            const H0p = shArr.length >= 3 ? shArr[shArr.length - 3] : null;
+            const priorUptrendOk = H0p && H0p.price < H1.price; // H1 was a higher-high
+            // RSI bounds tightened 25→35 on the short side (2026-07-02): mirror of the
+            // symbol exhaustion floors so CHoCH can't short into oversold.
+            if (priorUptrendOk && rsiV > 35 && rsiV < 75) {
               // Conv check
               const chConv = convictionFor('put');
               if (chConv.score >= 4) {
+                // ===== STRUCTURAL SL BUDGET CHECK (added 2026-07-02) =====
+                // The structural stop (above H2) is the thesis invalidation, but it must
+                // respect the symbol risk cap. First fire lost $14.14 on a $10-capped
+                // symbol because this override bypassed buildCfdTrade's cap. If structure
+                // demands more risk than the budget allows, the trade doesn't exist.
+                const chSlP = H2.price + chochBuf;
+                const slDistP = chSlP - price;
+                const maxSlP = isXAU ? 10 : atrVal * 2.5;
+                if (slDistP <= 0 || slDistP > maxSlP) {
+                  s.chochLastPutTs = nowCh; // consume cooldown to avoid per-tick log spam
+                  log(sym, '⏭️ CHoCH PUT skipped — structural SL $' + slDistP.toFixed(2) + ' exceeds risk cap $' + maxSlP.toFixed(2) + ' (SL above H2 $' + H2.price.toFixed(2) + ')');
+                } else {
                 s.chochLastPutTs = nowCh;
                 s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
                 if (s.lastSignalDir === 'call') s.lastReversalTs = nowCh;
@@ -7142,6 +7167,7 @@ function processPrice(sym, price, hi, lo) {
                 log(sym, '🔄 CHoCH PUT — lower-high $' + H2.price.toFixed(2) + ' < $' + H1.price.toFixed(2) + ' + break below intermediate low $' + midLo.price.toFixed(2) + ' [#' + s.dailySignalCount + ']');
                 sendPush('🔄 ' + sym + ' CHoCH PUT #' + s.dailySignalCount, 'Change of character bearish · $' + price.toFixed(2), 'signal');
                 return;
+                } // end structural-SL budget else
               }
             }
           }
@@ -7157,9 +7183,26 @@ function processPrice(sym, price, hi, lo) {
           // Find swing high between L1 and L2
           const midHi = shArr.filter(h => h.ts > L1.ts && h.ts < L2.ts).sort((a,b) => b.price - a.price)[0];
           if (midHi && price > midHi.price + chochBuf) {
-            if (rsiV > 25 && rsiV < 75) {
+            // ===== PRIOR-TREND REQUIREMENT (added 2026-07-02) =====
+            // Bullish CHoCH is only valid if the market was making LOWER lows into L1
+            // (downtrend) before printing the higher low L2. On a parabolic up-day every
+            // pullback is a "higher low + break" — that's continuation, not a change of
+            // character. This is the check whose absence caused the 7/02 09:47 top-buy.
+            const L0p = slArr.length >= 3 ? slArr[slArr.length - 3] : null;
+            const priorDowntrendOk = L0p && L0p.price > L1.price; // L1 was a lower-low
+            // RSI bounds tightened 75→65 on the long side (2026-07-02): first fire entered
+            // at RSI 74.2 — passing by 0.8. CALLs above 65 are chasing exhaustion.
+            if (priorDowntrendOk && rsiV > 25 && rsiV < 65) {
               const chConv = convictionFor('call');
               if (chConv.score >= 4) {
+                // ===== STRUCTURAL SL BUDGET CHECK (added 2026-07-02) — see PUT branch =====
+                const chSlC = L2.price - chochBuf;
+                const slDistC = price - chSlC;
+                const maxSlC = isXAU ? 10 : atrVal * 2.5;
+                if (slDistC <= 0 || slDistC > maxSlC) {
+                  s.chochLastCallTs = nowCh; // consume cooldown to avoid per-tick log spam
+                  log(sym, '⏭️ CHoCH CALL skipped — structural SL $' + slDistC.toFixed(2) + ' exceeds risk cap $' + maxSlC.toFixed(2) + ' (SL below L2 $' + L2.price.toFixed(2) + ')');
+                } else {
                 s.chochLastCallTs = nowCh;
                 s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
                 if (s.lastSignalDir === 'put') s.lastReversalTs = nowCh;
@@ -7187,6 +7230,7 @@ function processPrice(sym, price, hi, lo) {
                 log(sym, '🔄 CHoCH CALL — higher-low $' + L2.price.toFixed(2) + ' > $' + L1.price.toFixed(2) + ' + break above intermediate high $' + midHi.price.toFixed(2) + ' [#' + s.dailySignalCount + ']');
                 sendPush('🔄 ' + sym + ' CHoCH CALL #' + s.dailySignalCount, 'Change of character bullish · $' + price.toFixed(2), 'signal');
                 return;
+                } // end structural-SL budget else
               }
             }
           }
