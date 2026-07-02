@@ -1522,7 +1522,9 @@ function log(sym, msg) {
   // over-gating without needing to read Railway logs (e.g., BTC dropped from 4-5/day to
   // 0-1/day — we need to see what's getting eliminated).
   try {
-    if (S && S[sym] && (msg.includes('BLOCKED') || msg.includes('SUPPRESSED'))) {
+    // Case-insensitive match (fixed 2026-07-02): V-REV's "suppressed" is lowercase, so its
+    // chop suppressions were NEVER shadow-tracked — we had zero data on what that gate costs.
+    if (S && S[sym] && /BLOCKED|SUPPRESSED/i.test(msg)) {
       S[sym].blockedAttempts = S[sym].blockedAttempts || [];
       S[sym].blockedAttempts.push({ ts: Date.now(), time: ts(), msg: msg.substring(0, 240) });
       if (S[sym].blockedAttempts.length > 30) S[sym].blockedAttempts.shift();
@@ -1547,13 +1549,16 @@ function log(sym, msg) {
 // winners — relax it").
 const BLOCK_TRACK_COOLDOWN_MS = 35 * 60 * 1000;
 
-function trackBlockedOutcome(sym, msg) {
+function trackBlockedOutcome(sym, msg, force) {
+  // force=true (added 2026-07-02): dormant-analysis detectors (V-REV) bypass the shared
+  // 35-min sampling cooldown — every dormant trigger is tracked, and forced entries do
+  // NOT consume the cooldown slot of regular block sampling.
   const s = S[sym];
   if (!s) return;
   if (!Array.isArray(s.prices) || s.prices.length === 0) return;
   const now = Date.now();
   s.lastBlockTrackedTs = s.lastBlockTrackedTs || 0;
-  if (now - s.lastBlockTrackedTs < BLOCK_TRACK_COOLDOWN_MS) return;
+  if (!force && now - s.lastBlockTrackedTs < BLOCK_TRACK_COOLDOWN_MS) return;
   // Parse direction from message (most block logs contain "CALL" or "PUT")
   const typeMatch = msg.match(/\b(CALL|PUT)\b/);
   if (!typeMatch) return; // can't determine direction — skip
@@ -1593,7 +1598,7 @@ function trackBlockedOutcome(sym, msg) {
     closed: false, closedTs: null,
     outcome: null  // 'win' | 'loss' | 'scratch' | 'no_resolve'
   });
-  s.lastBlockTrackedTs = now;
+  if (!force) s.lastBlockTrackedTs = now; // forced (dormant-analysis) entries don't consume the sampling slot
   // Cap raised 50 → 200 (2026-07-02): 50 forced mixed-regime analysis (BTC/NAS entries
   // spanned Jun 9 → Jul 1 configs in one bucket). 200 ≈ 3-4 weeks at current sampling,
   // enough for date-windowed gate reports via /blocked-outcomes/:sym?days=N.
@@ -8713,6 +8718,17 @@ function processPrice(sym, price, hi, lo) {
   // All thresholds are scaled by symbol — BTC values are ~40× XAU.
   const vrevEnabled = isXAU || isBTC;
 
+  // ===== V-REV DORMANT MODE (added 2026-07-02) =====
+  // V-REV was effectively retired (too many wrong fires) but the pattern it hunts is real —
+  // e.g. 7/02 ~11:05 ET XAU $16 displacement dump into demand + instant V-reclaim, missed
+  // by everything. Dormant mode: the detector runs EVERYWHERE (including chop, which
+  // previously suppressed detection entirely), logs every would-be fire with full context
+  // (displacement ×ATR, bounce %, RSI, chop, conviction), force-tracks it in the shadow
+  // outcomes (bypasses the 35-min sampling cooldown) — and NEVER fires, notifies, or trades.
+  // After 1-2 weeks, segment /blocked-outcomes VREV entries by context to find the gate
+  // (hypothesis: displacement ≥2×ATR + bounce ≥40% is the winning subset).
+  const VREV_DORMANT = true;
+
   // Chop block (2026-05-18): if chopActive, suppress V-REV but continue to other detectors
   // below (ATH/ATL, MFLIP, TREND RIDE still need to evaluate). Throttled log every 10 min so
   // we don't spam each tick.
@@ -8722,7 +8738,7 @@ function processPrice(sym, price, hi, lo) {
     s.vrevChopBlockLogTs = now2;
   }
 
-  if (vrevEnabled && !vrevChopBlocked && s.vrevSnaps.length >= 60 && cool && (now2 - s.vrevLastTs > 900000)) {
+  if (vrevEnabled && (!vrevChopBlocked || VREV_DORMANT) && s.vrevSnaps.length >= 60 && cool && (now2 - s.vrevLastTs > 900000)) {
     // Find the high and low in the last 15 min of snapshots
     const lookback = s.vrevSnaps.filter(sn => sn.ts > now2 - 900000); // 15 min
     if (lookback.length >= 30) {
@@ -8837,6 +8853,23 @@ function processPrice(sym, price, hi, lo) {
       }
       if (dropThenBounce && roc3 > symRocThr * 2 && rsiV > 32 && rsiV < 65 && vrevGapOkCall && vrevRoundOkCall && vrevRoomOkCall && vrevMacroOppOkCall && flipCoolFor('call') && vrevFlipOk('call') && winProtectDir !== 'put') {
         // CALL reversal: was dropping, now bouncing with strong upward ROC
+        if (VREV_DORMANT) {
+          s.vrevLastTs = now2; // keep the 15-min cooldown so analysis entries don't flood
+          try {
+            const convD = convictionFor('call');
+            const dispX = (typeof atrVal === 'number' && atrVal > 0) ? range / atrVal : 0;
+            const bouncePct = range > 0 ? (price - lbLow) / range * 100 : 0;
+            const msgD = '🌊 ⬆VREV CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(2) +
+              ' · drop $' + range.toFixed(2) + ' (' + dispX.toFixed(1) + '×ATR)' +
+              ' · bounce ' + bouncePct.toFixed(0) + '%' +
+              ' · ROC ' + roc3.toFixed(3) + '% · RSI ' + rsiV.toFixed(1) +
+              ' · chop ' + (s.chopActive ? 1 : 0) +
+              ' · conv ' + convD.score + ' [' + (convD.factors || []).join(',') + ']' +
+              ((dispX >= 2 && bouncePct >= 40) ? ' [DISP-V]' : '');
+            log(sym, msgD);
+            trackBlockedOutcome(sym, msgD, true);
+          } catch (e) { /* dormant analysis must never crash the detector */ }
+        } else {
         s.vrevLastTs = now2;
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
         if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
@@ -8849,6 +8882,7 @@ function processPrice(sym, price, hi, lo) {
         sendPush('🔄 ' + sym + ' V-REVERSAL CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · bounced $' + (price - lbLow).toFixed(2) + ' off $' + lbLow.toFixed(2) + ' low', 'signal');
         s.trade = isMT5 ? buildCfdTrade('call', price, atrVal, sym) : { active: true, type: 'call', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
         return;
+        } // end VREV_DORMANT else
       }
 
       if (rallyThenDrop && !vrevMacroOppOkPut) {
@@ -8857,6 +8891,23 @@ function processPrice(sym, price, hi, lo) {
       }
       if (rallyThenDrop && roc3 < -symRocThr * 2 && rsiV > 35 && rsiV < 68 && vrevGapOkPut && vrevRoundOkPut && vrevRoomOkPut && vrevMacroOppOkPut && flipCoolFor('put') && vrevFlipOk('put') && winProtectDir !== 'call') {
         // PUT reversal: was rallying, now dropping with strong downward ROC
+        if (VREV_DORMANT) {
+          s.vrevLastTs = now2; // keep the 15-min cooldown so analysis entries don't flood
+          try {
+            const convD = convictionFor('put');
+            const dispX = (typeof atrVal === 'number' && atrVal > 0) ? range / atrVal : 0;
+            const dropPct = range > 0 ? (lbHigh - price) / range * 100 : 0;
+            const msgD = '🌊 ⬇VREV PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(2) +
+              ' · rally $' + range.toFixed(2) + ' (' + dispX.toFixed(1) + '×ATR)' +
+              ' · drop ' + dropPct.toFixed(0) + '%' +
+              ' · ROC ' + roc3.toFixed(3) + '% · RSI ' + rsiV.toFixed(1) +
+              ' · chop ' + (s.chopActive ? 1 : 0) +
+              ' · conv ' + convD.score + ' [' + (convD.factors || []).join(',') + ']' +
+              ((dispX >= 2 && dropPct >= 40) ? ' [DISP-V]' : '');
+            log(sym, msgD);
+            trackBlockedOutcome(sym, msgD, true);
+          } catch (e) { /* dormant analysis must never crash the detector */ }
+        } else {
         s.vrevLastTs = now2;
         s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
         if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
@@ -8869,6 +8920,7 @@ function processPrice(sym, price, hi, lo) {
         sendPush('🔄 ' + sym + ' V-REVERSAL PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · dropped $' + (lbHigh - price).toFixed(2) + ' off $' + lbHigh.toFixed(2) + ' high', 'signal');
         s.trade = isMT5 ? buildCfdTrade('put', price, atrVal, sym) : { active: true, type: 'put', ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
         return;
+        } // end VREV_DORMANT else
       }
     }
   }
