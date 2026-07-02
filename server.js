@@ -11909,6 +11909,7 @@ app.get('/signals/csv/:date', (req, res) => {
       // For CALL: delta = priceN - entryPrice. For PUT: delta = entryPrice - priceN.
       const entryPx = parseFloat(price);
       const sign = (type === 'call') ? 1 : -1;
+      const snaps = entry && entry.priceSnaps ? entry.priceSnaps : {};
       const fmtPx = (v) => (v == null ? '' : v.toFixed(2));
       const fmtDelta = (v) => (v == null || !isFinite(entryPx) ? '' : ((v - entryPx) * sign).toFixed(2));
       const p5  = fmtPx(snaps.p5m),  d5  = fmtDelta(snaps.p5m);
