@@ -1586,7 +1586,7 @@ function trackBlockedOutcome(sym, msg) {
     price: +price.toFixed(2),
     virtualTp1: +virtualTp1.toFixed(2),
     virtualSl: +virtualSl.toFixed(2),
-    blockReason: msg.substring(0, 200),
+    blockReason: msg.substring(0, 320), // 200 → 320 (2026-07-02): keep [EXEMPT-CANDIDATE] tag intact
     snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
     tp1Hit: false, tp1HitTs: null,
     slHit: false, slHitTs: null,
@@ -1594,8 +1594,10 @@ function trackBlockedOutcome(sym, msg) {
     outcome: null  // 'win' | 'loss' | 'scratch' | 'no_resolve'
   });
   s.lastBlockTrackedTs = now;
-  // Cap rolling buffer at 50 entries per symbol (~3-5 sessions of data)
-  if (s.blockedOutcomes.length > 50) s.blockedOutcomes.shift();
+  // Cap raised 50 → 200 (2026-07-02): 50 forced mixed-regime analysis (BTC/NAS entries
+  // spanned Jun 9 → Jul 1 configs in one bucket). 200 ≈ 3-4 weeks at current sampling,
+  // enough for date-windowed gate reports via /blocked-outcomes/:sym?days=N.
+  if (s.blockedOutcomes.length > 200) s.blockedOutcomes.shift();
 }
 
 // Update tracked block outcomes on each tick — snapshots + TP1/SL hit detection.
@@ -4090,13 +4092,24 @@ function processPrice(sym, price, hi, lo) {
     if (isXAU) {
       const tagX = sig.score || '';
       const isFadeAtExtreme = /HI|LO|ATH|ATL|DIV|SWEEP/.test(tagX) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tagX);
+      // ===== DORMANT EXEMPT-CANDIDATE FLAG (added 2026-07-02, log-only) =====
+      // Shadow audit (6/25–7/02): 3 exhaustion-blocked XAU signals with conv≥5 + 1h HTF
+      // aligned went 2 wins / 1 scratch / 0 losses. All failed Phase 3.81 only on its
+      // REGIME-alignment leg. Hypothesis: with strong momentum + HTF agreement, oversold
+      // RSI on gold is continuation, not exhaustion — regime alignment may be redundant.
+      // This flag tags such blocks in the log/blockReason so the shadow tracker can score
+      // the relaxed rule. NO TRADING CHANGE — the block still stands. Promote only if
+      // /blocked-outcomes/XAU exemptCandidates shows a clear edge after ~2 weeks.
+      const relaxedExemptCandidate = !phase381Bypass && sig.conv && sig.conv.score >= 5 &&
+        ((sig.type === 'put' && s.htf1h_dir === 'down') || (sig.type === 'call' && s.htf1h_dir === 'up'));
+      const ecTag = relaxedExemptCandidate ? ' [EXEMPT-CANDIDATE dormant: conv ' + sig.conv.score + ' + 1h ' + s.htf1h_dir + ', regime not aligned]' : '';
       if (!isFadeAtExtreme) {
         if (sig.type === 'put' && typeof rsiV === 'number' && rsiV < 35) {
           // PHASE 3.81 bypass — regime+1h+conv5 alignment proves the trend is real, not exhausted
           if (phase381Bypass) {
             log(sym, '↪️ ' + tagX + ' PUT Phase 3.81 — RSI exhaustion gate bypassed (RSI ' + rsiV.toFixed(1) + ', regime ' + sig._regime.dir + ', 1h ' + s.htf1h_dir + ', conv ' + sig.conv.score + ').');
           } else {
-            log(sym, '🛑 ' + tagX + ' PUT BLOCKED — XAU RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' < 35 (oversold). No PUT at the bottom regardless of conviction — macro factors lag price exhaustion.');
+            log(sym, '🛑 ' + tagX + ' PUT BLOCKED — XAU RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' < 35 (oversold). No PUT at the bottom regardless of conviction — macro factors lag price exhaustion.' + ecTag);
             return false;
           }
         }
@@ -4104,7 +4117,7 @@ function processPrice(sym, price, hi, lo) {
           if (phase381Bypass) {
             log(sym, '↪️ ' + tagX + ' CALL Phase 3.81 — RSI exhaustion gate bypassed (RSI ' + rsiV.toFixed(1) + ', regime ' + sig._regime.dir + ', 1h ' + s.htf1h_dir + ', conv ' + sig.conv.score + ').');
           } else {
-            log(sym, '🛑 ' + tagX + ' CALL BLOCKED — XAU RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' > 65 (overbought). No CALL at the top regardless of conviction — macro factors lag price exhaustion.');
+            log(sym, '🛑 ' + tagX + ' CALL BLOCKED — XAU RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' > 65 (overbought). No CALL at the top regardless of conviction — macro factors lag price exhaustion.' + ecTag);
             return false;
           }
         }
@@ -11459,7 +11472,22 @@ app.get('/blocked-outcomes/:sym', (req, res) => {
   const sym = req.params.sym.toUpperCase();
   const s = S[sym];
   if (!s) return res.status(404).json({ error: 'Unknown symbol: ' + sym });
-  const outcomes = Array.isArray(s.blockedOutcomes) ? s.blockedOutcomes : [];
+  let outcomes = Array.isArray(s.blockedOutcomes) ? s.blockedOutcomes : [];
+  // Date filtering (added 2026-07-02): ?days=N (last N days) or ?from=YYYY-MM-DD&to=YYYY-MM-DD.
+  // Prevents mixed-regime analysis — e.g. compare gates before/after the 6/30 loosening.
+  const q = req.query || {};
+  if (q.days && isFinite(parseFloat(q.days))) {
+    const cutoffTs = Date.now() - parseFloat(q.days) * 86400000;
+    outcomes = outcomes.filter(o => o.ts >= cutoffTs);
+  }
+  if (q.from && /^\d{4}-\d{2}-\d{2}$/.test(q.from)) {
+    const fromTs = Date.parse(q.from + 'T00:00:00-04:00'); // ET day start
+    if (isFinite(fromTs)) outcomes = outcomes.filter(o => o.ts >= fromTs);
+  }
+  if (q.to && /^\d{4}-\d{2}-\d{2}$/.test(q.to)) {
+    const toTs = Date.parse(q.to + 'T23:59:59-04:00'); // ET day end
+    if (isFinite(toTs)) outcomes = outcomes.filter(o => o.ts <= toTs);
+  }
   const closed = outcomes.filter(o => o.closed);
   const wins = closed.filter(o => o.outcome === 'win').length;
   const losses = closed.filter(o => o.outcome === 'loss').length;
@@ -11484,7 +11512,19 @@ app.get('/blocked-outcomes/:sym', (req, res) => {
     byDetector,
     lastTrackedAgoMin: s.lastBlockTrackedTs ? Math.round((Date.now() - s.lastBlockTrackedTs) / 60000) : null,
     cooldownMin: BLOCK_TRACK_COOLDOWN_MS / 60000,
-    entries: outcomes.slice(-30)
+    filter: { days: q.days || null, from: q.from || null, to: q.to || null },
+    // exemptCandidates: dormant Phase 3.81-relaxed exhaustion blocks (conv≥5 + 1h aligned,
+    // regime NOT required). Review with: how many would-be wins vs losses carry this tag?
+    exemptCandidates: (() => {
+      const ec = closed.filter(o => /EXEMPT-CANDIDATE/.test(o.blockReason || ''));
+      return {
+        total: ec.length,
+        win: ec.filter(o => o.outcome === 'win').length,
+        loss: ec.filter(o => o.outcome === 'loss').length,
+        scratch: ec.filter(o => o.outcome === 'scratch').length
+      };
+    })(),
+    entries: outcomes.slice(-50)
   });
 });
 
@@ -11619,8 +11659,40 @@ app.post('/feed', (req, res) => {
   }
   S[sym].lastPrice = p;
   S[sym].tickBuf.push({ p, h, l });
+  // FEED WATCHDOG (added 2026-07-02): track last-received time per symbol; recovery logging
+  S[sym].lastFeedTs = Date.now();
+  if (S[sym]._feedStale) {
+    S[sym]._feedStale = false;
+    console.log('[' + ts() + '] [FEED] ✅ ' + sym + ' feed RECOVERED — ticks flowing again @ $' + p);
+    try { sendPush('✅ ' + sym + ' FEED RECOVERED', 'Ticks flowing again @ $' + p, 'exit'); } catch (e) {}
+  }
   res.json({ ok: true, sym, price: p, samples: S[sym].prices.length });
 });
+
+// ===== FEED STALENESS WATCHDOG (added 2026-07-02) =====
+// The MT5 EA posts every 1s. Twice today (07:50 and 10:28 UTC) all symbols went silent
+// simultaneously (VPS/terminal-side outage) and the server had NO log of it — signals
+// just stopped and priceSnaps stayed blank. This watchdog makes feed death loud:
+// one log line + one push per outage (not per check), plus a recovery notice above.
+const FEED_STALE_MS = 90 * 1000; // 90s without a tick = stale (EA posts every 1s)
+const FEED_WATCHDOG_BOOT_TS = Date.now(); // so "dead since boot" is also detected
+setInterval(() => {
+  try {
+    const now = Date.now();
+    ['XAU', 'BTC', 'NAS100'].forEach(sym => {
+      const s = S[sym];
+      if (!s) return;
+      // If no tick has EVER arrived since boot, compare against boot time — a feed
+      // that is already dead when the server starts must still trigger the alert.
+      const age = now - (s.lastFeedTs || FEED_WATCHDOG_BOOT_TS);
+      if (age > FEED_STALE_MS && !s._feedStale) {
+        s._feedStale = true;
+        console.log('[' + ts() + '] [FEED] 🚨 ' + sym + ' feed STALE — no ticks for ' + Math.round(age / 1000) + 's (last $' + s.lastPrice + '). Check MT5 EA / VPS connection.');
+        try { sendPush('🚨 ' + sym + ' FEED DEAD', 'No ticks for ' + Math.round(age / 1000) + 's — check MT5/VPS', 'exit'); } catch (e) {}
+      }
+    });
+  } catch (e) { /* watchdog must never crash the server */ }
+}, 30 * 1000);
 
 // Full prices + indicators endpoint for mobile PWA polling
 app.get('/prices', (req, res) => {
