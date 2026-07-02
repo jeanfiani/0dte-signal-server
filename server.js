@@ -2426,7 +2426,52 @@ function logSignal(sym, sig) {
   // checkExit() uses this to update outcomes when t.t1/t.t2/t.sl flags flip.
   // Direct reference (fixed 2026-06-11) — index-based tracking broke whenever
   // saveSignalHistory() pruned old entries and shifted the array.
-  S[sym].lastHistEntry = histEntry;
+  // BLOCKED-HIJACK FIX (added 2026-07-02): enrichBlocked/BLOCKED entries are stored for
+  // analytics but never activate a trade — yet they were unconditionally taking over
+  // lastHistEntry here. Result: the STILL-ACTIVE previous trade's TP/SL hits got stamped
+  // onto the blocked entry, and the entry that actually fired stayed "Open" forever.
+  // (7-day audit 6/25–7/02: 67 of 86 BTC TP1 stamps sat on blocked entries.)
+  // Only fired signals may own outcome tracking.
+  const _isBlockedSig = !!(sig.conv && (sig.conv.enrichBlocked === true || sig.conv.label === 'BLOCKED'));
+  if (!_isBlockedSig) S[sym].lastHistEntry = histEntry;
+
+  // ===== PER-FIRE VIRTUAL OUTCOME TRACKS (added 2026-07-02) =====
+  // Problem: outcome stamping followed lastHistEntry only, so same-direction continuation
+  // fires while a trade was open were never resolved (47% of fired signals had empty
+  // outcomes in the 6/25–7/02 audit — some -$200/-$358 adverse at 30m, invisible to stats).
+  // Fix: every FIRED CFD signal gets its own virtual track with its own TP/SL levels,
+  // evaluated per tick in checkCfdTracks(). Detectors assign s.trade synchronously right
+  // after logSignal() returns, so we read the levels on the next event-loop turn.
+  // Writes are fill-in-only (never overwrites a stamp set by updateSignalOutcome).
+  if (!_isBlockedSig && (sym === 'XAU' || sym === 'BTC' || sym === 'NAS100')) {
+    const _fireTs = Date.now();
+    setImmediate(() => {
+      try {
+        const st = S[sym];
+        const t = st.trade;
+        if (!t || !t.active || !t.isCfd || t.type !== sig.type) return;
+        if (!(t.slPrice > 0) || !(t.tp1Price > 0)) return;
+        const ep = parseFloat(sig.price);
+        if (!isFinite(ep)) return;
+        const iC = sig.type === 'call';
+        // Levels anchored to THIS fire's price, using the trade's distances. For
+        // continuation fires the merged trade keeps the original ep, so re-anchoring
+        // by distance gives this fire its own honest levels.
+        const slD = Math.abs(t.ep - t.slPrice), tp1D = Math.abs(t.tp1Price - t.ep);
+        const tp2D = Math.abs(t.tp2Price - t.ep), tp3D = Math.abs(t.tp3Price - t.ep);
+        st.cfdTracks = st.cfdTracks || [];
+        st.cfdTracks.push({
+          entry: histEntry, type: sig.type, ep: ep, ts: _fireTs,
+          sl:  iC ? ep - slD  : ep + slD,
+          tp1: iC ? ep + tp1D : ep - tp1D,
+          tp2: iC ? ep + tp2D : ep - tp2D,
+          tp3: iC ? ep + tp3D : ep - tp3D,
+          t1: false, t2: false, done: false
+        });
+        if (st.cfdTracks.length > 12) st.cfdTracks.shift();
+      } catch (e) { /* never crash signal emission on tracking */ }
+    });
+  }
 
   // Schedule post-signal price snapshots at +5m / +15m / +30m (added 2026-05-14).
   // processPrice() will check pendingSnapshots each tick and populate priceSnaps on the
@@ -3405,6 +3450,8 @@ function processPrice(sym, price, hi, lo) {
 
   // Check exit for active trades
   checkExit(sym, price);
+  // Resolve per-fire virtual outcome tracks (added 2026-07-02) — stats only, no trade side effects
+  checkCfdTracks(sym, price);
 
   // ===== CONVICTION SCORE CALCULATOR (MT5 + QQQ) =====
   // Returns { score: 0-7, label: 'HIGH'|'MOD'|'LOW', factors: [...] } for a given direction.
@@ -10200,6 +10247,53 @@ function updateSignalOutcome(sym, finalPrice) {
   // Persist after outcome update (added 2026-05-14). Outcomes are critical for audit —
   // every TP/SL hit must survive a restart.
   try { saveSignalHistory(); } catch (e) { /* already logged */ }
+}
+
+// ===== PER-FIRE VIRTUAL OUTCOME TRACKS (added 2026-07-02) =====
+// Companion to the cfdTracks created in logSignal(). Each fired CFD signal is resolved
+// independently against its OWN levels, so continuation fires and superseded signals get
+// honest outcomes instead of staying "Open" forever. Fill-in-only writes: a field already
+// stamped by updateSignalOutcome() (live-trade path) is never overwritten. Tracks resolve
+// on TP3 or SL, or expire after 24h. No trade/EA side effects — stats only.
+function checkCfdTracks(sym, price) {
+  const s = S[sym];
+  if (!s || !Array.isArray(s.cfdTracks) || s.cfdTracks.length === 0 || !(price > 0)) return;
+  const now = Date.now();
+  let changed = false;
+  for (const tr of s.cfdTracks) {
+    if (tr.done) continue;
+    if (now - tr.ts > 24 * 3600 * 1000) { tr.done = true; continue; }
+    const e = tr.entry;
+    if (!e) { tr.done = true; continue; }
+    if (!e.outcomes) e.outcomes = {};
+    const o = e.outcomes;
+    const iC = tr.type === 'call';
+    const hitTp1 = iC ? price >= tr.tp1 : price <= tr.tp1;
+    const hitTp2 = iC ? price >= tr.tp2 : price <= tr.tp2;
+    const hitTp3 = iC ? price >= tr.tp3 : price <= tr.tp3;
+    const hitSl  = iC ? price <= tr.sl  : price >= tr.sl;
+    if (hitTp1 && !tr.t1) {
+      tr.t1 = true;
+      if (!o.tp1Hit) { o.tp1Hit = true; o.tp1HitTs = now; changed = true; }
+    }
+    if (hitTp2 && !tr.t2) {
+      tr.t2 = true;
+      if (!o.tp2Hit) { o.tp2Hit = true; o.tp2HitTs = now; changed = true; }
+    }
+    if (hitTp3) {
+      tr.done = true;
+      if (!o.tp3Hit) { o.tp3Hit = true; o.tp3HitTs = now; if (o.closePrice == null) o.closePrice = price; changed = true; }
+    } else if (hitSl) {
+      // Raw SL on this fire's own levels — no trailing/BE logic here by design:
+      // the virtual track measures per-signal quality, not live trade management.
+      tr.done = true;
+      if (!o.slHit && !o.tp3Hit) { o.slHit = true; o.slHitTs = now; if (o.closePrice == null) o.closePrice = price; changed = true; }
+    }
+  }
+  // Prune resolved tracks
+  if (s.cfdTracks.length && s.cfdTracks.every(tr => tr.done)) s.cfdTracks = [];
+  else if (s.cfdTracks.length > 12) s.cfdTracks = s.cfdTracks.filter(tr => !tr.done).slice(-12);
+  if (changed) { try { saveSignalHistory(); } catch (e) { /* already logged */ } }
 }
 
 function checkExit(sym, price) {
