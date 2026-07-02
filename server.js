@@ -2767,6 +2767,32 @@ function processPrice(sym, price, hi, lo) {
         }
       }
     } catch (e) {}
+
+    // ===== DORMANT GRIND-TREND OVERRIDE (added 2026-07-02, LOG-ONLY) =====
+    // Phase 3.57 only sees BURSTS (30-min move > threshold). A slow grind never trips it:
+    // 7/02 BTC ground +3% overnight (60,300 → 62,100) at ~0.1-0.2% per 30min — chop mode
+    // stayed ON the entire time and every RIDE entry was blocked while a $1,800 trend
+    // played out. Hypothesis: |3h net drift| > 1.2% = trend, regardless of burst size.
+    // DORMANT: logs what it WOULD do, changes nothing. Grep '🌀 GRIND' after ~1 week and
+    // compare against chop-blocked RIDE shadow outcomes to decide on promotion.
+    try {
+      if (s.chopActive && Array.isArray(s.macroSnaps) && s.macroSnaps.length >= 24 && s.lastPrice > 0) {
+        const now = Date.now();
+        if (!s._grindLogTs || now - s._grindLogTs > 5 * 60 * 1000) { // throttle: 1 log / 5 min
+          // Oldest snap within the last 3h (snaps are 5-min spaced, 36 = 3h)
+          const cutoff3h = now - 3 * 3600 * 1000;
+          const window3h = s.macroSnaps.filter(sn => sn && sn.ts >= cutoff3h && sn.p > 0);
+          if (window3h.length >= 24) { // at least 2h of coverage inside the 3h window
+            const oldest = window3h[0];
+            const driftPct = (s.lastPrice - oldest.p) / oldest.p * 100;
+            if (Math.abs(driftPct) > 1.2) {
+              s._grindLogTs = now;
+              log(sym, '🌀 GRIND OVERRIDE (dormant) — 3h net drift ' + (driftPct >= 0 ? '+' : '') + driftPct.toFixed(2) + '% > 1.2% with chop still ON. Would force chopActive OFF (' + (driftPct >= 0 ? 'up' : 'down') + '-grind). Log-only, no behavior change.');
+            }
+          }
+        }
+      }
+    } catch (e) { /* dormant logging must never affect the tick loop */ }
   }
 
   // === ORDER BLOCK — 1-min candle builder + OB zone detection ===
@@ -4137,6 +4163,48 @@ function processPrice(sym, price, hi, lo) {
         }
         if (sig.type === 'put' && typeof rsiV === 'number' && rsiV < 35) {
           log(sym, '🛑 ' + tagX + ' PUT BLOCKED — fade on wrong side: RSI ' + rsiV.toFixed(1) + ' < 35. A high-fade PUT fires near the high, not after the drop.');
+          return false;
+        }
+      }
+    }
+
+    // ===== NAS100/BTC RSI EXHAUSTION FLOOR + WRONG-SIDE FADE GATE (added 2026-07-02) =====
+    // Port of the QQQ (5/22) and XAU (5/20 + R3 6/11) gates that NAS100 and BTC never got.
+    // Cost of the gap, 7/02 alone: NAS 09:44 ⬇HI PUT fired at RSI 18.3 (wrong-side fade,
+    // $80 after the drop, against the day's uptrend) → SL -$174; NAS 05:33 STRUCT_VWAP
+    // CALL at RSI 71.1 → -$70 drift. Floors set at 32/68 (vs XAU 35/65, QQQ 30/70) —
+    // index/crypto momentum legitimately enters mid-30s / mid-60s more often than gold.
+    // Continuation detectors keep the Phase 3.81 bypass; fades and CHoCH never get it.
+    if (sym === 'NAS100' || sym === 'BTC') {
+      const tagNB = sig.score || '';
+      const isFadeAtExtremeNB = /HI|LO|ATH|ATL|DIV|SWEEP/.test(tagNB) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tagNB);
+      if (!isFadeAtExtremeNB) {
+        if (sig.type === 'put' && typeof rsiV === 'number' && rsiV < 32) {
+          if (phase381Bypass && !/CHoCH/.test(tagNB)) {
+            log(sym, '↪️ ' + tagNB + ' PUT Phase 3.81 — ' + sym + ' RSI exhaustion gate bypassed (RSI ' + rsiV.toFixed(1) + ', regime ' + (sig._regime ? sig._regime.dir : '?') + ', 1h ' + s.htf1h_dir + ', conv ' + sig.conv.score + ').');
+          } else {
+            log(sym, '🛑 ' + tagNB + ' PUT BLOCKED — ' + sym + ' RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' < 32 (oversold). No PUT at the bottom — macro factors lag price exhaustion.');
+            return false;
+          }
+        }
+        if (sig.type === 'call' && typeof rsiV === 'number' && rsiV > 68) {
+          if (phase381Bypass && !/CHoCH/.test(tagNB)) {
+            log(sym, '↪️ ' + tagNB + ' CALL Phase 3.81 — ' + sym + ' RSI exhaustion gate bypassed (RSI ' + rsiV.toFixed(1) + ', regime ' + (sig._regime ? sig._regime.dir : '?') + ', 1h ' + s.htf1h_dir + ', conv ' + sig.conv.score + ').');
+          } else {
+            log(sym, '🛑 ' + tagNB + ' CALL BLOCKED — ' + sym + ' RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' > 68 (overbought). No CALL at the top — macro factors lag price exhaustion.');
+            return false;
+          }
+        }
+      } else {
+        // Direction-aware fade wrong-side gate (same rule as QQQ/XAU): a LO/ATL fade CALL
+        // fires near the low — by RSI > 65 the bounce already happened. A HI/ATH fade PUT
+        // fires near the high — at RSI < 35 the drop already happened.
+        if (sig.type === 'call' && typeof rsiV === 'number' && rsiV > 65) {
+          log(sym, '🛑 ' + tagNB + ' CALL BLOCKED — fade on wrong side: RSI ' + rsiV.toFixed(1) + ' > 65. A low-fade CALL fires near the low, not after the bounce.');
+          return false;
+        }
+        if (sig.type === 'put' && typeof rsiV === 'number' && rsiV < 35) {
+          log(sym, '🛑 ' + tagNB + ' PUT BLOCKED — fade on wrong side: RSI ' + rsiV.toFixed(1) + ' < 35. A high-fade PUT fires near the high, not after the drop.');
           return false;
         }
       }
@@ -8843,12 +8911,13 @@ function processPrice(sym, price, hi, lo) {
       if (isLong && price > t.bestPrice) t.bestPrice = price;
       if (!isLong && price < t.bestPrice) t.bestPrice = price;
 
-      // TP1 hit — move SL to breakeven
+      // TP1 hit — lock small profit (changed 2026-07-02: was pure breakeven; see checkExit)
       if (!t.tp1Hit && ((isLong && price >= t.tp1) || (!isLong && price <= t.tp1))) {
         t.tp1Hit = true;
-        t.trailSl = t.ep;
-        log(sym, '🎯 TRv2 TP1 HIT — $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2) + ' (' + pnlPct.toFixed(2) + '%) · SL moved to breakeven $' + t.ep.toFixed(2));
-        sendPush('🎯 ' + sym + ' TP1 HIT', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · SL → breakeven', 'signal');
+        const lockDistT2 = (typeof t.atr === 'number' && isFinite(t.atr) && t.atr > 0) ? t.atr * 0.3 : 0;
+        t.trailSl = isLong ? t.ep + lockDistT2 : t.ep - lockDistT2;
+        log(sym, '🎯 TRv2 TP1 HIT — $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2) + ' (' + pnlPct.toFixed(2) + '%) · SL moved to entry' + (lockDistT2 > 0 ? (isLong ? '+' : '-') + '$' + lockDistT2.toFixed(2) + ' (profit-lock)' : ' (BE)') + ' $' + t.trailSl.toFixed(2));
+        sendPush('🎯 ' + sym + ' TP1 HIT', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · SL → entry±0.3ATR lock', 'signal');
       }
 
       // TP2 hit — trail SL to TP1
@@ -10366,11 +10435,15 @@ function checkExit(sym, price) {
     if (iC && price > t.bestPrice) t.bestPrice = price;
     if (!iC && price < t.bestPrice) t.bestPrice = price;
 
-    // TP1 hit → move SL to breakeven
+    // TP1 hit → lock small profit (changed 2026-07-02: was pure breakeven).
+    // ~1/3 of fired trades were ending as BE scratches — e.g. 7/02 XAU peaked +$5.04 and
+    // exited at $0.00; BTC 09:31 TP1'd then scratched while price ran +$266 more. Trailing
+    // at entry ± 0.3×ATR keeps a small win on every scratch instead of zero.
     if (!t.t1 && ((iC && price >= t.tp1Price) || (!iC && price <= t.tp1Price))) {
-      t.t1 = true; t.trailSl = t.ep; t.lastETs = now;
-      log(sym, '🎯 TP1 HIT — $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2) + ' · SL → breakeven $' + t.ep.toFixed(2));
-      sendPush('🎯 ' + sym + ' TP1 HIT', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · SL → breakeven', 'signal');
+      const lockDist = (typeof t.atr === 'number' && isFinite(t.atr) && t.atr > 0) ? t.atr * 0.3 : 0;
+      t.t1 = true; t.trailSl = iC ? t.ep + lockDist : t.ep - lockDist; t.lastETs = now;
+      log(sym, '🎯 TP1 HIT — $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2) + ' · SL → entry' + (lockDist > 0 ? (iC ? '+' : '-') + '$' + lockDist.toFixed(2) + ' (profit-lock)' : ' (BE)') + ' $' + t.trailSl.toFixed(2));
+      sendPush('🎯 ' + sym + ' TP1 HIT', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · SL → entry' + (lockDist > 0 ? '±0.3ATR lock' : ' (BE)'), 'signal');
       updateSignalOutcome(sym, price);
     }
     // TP2 hit → trail SL to TP1
