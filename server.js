@@ -11813,12 +11813,40 @@ app.get('/state/:sym', (req, res) => {
 // ===== EXTERNAL PRICE FEED (MT5 → Railway) =====
 // POST /feed — accepts price data from MT5 EA or any external source
 // Body: { sym: "XAU", price: 3315.42, high: 3316.10, low: 3314.80 }
+// ===== TICK QUARANTINE (added 2026-07-03) =====
+// 7/03 01:47:53: a single poison tick ($4066.65 vs market ~$4170, -2.5%) sailed through
+// the 10% jump filter, phantom-stopped the live XAU trade at "-$114" (cap is $10), and
+// poisoned sessionLow + dailyLevels. 10% of gold is $400 — useless as a sanity bound.
+// Fix: any tick jumping more than QUARANTINE_THR% from lastPrice is HELD, not applied.
+// If the next tick (within 15s) lands within 0.3% of the held price, the move is real
+// (gap open, news spike) and flows through with a one-tick delay. An isolated bad print
+// is never confirmed and dies in quarantine. This REPLACES the old 10% hard reject —
+// which had its own failure mode: a genuine >10% weekend gap got rejected forever.
+const QUARANTINE_THR = { XAU: 1.0, BTC: 1.5, NAS100: 1.0, QQQ: 0.5, SPY: 0.5 };
+function quarantineCheck(sym, p) {
+  const s = S[sym];
+  if (!s || !(s.lastPrice > 0)) return { ok: true };
+  const thr = QUARANTINE_THR[sym] || 1.0;
+  const jumpPct = Math.abs(p - s.lastPrice) / s.lastPrice * 100;
+  if (jumpPct <= thr) { s._qTick = null; return { ok: true }; }
+  const now = Date.now();
+  if (s._qTick && (now - s._qTick.ts) < 15000 && Math.abs(p - s._qTick.p) / s._qTick.p * 100 <= 0.3) {
+    console.log('[' + ts() + '] [FEED] ✅ ' + sym + ' quarantined jump CONFIRMED @ $' + p + ' (' + jumpPct.toFixed(2) + '% from $' + s.lastPrice + ') — real move, accepting.');
+    s._qTick = null;
+    return { ok: true };
+  }
+  s._qTick = { p: p, ts: now };
+  console.log('[' + ts() + '] [FEED] 🧪 ' + sym + ' tick QUARANTINED @ $' + p + ' — ' + jumpPct.toFixed(2) + '% jump from $' + s.lastPrice + ' > ' + thr + '%. Held pending confirmation (poison-tick guard).');
+  return { ok: false };
+}
+
 app.post('/feed', (req, res) => {
   const { sym, price, high, low } = req.body;
   if (!sym || !price) return res.status(400).json({ error: 'Missing sym or price' });
   if (!S[sym]) return res.status(400).json({ error: 'Unknown symbol: ' + sym });
   const p = parseFloat(price), h = parseFloat(high) || p, l = parseFloat(low) || p;
   if (isNaN(p) || p <= 0) return res.status(400).json({ error: 'Invalid price' });
+  if (!quarantineCheck(sym, p).ok) return res.json({ ok: false, quarantined: true, sym, price: p });
   // Price sanity check — reject prices wildly outside expected range (catches cross-symbol feed leaks)
   const PRICE_RANGES = { XAU: [1000, 10000], BTC: [10000, 500000], NAS100: [10000, 50000], QQQ: [100, 1000], SPY: [100, 1000] };
   const range = PRICE_RANGES[sym];
@@ -11826,18 +11854,8 @@ app.post('/feed', (req, res) => {
     console.log('[FEED] REJECTED ' + sym + ' price $' + p + ' — outside range $' + range[0] + '-$' + range[1]);
     return res.status(400).json({ error: 'Price ' + p + ' outside expected range for ' + sym });
   }
-  // Also reject if price jumps too far from last known price (unless first price)
-  // MT5 instruments (XAU/BTC/NAS100): 10% threshold — weekend gaps, daily resets cause legitimate large jumps
-  // Equities (SPY/QQQ): 5% threshold — less volatile, tighter check
-  if (S[sym].lastPrice > 0) {
-    const isMT5sym = sym === 'XAU' || sym === 'BTC' || sym === 'NAS100';
-    const maxJump = isMT5sym ? 10 : 5;
-    const pctChange = Math.abs(p - S[sym].lastPrice) / S[sym].lastPrice * 100;
-    if (pctChange > maxJump) {
-      console.log('[FEED] REJECTED ' + sym + ' price $' + p + ' — ' + pctChange.toFixed(1) + '% jump from $' + S[sym].lastPrice + ' (limit ' + maxJump + '%)');
-      return res.status(400).json({ error: 'Price jump too large: ' + pctChange.toFixed(1) + '%' });
-    }
-  }
+  // Old 10%/5% hard jump reject removed 2026-07-03 — superseded by quarantineCheck above,
+  // which both catches small poison ticks (1%+) AND correctly admits confirmed large gaps.
   S[sym].lastPrice = p;
   S[sym].tickBuf.push({ p, h, l });
   // FEED WATCHDOG (added 2026-07-02): track last-received time per symbol; recovery logging
@@ -11868,12 +11886,7 @@ app.post('/feed/batch', (req, res) => {
       if (isNaN(p) || p <= 0) { results.push({ sym, ok: false, err: 'invalid price' }); continue; }
       const range = PRICE_RANGES_B[sym];
       if (range && (p < range[0] || p > range[1])) { results.push({ sym, ok: false, err: 'out of range' }); continue; }
-      if (S[sym].lastPrice > 0) {
-        const isMT5b = sym === 'XAU' || sym === 'BTC' || sym === 'NAS100';
-        const maxJump = isMT5b ? 10 : 5;
-        const pctChange = Math.abs(p - S[sym].lastPrice) / S[sym].lastPrice * 100;
-        if (pctChange > maxJump) { results.push({ sym, ok: false, err: 'jump too large' }); continue; }
-      }
+      if (!quarantineCheck(sym, p).ok) { results.push({ sym, ok: false, err: 'quarantined' }); continue; }
       S[sym].lastPrice = p;
       S[sym].tickBuf.push({ p, h, l });
       S[sym].lastFeedTs = Date.now();
@@ -12213,6 +12226,41 @@ app.get('/admin/resub', (req, res) => {
 // Manually trigger dailyLevels seed without restarting. Use when /state shows
 // dailyLevels.count=0 and you want to fix it without a redeploy.
 //   GET /admin/seed-daily-levels?key=<ADMIN_KEY>
+// ===== ADMIN: REPAIR SESSION/DAILY LOW-HIGH (added 2026-07-03) =====
+// One-shot repair for poison-tick damage. 7/03: bad print $4066.65 became XAU's
+// sessionLow AND today's dailyLevels low, distorting the 5-day regime, LLF local-low
+// distances, and ATL fades. Usage:
+//   GET /admin/fix-level?sym=XAU&low=4124.16          (fix session + today's daily low)
+//   GET /admin/fix-level?sym=XAU&high=4185.96          (same for high, if ever needed)
+//   Add &key=<ADMIN_KEY> if ADMIN_KEY env var is set.
+app.get('/admin/fix-level', (req, res) => {
+  const adminKey = process.env.ADMIN_KEY || '';
+  if (adminKey && req.query.key !== adminKey) return res.status(403).json({ error: 'forbidden' });
+  const sym = (req.query.sym || '').toUpperCase();
+  const s = S[sym];
+  if (!s) return res.status(400).json({ error: 'Unknown symbol: ' + sym });
+  const newLow = parseFloat(req.query.low);
+  const newHigh = parseFloat(req.query.high);
+  const before = { sessionLow: s.sessionLow, sessionHigh: s.sessionHigh, todayDaily: null };
+  const today = todayDateET();
+  const todayLvl = Array.isArray(s.dailyLevels) ? s.dailyLevels.find(d => d.date === today) : null;
+  if (todayLvl) before.todayDaily = { high: todayLvl.high, low: todayLvl.low };
+  if (isFinite(newLow) && newLow > 0) {
+    s.sessionLow = newLow;
+    if (todayLvl) todayLvl.low = newLow;
+  }
+  if (isFinite(newHigh) && newHigh > 0) {
+    s.sessionHigh = newHigh;
+    if (todayLvl) todayLvl.high = newHigh;
+  }
+  const after = {
+    sessionLow: s.sessionLow, sessionHigh: s.sessionHigh,
+    todayDaily: todayLvl ? { high: todayLvl.high, low: todayLvl.low } : null
+  };
+  console.log('[' + ts() + '] 🔧 ADMIN fix-level ' + sym + ' — before ' + JSON.stringify(before) + ' after ' + JSON.stringify(after));
+  res.json({ ok: true, sym: sym, before: before, after: after });
+});
+
 app.get('/admin/seed-daily-levels', (req, res) => {
   const adminKey = process.env.ADMIN_KEY || '';
   if (adminKey && req.query.key !== adminKey) {
