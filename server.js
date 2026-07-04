@@ -4215,6 +4215,32 @@ function processPrice(sym, price, hi, lo) {
       }
     }
 
+    // ===== BTC WEEKEND LOW-VOLUME GATE (added 2026-07-04) =====
+    // Weekend BTC drifts on vacuum liquidity: signals resolve in hours instead of minutes
+    // (7/04 audit: last weekend CALL took 2h to reach TP1), extending exposure before the
+    // BE-trail arms. Rule: on Sat/Sun (ET), BTC entries need PARTICIPATION EVIDENCE —
+    // a VOL× or BURST× conviction factor ≥ 1.3 (real Binance volume/ATR-burst spike),
+    // OR conviction ≥ 6 (heavily cross-confirmed setups may fire without a spike).
+    // Blocked signals are shadow-tracked, so this gate's cost/benefit is measurable.
+    if (sym === 'BTC') {
+      try {
+        const wkdET = new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone: 'America/New_York' }).format(new Date());
+        if (wkdET === 'Sat' || wkdET === 'Sun') {
+          const convWk = sig.conv || { score: 0, factors: [] };
+          let volEvidence = false;
+          for (const f of (convWk.factors || [])) {
+            // Anchor on the × multiplier so 'VOL≥1×1.3' parses as 1.3, not 1
+            const m = /^(?:VOL|BURST).*?×([\d.]+)/.exec(String(f));
+            if (m && parseFloat(m[1]) >= 1.3) { volEvidence = true; break; }
+          }
+          if (!volEvidence && convWk.score < 6) {
+            log(sym, '🚫 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' BLOCKED — BTC weekend low-volume gate: no VOL×/BURST× ≥1.3 factor and conv ' + convWk.score + ' < 6. Weekend drift resolves too slowly without participation (7/04: TP1 took 2h).');
+            return false;
+          }
+        }
+      } catch (e) { /* weekend gate must never crash enrichment */ }
+    }
+
     // ===== REPEAT-LOSS ZONE LOCKOUT (R5, added 2026-06-11 — 0-losers policy) =====
     // After 2 SL losses from the same detector+direction within 3 hours, stop re-entering
     // until price escapes the loss zone by >= 1.5x ATR (or the 3h window rolls off).
@@ -10567,6 +10593,27 @@ function checkExit(sym, price) {
     let fl = 0;
     if (iC) { if (!e5b) fl++; if (!e13b) fl++; if (roc3Now < 0) fl++; }
     else { if (e5b) fl++; if (e13b) fl++; if (roc3Now > 0) fl++; }
+
+    // ===== PERIODIC TREND-HEALTH CHECK-IN (added 2026-07-04) =====
+    // For long holds (weekend BTC rides can run to TP3 over many hours) the monitor used
+    // to be silent unless something looked wrong — all fear, no reassurance. Every 45 min
+    // on a profitable open trade: an honest health scorecard + next target, pushed.
+    if (pnl > 0 && (now - t.ts) > 30 * 60 * 1000 && now - (t.lastPeriodicAdviceTs || 0) > 45 * 60 * 1000) {
+      t.lastPeriodicAdviceTs = now;
+      try {
+        const healthyP = [];
+        if (iC ? e5b : !e5b) healthyP.push('EMA5>13');
+        if (iC ? e13b : !e13b) healthyP.push('EMA13>34');
+        if (iC ? roc3Now >= 0 : roc3Now <= 0) healthyP.push('ROC aligned');
+        if (typeof s.macroEma === 'number' && s.macroEma > 0 && (iC ? price > s.macroEma : price < s.macroEma)) healthyP.push('macro EMA side');
+        if (s.htf1h_dir && (iC ? s.htf1h_dir === 'up' : s.htf1h_dir === 'down')) healthyP.push('1h HTF aligned');
+        const nextTgtP = !t.t1 ? 'TP1 $' + t.tp1Price.toFixed(2) : !t.t2 ? 'TP2 $' + t.tp2Price.toFixed(2) : 'TP3 $' + t.tp3Price.toFixed(2);
+        const ageH = ((now - t.ts) / 3600000).toFixed(1);
+        const verdictP = healthyP.length >= 3 ? 'HOLD — trend intact' : 'CAUTION — trend weakening';
+        log(sym, '🧭 CHECK-IN (' + ageH + 'h) — ' + verdictP + ' · +$' + pnl.toFixed(2) + ' · healthy: ' + (healthyP.join(', ') || 'none') + ' (' + healthyP.length + '/5) · next: ' + nextTgtP);
+        sendPush('🧭 ' + sym + ' ' + (healthyP.length >= 3 ? 'HOLD' : 'CAUTION') + ' (' + ageH + 'h)', '+$' + pnl.toFixed(2) + ' · ' + healthyP.length + '/5 healthy · next ' + nextTgtP, 'signal');
+      } catch (e) { /* advisory must never crash exits */ }
+    }
     // Reversal gates: 3/3 indicators flipped + 2 min since last exit event + trade open at least REV_MIN_HOLD_MS.
     // The hold gate (added 2026-05-07) stops reversal warnings firing immediately after entry —
     // lastETs starts at 0 so the cooldown alone never protects fresh trades.
@@ -10584,18 +10631,45 @@ function checkExit(sym, price) {
       const bestPnl = iC ? t.bestPrice - t.ep : t.ep - t.bestPrice;
       const pullback = bestPnl - pnl; // how much we've given back from peak
       const revMinPullback = (sym === 'XAU') ? 5 : (sym === 'BTC') ? 250 : (sym === 'NAS100') ? 25 : 5;
-      if (pnl > 0 && pullback >= revMinPullback) {
-        // Meaningful reversal + still profitable → set t.rev=true and log only.
-        // Push notification removed (2026-05-08, by user request) — reversal warnings used
-        // to ping the phone, but only the user should close trades (via ✕ Clear button,
-        // popup accept, or new signal). Log stays so we can correlate post-hoc.
+      // ===== EXTREME-ONLY REVERSAL + HOLD ADVISORY (reworked 2026-07-04) =====
+      // User feedback (7/04): reversal flags fired so often on routine breathers that a
+      // day-long BTC winner got abandoned hours before TP3. The fixed-$ pullback branded
+      // a +$600 runner "REVERSAL" after a normal 40% pause. New definition — reversal
+      // requires ALL THREE, i.e. genuine risk of a big turnover:
+      //   1. DEEP giveback: pullback ≥ max($fixed, 60% of peak profit)
+      //   2. MEANINGFUL peak: peak profit ≥ 1.5×ATR (small winners are TP1/BE-trail's job)
+      //   3. EXTREME confirmation: violent counter-move (3-min ROC beyond the symbol's
+      //      blowoff threshold against the trade) OR structural turn (price crossed the
+      //      3h macro EMA against the trade).
+      // Anything less = the monitor argues FOR holding: trend-health advisory with a push
+      // (throttled 30 min) so the human has a reason to stay in, not just reasons to leave.
+      const atrRef = (typeof t.atr === 'number' && isFinite(t.atr) && t.atr > 0) ? t.atr : revMinPullback;
+      const deepGiveback = pullback >= Math.max(revMinPullback, bestPnl * 0.6);
+      const meaningfulPeak = bestPnl >= 1.5 * atrRef;
+      const blowThrRev = (typeof ROC_BLOWOFF === 'object' && ROC_BLOWOFF[sym]) ? ROC_BLOWOFF[sym] : 0.2;
+      const violentCounter = iC ? roc3Now <= -blowThrRev : roc3Now >= blowThrRev;
+      const structuralTurn = (typeof s.macroEma === 'number' && s.macroEma > 0) ? (iC ? price < s.macroEma : price > s.macroEma) : false;
+      if (pnl > 0 && deepGiveback && meaningfulPeak && (violentCounter || structuralTurn)) {
         t.rev = true; t.lastETs = now;
-        log(sym, '🎯 REVERSAL EXIT (log-only) — pulled back $' + pullback.toFixed(2) + ' from peak $' + bestPnl.toFixed(2) + ' · current +$' + pnl.toFixed(2) + ' · ' + fl + '/3 indicators flipped · age ' + Math.round((now - t.ts) / 60000) + 'min');
-      } else if (pnl > 0 && pullback < revMinPullback) {
-        // Indicators flipped + profitable BUT pullback too small — noise, not a real reversal.
-        // Wait for either more pullback (real reversal) or recovery (trade continues).
-        if (now - (t.lastRevHoldLog || 0) > 60000) {
-          log(sym, '⏸ Reversal indicators flipped but pullback $' + pullback.toFixed(2) + ' < $' + revMinPullback + ' (noise — holding) · peak +$' + bestPnl.toFixed(2) + ' · current +$' + pnl.toFixed(2));
+        const why = (violentCounter ? 'violent counter-move ROC ' + roc3Now.toFixed(3) + '%' : 'price crossed 3h macro EMA $' + s.macroEma.toFixed(2));
+        log(sym, '🚨 EXTREME REVERSAL — gave back $' + pullback.toFixed(2) + ' of peak $' + bestPnl.toFixed(2) + ' (' + Math.round(pullback / bestPnl * 100) + '%) · ' + why + ' · still +$' + pnl.toFixed(2) + ' · consider closing');
+        sendPush('🚨 ' + sym + ' EXTREME REVERSAL', 'Gave back ' + Math.round(pullback / bestPnl * 100) + '% of peak · ' + why + ' · still +$' + pnl.toFixed(2), 'exit');
+      } else if (pnl > 0) {
+        // Trend-health HOLD advisory: count what's still healthy and say so.
+        if (now - (t.lastHoldAdviceTs || 0) > 30 * 60 * 1000 && bestPnl > 0) {
+          t.lastHoldAdviceTs = now;
+          const healthy = [];
+          if (iC ? e5b : !e5b) healthy.push('EMA5>13');
+          if (iC ? e13b : !e13b) healthy.push('EMA13>34');
+          if (iC ? roc3Now >= 0 : roc3Now <= 0) healthy.push('ROC aligned');
+          if (typeof s.macroEma === 'number' && s.macroEma > 0 && (iC ? price > s.macroEma : price < s.macroEma)) healthy.push('above macro EMA');
+          if (s.htf1h_dir && (iC ? s.htf1h_dir === 'up' : s.htf1h_dir === 'down')) healthy.push('1h HTF aligned');
+          const nextTgt = !t.t1 ? 'TP1 $' + t.tp1Price.toFixed(2) : !t.t2 ? 'TP2 $' + t.tp2Price.toFixed(2) : 'TP3 $' + t.tp3Price.toFixed(2);
+          const verdict = healthy.length >= 3 ? 'HOLD — trend intact' : 'CAUTION — trend weakening, tighten mentally';
+          log(sym, '🧭 ' + verdict + ' · +$' + pnl.toFixed(2) + ' (peak +$' + bestPnl.toFixed(2) + ') · healthy: ' + (healthy.join(', ') || 'none') + ' (' + healthy.length + '/5) · next: ' + nextTgt);
+          sendPush('🧭 ' + sym + ' ' + (healthy.length >= 3 ? 'HOLD' : 'CAUTION'), '+$' + pnl.toFixed(2) + ' · ' + healthy.length + '/5 trend checks healthy · next ' + nextTgt, 'signal');
+        } else if (now - (t.lastRevHoldLog || 0) > 60000) {
+          log(sym, '⏸ Pullback $' + pullback.toFixed(2) + ' of peak $' + bestPnl.toFixed(2) + ' — normal breather, not reversal-grade. Holding.');
           t.lastRevHoldLog = now;
         }
       } else {
