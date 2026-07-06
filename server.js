@@ -4267,6 +4267,57 @@ function processPrice(sym, price, hi, lo) {
     const isFadeEarly = /ATH|ATL|HI|LO|DIV/.test(tagEarly) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tagEarly);
     const macroContraNow = Date.now();
 
+    // ===== PHASE 3.91 — EXTENSION GUARD, ALL NON-TRv2 PATHS (2026-07-06) =====
+    // 3 documented SLs from entering at the crest of an oversized 15-min impulse on paths
+    // without TRv2's EXT-WAIT protection:
+    //   7/06 08:42 XAU ⬇FAST PUT @4134.31 — sold the bottom of a $22/40min waterfall;
+    //     session low 4131.6 printed minutes later, reaction bounce → SL -$9.32 in 18min.
+    //   7/06 08:01 XAU ⬆LLF CALL @4156.65 — bought the top of a mature bounce → SL -$6.76.
+    //   7/02 09:36 XAU conv-10 extension case (documented in strategy review).
+    // TRv2 got dormant EXT-WAIT + impulse-aware SL on 7/04. Per 7/06 decision this guard
+    // is a FULL BLOCK on every enrichSig path (TRv2 excluded — its own pipeline).
+    // Geometry note: only momentum-CHASING entries are blocked — CALL in the top 10% /
+    // PUT in the bottom 10% of a 15-min range ≥1.5×ATR. Fades firing AT extremes
+    // (ATL CALL at the low, LHF PUT at the high) sit at the opposite end and pass.
+    // Message contains BLOCKED → shadow tracker collects counterfactual outcomes.
+    try {
+      if (typeof atrVal === 'number' && atrVal > 0 && Array.isArray(s.vrevSnaps)) {
+        const _egNow = Date.now();
+        const _egSnaps = s.vrevSnaps.filter(sn => sn && sn.ts > _egNow - 900000 && sn.p > 0);
+        if (_egSnaps.length >= 20) {
+          let _egHi = -Infinity, _egLo = Infinity;
+          for (const sn of _egSnaps) { if (sn.p > _egHi) _egHi = sn.p; if (sn.p < _egLo) _egLo = sn.p; }
+          const _egRange = _egHi - _egLo;
+          if (_egRange >= 1.5 * atrVal) {
+            const _egPos = (price - _egLo) / _egRange;
+            const _egCrest = sig.type === 'call' ? _egPos >= 0.9 : _egPos <= 0.1;
+            if (_egCrest) {
+              const _egRetest = sig.type === 'call' ? (_egHi - _egRange * 0.4) : (_egLo + _egRange * 0.4);
+              // ===== EXT-FLIP ARM (Phase 3.93, 2026-07-06) =====
+              // A blocked crest chase marks the extreme of an exhausted impulse. Arm a
+              // candidate in the OPPOSITE direction; the EXT-FLIP detector (specialized
+              // section) fires it only if all 6 gates pass: climax volume, 3-min
+              // stabilization, HTF alignment, RSI sanity, stop budget, cooldown.
+              try {
+                const _fDir = sig.type === 'call' ? 'put' : 'call';
+                const _fConv = convictionFor(_fDir);
+                let _fBurst = 0;
+                for (const _ff of (_fConv.factors || [])) {
+                  const _fm = /^(?:VOL≥1|BURST)×([\d.]+)/.exec(_ff);
+                  if (_fm) { _fBurst = parseFloat(_fm[1]); break; }
+                }
+                s.extFlip = { dir: _fDir, extreme: _fDir === 'call' ? _egLo : _egHi, armTs: Date.now(),
+                              burst: _fBurst, atr: atrVal, src: tagEarly + ' ' + sig.type.toUpperCase() + ' crest-block' };
+              } catch (eF) {}
+              Object.assign(s, _emitSnapshot);
+              log(sym, '⏳ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — EXT-GUARD (Phase 3.91): entering at ' + Math.round(_egPos * 100) + '% of a $' + _egRange.toFixed(2) + ' 15-min impulse (' + (_egRange / atrVal).toFixed(1) + '×ATR). Chasing the crest of an oversized move; retest ~$' + _egRetest.toFixed(2) + ' would be the entry. EXT-FLIP candidate armed ' + (sig.type === 'call' ? 'PUT' : 'CALL') + '.');
+              return false;
+            }
+          }
+        }
+      }
+    } catch (e) { /* extension guard must never crash enrichment */ }
+
     // ===== SESSION-DIRECTION COUNTER-TREND GATE (added 2026-05-26) =====
     // When the 4-hour price trajectory is decisively in one direction, counter-trend
     // signals need higher conviction to fire. Cross-asset conv factors can be misleading
@@ -6282,6 +6333,88 @@ function processPrice(sym, price, hi, lo) {
     }
   }
 
+  // ===== EXT-FLIP DETECTOR (Phase 3.93, 2026-07-06) — LIVE =====
+  // When EXT-GUARD (3.91) blocks a crest chase, or the LLF freshness gate (3.92) blocks a
+  // stale fade, the market sits at the extreme of an exhausted move. EXT-FLIP trades the
+  // OPPOSITE direction — the fade the blocked signal should have been — behind 6 gates:
+  //   1. Climax volume: BURST/VOL ≥1.5 at arm time (capitulation marks reversal points)
+  //   2. Stabilization: no new extreme for 3 min after arm (never catch the knife);
+  //      a fresh extreme re-arms the clock; the arm expires after 15 min unfired
+  //   3. HTF: the flip must not fight BOTH the 1h and 4h trend
+  //   4. RSI sanity: no flip CALL above RSI 55, no flip PUT below RSI 45
+  //   5. Stop budget: SL just beyond the extreme, within $10 XAU / 2.5×ATR cap
+  //   6. One evaluation per impulse + 30-min cooldown per symbol
+  // Fires OUTSIDE enrichSig by design: enrichSig's gates (chop allow-list, session
+  // counter-trend, MACD consistency) are built for momentum chases and would kill
+  // deliberate extreme-fades. The 6 gates above are this detector's whole pipeline.
+  // Origin: 7/06 XAU losses (08:01 LLF CALL, 08:42 FAST PUT) — flipping both won.
+  // Gate-blocked flips log with BLOCKED so the shadow tracker collects counterfactuals.
+  if (isMT5 && s.extFlip && s.extFlip.armTs > 0) {
+    try {
+      const EF = s.extFlip;
+      const efCall = EF.dir === 'call';
+      const efAgeMs = now2 - EF.armTs;
+      if ((efCall && price < EF.extreme) || (!efCall && price > EF.extreme)) {
+        // Gate 2: new extreme — knife still falling/rising. Track it, restart the clock.
+        EF.extreme = price;
+        EF.armTs = now2;
+      } else if (efAgeMs > 900000) {
+        s.extFlip = null; // 15 min unfired — the moment has passed
+      } else if (efAgeMs >= 180000) {
+        const efAtr = (typeof atrVal === 'number' && atrVal > 0) ? atrVal : (EF.atr || 0);
+        const efSlBuf = Math.max(efAtr * 0.25, isXAU ? 0.5 : 0);
+        const efSlPrice = efCall ? EF.extreme - efSlBuf : EF.extreme + efSlBuf;
+        const efSlDist = Math.abs(price - efSlPrice);
+        const efSlCap = isXAU ? 10 : efAtr * 2.5;
+        const efFightsBoth = s.htf1h_dir && s.htf4h_dir &&
+          ((efCall && s.htf1h_dir === 'down' && s.htf4h_dir === 'down') ||
+           (!efCall && s.htf1h_dir === 'up' && s.htf4h_dir === 'up'));
+        let efReason = null;
+        if (!(EF.burst >= 1.5)) efReason = 'no climax volume (burst ×' + (EF.burst || 0).toFixed(1) + ' < 1.5)';
+        else if (efFightsBoth) efReason = 'fights both HTFs (1h=' + s.htf1h_dir + ', 4h=' + s.htf4h_dir + ')';
+        else if (efCall && rsiV > 55) efReason = 'RSI ' + rsiV.toFixed(1) + ' > 55 — nothing oversold to bounce';
+        else if (!efCall && rsiV < 45) efReason = 'RSI ' + rsiV.toFixed(1) + ' < 45 — nothing overbought to fade';
+        else if (!(efSlDist > 0) || efSlDist > efSlCap || !(efAtr > 0)) efReason = 'stop budget: $' + efSlDist.toFixed(2) + ' to extreme exceeds cap $' + efSlCap.toFixed(2);
+        else if (now2 - (s.extFlipLastTs || 0) < 1800000) efReason = 'flip cooldown ' + Math.round((1800000 - (now2 - (s.extFlipLastTs || 0))) / 60000) + 'm left';
+        else if (winProtectDir && winProtectDir !== EF.dir) efReason = 'protecting winning ' + winProtectDir.toUpperCase() + ' trade';
+        if (efReason) {
+          log(sym, '⏳ EXT-FLIP ' + EF.dir.toUpperCase() + ' BLOCKED — ' + efReason + ' (armed by ' + EF.src + ', extreme $' + EF.extreme.toFixed(2) + ' held ' + Math.round(efAgeMs / 60000) + 'min, burst ×' + (EF.burst || 0).toFixed(1) + ', RSI ' + rsiV.toFixed(1) + ').');
+          s.extFlip = null; // gate 6: one evaluation per impulse
+        } else {
+          // ALL GATES PASSED — FIRE
+          s.lastAT = EF.dir; if (efCall) s.nC++; else s.nP++;
+          s.dailySignalCount++;
+          if (s.lastSignalDir && s.lastSignalDir !== EF.dir) s.lastReversalTs = now2;
+          s.lastSignalDir = EF.dir; s.lastSignalTs = now2; s.lastNTs = now2;
+          s.lastSameDir = EF.dir; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
+          const sigEf = { type: EF.dir, time: ts(), price: price.toFixed(2), score: (efCall ? '⬆' : '⬇') + 'EXT-FLIP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+          try {
+            const cEf = convictionFor(EF.dir);
+            sigEf.conv = { score: cEf.score, label: cEf.score >= 5 ? 'HIGH' : cEf.score >= 3 ? 'MOD' : 'LOW', factors: cEf.factors };
+          } catch (eC) {}
+          s.signals.push(sigEf);
+          logSignal(sym, sigEf);
+          // Structural SL beyond the extreme; TPs in R-multiples of that stop (1.5R/3R/5R)
+          const efTp1 = efCall ? price + efSlDist * 1.5 : price - efSlDist * 1.5;
+          const efTp2 = efCall ? price + efSlDist * 3.0 : price - efSlDist * 3.0;
+          const efTp3 = efCall ? price + efSlDist * 5.0 : price - efSlDist * 5.0;
+          s.trade = buildCfdTrade(EF.dir, price, efAtr, sym);
+          s.trade.slPrice = +efSlPrice.toFixed(2);
+          s.trade.tp1Price = +efTp1.toFixed(2);
+          s.trade.tp2Price = +efTp2.toFixed(2);
+          s.trade.tp3Price = +efTp3.toFixed(2);
+          sigEf.sl = efSlPrice.toFixed(2); sigEf.tp1 = efTp1.toFixed(2); sigEf.tp2 = efTp2.toFixed(2); sigEf.tp3 = efTp3.toFixed(2);
+          s.extFlipLastTs = now2;
+          s.extFlip = null;
+          log(sym, '🔄 EXT-FLIP ' + EF.dir.toUpperCase() + ' — fading exhausted impulse (armed by ' + EF.src + '). Extreme $' + EF.extreme.toFixed(2) + ' held ' + Math.round(efAgeMs / 60000) + 'min · burst ×' + (EF.burst || 0).toFixed(1) + ' · RSI ' + rsiV.toFixed(1) + ' · SL $' + efSlPrice.toFixed(2) + ' (-$' + efSlDist.toFixed(2) + ') · TP1 $' + efTp1.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+          sendPush('🔄 ' + sym + ' EXT-FLIP ' + EF.dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · fading exhausted move · SL $' + efSlPrice.toFixed(2) + ' · TP1 $' + efTp1.toFixed(2), 'signal');
+          SYMBOLS.forEach(other => { if (other !== sym) { S[other].crossAssetDir = EF.dir; S[other].crossAssetTs = now2; } });
+          return;
+        }
+      }
+    } catch (eEf) { /* EXT-FLIP must never crash the tick */ }
+  }
+
   // Session High Reversal Detector — fire high-confidence PUT when price reverses from session high
   // Conditions: hit session high, reversed >$1 from it, RSI > 60 (was overbought), MACD turning bearish
   // RSI sanity: skip when RSI is corrupted from reconnection gaps (RSI 13.8, 99.2 artifacts)
@@ -6607,7 +6740,10 @@ function processPrice(sym, price, hi, lo) {
     const llfCallDistOk   = riseFromLocalLo >= lhfDistMin && riseFromLocalLo <= lhfDistMax;
     const llfCallRangeOk  = lhfLocalRange >= lhfRangeMin;
     const llfCallCoolOk   = (Date.now() - s.lastLlfCallTs) >= lhfCooldownMs;
-    const llfCallRsiOk    = rsiV > 40 && rsiV < 65;
+    // Phase 3.92 (2026-07-06): RSI ceiling 65→60. 7/06 08:01 ⬆LLF CALL fired at RSI 62.0
+    // near the top of a mature corrective bounce and SL'd — a fade-CALL at RSI 60+ means
+    // the bounce already happened; the edge belongs to whoever bought at RSI 40.
+    const llfCallRsiOk    = rsiV > 40 && rsiV < 60;
     const llfCallMacdOk   = macdL > macdS && macdHist > 0;
     // R4 fix (2026-06-11): mirror of LHF PUT ROC ceiling — don't fade INTO a live down-thrust.
     const llfCallRocOk    = roc3 >= -0.10;
@@ -6661,8 +6797,34 @@ function processPrice(sym, price, hi, lo) {
       llfCallHtfReversalOk;
     const llfCallFlipOk   = flipCoolFor('call');
     const llfCallWinOk    = winProtectDir !== 'put';
+    // ===== PHASE 3.92 — LLF FRESHNESS GATE (2026-07-06) =====
+    // 7/06 08:01 ⬆LLF CALL @4156.65 SL'd: the 60-min local low it faded was shallow, but
+    // the REAL swing low ($4138.10) was 146 min old and price had already bounced $18.5
+    // (4.1×ATR) off it. The fade edge was long gone — the entry was the top of a mature
+    // corrective bounce inside a down session (lower highs 4198→4177→4159). London
+    // momentum resumed at 08:00 → SL in 19 min.
+    // Rule: an LLF CALL needs a FRESH fade — either the 3-hour swing low is <45 min old,
+    // or the bounce off it is still <2.5×ATR. Stale swing low + extended bounce = buying
+    // a mature recovery, not fading a fresh low. (ATR-normalized rise stands in for the
+    // <60%-retrace idea — no reliable reference high needed.)
+    let llfCallFreshOk = true, _llfSwAgeMin = 0, _llfRiseAtr = 0, _llfSwLow = 0;
+    try {
+      if (Array.isArray(s.macroSnaps) && s.macroSnaps.length >= 6 && typeof atrVal === 'number' && atrVal > 0) {
+        const _fCut = Date.now() - 3 * 3600000;
+        let _fLo = Infinity, _fLoTs = 0;
+        for (const snF of s.macroSnaps) {
+          if (snF && snF.ts >= _fCut && snF.p > 0 && snF.p < _fLo) { _fLo = snF.p; _fLoTs = snF.ts; }
+        }
+        if (isFinite(_fLo) && _fLoTs > 0) {
+          _llfSwLow = _fLo;
+          _llfSwAgeMin = (Date.now() - _fLoTs) / 60000;
+          _llfRiseAtr = (price - _fLo) / atrVal;
+          if (_llfSwAgeMin >= 45 && _llfRiseAtr >= 2.5) llfCallFreshOk = false;
+        }
+      }
+    } catch (e) { /* freshness gate must never crash the detector */ }
     if (llfCallTimingOk && llfCallDistOk && llfCallRangeOk && llfCallCoolOk &&
-        llfCallRsiOk && llfCallMacdOk && llfCallRocOk && llfCallMacroOk && llfCallFlipOk && llfCallWinOk) {
+        llfCallRsiOk && llfCallMacdOk && llfCallRocOk && llfCallMacroOk && llfCallFlipOk && llfCallWinOk && llfCallFreshOk) {
       if (s.lastSignalDir !== 'call' || (now2 - s.lastNTs > COOLDOWN_MS)) {
         s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
         if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
@@ -6701,14 +6863,37 @@ function processPrice(sym, price, hi, lo) {
     } else if (llfCallTimingOk && llfCallDistOk && llfCallRangeOk && llfCallCoolOk) {
       let reason;
       if (!llfCallMacroOk) reason = 'macro not CALL-aligned (need strict 6+/7@5min OR soft 5+/7@2min OR Phase 3.80: 1h-up + conv≥5)';
-      else if (!llfCallRsiOk) reason = 'RSI ' + rsiV.toFixed(1) + ' outside 40-65';
+      else if (!llfCallFreshOk) reason = 'STALE FADE (Phase 3.92) — 3h swing low $' + _llfSwLow.toFixed(2) + ' is ' + Math.round(_llfSwAgeMin) + 'min old and price already bounced ' + _llfRiseAtr.toFixed(1) + '×ATR off it (need low <45min old OR rise <2.5×ATR)';
+      else if (!llfCallRsiOk) reason = 'RSI ' + rsiV.toFixed(1) + ' outside 40-60 (ceiling 65→60, Phase 3.92)';
       else if (!llfCallMacdOk) reason = 'MACD not compressing bullish (line ' + macdL.toFixed(3) + ' vs sig ' + macdS.toFixed(3) + ', hist ' + macdHist.toFixed(3) + ')';
       else if (!llfCallRocOk) reason = 'ROC ' + roc3.toFixed(3) + '% < -0.10% — price thrusting down, not fading (R4)';
       else if (!llfCallFlipOk) reason = 'flip cooldown';
       else if (!llfCallWinOk) reason = 'protecting winning PUT';
       if (reason) log(sym, '🚫 ⬆LLF CALL BLOCKED — ' + reason + ' (was $' + riseFromLocalLo.toFixed(2) + ' off local low $' + localLo6.toFixed(2) + ', ' + Math.round(lhfLoAgeMin) + 'min ago).');
+      // ===== EXT-FLIP ARM from stale-fade block (Phase 3.93, 2026-07-06) =====
+      // A stale-fade block means price sits at the top of a MATURE corrective bounce —
+      // the flip PUT fades that bounce WITH the larger trend (7/06 08:01 case: a PUT
+      // at the blocked CALL's price rode the $22 resumption to TP3). Extreme = 15-min high.
+      if (!llfCallFreshOk && llfCallTimingOk && llfCallDistOk && llfCallRangeOk && llfCallCoolOk) {
+        try {
+          let _fHiL = -Infinity;
+          const _fCutL = Date.now() - 900000;
+          for (const snL of (Array.isArray(s.vrevSnaps) ? s.vrevSnaps : [])) {
+            if (snL && snL.ts > _fCutL && snL.p > _fHiL) _fHiL = snL.p;
+          }
+          if (!isFinite(_fHiL) || _fHiL < price) _fHiL = price;
+          const _fConvL = convictionFor('put');
+          let _fBurstL = 0;
+          for (const _fL of (_fConvL.factors || [])) {
+            const _fmL = /^(?:VOL≥1|BURST)×([\d.]+)/.exec(_fL);
+            if (_fmL) { _fBurstL = parseFloat(_fmL[1]); break; }
+          }
+          s.extFlip = { dir: 'put', extreme: _fHiL, armTs: Date.now(), burst: _fBurstL, atr: atrVal,
+                        src: 'LLF CALL stale-fade block (bounce ' + _llfRiseAtr.toFixed(1) + '×ATR off ' + Math.round(_llfSwAgeMin) + 'min-old low)' };
+        } catch (eL) {}
+      }
       // Persistence tracking — macro-only blocks (added 2026-05-28)
-      if (!llfCallMacroOk && llfCallRsiOk && llfCallMacdOk && llfCallRocOk) {
+      if (!llfCallMacroOk && llfCallRsiOk && llfCallMacdOk && llfCallRocOk && llfCallFreshOk) {
         s.llfCallMacroBlocks = s.llfCallMacroBlocks || [];
         s.llfCallMacroBlocks.push({ ts: Date.now(), localLo: localLo6, rise: riseFromLocalLo });
         const cutoff = Date.now() - 10 * 60 * 1000;
@@ -9502,7 +9687,38 @@ function processPrice(sym, price, hi, lo) {
         if (isChopOverride) {
           log(sym, '🌊 TRv2 CHOP-OVERRIDE TPs — tighter SL/TPs applied (chop+outside-KZ, conv 5+).');
         }
-        const sl = dir === 'long' ? price - Math.max(trv2Atr * entMults.sl, 5) : price + Math.max(trv2Atr * entMults.sl, 5);
+        let sl = dir === 'long' ? price - Math.max(trv2Atr * entMults.sl, 5) : price + Math.max(trv2Atr * entMults.sl, 5);
+        // ===== IMPULSE-AWARE STOP (active) + EXT-WAIT (dormant) — added 2026-07-04 =====
+        // 4th identical loss this week (7/04 15:34 BTC: entered the top tick of a $171/15min
+        // burst with a $110 stop → stopped on the routine retest in 112s, then trend resumed).
+        // Right direction, wrong geometry: a stop tighter than the impulse it chased is a
+        // coin flip. When entering at the crest (top/bottom 10%) of an oversized 15-min
+        // impulse (≥1.5×ATR):
+        //   1. DORMANT: log the EXT-WAIT counterfactual (retest entry ~40% back into range)
+        //   2. ACTIVE: widen SL to 0.75× the impulse, capped at 2.5×ATR — stop sized to the
+        //      wave being traded, not background ATR.
+        try {
+          const snapsImp = Array.isArray(s.vrevSnaps) ? s.vrevSnaps.filter(sn => sn && sn.ts > now3 - 900000 && sn.p > 0) : [];
+          if (snapsImp.length >= 20 && trv2Atr > 0) {
+            let impHi = -Infinity, impLo = Infinity;
+            for (const sn of snapsImp) { if (sn.p > impHi) impHi = sn.p; if (sn.p < impLo) impLo = sn.p; }
+            const impRange = impHi - impLo;
+            if (impRange >= 1.5 * trv2Atr && impRange > 0) {
+              const posInRange = (price - impLo) / impRange;
+              const atCrest = dir === 'long' ? posInRange >= 0.9 : posInRange <= 0.1;
+              if (atCrest) {
+                const retest = dir === 'long' ? (impHi - impRange * 0.4) : (impLo + impRange * 0.4);
+                log(sym, '⏳ EXT-WAIT (dormant) — TRv2 ' + dir.toUpperCase() + ' entering at crest of 15-min impulse $' + impRange.toFixed(2) + ' (' + (impRange / trv2Atr).toFixed(1) + '×ATR, position ' + Math.round(posInRange * 100) + '% of range). Would wait for retest ~$' + retest.toFixed(2) + '. Log-only, entry proceeds.');
+                const slDistBase = Math.max(trv2Atr * entMults.sl, 5);
+                const slDistImp = Math.min(Math.max(slDistBase, impRange * 0.75), trv2Atr * 2.5);
+                if (slDistImp > slDistBase) {
+                  sl = dir === 'long' ? price - slDistImp : price + slDistImp;
+                  log(sym, '🛡️ IMPULSE-AWARE SL — widened to $' + slDistImp.toFixed(2) + ' (0.75× impulse, cap 2.5×ATR) from $' + slDistBase.toFixed(2) + '. Crest entries get stops sized to the wave.');
+                }
+              }
+            }
+          }
+        } catch (e) { /* impulse logic must never block entries */ }
         // ===== PHASE 3.28 — Fix TP2/TP3 < TP1 bug (added 2026-06-22, task #228) =====
         // Previously TP1 had a Math.max(...,tp1Floor) clamp but TP2/TP3 used raw
         // ATR multipliers. On low-ATR XAU entries (ATR=1.38), TP1 hit the $5 floor
@@ -10282,8 +10498,16 @@ function findObAnchoredTp1(s, sym, dir, entryPrice, atr) {
   if (!s.orderBlocks || s.orderBlocks.length === 0) return null;
   // Per-symbol buffer before the OB edge (how much room to leave for TP1 to hit reliably)
   const buffer = sym === 'XAU' ? 0.50 : sym === 'BTC' ? 20 : sym === 'NAS100' ? 2.0 : 0.20;
-  // Minimum distance from entry — don't anchor TP1 if OB is too close (would be insta-hit)
-  const minDist = sym === 'XAU' ? 1.5 : sym === 'BTC' ? 30 : sym === 'NAS100' ? 3 : 0.10;
+  // Minimum distance from entry — don't anchor TP1 if OB is too close (would be insta-hit).
+  // ATR-aware since 2026-07-05: the fixed floors ($30 BTC) were calibrated for quiet tape.
+  // 7/05 03:38 case: weekend ATR ~$66, OB-anchored TP1 $30 out, post-TP1 trail lock $20
+  // (0.3×ATR) from entry — TP1 and trail sat ~$10 apart, inside one wiggle. Price tapped
+  // TP1 and the trail 2 SECONDS apart; a 5-min round trip for crumbs while the move ran on.
+  // Rule: anchored TP1 must be at least 0.75×ATR away, so the trail lock (0.3×ATR) always
+  // keeps ≥0.45×ATR of breathing room below TP1. If the OB is closer than that, skip the
+  // anchor and let the normal ATR-based TP1 stand.
+  const minDistFixed = sym === 'XAU' ? 1.5 : sym === 'BTC' ? 30 : sym === 'NAS100' ? 3 : 0.10;
+  const minDist = Math.max(minDistFixed, (typeof atr === 'number' && isFinite(atr) && atr > 0) ? atr * 0.75 : 0);
   let bestTp1 = null;
   let bestDist = Infinity;
   for (const ob of s.orderBlocks) {
