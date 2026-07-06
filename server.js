@@ -1529,7 +1529,11 @@ function log(sym, msg) {
       S[sym].blockedAttempts.push({ ts: Date.now(), time: ts(), msg: msg.substring(0, 240) });
       if (S[sym].blockedAttempts.length > 30) S[sym].blockedAttempts.shift();
       // Shadow-fire outcome tracking (added 2026-05-25, rate-limited)
-      trackBlockedOutcome(sym, msg);
+      // Elite force (Phase 3.94, 2026-07-06): conv≥7 signal blocks bypass the 35-min
+      // sampling cooldown. The 7/06 10:41 conv-7 4/4-metals PUT block was invisible —
+      // a routine LLF block 62s earlier had consumed the sampling slot.
+      const _eliteBlk = S[sym]._eliteSigTs && (Date.now() - S[sym]._eliteSigTs) < 2000 && S[sym]._eliteSigConv >= 7;
+      trackBlockedOutcome(sym, msg, _eliteBlk === true);
     }
   } catch (e) { /* never let blocked-tracking crash logging */ }
 }
@@ -2473,7 +2477,8 @@ function logSignal(sym, sig) {
           tp1: iC ? ep + tp1D : ep - tp1D,
           tp2: iC ? ep + tp2D : ep - tp2D,
           tp3: iC ? ep + tp3D : ep - tp3D,
-          t1: false, t2: false, done: false
+          t1: false, t2: false, done: false,
+          scalp: !!t.scalp // Phase 3.94: TP1-only scalp — track resolves at TP1
         });
         if (st.cfdTracks.length > 12) st.cfdTracks.shift();
       } catch (e) { /* never crash signal emission on tracking */ }
@@ -4262,6 +4267,10 @@ function processPrice(sym, price, hi, lo) {
 
     // PHASE 3.81 — conv was computed up-top into sig.conv; reuse it (was: const conv = convictionFor(sig.type)).
     const conv = sig.conv;
+    // Phase 3.94 (2026-07-06): stamp conviction so the log-capture force-tracks elite
+    // (conv≥7) blocks past the 35-min shadow-sampling cooldown.
+    s._eliteSigConv = (conv && conv.score) || 0;
+    s._eliteSigTs = Date.now();
 
     const tagEarly = sig.score || '';
     const isFadeEarly = /ATH|ATL|HI|LO|DIV/.test(tagEarly) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tagEarly);
@@ -5487,15 +5496,51 @@ function processPrice(sym, price, hi, lo) {
         // catching local-top reversals is a dedicated LOCAL-HIGH/LOW fade detector (top-fade
         // signal that fires only $3-7 off a fresh local extreme with R:R 1:4+) — separate work.
 
+        // ===== PHASE 3.94 — ELITE-CONTINUATION SCALP BYPASS (2026-07-06) =====
+        // 7/06 trend day: four RIDE(+MACRO) PUTs blocked here. Outcomes if fired:
+        //   09:15 conv 5, 0 metals → LOSER (+$8 against) — correct block
+        //   09:47 conv 5, 3 metals → marginal (~-$3.5) — correct block
+        //   10:17 conv 8, 4/4 metals → TP1 winner (-$10.6 max)
+        //   10:41 conv 7, 4/4 metals + HTF×2 → TP1 winner (4136→4128, then V-bounced to 4137)
+        // The conv≥7 + ≥3 cross-asset factor line separates winners from losers — the same
+        // elite tier as Phase 3.69/3.86. On trend days "lower half, no fresh low" describes
+        // every pullback continuation entry, so the elite tier may take those — but as
+        // TP1-ONLY SCALPS (both winners V-bounced right after TP1; low-in-range entries
+        // have no room for runners). s._scalpUntil makes buildCfdTrade flag the trade;
+        // checkExit/checkCfdTracks fully exit at TP1 — no TP2/TP3.
+        let _eliteCont = false;
+        try {
+          const _ecScore = (conv && conv.score) || 0;
+          const _ecF = (conv && conv.factors) || [];
+          const _ecSet = isXAU ? ['DXY', 'TLT', 'SLV', 'GDX']
+                       : isNAS ? ['SPY', 'QQQ', 'DXY', 'BTC', 'QQQ_SIG', 'TRUMP']
+                       : isBTC ? ['SPY', 'QQQ', 'DXY', 'NAS']
+                       : null;
+          if (_ecSet && _ecScore >= 7 && isTrendOrMomentum) {
+            const _ecMatch = _ecSet.filter(f => _ecF.indexOf(f) !== -1).length;
+            if (_ecMatch >= 3 && Array.isArray(s.macroSnaps) && s.macroSnaps.length >= 6) {
+              const _ecSn = s.macroSnaps[Math.max(0, s.macroSnaps.length - 6)];
+              if (_ecSn && _ecSn.p > 0) {
+                const _ecChg = (price - _ecSn.p) / _ecSn.p;
+                const _ecAligned = sig.type === 'call' ? _ecChg > 0.001 : _ecChg < -0.001;
+                if (_ecAligned) {
+                  _eliteCont = true;
+                  s._scalpUntil = Date.now() + 5000; // buildCfdTrade → TP1-only scalp mode
+                  log(sym, '↪️ ' + tag + ' ' + sig.type.toUpperCase() + ' — elite-continuation bypass (Phase 3.94): conv ' + _ecScore + ' + ' + _ecMatch + '/' + _ecSet.length + ' cross-asset factors + aligned 30-min drift (' + (_ecChg * 100).toFixed(2) + '%). Session-range bias waived — TP1-ONLY SCALP.');
+                }
+              }
+            }
+          }
+        } catch (eEc) {}
         // PUT in lower half + NOT making new low = stale exhausted move
-        if (sig.type === 'put' && inLowerHalf && !freshNewLow) {
+        if (!_eliteCont && sig.type === 'put' && inLowerHalf && !freshNewLow) {
           Object.assign(s, _emitSnapshot);
           const pctFromHigh = ((s.sessionHigh - price) / sessionRange * 100).toFixed(0);
           log(sym, '🚫 ' + tag + ' PUT BLOCKED — session-range bias: price $' + price.toFixed(2) + ' is in lower half of session range ($' + s.sessionLow.toFixed(2) + '-$' + s.sessionHigh.toFixed(2) + ', ' + pctFromHigh + '% off high) and NOT making new low — move is stale.');
           return false;
         }
         // CALL in upper half + NOT making new high = stale
-        if (sig.type === 'call' && inUpperHalf && !freshNewHigh) {
+        if (!_eliteCont && sig.type === 'call' && inUpperHalf && !freshNewHigh) {
           Object.assign(s, _emitSnapshot);
           const pctFromLow = ((price - s.sessionLow) / sessionRange * 100).toFixed(0);
           log(sym, '🚫 ' + tag + ' CALL BLOCKED — session-range bias: price $' + price.toFixed(2) + ' is in upper half of session range ($' + s.sessionLow.toFixed(2) + '-$' + s.sessionHigh.toFixed(2) + ', ' + pctFromLow + '% off low) and NOT making new high — move is stale.');
@@ -10537,6 +10582,10 @@ function buildCfdTrade(type, price, atr, sym) {
   const iC = type === 'call';
   const isXAU = sym === 'XAU';
   const isNAS = sym === 'NAS100';
+  // Phase 3.94 (2026-07-06): elite-continuation bypass marks the next trade as a
+  // TP1-only scalp (full exit at TP1, no TP2/TP3 runners). One-shot flag, 5s window.
+  const _scalp = !!(sym && S[sym] && S[sym]._scalpUntil && Date.now() < S[sym]._scalpUntil);
+  if (sym && S[sym]) S[sym]._scalpUntil = 0;
   // Per-instrument TP/SL policy (multiples of ATR).
   // Default (XAU, BTC): SL=2×, TP1=1.5×, TP2=2.5×, TP3=4×.
   // NAS (updated 2026-05-16, retightened 2026-07-01): NAS futures show cleaner directional
@@ -10613,7 +10662,8 @@ function buildCfdTrade(type, price, atr, sym) {
       atr: atr,
       bestPrice: oldTrade.bestPrice || price,  // keep best-price tracking
       trailSl: oldTrade.trailSl || 0,
-      isCfd: true
+      isCfd: true,
+      scalp: _scalp || oldTrade.scalp || false
     };
   }
 
@@ -10624,7 +10674,8 @@ function buildCfdTrade(type, price, atr, sym) {
     ts: Date.now(),  // entry timestamp — used by reversal-warning hold gate
     slPrice: sl, tp1Price: tp1, tp2Price: tp2, tp3Price: tp3,
     atr: atr, bestPrice: price, trailSl: 0,
-    isCfd: true
+    isCfd: true,
+    scalp: _scalp
   };
 }
 
@@ -10715,6 +10766,13 @@ function checkCfdTracks(sym, price) {
     if (hitTp1 && !tr.t1) {
       tr.t1 = true;
       if (!o.tp1Hit) { o.tp1Hit = true; o.tp1HitTs = now; changed = true; }
+      // Phase 3.94: TP1-only scalps resolve HERE — full exit at TP1, the track is done.
+      // No TP2/TP3 chase, and no later raw-SL stamp misrepresenting a banked win.
+      if (tr.scalp) {
+        tr.done = true;
+        if (o.closePrice == null) { o.closePrice = price; changed = true; }
+        continue;
+      }
     }
     if (hitTp2 && !tr.t2) {
       tr.t2 = true;
@@ -10754,6 +10812,17 @@ function checkExit(sym, price) {
     // exited at $0.00; BTC 09:31 TP1'd then scratched while price ran +$266 more. Trailing
     // at entry ± 0.3×ATR keeps a small win on every scratch instead of zero.
     if (!t.t1 && ((iC && price >= t.tp1Price) || (!iC && price <= t.tp1Price))) {
+      // Phase 3.94 (2026-07-06): TP1-only scalp trades (elite-continuation bypass) take
+      // the FULL exit at TP1 — no runners. Low-in-range continuation entries V-bounce
+      // right after TP1 (7/06 10:41 case: 4136→4128→4137 in minutes).
+      if (t.scalp) {
+        t.t1 = true; t.sl = true; t.lastETs = now;
+        log(sym, '🎯 SCALP TP1 — FULL EXIT — $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2) + ' (TP1-only scalp, Phase 3.94 — no TP2/TP3).');
+        sendPush('🎯 ' + sym + ' SCALP TP1 — FULL EXIT', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · close entire position', 'signal');
+        updateSignalOutcome(sym, price); // capture outcome BEFORE clearing trade
+        s.trade = { active: false };
+        return;
+      }
       const lockDist = (typeof t.atr === 'number' && isFinite(t.atr) && t.atr > 0) ? t.atr * 0.3 : 0;
       t.t1 = true; t.trailSl = iC ? t.ep + lockDist : t.ep - lockDist; t.lastETs = now;
       log(sym, '🎯 TP1 HIT — $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2) + ' · SL → entry' + (lockDist > 0 ? (iC ? '+' : '-') + '$' + lockDist.toFixed(2) + ' (profit-lock)' : ' (BE)') + ' $' + t.trailSl.toFixed(2));
