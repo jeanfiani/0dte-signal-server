@@ -2736,9 +2736,14 @@ function processPrice(sym, price, hi, lo) {
     const isChoppy   = effS < thrS && effL < thrL;
     const isTrending = effS > resS && effL > resL;
     const dwellTicks = 10;
+    // Phase 3.96 (2026-07-06): while GRIND-LIVE is fresh (<90s since last confirmation),
+    // the machine may not flip chop back ON — prevents chop/grind flicker + log spam
+    // during multi-hour grinds. When the grind condition stops being confirmed, the
+    // stamp ages out and normal chop behavior resumes.
+    const grindFresh = !!(s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000));
     if (!s.chopActive) {
       if (isChoppy) { s.chopCount++; s.trendCount = 0; } else { s.chopCount = 0; }
-      if (s.chopCount >= dwellTicks) {
+      if (s.chopCount >= dwellTicks && !grindFresh) {
         s.chopActive = true; s.chopCount = 0;
         log(sym, '🌊 CHOP MODE');
         // Push notification removed (2026-05-08, by user request) — chop transitions are
@@ -2778,31 +2783,45 @@ function processPrice(sym, price, hi, lo) {
       }
     } catch (e) {}
 
-    // ===== DORMANT GRIND-TREND OVERRIDE (added 2026-07-02, LOG-ONLY) =====
-    // Phase 3.57 only sees BURSTS (30-min move > threshold). A slow grind never trips it:
-    // 7/02 BTC ground +3% overnight (60,300 → 62,100) at ~0.1-0.2% per 30min — chop mode
-    // stayed ON the entire time and every RIDE entry was blocked while a $1,800 trend
-    // played out. Hypothesis: |3h net drift| > 1.2% = trend, regardless of burst size.
-    // DORMANT: logs what it WOULD do, changes nothing. Grep '🌀 GRIND' after ~1 week and
-    // compare against chop-blocked RIDE shadow outcomes to decide on promotion.
+    // ===== PHASE 3.96 — GRIND-LIVE TREND-AWARE CHOP SUSPENSION (promoted 2026-07-06) =====
+    // Promoted from the 7/02 dormant experiment after 4 documented grind sessions
+    // (7/02, 7/03, 7/04 nights + the 7/06 full-day XAU/BTC grind). The efficiency
+    // detector reads slow steady grinds as chop (low tick-efficiency while price nets
+    // 1%+), blocking every with-trend entry and shrinking TP ladders while the trend
+    // plays out. Phase 3.57 only sees 30-min BURSTS; a grind never trips it.
+    // Rule: chop is SUSPENDED while BOTH HTFs (1h + 4h) agree on a direction AND the
+    // 3h net drift is ≥0.8% in that SAME direction (7/06 calibration: XAU ~1% ✓,
+    // BTC ~1.5% ✓, NAS ~0.4% ✗ stays chopped). One switch — gates, TP mults and TRv2
+    // all inherit trend behavior downstream.
+    // Guard rails: with-grind signals need conv ≥6 (enrichSig floor; conv-5 would-fires
+    // logged dormant + force shadow-tracked to decide the floor later). EXT-GUARD (3.91)
+    // and the counter-trend gates stay fully active.
+    // 7/06 replay @ conv≥6: 2 fires, 2 winners (XAU 22:33 TP3, BTC 07:59 pre-flush), 0 losses.
     try {
-      if (s.chopActive && Array.isArray(s.macroSnaps) && s.macroSnaps.length >= 24 && s.lastPrice > 0) {
-        const now = Date.now();
-        if (!s._grindLogTs || now - s._grindLogTs > 5 * 60 * 1000) { // throttle: 1 log / 5 min
-          // Oldest snap within the last 3h (snaps are 5-min spaced, 36 = 3h)
-          const cutoff3h = now - 3 * 3600 * 1000;
-          const window3h = s.macroSnaps.filter(sn => sn && sn.ts >= cutoff3h && sn.p > 0);
-          if (window3h.length >= 24) { // at least 2h of coverage inside the 3h window
-            const oldest = window3h[0];
-            const driftPct = (s.lastPrice - oldest.p) / oldest.p * 100;
-            if (Math.abs(driftPct) > 1.2) {
-              s._grindLogTs = now;
-              log(sym, '🌀 GRIND OVERRIDE (dormant) — 3h net drift ' + (driftPct >= 0 ? '+' : '') + driftPct.toFixed(2) + '% > 1.2% with chop still ON. Would force chopActive OFF (' + (driftPct >= 0 ? 'up' : 'down') + '-grind). Log-only, no behavior change.');
+      if ((s.chopActive || grindFresh) && Array.isArray(s.macroSnaps) && s.macroSnaps.length >= 24 && s.lastPrice > 0 &&
+          s.htf1h_dir && s.htf4h_dir && s.htf1h_dir === s.htf4h_dir &&
+          (s.htf1h_dir === 'up' || s.htf1h_dir === 'down')) {
+        const nowG = Date.now();
+        // Oldest snap within the last 3h (snaps are 5-min spaced, 36 = 3h)
+        const cutoff3h = nowG - 3 * 3600 * 1000;
+        const window3h = s.macroSnaps.filter(sn => sn && sn.ts >= cutoff3h && sn.p > 0);
+        if (window3h.length >= 24) { // at least 2h of coverage inside the 3h window
+          const oldest = window3h[0];
+          const driftPct = (s.lastPrice - oldest.p) / oldest.p * 100;
+          const driftAligned = (driftPct >= 0.8 && s.htf1h_dir === 'up') || (driftPct <= -0.8 && s.htf1h_dir === 'down');
+          if (driftAligned) {
+            s.chopActive = false;
+            s.chopCount = 0; s.trendCount = 0;
+            s._grindDir = s.htf1h_dir === 'up' ? 'call' : 'put';
+            s._grindTs = nowG; // freshness stamp — machine flip-guard + enrichSig floor key off this
+            if (!s._grindLogTs || nowG - s._grindLogTs > 5 * 60 * 1000) { // throttle: 1 log / 5 min
+              s._grindLogTs = nowG;
+              log(sym, '🌀 GRIND-LIVE (Phase 3.96) — chop SUSPENDED: 1h+4h both ' + s.htf1h_dir.toUpperCase() + ' + 3h drift ' + (driftPct >= 0 ? '+' : '') + driftPct.toFixed(2) + '% (≥0.8%). With-trend ' + (s._grindDir === 'call' ? 'CALLs' : 'PUTs') + ' need conv ≥6 · full TP ladder active.');
             }
           }
         }
       }
-    } catch (e) { /* dormant logging must never affect the tick loop */ }
+    } catch (e) { /* grind suspension must never affect the tick loop */ }
   }
 
   // === ORDER BLOCK — 1-min candle builder + OB zone detection ===
@@ -4326,6 +4345,33 @@ function processPrice(sym, price, hi, lo) {
         }
       }
     } catch (e) { /* extension guard must never crash enrichment */ }
+
+    // ===== PHASE 3.96 — GRIND CONVICTION FLOOR (2026-07-06) =====
+    // Applies ONLY while GRIND-LIVE is fresh (chop suspended by the grind override —
+    // never during naturally-trending markets, where conv-5s keep firing as before).
+    // With-grind signals need conv ≥6. 7/06 calibration: the conv-6 line kept both
+    // winners (XAU 22:33 TP3 conv 6, BTC 07:59 conv 6 VOL×6) and dropped both losers
+    // (02:05 + 02:55, both conv 5, late-grind entries as factor alignment decayed).
+    // Conv-5 would-fires are force shadow-tracked: if that tier is net positive over
+    // ~10 samples, lower the floor with evidence.
+    try {
+      const _gFresh = s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000);
+      if (_gFresh && sig.type === s._grindDir) {
+        const _gScore = (conv && conv.score) || 0;
+        if (_gScore === 5) {
+          const msgG = '🌀 GRIND-DORMANT conv-5 would-fire — ' + tagEarly + ' ' + sig.type.toUpperCase() + ' @ $' + price.toFixed(2) + ' aligned with grind but conv 5 < 6 floor (Phase 3.96). Shadow-tracking to calibrate the floor.';
+          log(sym, msgG);
+          trackBlockedOutcome(sym, msgG, true);
+          Object.assign(s, _emitSnapshot);
+          return false;
+        }
+        if (_gScore < 5) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — grind conv floor (Phase 3.96): conv ' + _gScore + ' < 6 during GRIND-LIVE. Only strong-confluence entries ride the grind.');
+          return false;
+        }
+      }
+    } catch (eG) { /* grind floor must never crash enrichment */ }
 
     // ===== SESSION-DIRECTION COUNTER-TREND GATE (added 2026-05-26) =====
     // When the 4-hour price trajectory is decisively in one direction, counter-trend
@@ -7209,6 +7255,22 @@ function processPrice(sym, price, hi, lo) {
           const minReentry = isConservativeMode ? minReentryCons : minReentryAggr;
           const candlesOk = isConservativeMode ? candleConfirm(true, false) : true;
           if (sweepDistAbove >= minSweep && reentryDistRaw >= minReentry && candlesOk) {
+            // ===== PHASE 3.95 — NAS ASIAN-SWEEP DORMANT (2026-07-06) =====
+            // 7/06 11:19 NAS ⬇STRUCT_SWEEP PUT @29,718 SL'd -$103 in 11 min, fired with
+            // MACD +2.03 into the 07:19 ET pre-market rally — a CALL there was the day's
+            // best move. The Asian-range Judas is a gold/London pattern: NAS Asian-session
+            // volume is thin (no real liquidity pool at the Asian extremes) and pre-market
+            // breaks are news/earnings-driven gap-and-go, not liquidity grabs. NAS local
+            // fades were already 0-clean-wins (N3 kill-switch). Asian-sweep fades on
+            // NAS100 are DORMANT: logged + force shadow-tracked, never fired.
+            if (isNAS) {
+              const msgN = '🥷 ⬇STRUCT_SWEEP PUT DORMANT-WOULD-FIRE (NAS, Phase 3.95) @ $' + price.toFixed(2) + ' — swept Asian high $' + s.asianH_locked.toFixed(2) + ' (+$' + sweepDistAbove.toFixed(2) + '), re-entry $' + reentryDistRaw.toFixed(2) + ' · MACD ' + macdL.toFixed(3) + ' · Asian-range Judas disabled on NAS100.';
+              log(sym, msgN);
+              trackBlockedOutcome(sym, msgN, true);
+              s.structSweepLastTs = now2;
+              s.structSweepLastDir = 'put';
+              s.asianSweptHigh = false;
+            } else {
             s.dailySignalCount++;
             s.lastAT = 'put'; s.nP++;
             if (s.lastSignalDir === 'call') s.lastReversalTs = now2;
@@ -7226,6 +7288,7 @@ function processPrice(sym, price, hi, lo) {
             log(sym, '🥷 STRUCT_SWEEP PUT (Judas)' + modeTag + htfTag + ' — swept Asian high $' + s.asianH_locked.toFixed(2) + ' to peak $' + s.asianSweepHighPeak.toFixed(2) + ' (+$' + sweepDistAbove.toFixed(2) + '), now back below at $' + price.toFixed(2) + ' (-$' + reentryDistRaw.toFixed(2) + ') [#' + s.dailySignalCount + ']');
             sendPush('🥷 ' + sym + ' STRUCT_SWEEP PUT #' + s.dailySignalCount, 'Asian high swept then reversed — $' + price.toFixed(2), 'signal');
             return;
+            } // end Phase 3.95 NAS-dormant else
           }
         }
       }
@@ -7248,6 +7311,15 @@ function processPrice(sym, price, hi, lo) {
           const minReentry = isConservativeMode ? minReentryCons : minReentryAggr;
           const candlesOk = isConservativeMode ? candleConfirm(false, true) : true;
           if (sweepDistBelow >= minSweep && reentryDistRaw >= minReentry && candlesOk) {
+            // Phase 3.95 (2026-07-06): NAS Asian-sweep DORMANT — mirror of PUT branch.
+            if (isNAS) {
+              const msgN = '🥷 ⬆STRUCT_SWEEP CALL DORMANT-WOULD-FIRE (NAS, Phase 3.95) @ $' + price.toFixed(2) + ' — swept Asian low $' + s.asianL_locked.toFixed(2) + ' (-$' + sweepDistBelow.toFixed(2) + '), re-entry $' + reentryDistRaw.toFixed(2) + ' · MACD ' + macdL.toFixed(3) + ' · Asian-range Judas disabled on NAS100.';
+              log(sym, msgN);
+              trackBlockedOutcome(sym, msgN, true);
+              s.structSweepLastTs = now2;
+              s.structSweepLastDir = 'call';
+              s.asianSweptLow = false;
+            } else {
             s.dailySignalCount++;
             s.lastAT = 'call'; s.nC++;
             if (s.lastSignalDir === 'put') s.lastReversalTs = now2;
@@ -7265,6 +7337,7 @@ function processPrice(sym, price, hi, lo) {
             log(sym, '🥷 STRUCT_SWEEP CALL (Judas)' + modeTag + htfTag + ' — swept Asian low $' + s.asianL_locked.toFixed(2) + ' to trough $' + s.asianSweepLowTrough.toFixed(2) + ' (-$' + sweepDistBelow.toFixed(2) + '), now back above at $' + price.toFixed(2) + ' (+$' + reentryDistRaw.toFixed(2) + ') [#' + s.dailySignalCount + ']');
             sendPush('🥷 ' + sym + ' STRUCT_SWEEP CALL #' + s.dailySignalCount, 'Asian low swept then reversed — $' + price.toFixed(2), 'signal');
             return;
+            } // end Phase 3.95 NAS-dormant else
           }
         }
       }
@@ -12132,6 +12205,8 @@ app.get('/state/:sym', (req, res) => {
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
     chopActive: !!s.chopActive,
+    grindLive: !!(s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)),
+    grindDir: (s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)) ? s._grindDir : null,
     weekendBtcPutOnly: !!s._weekendBtcPutOnly,
     breakCoilActive: !!s.breakCoilActive,
     breakFrozenHi: s.breakFrozenHi || null,
