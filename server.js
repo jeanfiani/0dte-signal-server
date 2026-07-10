@@ -4335,7 +4335,8 @@ function processPrice(sym, price, hi, lo) {
                   if (_fm) { _fBurst = parseFloat(_fm[1]); break; }
                 }
                 s.extFlip = { dir: _fDir, extreme: _fDir === 'call' ? _egLo : _egHi, armTs: Date.now(),
-                              burst: _fBurst, atr: atrVal, src: tagEarly + ' ' + sig.type.toUpperCase() + ' crest-block' };
+                              burst: _fBurst, atr: atrVal, srcConv: (conv && conv.score) || 0,
+                              src: tagEarly + ' ' + sig.type.toUpperCase() + ' crest-block' };
               } catch (eF) {}
               Object.assign(s, _emitSnapshot);
               log(sym, '⏳ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — EXT-GUARD (Phase 3.91): entering at ' + Math.round(_egPos * 100) + '% of a $' + _egRange.toFixed(2) + ' 15-min impulse (' + (_egRange / atrVal).toFixed(1) + '×ATR). Chasing the crest of an oversized move; retest ~$' + _egRetest.toFixed(2) + ' would be the entry. EXT-FLIP candidate armed ' + (sig.type === 'call' ? 'PUT' : 'CALL') + '.');
@@ -5011,10 +5012,34 @@ function processPrice(sym, price, hi, lo) {
                   const eliteFreshX = cXauS >= 9 && metalsCount >= 4 && typeof rsiV === 'number' &&
                     ((sigDX > 0 && dirChgX > 0.0002 && dirChgX < 0.0035 && rsiV <= 63) ||
                      (sigDX < 0 && dirChgX < -0.0002 && dirChgX > -0.0035 && rsiV >= 33));
-                  if (alignedX || eliteFreshX) {
+                  // ===== PHASE 3.97 — RECOVERY UNLOCK (2026-07-10) =====
+                  // After a V-bottom the 30-min drift still contains the dip, so alignedX
+                  // reads ~0% while price recovers (7/06+7/09+7/10: conv 6-9 with-recovery
+                  // entries ALL blocked here). An established bounce (≥0.2% off the 30-min
+                  // extreme, held ≥10min) counts as aligned — conv ≥6 only, and the entry
+                  // must pass the structure gate (OB / Asian H-L / ATH-ATL: room overhead,
+                  // not extended off the anchor). Structural SL rides along to buildCfdTrade.
+                  let _rcX = null, _rcStructX = null;
+                  if (!alignedX && !eliteFreshX && cXauS >= 6) {
+                    _rcX = recoveryContext(s, price, sig.type);
+                    if (_rcX) {
+                      _rcStructX = findRecoveryStructure(s, sym, sig.type, price, atrVal, _rcX.ref);
+                      if (!_rcStructX.ok) {
+                        log(sym, '⏳ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' recovery unlock DEFERRED (Phase 3.97 entry-structure): ' + _rcStructX.reason + '.');
+                        _rcX = null;
+                      }
+                    }
+                  }
+                  if (alignedX || eliteFreshX || _rcX) {
                     _xauMetalsBypass = true;
-                    const tierX = alignedX ? 'Phase 3.69' : 'Phase 3.90 ELITE-FRESH';
-                    log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — XAU metals-confluence bypass (' + tierX + '): conv ' + cXauS + ' + ' + metalsCount + '/4 metals (' + metalsSet.filter(m => cXauF.indexOf(m) !== -1).join(',') + ') + dir ' + (dirChgX * 100).toFixed(2) + '% · RSI ' + rsiV.toFixed(1) + '. Allowed.');
+                    if (_rcX) {
+                      s._recovUnlockTs = Date.now(); s._recovUnlockDir = sig.type;
+                      if (_rcStructX && typeof _rcStructX.structSl === 'number') { s._structSl = _rcStructX.structSl; s._structSlUntil = Date.now() + 5000; }
+                      log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — XAU metals bypass (Phase 3.97 RECOVERY): conv ' + cXauS + ' + ' + metalsCount + '/4 metals + ' + _rcX.offPct.toFixed(2) + '% off 30-min extreme (held ' + Math.round(_rcX.ageMin) + 'min)' + (_rcStructX && _rcStructX.anchorName ? ' · anchored to ' + _rcStructX.anchorName + ' $' + _rcStructX.anchor.toFixed(2) + ' · structural SL $' + _rcStructX.structSl.toFixed(2) : '') + '. Allowed.');
+                    } else {
+                      const tierX = alignedX ? 'Phase 3.69' : 'Phase 3.90 ELITE-FRESH';
+                      log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — XAU metals-confluence bypass (' + tierX + '): conv ' + cXauS + ' + ' + metalsCount + '/4 metals (' + metalsSet.filter(m => cXauF.indexOf(m) !== -1).join(',') + ') + dir ' + (dirChgX * 100).toFixed(2) + '% · RSI ' + rsiV.toFixed(1) + '. Allowed.');
+                    }
                   }
                 }
               }
@@ -5049,10 +5074,29 @@ function processPrice(sym, price, hi, lo) {
                   const dirChgC = (price - sn30c.p) / sn30c.p;
                   const sigDC = sig.type === 'call' ? 1 : sig.type === 'put' ? -1 : 0;
                   const alignedC = (sigDC > 0 && dirChgC > 0.001) || (sigDC < 0 && dirChgC < -0.001);
-                  if (alignedC) {
+                  // Phase 3.97 RECOVERY (2026-07-10): same V-recovery unlock as XAU —
+                  // see metals-bypass comment. Conv floor is already ≥6 here (outer check).
+                  let _rcC = null, _rcStructC = null;
+                  if (!alignedC) {
+                    _rcC = recoveryContext(s, price, sig.type);
+                    if (_rcC) {
+                      _rcStructC = findRecoveryStructure(s, sym, sig.type, price, atrVal, _rcC.ref);
+                      if (!_rcStructC.ok) {
+                        log(sym, '⏳ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' recovery unlock DEFERRED (Phase 3.97 entry-structure): ' + _rcStructC.reason + '.');
+                        _rcC = null;
+                      }
+                    }
+                  }
+                  if (alignedC || _rcC) {
                     _crossAssetBypass = true;
                     const matched = factorSet.filter(f => cCAF.indexOf(f) !== -1).join(',');
-                    log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — ' + sym + ' cross-asset confluence bypass (Phase 3.70): conv ' + cCAS + ' + ' + matchCount + '/' + factorSet.length + ' factors (' + matched + ') + aligned dir (' + (dirChgC * 100).toFixed(2) + '%). Allowed.');
+                    if (_rcC) {
+                      s._recovUnlockTs = Date.now(); s._recovUnlockDir = sig.type;
+                      if (_rcStructC && typeof _rcStructC.structSl === 'number') { s._structSl = _rcStructC.structSl; s._structSlUntil = Date.now() + 5000; }
+                      log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — ' + sym + ' cross-asset bypass (Phase 3.97 RECOVERY): conv ' + cCAS + ' + ' + matchCount + '/' + factorSet.length + ' factors (' + matched + ') + ' + _rcC.offPct.toFixed(2) + '% off 30-min extreme (held ' + Math.round(_rcC.ageMin) + 'min)' + (_rcStructC && _rcStructC.anchorName ? ' · anchored to ' + _rcStructC.anchorName + ' $' + _rcStructC.anchor.toFixed(2) + ' · structural SL $' + _rcStructC.structSl.toFixed(2) : '') + '. Allowed.');
+                    } else {
+                      log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — ' + sym + ' cross-asset confluence bypass (Phase 3.70): conv ' + cCAS + ' + ' + matchCount + '/' + factorSet.length + ' factors (' + matched + ') + aligned dir (' + (dirChgC * 100).toFixed(2) + '%). Allowed.');
+                    }
                   }
                 }
               }
@@ -5458,10 +5502,32 @@ function processPrice(sym, price, hi, lo) {
         const remainMin = Math.round(((sig.type === 'call' ? s.macroContraBlockCallUntil : s.macroContraBlockPutUntil) - macroContraNow) / 60000);
         log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' contra-block EXEMPT (fade signal) — macro aligned ' + (sig.type === 'call' ? 'PUT' : 'CALL') + ' ' + remainMin + 'min more, but fade detectors are designed to counter-trend at extremes.');
       } else {
+        // ===== PHASE 3.97 — RECOVERY WAIVER (2026-07-10) =====
+        // The contra-block is stamped by the PRIOR trend's macro alignment and lags
+        // V-reversals by 30+ min (7/06/7/09/7/10: it stacked on top of the chop gate to
+        // keep conv 7-9 recovery entries out for the entire move). Conv ≥7 + established
+        // recovery (≥0.2% off the 30-min extreme, held ≥10min) + structure-approved
+        // entry waives it. Everything else still blocks as before.
+        let _rcCB = null, _rcCBStruct = null;
+        try {
+          const _cCBscore = (sig.conv && sig.conv.score) || 0;
+          if (_cCBscore >= 7) {
+            _rcCB = recoveryContext(s, price, sig.type);
+            if (_rcCB) {
+              _rcCBStruct = findRecoveryStructure(s, sym, sig.type, price, atrVal, _rcCB.ref);
+              if (!_rcCBStruct.ok) _rcCB = null;
+            }
+          }
+        } catch (eCB) { _rcCB = null; }
+        if (_rcCB) {
+          if (_rcCBStruct && typeof _rcCBStruct.structSl === 'number') { s._structSl = _rcCBStruct.structSl; s._structSlUntil = Date.now() + 5000; }
+          log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' contra-block WAIVED (Phase 3.97) — conv ' + sig.conv.score + ' + recovery ' + _rcCB.offPct.toFixed(2) + '% off 30-min extreme (held ' + Math.round(_rcCB.ageMin) + 'min)' + (_rcCBStruct && _rcCBStruct.anchorName ? ' · anchored to ' + _rcCBStruct.anchorName + ' $' + _rcCBStruct.anchor.toFixed(2) : '') + '. Macro alignment lags V-reversals.');
+        } else {
         Object.assign(s, _emitSnapshot);
         const remainMin = Math.round(((sig.type === 'call' ? s.macroContraBlockCallUntil : s.macroContraBlockPutUntil) - macroContraNow) / 60000);
         log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — macro 6+/7 aligned ' + (sig.type === 'call' ? 'PUT' : 'CALL') + '. Contra-block active ' + remainMin + 'min more.');
         return false;
+        } // end Phase 3.97 recovery waiver else
       }
     }
 
@@ -6454,20 +6520,36 @@ function processPrice(sym, price, hi, lo) {
       } else if (efAgeMs >= 180000) {
         const efAtr = (typeof atrVal === 'number' && atrVal > 0) ? atrVal : (EF.atr || 0);
         const efSlBuf = Math.max(efAtr * 0.25, isXAU ? 0.5 : 0);
-        const efSlPrice = efCall ? EF.extreme - efSlBuf : EF.extreme + efSlBuf;
-        const efSlDist = Math.abs(price - efSlPrice);
+        // ===== SL CLAMP (2026-07-10, confirmed on the 7/06-7/10 13-sample ledger) =====
+        // Floor 0.75×ATR — WIDEN, don't skip: NAS 7/09 14:45 died on a $6 noise stop in
+        // 14s then hit TP1; skipping tiny-R flips would also have killed BTC 7/09 08:49
+        // (the detector's best TP3 win — tiny structural R made TP3 reachable in 3 min).
+        // Cap 1.5×ATR — BTC 7/09 11:21 risked 2.1×ATR (-$216), XAU 7/10 08:40 1.9×ATR:
+        // every flip now risks ~1 comparable unit, leverage-agnostic per symbol.
+        let efSlDist = Math.abs(price - (efCall ? EF.extreme - efSlBuf : EF.extreme + efSlBuf));
+        efSlDist = Math.min(Math.max(efSlDist, efAtr * 0.75), efAtr * 1.5);
+        const efSlPrice = efCall ? price - efSlDist : price + efSlDist;
         const efSlCap = isXAU ? 10 : efAtr * 2.5;
         const efFightsBoth = s.htf1h_dir && s.htf4h_dir &&
           ((efCall && s.htf1h_dir === 'down' && s.htf4h_dir === 'down') ||
            (!efCall && s.htf1h_dir === 'up' && s.htf4h_dir === 'up'));
         let efReason = null;
         if (!(EF.burst >= 1.5)) efReason = 'no climax volume (burst ×' + (EF.burst || 0).toFixed(1) + ' < 1.5)';
+        // Elite stand-down (2026-07-10): both 7/09 XAU flip losses (-$637/lot combined)
+        // faded blocked conv-9/10 signals. An elite-conviction crest block is a TIMING
+        // objection, not a direction one — don't fade the metals board.
+        else if ((EF.srcConv || 0) >= 8) efReason = 'armed by a conv-' + EF.srcConv + ' block — elite conviction says trend, not reversal; standing down';
         else if (efFightsBoth) efReason = 'fights both HTFs (1h=' + s.htf1h_dir + ', 4h=' + s.htf4h_dir + ')';
         else if (efCall && rsiV > 55) efReason = 'RSI ' + rsiV.toFixed(1) + ' > 55 — nothing oversold to bounce';
         else if (!efCall && rsiV < 45) efReason = 'RSI ' + rsiV.toFixed(1) + ' < 45 — nothing overbought to fade';
         else if (!(efSlDist > 0) || efSlDist > efSlCap || !(efAtr > 0)) efReason = 'stop budget: $' + efSlDist.toFixed(2) + ' to extreme exceeds cap $' + efSlCap.toFixed(2);
         else if (now2 - (s.extFlipLastTs || 0) < 1800000) efReason = 'flip cooldown ' + Math.round((1800000 - (now2 - (s.extFlipLastTs || 0))) / 60000) + 'm left';
         else if (winProtectDir && winProtectDir !== EF.dir) efReason = 'protecting winning ' + winProtectDir.toUpperCase() + ' trade';
+        // Gate 7 (2026-07-06, added after the 18:36→18:38 whipsaw): never contradict a
+        // JUST-FIRED opposite trade, profitable or not. The 18:36 IB CALL was 82s old and
+        // flat when the flip PUT fired and overwrote its trade management — winProtect
+        // only covers trades in profit, so a fresh flat position had no protection.
+        else if (s.trade && s.trade.active && s.trade.ts && s.trade.type !== EF.dir && (now2 - s.trade.ts) < 600000) efReason = 'fresh opposite ' + s.trade.type.toUpperCase() + ' trade is only ' + Math.round((now2 - s.trade.ts) / 60000) + 'min old — flip would whipsaw our own fire (need 10min)';
         if (efReason) {
           log(sym, '⏳ EXT-FLIP ' + EF.dir.toUpperCase() + ' BLOCKED — ' + efReason + ' (armed by ' + EF.src + ', extreme $' + EF.extreme.toFixed(2) + ' held ' + Math.round(efAgeMs / 60000) + 'min, burst ×' + (EF.burst || 0).toFixed(1) + ', RSI ' + rsiV.toFixed(1) + ').');
           s.extFlip = null; // gate 6: one evaluation per impulse
@@ -6980,6 +7062,7 @@ function processPrice(sym, price, hi, lo) {
             if (_fmL) { _fBurstL = parseFloat(_fmL[1]); break; }
           }
           s.extFlip = { dir: 'put', extreme: _fHiL, armTs: Date.now(), burst: _fBurstL, atr: atrVal,
+                        srcConv: (function(){ try { return convictionFor('call').score || 0; } catch (eSc) { return 0; } })(),
                         src: 'LLF CALL stale-fade block (bounce ' + _llfRiseAtr.toFixed(1) + '×ATR off ' + Math.round(_llfSwAgeMin) + 'min-old low)' };
         } catch (eL) {}
       }
@@ -10651,6 +10734,99 @@ function findObAnchoredTp1(s, sym, dir, entryPrice, atr) {
   return bestTp1;
 }
 
+// ===== PHASE 3.97 — RECOVERY CONTEXT + STRUCTURE-ENTRY HELPERS (2026-07-10) =====
+// Three sessions (7/06 pm, 7/09 am, 7/10) showed the same failure: after a V-bottom,
+// every with-recovery entry died because the 30-min drift check still contained the
+// dip (price vs 30-min-ago ≈ 0 while price was +0.2-0.3% off the low and climbing).
+// recoveryContext() detects an ESTABLISHED bounce: ≥0.2% off the 30-min extreme AND
+// the extreme printed ≥10 min ago (holds = not a falling knife / spike top).
+function recoveryContext(s, price, dir) {
+  try {
+    if (!s || !Array.isArray(s.vrevSnaps) || !(price > 0)) return null;
+    const nowR = Date.now();
+    const w = s.vrevSnaps.filter(sn => sn && sn.ts > nowR - 1800000 && sn.p > 0);
+    if (w.length < 30) return null;
+    let lo = Infinity, loTs = 0, hi = -Infinity, hiTs = 0;
+    for (const sn of w) {
+      if (sn.p < lo) { lo = sn.p; loTs = sn.ts; }
+      if (sn.p > hi) { hi = sn.p; hiTs = sn.ts; }
+    }
+    if (dir === 'call') {
+      const offPct = (price - lo) / lo * 100;
+      const ageMin = (nowR - loTs) / 60000;
+      if (offPct >= 0.2 && ageMin >= 10) return { ref: lo, offPct: offPct, ageMin: ageMin };
+    } else {
+      const offPct = (hi - price) / hi * 100;
+      const ageMin = (nowR - hiTs) / 60000;
+      if (offPct >= 0.2 && ageMin >= 10) return { ref: hi, offPct: offPct, ageMin: ageMin };
+    }
+  } catch (e) {}
+  return null;
+}
+
+// Entry-price optimization against structure: order blocks, Asian H/L, rolling ATH/ATL
+// and the 30-min extreme. Two rules:
+//   1. NO-ROOM: don't enter INTO a barrier (<0.5×ATR of overhead resistance for CALLs /
+//      underfoot support for PUTs) — wait for the break or a deeper pullback.
+//   2. NOT-EXTENDED: don't enter >1.2×ATR beyond the nearest anchoring structure —
+//      detectors re-fire every 15-20 min, so rejecting here naturally catches the retest.
+// When OK, returns a structural SL just beyond the anchor (tighter, level-based risk).
+function findRecoveryStructure(s, sym, dir, price, atr, ref) {
+  try {
+    if (!s || !(price > 0) || !(atr > 0)) return { ok: true };
+    const iC = dir === 'call';
+    // -- Rule 1: barrier check --
+    const candB = [];
+    if (iC) {
+      if (s.asianH_locked > price) candB.push([s.asianH_locked, 'Asian high']);
+      if (s.rollingHigh > price) candB.push([s.rollingHigh, 'rolling ATH']);
+      if (Array.isArray(s.orderBlocks)) for (const ob of s.orderBlocks) {
+        if (ob && !ob.mitigated && ob.type === 'bear' && ob.lo > price) candB.push([ob.lo, 'bear OB']);
+      }
+    } else {
+      if (s.asianL_locked > 0 && s.asianL_locked < price) candB.push([s.asianL_locked, 'Asian low']);
+      if (s.rollingLow > 0 && s.rollingLow < Infinity && s.rollingLow < price) candB.push([s.rollingLow, 'rolling ATL']);
+      if (Array.isArray(s.orderBlocks)) for (const ob of s.orderBlocks) {
+        if (ob && !ob.mitigated && ob.type === 'bull' && ob.hi < price) candB.push([ob.hi, 'bull OB']);
+      }
+    }
+    let barrier = null, barrierName = null;
+    for (const [lvl, nm] of candB) {
+      if (barrier === null || (iC ? lvl < barrier : lvl > barrier)) { barrier = lvl; barrierName = nm; }
+    }
+    if (barrier !== null && Math.abs(barrier - price) < atr * 0.5) {
+      return { ok: false, reason: barrierName + ' $' + barrier.toFixed(2) + ' only $' + Math.abs(barrier - price).toFixed(2) + ' away (<0.5×ATR) — no room, wait for the break or a deeper pullback' };
+    }
+    // -- Rule 2: anchor check --
+    const candA = [];
+    if (iC) {
+      if (Array.isArray(s.orderBlocks)) for (const ob of s.orderBlocks) {
+        if (ob && !ob.mitigated && ob.type === 'bull' && ob.hi <= price) candA.push([ob.hi, 'bull OB']);
+      }
+      if (s.asianL_locked > 0 && s.asianL_locked <= price) candA.push([s.asianL_locked, 'Asian low']);
+      if (typeof ref === 'number' && ref > 0 && ref <= price) candA.push([ref, '30-min low']);
+    } else {
+      if (Array.isArray(s.orderBlocks)) for (const ob of s.orderBlocks) {
+        if (ob && !ob.mitigated && ob.type === 'bear' && ob.lo >= price) candA.push([ob.lo, 'bear OB']);
+      }
+      if (s.asianH_locked > 0 && s.asianH_locked >= price) candA.push([s.asianH_locked, 'Asian high']);
+      if (typeof ref === 'number' && ref > 0 && ref >= price) candA.push([ref, '30-min high']);
+    }
+    let anchor = null, anchorName = null;
+    for (const [lvl, nm] of candA) {
+      if (anchor === null || (iC ? lvl > anchor : lvl < anchor)) { anchor = lvl; anchorName = nm; }
+    }
+    if (anchor !== null) {
+      const dist = Math.abs(price - anchor);
+      if (dist > atr * 1.2) {
+        return { ok: false, reason: 'extended $' + dist.toFixed(2) + ' (>1.2×ATR) beyond ' + anchorName + ' $' + anchor.toFixed(2) + ' — wait for the retest (detectors re-fire on the pullback)' };
+      }
+      return { ok: true, anchor: anchor, anchorName: anchorName, structSl: iC ? anchor - atr * 0.3 : anchor + atr * 0.3 };
+    }
+    return { ok: true };
+  } catch (e) { return { ok: true }; }
+}
+
 function buildCfdTrade(type, price, atr, sym) {
   const iC = type === 'call';
   const isXAU = sym === 'XAU';
@@ -10659,6 +10835,10 @@ function buildCfdTrade(type, price, atr, sym) {
   // TP1-only scalp (full exit at TP1, no TP2/TP3 runners). One-shot flag, 5s window.
   const _scalp = !!(sym && S[sym] && S[sym]._scalpUntil && Date.now() < S[sym]._scalpUntil);
   if (sym && S[sym]) S[sym]._scalpUntil = 0;
+  // Phase 3.97 (2026-07-10): structure-anchored SL from the recovery unlock (one-shot,
+  // 5s window). Applied only if TIGHTER than the ATR default — structure never widens risk.
+  const _structSlP = (sym && S[sym] && S[sym]._structSlUntil && Date.now() < S[sym]._structSlUntil && typeof S[sym]._structSl === 'number') ? S[sym]._structSl : null;
+  if (sym && S[sym]) S[sym]._structSlUntil = 0;
   // Per-instrument TP/SL policy (multiples of ATR).
   // Default (XAU, BTC): SL=2×, TP1=1.5×, TP2=2.5×, TP3=4×.
   // NAS (updated 2026-05-16, retightened 2026-07-01): NAS futures show cleaner directional
@@ -10684,7 +10864,16 @@ function buildCfdTrade(type, price, atr, sym) {
   const tp1Dist = isXAU ? 5.0 : isNAS ? Math.max(atr * mults.t1, 30) : Math.max(atr * mults.t1, 5);
   const tp2Dist = atr * mults.t2;
   const tp3Dist = atr * mults.t3;
-  const sl = iC ? price - slDist : price + slDist;
+  let sl = iC ? price - slDist : price + slDist;
+  // Phase 3.97: structural SL override — use the level-based stop when it's a real level
+  // behind the entry and tighter than (or equal to) the ATR-based default.
+  if (_structSlP !== null) {
+    const _dStruct = iC ? (price - _structSlP) : (_structSlP - price);
+    if (_dStruct > atr * 0.25 && _dStruct <= slDist) {
+      sl = _structSlP;
+      console.log('[' + ts() + '] ' + sym + ': 🧱 Structural SL — $' + _structSlP.toFixed(2) + ' (behind structure anchor) instead of ATR default $' + (iC ? price - slDist : price + slDist).toFixed(2) + '.');
+    }
+  }
   let tp1 = iC ? price + tp1Dist : price - tp1Dist;
   const tp2 = iC ? price + tp2Dist : price - tp2Dist;
   const tp3 = iC ? price + tp3Dist : price - tp3Dist;
@@ -12839,3 +13028,4 @@ app.get('/signals', (req, res) => {
 app.listen(PORT, () => {
   console.log('[STARTUP] Server listening on port ' + PORT);
 });
+// build: 2026-07-10 Phase 3.97 + EXT-FLIP fixes
