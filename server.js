@@ -1606,7 +1606,10 @@ function trackBlockedOutcome(sym, msg, force) {
   // Cap raised 50 → 200 (2026-07-02): 50 forced mixed-regime analysis (BTC/NAS entries
   // spanned Jun 9 → Jul 1 configs in one bucket). 200 ≈ 3-4 weeks at current sampling,
   // enough for date-windowed gate reports via /blocked-outcomes/:sym?days=N.
-  if (s.blockedOutcomes.length > 200) s.blockedOutcomes.shift();
+  // Raised 200 → 500 (2026-07-13): forced elite/dormant tracking + spam-retry entries can
+  // burn 170+ slots in a single volatile session (7/13 XAU breakdown), rolling the morning's
+  // missed winners out of the store before the evening audit. ~250KB/symbol at 500.
+  if (s.blockedOutcomes.length > 500) s.blockedOutcomes.shift();
 }
 
 // Update tracked block outcomes on each tick — snapshots + TP1/SL hit detection.
@@ -2291,10 +2294,29 @@ function logSignal(sym, sig) {
   try {
     const s = S[sym];
     if (s && Array.isArray(s.signals) && s.signals.length >= 2) {
-      const prev = s.signals[s.signals.length - 2]; // the new sig was already pushed before logSignal
-      if (prev && prev.type && sig.type && prev.type !== sig.type) {
-        if (!Array.isArray(s.flipHistory)) s.flipHistory = [];
-        s.flipHistory.push(Date.now());
+      // ===== GHOST-FLIP FIX (2026-07-13) =====
+      // Only REAL fires may feed the chop circuit breaker. This block also runs for
+      // analytics-stored BLOCKED signals, so alternating blocked CALL/PUT attempts were
+      // pushing phantom flip timestamps — 3 ghosts/hour engaged the breaker, and then
+      // 'flip cooldown' rejected real opposite-direction winners (7/10 14:45 LHF PUT,
+      // a would-be TP3, was blocked against a breaker built entirely from ghosts).
+      // Also: exit-put/exit-call advisory entries no longer count as direction flips.
+      const _fBlockedNew = !!(sig.conv && (sig.conv.enrichBlocked === true || sig.conv.label === 'BLOCKED'));
+      const _fRealDirNew = sig.type === 'call' || sig.type === 'put';
+      if (!_fBlockedNew && _fRealDirNew) {
+        // Compare against the previous FIRED call/put signal, skipping blocked + exit entries
+        let prev = null;
+        for (let i = s.signals.length - 2; i >= 0; i--) {
+          const p = s.signals[i];
+          if (!p || (p.type !== 'call' && p.type !== 'put')) continue;
+          if (p.conv && (p.conv.enrichBlocked === true || p.conv.label === 'BLOCKED')) continue;
+          prev = p;
+          break;
+        }
+        if (prev && prev.type !== sig.type) {
+          if (!Array.isArray(s.flipHistory)) s.flipHistory = [];
+          s.flipHistory.push(Date.now());
+        }
       }
     }
   } catch (e) { /* never let chop-breaker bookkeeping crash signal emission */ }
@@ -5064,6 +5086,18 @@ function processPrice(sym, price, hi, lo) {
                       }
                     }
                   }
+                  // ===== ELITE-TURN DORMANT (2026-07-13) =====
+                  // 7/13 09:33 case: conv-8 PUT with 3 metals + HTF×2 + BURST×2.5 blocked
+                  // minutes before a $17.5 waterfall. The 30-min drift read -0.09% (needs
+                  // -0.1%) — at a trend TURN the drift window contains both sides and nets
+                  // ~zero, structurally vetoing elite stacks at the best entries. Recovery
+                  // unlock also just missed (0.15% off the high vs 0.2% floor). Hypothesis:
+                  // conv ≥8 + ≥3 metals may fire inside the drift dead-zone. DORMANT.
+                  if (!alignedX && !eliteFreshX && !_rcX && cXauS >= 8 && metalsCount >= 3 && Math.abs(dirChgX) < 0.001) {
+                    const msgET = '🌀 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' ELITE-TURN DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — conv ' + cXauS + ' + ' + metalsCount + '/4 metals inside the drift dead-zone (30-min ' + (dirChgX * 100).toFixed(2) + '%). Turn geometry vetoed an elite stack (dormant).';
+                    log(sym, msgET);
+                    trackBlockedOutcome(sym, msgET, true);
+                  }
                   if (alignedX || eliteFreshX || _rcX) {
                     _xauMetalsBypass = true;
                     if (_rcX) {
@@ -5121,6 +5155,13 @@ function processPrice(sym, price, hi, lo) {
                       }
                     }
                   }
+                  // ELITE-TURN DORMANT (2026-07-13): mirror of the XAU metals-bypass version —
+                  // see comment there. Conv ≥8 + ≥3 cross-asset factors in the drift dead-zone.
+                  if (!alignedC && !_rcC && cCAS >= 8 && matchCount >= 3 && Math.abs(dirChgC) < 0.001) {
+                    const msgETC = '🌀 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' ELITE-TURN DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — conv ' + cCAS + ' + ' + matchCount + '/' + factorSet.length + ' cross-asset factors inside the drift dead-zone (30-min ' + (dirChgC * 100).toFixed(2) + '%). Turn geometry vetoed an elite stack (dormant).';
+                    log(sym, msgETC);
+                    trackBlockedOutcome(sym, msgETC, true);
+                  }
                   if (alignedC || _rcC) {
                     _crossAssetBypass = true;
                     const matched = factorSet.filter(f => cCAF.indexOf(f) !== -1).join(',');
@@ -5147,12 +5188,18 @@ function processPrice(sym, price, hi, lo) {
           // session if the cohort is net positive. Signal still blocks below.
           try {
             const _cR6 = (conv && conv.score) || 0;
-            if (_cR6 >= 6) {
+            // Session-aware floor (2026-07-13): conviction has an OVERNIGHT CEILING —
+            // with SLV/GDX/TLT/SPY/QQQ closed, ~5 is the realistic max for a fully
+            // aligned setup (7/13 03:57 conv-5 RIDE CALL off the 4051 low ran +$12.7
+            // in 30min with every bypass structurally unreachable). Overnight the
+            // dormant cohort logs from conv 5; RTH keeps the 6 floor.
+            const _r6Floor = (typeof rthEtfFresh === 'function' && rthEtfFresh()) ? 6 : 5;
+            if (_cR6 >= _r6Floor) {
               const _rc6 = recoveryContext(s, price, sig.type);
               if (_rc6) {
                 const _rcS6 = findRecoveryStructure(s, sym, sig.type, price, atrVal, _rc6.ref);
                 if (_rcS6 && _rcS6.ok) {
-                  const msg6 = '🌀 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' RECOV-6 DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — conv ' + _cR6 + ' + recovery ' + _rc6.offPct.toFixed(2) + '% off 30-min extreme (held ' + Math.round(_rc6.ageMin) + 'min)' + (_rcS6.anchorName ? ' · anchored to ' + _rcS6.anchorName + ' $' + _rcS6.anchor.toFixed(2) : '') + ' · chop bypass would be granted without metals confluence (Phase 3.99 dormant).';
+                  const msg6 = '🌀 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' RECOV-6 DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — conv ' + _cR6 + ' (floor ' + _r6Floor + (_r6Floor === 5 ? ', overnight factor-ceiling' : '') + ') + recovery ' + _rc6.offPct.toFixed(2) + '% off 30-min extreme (held ' + Math.round(_rc6.ageMin) + 'min)' + (_rcS6.anchorName ? ' · anchored to ' + _rcS6.anchorName + ' $' + _rcS6.anchor.toFixed(2) : '') + ' · chop bypass would be granted without metals confluence (Phase 3.99 dormant).';
                   log(sym, msg6);
                   trackBlockedOutcome(sym, msg6, true);
                 }
@@ -5572,9 +5619,11 @@ function processPrice(sym, price, hi, lo) {
               _rcCBStruct = findRecoveryStructure(s, sym, sig.type, price, atrVal, _rcCB.ref);
               if (!_rcCBStruct.ok) _rcCB = null;
             }
-          } else if (_cCBscore === 6) {
+          } else if (_cCBscore >= ((typeof rthEtfFresh === 'function' && rthEtfFresh()) ? 6 : 5)) {
             // Phase 3.99 (DORMANT, 2026-07-10): conv-6 contra waiver candidate — the
             // 7/10 15:49 conv-6 recovery CALL hit this exact wall and ran to TP3.
+            // Session-aware floor (2026-07-13): conv-5 qualifies overnight when the RTH
+            // factors are closed (overnight conviction ceiling — see chop-gate comment).
             // Log + force shadow-track only; the block below still applies.
             const _rc6c = recoveryContext(s, price, sig.type);
             if (_rc6c) {
@@ -12435,7 +12484,16 @@ app.get('/blocked-outcomes/:sym', (req, res) => {
         scratch: ec.filter(o => o.outcome === 'scratch').length
       };
     })(),
-    entries: outcomes.slice(-50)
+    // Audit-window fix (2026-07-13): ?limit= up to 400 (default 50). The 7/13 XAU
+    // breakdown produced 43 blocked winners whose block reasons had scrolled out of
+    // the fixed 50-entry tail before they could be audited — the exact data needed
+    // to decide gate loosening. ?outcome=win|loss|scratch filters server-side.
+    entries: (function () {
+      let e = outcomes;
+      if (req.query.outcome) e = e.filter(o => o.outcome === String(req.query.outcome));
+      const lim = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 400);
+      return e.slice(-lim);
+    })()
   });
 });
 
@@ -12494,7 +12552,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '4.0-20260713', // bump on each deploy — lets /state verify what's live
+    build: '4.0b-20260713-ghostflip', // bump on each deploy — lets /state verify what's live
     chopActive: !!s.chopActive,
     grindLive: !!(s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)),
     grindDir: (s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)) ? s._grindDir : null,
