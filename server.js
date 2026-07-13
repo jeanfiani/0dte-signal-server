@@ -4253,12 +4253,17 @@ function processPrice(sym, price, hi, lo) {
           const convWk = sig.conv || { score: 0, factors: [] };
           let volEvidence = false;
           for (const f of (convWk.factors || [])) {
-            // Anchor on the × multiplier so 'VOL≥1×1.3' parses as 1.3, not 1
-            const m = /^(?:VOL|BURST).*?×([\d.]+)/.exec(String(f));
+            // Anchor on the × multiplier so 'VOL≥1×1.3' parses as 1.3, not 1.
+            // TIGHTENED 2026-07-11: REAL volume (VOL×) only — BURST× is the ATR price-range
+            // proxy, which by construction only appears when the actual volume test FAILED.
+            // 7/11 05:47 case: IB PUT passed on BURST×1.3 (zero volume spike), sat flat for
+            // 4.5h, got swept -$178 at the top of the range before the real move. On BTC we
+            // HAVE real volume — the participation gate must demand it.
+            const m = /^VOL.*?×([\d.]+)/.exec(String(f));
             if (m && parseFloat(m[1]) >= 1.3) { volEvidence = true; break; }
           }
           if (!volEvidence && convWk.score < 6) {
-            log(sym, '🚫 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' BLOCKED — BTC weekend low-volume gate: no VOL×/BURST× ≥1.3 factor and conv ' + convWk.score + ' < 6. Weekend drift resolves too slowly without participation (7/04: TP1 took 2h).');
+            log(sym, '🚫 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' BLOCKED — BTC weekend low-volume gate: no REAL volume factor (VOL× ≥1.3; BURST proxy no longer accepted, 7/11 fix) and conv ' + convWk.score + ' < 6. Weekend drift resolves too slowly without participation.');
             return false;
           }
         }
@@ -4595,13 +4600,28 @@ function processPrice(sym, price, hi, lo) {
       // chop reversal risk.
       if (isP2Mt5 && s.chopActive && !s.inKillzone && !isFadeP2) {
         const convForKZOverride = sig.conv ? sig.conv.score : convictionFor(sig.type).score;
-        if (convForKZOverride < 5) {
+        // ===== PHASE 3.98 — BTC STRUCTURAL KZ OVERRIDE (2026-07-10) =====
+        // The killzone concept is equity-session logic; BTC trades 24/7 and its
+        // structural detectors don't respect it. 7/06-7/10 gate audit: the two biggest
+        // missed winners of the week were BOTH BTC structural signals blocked here at
+        // conv 4 ("needs 5") — 7/08 13:16 CHoCH CALL @61,809 (+$1,167 in minutes) and
+        // 7/09 21:33 STRUCT_VWAP CALL @63,344 (+$480). BTC-only, structural detectors
+        // only (CHoCH / STRUCT_*): override floor lowered 5 → 4. Every 3.98 fire is
+        // logged with its own tag so the weekly review can score whether the lowered
+        // floor produces losses — revert if the cohort goes net negative.
+        const _kzBtcStruct = sym === 'BTC' && /CHoCH|STRUCT_/.test(tagP2);
+        const _kzFloor = _kzBtcStruct ? 4 : 5;
+        if (convForKZOverride < _kzFloor) {
           Object.assign(s, _emitSnapshot);
-          log(sym, '🕐 ' + tagP2 + ' ' + sig.type.toUpperCase() + ' BLOCKED — outside Killzone (session: ' + (s.session || '?') + ') + chop active, conv ' + convForKZOverride + '/5 needed for override. Non-fade detectors restricted to London KZ / NY AM in chop.');
+          log(sym, '🕐 ' + tagP2 + ' ' + sig.type.toUpperCase() + ' BLOCKED — outside Killzone (session: ' + (s.session || '?') + ') + chop active, conv ' + convForKZOverride + '/' + _kzFloor + ' needed for override. Non-fade detectors restricted to London KZ / NY AM in chop.');
           return false;
         }
         // High-conv signal passed override — log the bypass for visibility
-        log(sym, '↪️ ' + tagP2 + ' ' + sig.type.toUpperCase() + ' KILLZONE OVERRIDE — conv ' + convForKZOverride + '/5+ allowed despite chop+outside-KZ (' + (s.session || '?') + '). Tighter TP/SL applied.');
+        if (_kzBtcStruct && convForKZOverride < 5) {
+          log(sym, '↪️ ' + tagP2 + ' ' + sig.type.toUpperCase() + ' KILLZONE OVERRIDE [Phase 3.98 BTC-STRUCT conv-4] — structural BTC detector allowed despite chop+outside-KZ (' + (s.session || '?') + '). Cohort under review: revert if net negative.');
+        } else {
+          log(sym, '↪️ ' + tagP2 + ' ' + sig.type.toUpperCase() + ' KILLZONE OVERRIDE — conv ' + convForKZOverride + '/5+ allowed despite chop+outside-KZ (' + (s.session || '?') + '). Tighter TP/SL applied.');
+        }
       }
 
       // ── 2.4: Premium/Discount Zone Gate (task #192) — chop only
@@ -5104,6 +5124,27 @@ function processPrice(sym, price, hi, lo) {
           } catch (e) {}
         }
         if (!_chopVolBypass && !_btcMildChopBypass && !_xauMetalsBypass && !_crossAssetBypass) {
+          // ===== PHASE 3.99 — STANDALONE RECOVERY BYPASS (DORMANT, 2026-07-10) =====
+          // 7/10 15:49 case: conv-6 RIDE CALL with only 2/4 metals + STRUCT rode the
+          // 4073→4114 recovery to TP3 but had no bypass available (metals path needs ≥3,
+          // contra waiver needs conv ≥7). Hypothesis: established recovery + structure-
+          // approved entry at conv ≥6 deserves the chop bypass WITHOUT metals confluence.
+          // DORMANT: logs + force shadow-tracks the would-fire; promote after Monday's
+          // session if the cohort is net positive. Signal still blocks below.
+          try {
+            const _cR6 = (conv && conv.score) || 0;
+            if (_cR6 >= 6) {
+              const _rc6 = recoveryContext(s, price, sig.type);
+              if (_rc6) {
+                const _rcS6 = findRecoveryStructure(s, sym, sig.type, price, atrVal, _rc6.ref);
+                if (_rcS6 && _rcS6.ok) {
+                  const msg6 = '🌀 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' RECOV-6 DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — conv ' + _cR6 + ' + recovery ' + _rc6.offPct.toFixed(2) + '% off 30-min extreme (held ' + Math.round(_rc6.ageMin) + 'min)' + (_rcS6.anchorName ? ' · anchored to ' + _rcS6.anchorName + ' $' + _rcS6.anchor.toFixed(2) : '') + ' · chop bypass would be granted without metals confluence (Phase 3.99 dormant).';
+                  log(sym, msg6);
+                  trackBlockedOutcome(sym, msg6, true);
+                }
+              }
+            }
+          } catch (e6) {}
           Object.assign(s, _emitSnapshot);
           log(sym, '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' chop mode active (only V-REV / LHF / LLF / OBREJ / OBMIT allowed in chop; other detectors consistently lose in flat range).');
           return false;
@@ -5516,6 +5557,19 @@ function processPrice(sym, price, hi, lo) {
             if (_rcCB) {
               _rcCBStruct = findRecoveryStructure(s, sym, sig.type, price, atrVal, _rcCB.ref);
               if (!_rcCBStruct.ok) _rcCB = null;
+            }
+          } else if (_cCBscore === 6) {
+            // Phase 3.99 (DORMANT, 2026-07-10): conv-6 contra waiver candidate — the
+            // 7/10 15:49 conv-6 recovery CALL hit this exact wall and ran to TP3.
+            // Log + force shadow-track only; the block below still applies.
+            const _rc6c = recoveryContext(s, price, sig.type);
+            if (_rc6c) {
+              const _rcS6c = findRecoveryStructure(s, sym, sig.type, price, atrVal, _rc6c.ref);
+              if (_rcS6c && _rcS6c.ok) {
+                const msg6c = '🌀 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' RECOV-6 DORMANT-WOULD-WAIVE contra-block @ $' + price.toFixed(2) + ' — conv 6 + recovery ' + _rc6c.offPct.toFixed(2) + '% off 30-min extreme (held ' + Math.round(_rc6c.ageMin) + 'min)' + (_rcS6c.anchorName ? ' · anchored to ' + _rcS6c.anchorName + ' $' + _rcS6c.anchor.toFixed(2) : '') + ' (Phase 3.99 dormant).';
+                log(sym, msg6c);
+                trackBlockedOutcome(sym, msg6c, true);
+              }
             }
           }
         } catch (eCB) { _rcCB = null; }
@@ -6567,8 +6621,15 @@ function processPrice(sym, price, hi, lo) {
           } catch (eC) {}
           s.signals.push(sigEf);
           logSignal(sym, sigEf);
-          // Structural SL beyond the extreme; TPs in R-multiples of that stop (1.5R/3R/5R)
-          const efTp1 = efCall ? price + efSlDist * 1.5 : price - efSlDist * 1.5;
+          // Structural SL beyond the extreme; TPs in R-multiples of that stop (1.5R/3R/5R).
+          // TP1 CAP (2026-07-13): min(1.5R, 1.25×ATR). The flip's edge is the REACTION
+          // BOUNCE — an ATR-scale event — but the 7/10 SL clamp widened R and the R-based
+          // TP1 ballooned past the bounce. 7/12-13 overnight: XAU 01:33 flip bounced +$7
+          // in 5min with TP1 $11.4 away (-$7.6 loss); BTC 20:44 bounced +$284 with TP1
+          // $336 away (-$224 loss). Both become TP1 WINS under the cap. Post-TP1 trail
+          // lock still lets real reversals run toward the R-based TP2/TP3.
+          const efTp1Dist = Math.min(efSlDist * 1.5, efAtr * 1.25);
+          const efTp1 = efCall ? price + efTp1Dist : price - efTp1Dist;
           const efTp2 = efCall ? price + efSlDist * 3.0 : price - efSlDist * 3.0;
           const efTp3 = efCall ? price + efSlDist * 5.0 : price - efSlDist * 5.0;
           s.trade = buildCfdTrade(EF.dir, price, efAtr, sym);
@@ -12393,6 +12454,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
+    build: '3.99-20260711', // bump on each deploy — lets /state verify what's live
     chopActive: !!s.chopActive,
     grindLive: !!(s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)),
     grindDir: (s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)) ? s._grindDir : null,
