@@ -2830,7 +2830,12 @@ function processPrice(sym, price, hi, lo) {
         if (window3h.length >= 24) { // at least 2h of coverage inside the 3h window
           const oldest = window3h[0];
           const driftPct = (s.lastPrice - oldest.p) / oldest.p * 100;
-          const driftAligned = (driftPct >= 0.8 && s.htf1h_dir === 'up') || (driftPct <= -0.8 && s.htf1h_dir === 'down');
+          // Per-symbol drift bar (2026-07-13): NAS grinds at ~0.4%/3h — HALF the 0.8%
+          // bar calibrated on XAU/BTC. Two documented NAS trend days (7/12 overnight
+          // slide, 7/13 -2% US session) never qualified while chopActive stayed true
+          // throughout. NAS bar = 0.4%; XAU/BTC keep 0.8%.
+          const grindBar = sym === 'NAS100' ? 0.4 : 0.8;
+          const driftAligned = (driftPct >= grindBar && s.htf1h_dir === 'up') || (driftPct <= -grindBar && s.htf1h_dir === 'down');
           if (driftAligned) {
             s.chopActive = false;
             s.chopCount = 0; s.trendCount = 0;
@@ -4412,6 +4417,23 @@ function processPrice(sym, price, hi, lo) {
           log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — grind conv floor (Phase 3.96): conv ' + _gScore + ' < 6 during GRIND-LIVE. Only strong-confluence entries ride the grind.');
           return false;
         }
+        // ===== GRIND ENTRY-QUALITY GATE (2026-07-13) =====
+        // 7/13 shadow data: on NAS's -2% trend day the with-trend RIDE/LO PUT attempts
+        // went 0W/7L/5S — all low-chases at the extremes right before bounces. A grind
+        // unlock without entry quality just fires those losers. Grind-unlocked entries
+        // (conv ≥6, passed the floor above) must ALSO be structure-approved: anchored
+        // to an OB / Asian level / 30-min extreme, not extended >1.2×ATR past it, with
+        // ≥0.5×ATR of room to the next barrier. Pullback re-entries pass; chases wait
+        // for the retest (detectors re-fire within minutes).
+        if (_gScore >= 6) {
+          const _gStr = findRecoveryStructure(s, sym, sig.type, price, atrVal, null);
+          if (_gStr && !_gStr.ok) {
+            Object.assign(s, _emitSnapshot);
+            log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — grind entry-quality (Phase 3.96b): ' + _gStr.reason + '.');
+            return false;
+          }
+          if (_gStr && typeof _gStr.structSl === 'number') { s._structSl = _gStr.structSl; s._structSlUntil = Date.now() + 5000; }
+        }
       }
     } catch (eG) { /* grind floor must never crash enrichment */ }
 
@@ -5162,14 +5184,39 @@ function processPrice(sym, price, hi, lo) {
                     log(sym, msgETC);
                     trackBlockedOutcome(sym, msgETC, true);
                   }
-                  if (alignedC || _rcC) {
+                  // ===== QQQ-MIRROR BYPASS (2026-07-13, NAS only) =====
+                  // QQQ runs the light equity engine and beat NAS on its own index all
+                  // day (7/13: QQQ 6/6 PUT TP3 at 09:30 + another good PUT at ~20:00 while
+                  // NAS fired ~1 US-session signal on a -2% trend day, 84 blocks). A FIRED
+                  // same-direction QQQ signal within 15 min is external timing confirmation
+                  // NAS's gates can't produce internally. conv ≥5 + structure-approved entry.
+                  let _qqqMir = false, _qqqMirStr = null;
+                  if (!alignedC && !_rcC && sym === 'NAS100' && cCAS >= 5) {
+                    try {
+                      const _qS = S['QQQ'];
+                      const _qf = (_qS && Array.isArray(_qS.recentFires)) ? _qS.recentFires.filter(f => f && f.type === sig.type && (Date.now() - f.ts) < 900000) : [];
+                      if (_qf.length >= 1) {
+                        _qqqMirStr = findRecoveryStructure(s, sym, sig.type, price, atrVal, null);
+                        if (_qqqMirStr && !_qqqMirStr.ok) {
+                          log(sym, '⏳ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' QQQ-mirror bypass DEFERRED (entry-structure): ' + _qqqMirStr.reason + '.');
+                        } else {
+                          _qqqMir = true;
+                        }
+                      }
+                    } catch (eQm) {}
+                  }
+                  if (alignedC || _rcC || _qqqMir) {
                     _crossAssetBypass = true;
+                    if (_qqqMir) {
+                      if (_qqqMirStr && typeof _qqqMirStr.structSl === 'number') { s._structSl = _qqqMirStr.structSl; s._structSlUntil = Date.now() + 5000; }
+                      log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — QQQ-MIRROR bypass: QQQ fired same-direction within 15min + conv ' + cCAS + ' + structure-approved entry' + (_qqqMirStr && _qqqMirStr.anchorName ? ' (anchored to ' + _qqqMirStr.anchorName + ' $' + _qqqMirStr.anchor.toFixed(2) + ')' : '') + '. Allowed.');
+                    }
                     const matched = factorSet.filter(f => cCAF.indexOf(f) !== -1).join(',');
                     if (_rcC) {
                       s._recovUnlockTs = Date.now(); s._recovUnlockDir = sig.type;
                       if (_rcStructC && typeof _rcStructC.structSl === 'number') { s._structSl = _rcStructC.structSl; s._structSlUntil = Date.now() + 5000; }
                       log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — ' + sym + ' cross-asset bypass (Phase 3.97 RECOVERY): conv ' + cCAS + ' + ' + matchCount + '/' + factorSet.length + ' factors (' + matched + ') + ' + _rcC.offPct.toFixed(2) + '% off 30-min extreme (held ' + Math.round(_rcC.ageMin) + 'min)' + (_rcStructC && _rcStructC.anchorName ? ' · anchored to ' + _rcStructC.anchorName + ' $' + _rcStructC.anchor.toFixed(2) + ' · structural SL $' + _rcStructC.structSl.toFixed(2) : '') + '. Allowed.');
-                    } else {
+                    } else if (!_qqqMir) {
                       log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — ' + sym + ' cross-asset confluence bypass (Phase 3.70): conv ' + cCAS + ' + ' + matchCount + '/' + factorSet.length + ' factors (' + matched + ') + aligned dir (' + (dirChgC * 100).toFixed(2) + '%). Allowed.');
                     }
                   }
@@ -5997,6 +6044,30 @@ function processPrice(sym, price, hi, lo) {
       log(sym, '🚫 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — conv ' + conv.score + '/7 [' + conv.label + '] < ' + minConv + ' (' + reason + ')' + (conv.factors.length ? ' factors:' + conv.factors.join(',') : ''));
       return false;
     }
+    // ===== LATE-CYCLE MARKER (DORMANT, 2026-07-13 — user hypothesis) =====
+    // Tags FIRING signals that enter WITH a move already ≥0.5% extended over the last
+    // hour, split by whether real volume (VOL×≥1.5, not the BURST price-proxy) says the
+    // move is still alive. 7/13 replay: the 00:07/00:39/01:32 overnight losers (-$470)
+    // were late-cycle WITHOUT volume; the 10:19 conv-8 TP3 was late-cycle WITH massive
+    // acceleration. Nightly report tallies LATE-CYCLE fires W/L per volume split —
+    // promote to a block (no-volume side only) when the cohort separates. Log-only.
+    try {
+      if (Array.isArray(s.macroSnaps) && s.macroSnaps.length >= 12) {
+        const _lcSn = s.macroSnaps[s.macroSnaps.length - 12]; // ~1h back (5-min snaps)
+        if (_lcSn && _lcSn.p > 0) {
+          const _lcChg = (price - _lcSn.p) / _lcSn.p * 100;
+          const _lcAligned = (sig.type === 'put' && _lcChg <= -0.5) || (sig.type === 'call' && _lcChg >= 0.5);
+          if (_lcAligned) {
+            let _lcVol = false;
+            for (const _lf of ((sig.conv && sig.conv.factors) || [])) {
+              const _lm = /^VOL.*?×([\d.]+)/.exec(String(_lf));
+              if (_lm && parseFloat(_lm[1]) >= 1.5) { _lcVol = true; break; }
+            }
+            log(sym, '⏱️ LATE-CYCLE marker — ' + tag + ' ' + sig.type.toUpperCase() + ' firing ' + _lcChg.toFixed(2) + '%/1h into the move, ' + (_lcVol ? 'WITH real volume (VOL×≥1.5)' : 'NO real volume (proxy/none)') + '. Dormant cohort: block candidate if the no-volume side skews losses.');
+          }
+        }
+      }
+    } catch (eLc) { /* marker must never affect firing */ }
     return true;
   }
 
@@ -12552,7 +12623,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '4.0b-20260713-ghostflip', // bump on each deploy — lets /state verify what's live
+    build: '4.1-20260713-nas', // bump on each deploy — lets /state verify what's live
     chopActive: !!s.chopActive,
     grindLive: !!(s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)),
     grindDir: (s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)) ? s._grindDir : null,
