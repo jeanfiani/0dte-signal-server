@@ -4249,6 +4249,20 @@ function processPrice(sym, price, hi, lo) {
     if (sym === 'BTC') {
       try {
         const wkdET = new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone: 'America/New_York' }).format(new Date());
+        // ===== PHASE 4.0 — BTC WEEKEND NO-TRADE WINDOW (2026-07-13, user decision) =====
+        // Weekly review W-28: BTC -$2,160/unit, and the split is stark — Saturday +
+        // Sunday-morning fires went 1W/5L (vacuum-liquidity chop, stop sweeps), while
+        // Sunday-afternoon-onward went 3W/2L incl. a full TP3 (pre-open positioning is
+        // readable). Rule: NO BTC entries from Saturday 00:00 ET until Sunday 12:00 ET.
+        // Resume at Sun 12:00 ET keeps this week's 13:52 ET TP3 winner. Blocks are
+        // shadow-tracked so the window's cost/benefit stays measurable. The volume gate
+        // below still applies to the open portion of the weekend (Sun afternoon/evening).
+        const hrET = parseInt(new Intl.DateTimeFormat('en-US', { hour: '2-digit', hour12: false, timeZone: 'America/New_York' }).format(new Date()), 10);
+        if (wkdET === 'Sat' || (wkdET === 'Sun' && hrET < 12)) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '⛔ ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' BLOCKED — BTC weekend no-trade window (Phase 4.0): Sat 00:00 → Sun 12:00 ET. W-28 review: this window went 1W/5L on vacuum liquidity; entries resume Sunday afternoon when pre-open flows are readable.');
+          return false;
+        }
         if (wkdET === 'Sat' || wkdET === 'Sun') {
           const convWk = sig.conv || { score: 0, factors: [] };
           let volEvidence = false;
@@ -6588,7 +6602,8 @@ function processPrice(sym, price, hi, lo) {
           ((efCall && s.htf1h_dir === 'down' && s.htf4h_dir === 'down') ||
            (!efCall && s.htf1h_dir === 'up' && s.htf4h_dir === 'up'));
         let efReason = null;
-        if (!(EF.burst >= 1.5)) efReason = 'no climax volume (burst ×' + (EF.burst || 0).toFixed(1) + ' < 1.5)';
+        if (sym === 'BTC' && btcWeekendClosed()) efReason = 'BTC weekend no-trade window (Phase 4.0): Sat 00:00 → Sun 12:00 ET';
+        else if (!(EF.burst >= 1.5)) efReason = 'no climax volume (burst ×' + (EF.burst || 0).toFixed(1) + ' < 1.5)';
         // Elite stand-down (2026-07-10): both 7/09 XAU flip losses (-$637/lot combined)
         // faded blocked conv-9/10 signals. An elite-conviction crest block is a TIMING
         // objection, not a direction one — don't fade the metals board.
@@ -9421,6 +9436,14 @@ function processPrice(sym, price, hi, lo) {
   // XAU-specific constants: minSpreadPct 0.06% (~$2.5 on $4300 price), ATR fallback $3
   // (typical XAU 1-min candle range). These match BTC's relative scale, not absolute.
   if ((isNAS || isBTC || isXAU) && s.trv2TrendEma !== null && s.trv2Candles.length >= 30) {
+    // Phase 4.0 (2026-07-13): TRv2 fires outside enrichSig, so the BTC weekend
+    // no-trade window must be enforced here too (Sat 7/11 12:34 TRv2 -$52 case).
+    if (isBTC && btcWeekendClosed()) {
+      if (!s._wkndTrv2LogTs || Date.now() - s._wkndTrv2LogTs > 1800000) {
+        s._wkndTrv2LogTs = Date.now();
+        log(sym, '⛔ TRv2 BTC entries BLOCKED — weekend no-trade window (Phase 4.0): Sat 00:00 → Sun 12:00 ET.');
+      }
+    } else {
     const tEma = s.trv2TrendEma;
     const spread = Math.abs(price - tEma);
     const spreadPct = (spread / tEma) * 100;
@@ -10073,6 +10096,7 @@ function processPrice(sym, price, hi, lo) {
         return;
       }
     }
+    } // end Phase 4.0 BTC weekend no-trade else
   }
 
   // ===== MACRO TREND FLIP DETECTOR (XAU only — BTC/NAS100 use TRv2 trend-following system) =====
@@ -10793,6 +10817,22 @@ function findObAnchoredTp1(s, sym, dir, entryPrice, atr) {
     }
   }
   return bestTp1;
+}
+
+// ===== PHASE 4.0 — BTC WEEKEND NO-TRADE WINDOW (2026-07-13) =====
+// True during Sat 00:00 → Sun 12:00 ET. Checked in enrichSig (all standard detectors),
+// the TRv2 entry path, and the EXT-FLIP detector — the three independent fire doors.
+function btcWeekendClosed() {
+  try {
+    const nowW = new Date();
+    const wkdW = new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone: 'America/New_York' }).format(nowW);
+    if (wkdW === 'Sat') return true;
+    if (wkdW === 'Sun') {
+      const hrW = parseInt(new Intl.DateTimeFormat('en-US', { hour: '2-digit', hour12: false, timeZone: 'America/New_York' }).format(nowW), 10);
+      return hrW < 12;
+    }
+  } catch (eW) {}
+  return false;
 }
 
 // ===== PHASE 3.97 — RECOVERY CONTEXT + STRUCTURE-ENTRY HELPERS (2026-07-10) =====
@@ -12454,7 +12494,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '3.99-20260711', // bump on each deploy — lets /state verify what's live
+    build: '4.0-20260713', // bump on each deploy — lets /state verify what's live
     chopActive: !!s.chopActive,
     grindLive: !!(s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)),
     grindDir: (s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)) ? s._grindDir : null,
