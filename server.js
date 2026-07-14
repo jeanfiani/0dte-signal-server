@@ -4336,6 +4336,19 @@ function processPrice(sym, price, hi, lo) {
     // (conv≥7) blocks past the 35-min shadow-sampling cooldown.
     s._eliteSigConv = (conv && conv.score) || 0;
     s._eliteSigTs = Date.now();
+    // Phase 4.2 (2026-07-14): stamp every ATTEMPT (fired or blocked) for the
+    // CONFLUENCE-BURST unlock — deliberately NOT in _emitSnapshot, so blocked attempts
+    // remain visible to sibling symbols as confirmation evidence.
+    try {
+      s._attemptDir = sig.type;
+      s._attemptTs = Date.now();
+      let _abMax = 0;
+      for (const _af of ((conv && conv.factors) || [])) {
+        const _am = /^(?:VOL|BURST).*?×([\d.]+)/.exec(String(_af));
+        if (_am && parseFloat(_am[1]) > _abMax) _abMax = parseFloat(_am[1]);
+      }
+      s._attemptBurst = _abMax;
+    } catch (eAt) {}
 
     const tagEarly = sig.score || '';
     const isFadeEarly = /ATH|ATL|HI|LO|DIV/.test(tagEarly) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tagEarly);
@@ -5225,6 +5238,44 @@ function processPrice(sym, price, hi, lo) {
             }
           } catch (e) {}
         }
+        // ===== PHASE 4.2 — CONFLUENCE-BURST BYPASS (2026-07-14) =====
+        // 7/14 08:19-08:29: a news impulse fired same-direction CALLs on BTC, NAS and XAU
+        // within 10 minutes (bursts 1.9 / VOL×4.6 / 1.5) — all three chop-blocked because
+        // pre-news coiling reads ≈0 on every drift window. Individually blockable chases;
+        // TOGETHER they are cross-asset confirmation no single-symbol gate can produce
+        // (XAU then ran +$67 in 5 min; BTC +$554/15min — the month's best missed trade).
+        // Rule: conv ≥4 + own burst/vol ≥1.5 + at least ONE other MT5 symbol attempted
+        // (fired OR blocked) the SAME direction within 10 min with burst ≥1.5.
+        // 30-min per-symbol cooldown. Chop noise almost never fakes agreement between
+        // independent engines with participation on both sides.
+        let _confBurst = false;
+        try {
+          if (!_chopVolBypass && !_btcMildChopBypass && !_xauMetalsBypass && !_crossAssetBypass &&
+              (sym === 'XAU' || sym === 'BTC' || sym === 'NAS100') &&
+              ((conv && conv.score) || 0) >= 4 &&
+              (s._attemptBurst || 0) >= 1.5 &&
+              Date.now() - (s._confBurstTs || 0) > 1800000) {
+            const _cbNow = Date.now();
+            const _cbOthers = ['XAU', 'BTC', 'NAS100'].filter(o =>
+              o !== sym && S[o] &&
+              S[o]._attemptDir === sig.type &&
+              (_cbNow - (S[o]._attemptTs || 0)) < 600000 &&
+              (S[o]._attemptBurst || 0) >= 1.5);
+            if (_cbOthers.length >= 1) {
+              // DEMOTED TO DORMANT (2026-07-14, same day): 7-day backtest of this exact
+              // signature = 34 fires, 9W/20L/5S (31% WR). The winners are fresh-leg
+              // impulses (6/9 in the 06:30-09:35 UTC window, incl. the 7/14 news case);
+              // the losers are LATE CHASERS in the old trend direction (13/20 in the
+              // 18:00-03:00 block), and conviction does not separate them (a conv-9
+              // candidate lost). Log + force-track only; promotion requires the dormant
+              // cohort to isolate a net-positive sub-profile (fresh-leg / morning).
+              s._confBurstTs = _cbNow;
+              const msgCb = '🌀 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' CONFLUENCE-BURST DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — conv ' + ((conv && conv.score) || 0) + ' + burst ×' + (s._attemptBurst || 0).toFixed(1) + ' + ' + _cbOthers.join('+') + ' same-direction ≤10min (backtest 9W/20L — dormant).';
+              log(sym, msgCb);
+              trackBlockedOutcome(sym, msgCb, true);
+            }
+          }
+        } catch (eCb) {}
         if (!_chopVolBypass && !_btcMildChopBypass && !_xauMetalsBypass && !_crossAssetBypass) {
           // ===== PHASE 3.99 — STANDALONE RECOVERY BYPASS (DORMANT, 2026-07-10) =====
           // 7/10 15:49 case: conv-6 RIDE CALL with only 2/4 metals + STRUCT rode the
@@ -6718,9 +6769,13 @@ function processPrice(sym, price, hi, lo) {
         efSlDist = Math.min(Math.max(efSlDist, efAtr * 0.75), efAtr * 1.5);
         const efSlPrice = efCall ? price - efSlDist : price + efSlDist;
         const efSlCap = isXAU ? 10 : efAtr * 2.5;
+        // TIGHTENED 2026-07-14: was "must not fight BOTH HTFs" — the 'flat' loophole let
+        // 7 counter-trend flips fade established trends (7/12-14 overnight: 3 more losses,
+        // -$239, all conv ≤4 PUTs into the up-grind) vs ZERO counter-trend flip wins.
+        // New rule: at least ONE HTF must agree WITH the flip direction.
         const efFightsBoth = s.htf1h_dir && s.htf4h_dir &&
-          ((efCall && s.htf1h_dir === 'down' && s.htf4h_dir === 'down') ||
-           (!efCall && s.htf1h_dir === 'up' && s.htf4h_dir === 'up'));
+          !((efCall && (s.htf1h_dir === 'up' || s.htf4h_dir === 'up')) ||
+            (!efCall && (s.htf1h_dir === 'down' || s.htf4h_dir === 'down')));
         let efReason = null;
         if (sym === 'BTC' && btcWeekendClosed()) efReason = 'BTC weekend no-trade window (Phase 4.0): Sat 00:00 → Sun 12:00 ET';
         else if (!(EF.burst >= 1.5)) efReason = 'no climax volume (burst ×' + (EF.burst || 0).toFixed(1) + ' < 1.5)';
@@ -6728,7 +6783,7 @@ function processPrice(sym, price, hi, lo) {
         // faded blocked conv-9/10 signals. An elite-conviction crest block is a TIMING
         // objection, not a direction one — don't fade the metals board.
         else if ((EF.srcConv || 0) >= 8) efReason = 'armed by a conv-' + EF.srcConv + ' block — elite conviction says trend, not reversal; standing down';
-        else if (efFightsBoth) efReason = 'fights both HTFs (1h=' + s.htf1h_dir + ', 4h=' + s.htf4h_dir + ')';
+        else if (efFightsBoth) efReason = 'no HTF agrees with the flip (1h=' + s.htf1h_dir + ', 4h=' + s.htf4h_dir + ') — counter-trend flips are 0W/7L lifetime';
         else if (efCall && rsiV > 55) efReason = 'RSI ' + rsiV.toFixed(1) + ' > 55 — nothing oversold to bounce';
         else if (!efCall && rsiV < 45) efReason = 'RSI ' + rsiV.toFixed(1) + ' < 45 — nothing overbought to fade';
         else if (!(efSlDist > 0) || efSlDist > efSlCap || !(efAtr > 0)) efReason = 'stop budget: $' + efSlDist.toFixed(2) + ' to extreme exceeds cap $' + efSlCap.toFixed(2);
@@ -7056,7 +7111,10 @@ function processPrice(sym, price, hi, lo) {
           const lhfSlPrice = localHi6 + lhfSlBuffer;
           const slDist = lhfSlPrice - price;
           if (slDist > 0) {
-            const tp1P = price - slDist * 1.5;
+            // TP1 cap (2026-07-14): structural R inflates R-based TP1 past the reachable
+            // move — same fix as EXT-FLIP/LHFP. TP2/TP3 stay R-based for the runner.
+            const tp1CapL = isXAU ? 5 : isBTC ? 100 : isNAS ? 50 : 0.50;
+            const tp1P = price - Math.min(slDist * 1.5, tp1CapL);
             const tp2P = price - slDist * 3.0;
             const tp3P = price - slDist * 5.0;
             s.trade = buildCfdTrade('put', price, atrVal, sym);
@@ -7206,7 +7264,9 @@ function processPrice(sym, price, hi, lo) {
           const llfSlPrice = localLo6 - lhfSlBuffer;
           const slDist = price - llfSlPrice;
           if (slDist > 0) {
-            const tp1P = price + slDist * 1.5;
+            // TP1 cap (2026-07-14): mirror of the LHF PUT site above.
+            const tp1CapL = isXAU ? 5 : isBTC ? 100 : isNAS ? 50 : 0.50;
+            const tp1P = price + Math.min(slDist * 1.5, tp1CapL);
             const tp2P = price + slDist * 3.0;
             const tp3P = price + slDist * 5.0;
             s.trade = buildCfdTrade('call', price, atrVal, sym);
@@ -7338,7 +7398,7 @@ function processPrice(sym, price, hi, lo) {
             const lhfSlPrice = localHi6 + lhfSlBuffer;
             const slDist = lhfSlPrice - price;
             if (slDist > 0) {
-              const tp1Cap = isXAU ? 5 : isBTC ? 50 : isNAS ? 30 : 0.50;
+              const tp1Cap = isXAU ? 5 : isBTC ? 100 : isNAS ? 50 : 0.50;
               const tp1Dist = Math.min(slDist * 1.5, tp1Cap);
               const tp1P = price - tp1Dist;
               const tp2P = price - slDist * 2.5;
@@ -7408,7 +7468,7 @@ function processPrice(sym, price, hi, lo) {
             const llfSlPrice = localLo6 - lhfSlBuffer;
             const slDist = price - llfSlPrice;
             if (slDist > 0) {
-              const tp1Cap = isXAU ? 5 : isBTC ? 50 : isNAS ? 30 : 0.50;
+              const tp1Cap = isXAU ? 5 : isBTC ? 100 : isNAS ? 50 : 0.50;
               const tp1Dist = Math.min(slDist * 1.5, tp1Cap);
               const tp1P = price + tp1Dist;
               const tp2P = price + slDist * 2.5;
@@ -7843,7 +7903,11 @@ function processPrice(sym, price, hi, lo) {
                   const chSl = H2.price + chochBuf;
                   const slDist = chSl - price;
                   if (slDist > 0) {
-                    const tp1P = price - slDist * 1.5;
+                    // TP1 cap (2026-07-14): CHoCH's structural SL (beyond the broken swing)
+                    // inflated R-based TP1 to ~$15 on the 7/14 09:03 XAU fire — price ran +$9
+                    // and round-tripped to BE with TP1 untouched. Cap to the standard floor.
+                    const tp1CapC = isXAU ? 5 : isBTC ? 100 : isNAS ? 50 : 0.50;
+                    const tp1P = price - Math.min(slDist * 1.5, tp1CapC);
                     const tp2P = price - slDist * 2.5;
                     const tp3P = price - slDist * 4.0;
                     s.trade = buildCfdTrade('put', price, atrVal, sym);
@@ -7906,7 +7970,9 @@ function processPrice(sym, price, hi, lo) {
                   const chSl = L2.price - chochBuf;
                   const slDist = price - chSl;
                   if (slDist > 0) {
-                    const tp1P = price + slDist * 1.5;
+                    // TP1 cap (2026-07-14): mirror of the CHoCH PUT site — the 09:03 case.
+                    const tp1CapC = isXAU ? 5 : isBTC ? 100 : isNAS ? 50 : 0.50;
+                    const tp1P = price + Math.min(slDist * 1.5, tp1CapC);
                     const tp2P = price + slDist * 2.5;
                     const tp3P = price + slDist * 4.0;
                     s.trade = buildCfdTrade('call', price, atrVal, sym);
@@ -8095,7 +8161,7 @@ function processPrice(sym, price, hi, lo) {
         const ibSl = topLevel.extreme + slBuf;
         const slDist = ibSl - price;
         if (slDist > 0) {
-          const tp1Cap = isXAU ? 5 : isBTC ? 50 : isNAS ? 30 : 0.50;
+          const tp1Cap = isXAU ? 5 : isBTC ? 100 : isNAS ? 50 : 0.50;
           const tp1Dist = Math.min(slDist * 1.5, tp1Cap);
           const tp1P = price - tp1Dist;
           const tp2P = price - slDist * 2.5;
@@ -8138,7 +8204,7 @@ function processPrice(sym, price, hi, lo) {
         const ibSl = botLevel.extreme - slBuf;
         const slDist = price - ibSl;
         if (slDist > 0) {
-          const tp1Cap = isXAU ? 5 : isBTC ? 50 : isNAS ? 30 : 0.50;
+          const tp1Cap = isXAU ? 5 : isBTC ? 100 : isNAS ? 50 : 0.50;
           const tp1Dist = Math.min(slDist * 1.5, tp1Cap);
           const tp1P = price + tp1Dist;
           const tp2P = price + slDist * 2.5;
@@ -12623,7 +12689,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '4.1-20260713-nas', // bump on each deploy — lets /state verify what's live
+    build: '4.2f-20260714-tp1caps2', // bump on each deploy — lets /state verify what's live
     chopActive: !!s.chopActive,
     grindLive: !!(s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)),
     grindDir: (s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)) ? s._grindDir : null,
