@@ -1579,7 +1579,11 @@ function trackBlockedOutcome(sym, msg, force) {
   let tp1Dist;
   if (sym === 'XAU') tp1Dist = 5;
   else if (sym === 'BTC') tp1Dist = 50;
-  else if (sym === 'NAS100') tp1Dist = 10;
+  // NAS 10 → 30 (2026-07-17): real NAS trades use TP1 = max(3×ATR, $30); the $10
+  // virtual bracket scored every blocked PUT as stopped on 40-pt bounces during the
+  // 7/16-17 overnight -545pt slide — systematically marking real winners as losses
+  // and biasing every NAS gate audit anti-winner. $30 matches the real TP1 floor.
+  else if (sym === 'NAS100') tp1Dist = 30;
   else if (sym === 'QQQ' || sym === 'SPY') tp1Dist = 0.3;
   else tp1Dist = 5;
   const slDist = tp1Dist; // 1:1 for measurement purposes
@@ -4393,6 +4397,15 @@ function processPrice(sym, price, hi, lo) {
                   const _fm = /^(?:VOL≥1|BURST)×([\d.]+)/.exec(_ff);
                   if (_fm) { _fBurst = parseFloat(_fm[1]); break; }
                 }
+                // burst ×0.0 fix (2026-07-17): a missing factor is "no measurement", not
+                // "no volume" — 3 documented flip winners refused at ×0.0. Compute the
+                // ATR-burst proxy directly when the factor is absent.
+                if (_fBurst === 0 && atrVal > 0 && Array.isArray(s.vrevSnaps)) {
+                  const _bc = Date.now() - 180000;
+                  let _bh = -Infinity, _bl = Infinity, _bn = 0;
+                  for (const _bs of s.vrevSnaps) { if (_bs && _bs.ts > _bc && _bs.p > 0) { if (_bs.p > _bh) _bh = _bs.p; if (_bs.p < _bl) _bl = _bs.p; _bn++; } }
+                  if (_bn >= 3 && isFinite(_bh) && isFinite(_bl)) _fBurst = (_bh - _bl) / (atrVal * 0.6);
+                }
                 s.extFlip = { dir: _fDir, extreme: _fDir === 'call' ? _egLo : _egHi, armTs: Date.now(),
                               burst: _fBurst, atr: atrVal, srcConv: (conv && conv.score) || 0,
                               src: tagEarly + ' ' + sig.type.toUpperCase() + ' crest-block' };
@@ -4418,7 +4431,14 @@ function processPrice(sym, price, hi, lo) {
       const _gFresh = s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000);
       if (_gFresh && sig.type === s._grindDir) {
         const _gScore = (conv && conv.score) || 0;
-        if (_gScore === 5) {
+        // NAS OVERNIGHT FLOOR 6→5 (2026-07-17): with SPY/QQQ closed NAS conviction caps
+        // at ~5, so the conv-6 grind floor structurally locked out the entire 7/16-17
+        // overnight -545pt slide (five with-trend conv-5 PUTs floored — winners on real
+        // brackets; the old $10 virtual bracket had mislabeled this class as losses).
+        // XAU/BTC keep floor 6 (their conv-5 grind losses were measured on honest
+        // brackets and were real). Structure gate below still applies to every fire.
+        const _gFloor = (sym === 'NAS100' && typeof rthEtfFresh === 'function' && !rthEtfFresh()) ? 5 : 6;
+        if (_gScore === 5 && _gFloor === 6) {
           const msgG = '🌀 GRIND-DORMANT conv-5 would-fire — ' + tagEarly + ' ' + sig.type.toUpperCase() + ' @ $' + price.toFixed(2) + ' aligned with grind but conv 5 < 6 floor (Phase 3.96). Shadow-tracking to calibrate the floor.';
           log(sym, msgG);
           trackBlockedOutcome(sym, msgG, true);
@@ -4438,7 +4458,7 @@ function processPrice(sym, price, hi, lo) {
         // to an OB / Asian level / 30-min extreme, not extended >1.2×ATR past it, with
         // ≥0.5×ATR of room to the next barrier. Pullback re-entries pass; chases wait
         // for the retest (detectors re-fire within minutes).
-        if (_gScore >= 6) {
+        if (_gScore >= _gFloor) {
           const _gStr = findRecoveryStructure(s, sym, sig.type, price, atrVal, null);
           if (_gStr && !_gStr.ok) {
             Object.assign(s, _emitSnapshot);
@@ -7316,6 +7336,13 @@ function processPrice(sym, price, hi, lo) {
           for (const _fL of (_fConvL.factors || [])) {
             const _fmL = /^(?:VOL≥1|BURST)×([\d.]+)/.exec(_fL);
             if (_fmL) { _fBurstL = parseFloat(_fmL[1]); break; }
+          }
+          // burst ×0.0 fix (2026-07-17): see EXT-GUARD arm — absent factor ≠ dead tape.
+          if (_fBurstL === 0 && atrVal > 0 && Array.isArray(s.vrevSnaps)) {
+            const _bcL = Date.now() - 180000;
+            let _bhL = -Infinity, _blL = Infinity, _bnL = 0;
+            for (const _bsL of s.vrevSnaps) { if (_bsL && _bsL.ts > _bcL && _bsL.p > 0) { if (_bsL.p > _bhL) _bhL = _bsL.p; if (_bsL.p < _blL) _blL = _bsL.p; _bnL++; } }
+            if (_bnL >= 3 && isFinite(_bhL) && isFinite(_blL)) _fBurstL = (_bhL - _blL) / (atrVal * 0.6);
           }
           s.extFlip = { dir: 'put', extreme: _fHiL, armTs: Date.now(), burst: _fBurstL, atr: atrVal,
                         srcConv: (function(){ try { return convictionFor('call').score || 0; } catch (eSc) { return 0; } })(),
@@ -12689,7 +12716,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '4.2f-20260714-tp1caps2', // bump on each deploy — lets /state verify what's live
+    build: '4.3b-20260717-nasbracket', // bump on each deploy — lets /state verify what's live
     chopActive: !!s.chopActive,
     grindLive: !!(s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)),
     grindDir: (s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)) ? s._grindDir : null,
