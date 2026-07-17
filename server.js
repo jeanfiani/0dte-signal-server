@@ -2598,7 +2598,12 @@ function processPrice(sym, price, hi, lo) {
     atlApproachTs: s.atlApproachTs,
     lastAtlCallTs: s.lastAtlCallTs,
     lastAtlCallPrice: s.lastAtlCallPrice,
-    lastHiRevTs: s.lastHiRevTs
+    lastHiRevTs: s.lastHiRevTs,
+    // 2026-07-17 audit: one-shot trade-construction flags must roll back when a signal
+    // is blocked AFTER arming them, else they contaminate the next trade within 5s.
+    _scalpUntil: s._scalpUntil,
+    _structSl: s._structSl,
+    _structSlUntil: s._structSlUntil
   };
 
   // XAU/BTC: set open on first price (MT5 feeds only when market is open)
@@ -3909,6 +3914,23 @@ function processPrice(sym, price, hi, lo) {
   // The thresholds are deliberately moderate for the first deployment; tune after a week
   // of conv-logged data shows what wins / loses.
   function enrichSig(sig) {
+    // ===== TOP-OF-FUNCTION STAMPS (moved here 2026-07-17 audit) =====
+    // Previously stamped after ~10 early gates (regime/RSI/weekend/R5), so elite blocks
+    // by those gates were never force-tracked (3.94) and early-blocked attempts were
+    // invisible to sibling symbols' confluence evidence (4.2). Stamps must see EVERY attempt.
+    try {
+      const _cTop = (sig && sig.conv) || null;
+      s._eliteSigConv = (_cTop && _cTop.score) || 0;
+      s._eliteSigTs = Date.now();
+      s._attemptDir = sig.type;
+      s._attemptTs = Date.now();
+      let _abT = 0;
+      for (const _afT of ((_cTop && _cTop.factors) || [])) {
+        const _amT = /^(?:VOL|BURST).*?×([\d.]+)/.exec(String(_afT));
+        if (_amT && parseFloat(_amT[1]) > _abT) _abT = parseFloat(_amT[1]);
+      }
+      s._attemptBurst = _abT;
+    } catch (eTop) {}
     // ===== MT5 DAILY SIGNAL SAFETY VALVE (added 2026-06-11, audit v2 A1) =====
     // Equities are capped at MAX_SIG in the main path; MT5 specialists bypassed every cap.
     // Loose valve, not a tight cap — only a runaway day trips it. Sits here (not as an
@@ -4955,7 +4977,7 @@ function processPrice(sym, price, hi, lo) {
             // PUT OBREJ fades support (bottom) — needs price near 24h low (within 1%)
             const nearExtreme = isCallOR ? distHiPct < 1.0 : distLoPct < 1.0;
             if (!nearExtreme) {
-              const tagConv = (typeof convictionFor === 'function') ? convictionFor(sym, sig) : null;
+              const tagConv = (typeof convictionFor === 'function') ? convictionFor(sig.type) : null /* arity fix 2026-07-17: was (sym, sig) → always computed PUT-side conviction */;
               const tagConvS = tagConv ? tagConv.score : 0;
               if (tagConvS < 5) {
                 Object.assign(s, _emitSnapshot);
@@ -5035,7 +5057,7 @@ function processPrice(sym, price, hi, lo) {
         // AND signal direction matches recent 30min directional move, allow through.
         let _chopVolBypass = false;
         try {
-          const cConv = (typeof convictionFor === 'function') ? convictionFor(sym, sig) : null;
+          const cConv = (typeof convictionFor === 'function') ? convictionFor(sig.type) : null /* arity fix 2026-07-17: was (sym, sig) → always computed PUT-side conviction */;
           const volF = (cConv && cConv.factors || []).find(f => /^VOL×/.test(f));
           const volS = volF ? parseFloat(volF.split('×')[1]) : 0;
           if (volS >= 1.5 && s.macroSnaps && s.macroSnaps.length >= 6) {
@@ -5074,7 +5096,7 @@ function processPrice(sym, price, hi, lo) {
                 const rangePct = (mx > 0 && mn !== Infinity) ? (mx - mn) / mn * 100 : 0;
                 const isMildChop = rangePct >= 0.5 && rangePct <= 1.5;
                 if (isMildChop) {
-                  const cBtc = (typeof convictionFor === 'function') ? convictionFor(sym, sig) : null;
+                  const cBtc = (typeof convictionFor === 'function') ? convictionFor(sig.type) : null /* arity fix 2026-07-17: was (sym, sig) → always computed PUT-side conviction */;
                   const cBtcS = cBtc ? cBtc.score : 0;
                   const netDir = (price - sn60.p) / sn60.p;
                   const sigD = sig.type === 'call' ? 1 : sig.type === 'put' ? -1 : 0;
@@ -8614,7 +8636,7 @@ function processPrice(sym, price, hi, lo) {
       const slPrice = dir === 'put' ? ob.hi + obRejBuffer : ob.lo - obRejBuffer;
       const slDist = Math.abs(slPrice - price);
       if (slDist > 0) {
-        const tp1Cap = isXAU ? 5 : isBTC ? 50 : isNAS ? 30 : 5;
+        const tp1Cap = isXAU ? 5 : isBTC ? 100 : isNAS ? 50 : 5; // aligned 2026-07-17 audit (was 50/30)
         const tp1Dist = Math.min(slDist * 1.5, tp1Cap);
         const tp1P = dir === 'put' ? price - tp1Dist : price + tp1Dist;
         const tp2P = dir === 'put' ? price - slDist * 2.5 : price + slDist * 2.5;
@@ -9649,14 +9671,17 @@ function processPrice(sym, price, hi, lo) {
   // XAU-specific constants: minSpreadPct 0.06% (~$2.5 on $4300 price), ATR fallback $3
   // (typical XAU 1-min candle range). These match BTC's relative scale, not absolute.
   if ((isNAS || isBTC || isXAU) && s.trv2TrendEma !== null && s.trv2Candles.length >= 30) {
-    // Phase 4.0 (2026-07-13): TRv2 fires outside enrichSig, so the BTC weekend
-    // no-trade window must be enforced here too (Sat 7/11 12:34 TRv2 -$52 case).
+    // Phase 4.0 (2026-07-13, RESTRUCTURED 2026-07-17 audit): the original else-wrap
+    // here swallowed TRADE MANAGEMENT too — an open Friday BTC trv2 position would
+    // have received no SL/TP/exit processing all weekend. Management now always runs;
+    // only the ENTRY section (below) is gated on the weekend window.
     if (isBTC && btcWeekendClosed()) {
       if (!s._wkndTrv2LogTs || Date.now() - s._wkndTrv2LogTs > 1800000) {
         s._wkndTrv2LogTs = Date.now();
-        log(sym, '⛔ TRv2 BTC entries BLOCKED — weekend no-trade window (Phase 4.0): Sat 00:00 → Sun 12:00 ET.');
+        log(sym, '⛔ TRv2 BTC entries BLOCKED — weekend no-trade window (Phase 4.0): Sat 00:00 → Sun 12:00 ET. (Open-trade management continues.)');
       }
-    } else {
+    }
+    {
     const tEma = s.trv2TrendEma;
     const spread = Math.abs(price - tEma);
     const spreadPct = (spread / tEma) * 100;
@@ -9930,6 +9955,9 @@ function processPrice(sym, price, hi, lo) {
       }
     }
 
+    // Phase 4.0 (restructured 2026-07-17): weekend window gates ENTRIES ONLY —
+    // trade management above always runs, so open weekend positions stay managed.
+    if (!(isBTC && btcWeekendClosed())) {
     // ===== TRv2 ENTRY GUARDS (added 2026-05-22) — cascade limit + EMA-spread dedupe =====
     // Mirror the auto-reverse guards. Chop check intentionally NOT applied here — past
     // analysis showed NAS chop detector overfires on staircase trends. But after a TRv2 SL,
@@ -10303,13 +10331,17 @@ function processPrice(sym, price, hi, lo) {
         s.trv2Trade = { dir: dir, ep: price, ts: now3, sl: sl, tp1: tp1, tp2: tp2, tp3: tp3, tp1Hit: false, tp2Hit: false, tp3Hit: false, bestPrice: price, atr: trv2Atr, trailSl: 0, isCfd: true };
         log(sym, '🚀 TRv2 ENTRY ' + dir.toUpperCase() + (withMacro ? ' +MACRO' : '') + ' — $' + price.toFixed(2) + ' > EMA $' + tEma.toFixed(2) + ' (+' + spreadPct.toFixed(3) + '%) · ATR $' + trv2Atr.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('🚀 ' + sym + ' ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2), 'signal');
+        // 2026-07-17 audit: TRv2 builds its trade manually (no buildCfdTrade), so any
+        // one-shot flags armed during this signal's enrichment must be cleared here.
+        s._scalpUntil = 0; s._structSlUntil = 0;
         s.trade = { active: true, type: sigType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, ts: Date.now(), pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: sl, tp1Price: tp1, tp2Price: tp2, tp3Price: tp3, atr: trv2Atr, bestPrice: price, trailSl: 0 };
         s.signals.push(sig);
         logSignal(sym, sig);
         return;
       }
     }
-    } // end Phase 4.0 BTC weekend no-trade else
+    } // end Phase 4.0 entries-only gate (2026-07-17 restructure)
+    } // end TRv2 block scope
   }
 
   // ===== MACRO TREND FLIP DETECTOR (XAU only — BTC/NAS100 use TRv2 trend-following system) =====
@@ -12716,7 +12748,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '4.3b-20260717-nasbracket', // bump on each deploy — lets /state verify what's live
+    build: '4.4-20260717-audit', // bump on each deploy — lets /state verify what's live
     chopActive: !!s.chopActive,
     grindLive: !!(s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)),
     grindDir: (s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)) ? s._grindDir : null,
