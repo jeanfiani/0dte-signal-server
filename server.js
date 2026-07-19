@@ -6161,6 +6161,26 @@ function processPrice(sym, price, hi, lo) {
         }
       }
     } catch (eLc) { /* marker must never affect firing */ }
+    // ===== XAU FADE MOMENTUM-CONFIRMATION GATE (LIVE, 2026-07-18) =====
+    // Promoted straight to live (user decision — XAU WR too low to wait out a shadow
+    // period). W-29 evidence: winners fired at |ROC|~0.19%, flat-ROC fades lost.
+    // A fade must fire on CONFIRMATION (|ROC-3| ≥0.10% aligned with the signal), not
+    // at the flat extreme in anticipation. STRUCT_SWEEP deliberately EXCLUDED (2W/0L
+    // this week incl. the 7/17 conv-8 winner); EXT-FLIP has its own gate chain.
+    // TRIPWIRE (nightly cohort #12, revert rule): if blocked fades would-have-won ≥60%
+    // over ≥10 resolved, OR the gate passes <20% of attempts while XAU fade fires drop
+    // to ~zero, revert this gate to the dormant marker.
+    try {
+      if (sym === 'XAU' && /ATH|ATL|HI|LO|LHF|LLF|VREV|OBREJ|OBMIT/.test(tag) && !/MFLIP|TREND|FAST|BREAK|RIDE|SWEEP/.test(tag)) {
+        const _frAligned = (sig.type === 'call' && roc3 >= 0.10) || (sig.type === 'put' && roc3 <= -0.10);
+        if (!_frAligned) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🚫 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — XAU fade momentum-confirmation (live 7/18): ROC ' + roc3.toFixed(3) + '% not ≥0.10% aligned. Fades fire on confirmation, not anticipation (W-29: flat-ROC fades lost).');
+          return false;
+        }
+        log(sym, '🎯 FADE-ROC PASSED — ' + tag + ' ' + sig.type.toUpperCase() + ' confirmed at ROC ' + roc3.toFixed(3) + '%.');
+      }
+    } catch (eFr) { /* gate must never crash enrichment */ }
     return true;
   }
 
@@ -12748,7 +12768,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '4.4-20260717-audit', // bump on each deploy — lets /state verify what's live
+    build: '4.5-20260718-faderoc-live', // bump on each deploy — lets /state verify what's live
     chopActive: !!s.chopActive,
     grindLive: !!(s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)),
     grindDir: (s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)) ? s._grindDir : null,
