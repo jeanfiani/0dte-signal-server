@@ -4030,11 +4030,36 @@ function processPrice(sym, price, hi, lo) {
             sig.conv = conv; // also annotate (since we may return before normal conv set below)
             const requiredConv = regimeStrengthRG === 2 ? 6 : 5;
             if (conv.score < requiredConv) {
+              // ===== NAS COUNTER-TREND RECOVERY WAIVER (2026-07-20, structure-gated, live) =====
+              // 7/20: NAS ground +300 off the session low against a week-long WEAK BEAR
+              // regime; conv-4 CHoCH/fade CALLs into the turn (06:02, 06:38) were floored
+              // here and WON. The floor is right for conv-4 chases on failed bounces, but
+              // wrong at a CONFIRMED reversal. Waive only when recoveryContext shows an
+              // established bounce off the session low AND findRecoveryStructure approves the
+              // entry (not extended, room to the barrier) — the measured line between chase
+              // and confirmed turn. NAS only, conv≥4. Tripwire: nightly cohort reverts if
+              // these fires go net-negative over ≥5 resolved.
+              let _ctWaive = false;
+              try {
+                if (sym === 'NAS100' && conv.score >= 4) {
+                  const _ctRec = recoveryContext(s, price, sig.type);
+                  if (_ctRec) {
+                    const _ctStr = findRecoveryStructure(s, sym, sig.type, price, atrVal, _ctRec.ref);
+                    if (_ctStr && _ctStr.ok) {
+                      _ctWaive = true;
+                      if (typeof _ctStr.structSl === 'number') { s._structSl = _ctStr.structSl; s._structSlUntil = Date.now() + 5000; }
+                      log(sym, '↪️ ' + tagEarlyRG + ' ' + sig.type.toUpperCase() + ' — NAS recovery waiver (2026-07-20): conv ' + conv.score + ' + confirmed recovery ' + _ctRec.offPct.toFixed(2) + '% off session low (held ' + Math.round(_ctRec.ageMin) + 'min)' + (_ctStr.anchorName ? ' · anchored to ' + _ctStr.anchorName : '') + '. Regime floor waived.');
+                    }
+                  }
+                }
+              } catch (eCt) {}
+              if (!_ctWaive) {
               Object.assign(s, _emitSnapshot);
               const strengthLabel = regimeStrengthRG === 2 ? 'STRONG' : 'WEAK';
               const dirLabel = regimeDirRG.toUpperCase();
               log(sym, '🌍 ' + tagEarlyRG + ' ' + sig.type.toUpperCase() + ' BLOCKED — multi-day ' + strengthLabel + ' ' + dirLabel + ' regime (' + regimeWindowLabelRG + ' ' + (regimeNetChgPctRG >= 0 ? '+' : '') + regimeNetChgPctRG.toFixed(1) + '%): counter-direction needs conv ≥' + requiredConv + ', got ' + conv.score + '/7.');
               return false;
+              } // end NAS recovery waiver
             }
           }
         }
@@ -12802,7 +12827,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '4.6-20260720-capitguard', // bump on each deploy — lets /state verify what's live
+    build: '4.7-20260720-nasrecov', // bump on each deploy — lets /state verify what's live
     chopActive: !!s.chopActive,
     grindLive: !!(s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)),
     grindDir: (s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)) ? s._grindDir : null,
