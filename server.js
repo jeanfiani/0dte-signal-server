@@ -1489,6 +1489,21 @@ function sendPush(title, body, tag) {
     console.log('[' + ts() + '] Push skipped — no subscribers. Title: ' + title);
     return;
   }
+  // Confirmation grade in the push (2026-07-20): append the validator's fresh grade so
+  // every signal alert carries "Conf X/6" — live advisory to the trader this week while
+  // the auto-gate is still dormant. Fresh = scored within 15s (same tick as this push).
+  try {
+    if (title) {
+      for (const _sym of ['NAS100', 'XAU', 'BTC', 'QQQ', 'SPY']) {
+        if (title.indexOf(_sym) !== -1 && S[_sym] && S[_sym]._lastConfTs && (Date.now() - S[_sym]._lastConfTs) < 15000) {
+          const _g = S[_sym];
+          const _flag = _g._lastConfScore >= 4 ? ' ✅' : (_g._lastConfScore <= 2 ? ' ⚠️' : '');
+          body = body + ' · Conf ' + _g._lastConfScore + '/6' + _flag + ' [' + (_g._lastConfClass || '') + ']';
+          break;
+        }
+      }
+    }
+  } catch (ePG) { /* never let grade annotation break a push */ }
   const payload = JSON.stringify({ title, body, tag: tag || 'signal-' + Date.now() });
   console.log('[' + ts() + '] Pushing to ' + subscriptions.length + ' sub(s): ' + title);
   const dead = [];
@@ -4419,8 +4434,13 @@ function processPrice(sym, price, hi, lo) {
       const _macroDirCs = s.macroEma ? (price > s.macroEma ? 'call' : 'put') : null;
       const _isCounterTrend = _macroDirCs && _macroDirCs !== sig.type;
       const _isReversalCls = /ATH|ATL|HI|LO|LHF|LLF|VREV|OBREJ|OBMIT|INVERSAL_BREAK|CHoCH|SWEEP|EXT-FLIP/.test(tagEarly);
-      if (isMT5 && (_isReversalCls || _isCounterTrend) &&
-          (!s._confScoreTs || Date.now() - s._confScoreTs > 180000)) {
+      // VALIDATOR SCOPE (2026-07-20, user decision): grade EVERY MT5 signal. Tag class
+      // REV (reversal/counter-trend) vs CONT (with-trend continuation) so the nightly
+      // derives separate thresholds — the 'held-off-extreme' component is reversal-only,
+      // so CONT signals score on a naturally different scale. Stamp always; force-track
+      // throttled 3min/symbol to bound store volume.
+      const _confClass = (_isReversalCls || _isCounterTrend) ? 'REV' : 'CONT';
+      if (isMT5) {
         const iC = sig.type === 'call';
         // 1. AT STRUCTURE — within 0.4×ATR of OB / Asian H-L / rolling extreme / session extreme, or STRUCT/OB factor
         let sStruct = (_csF.indexOf('STRUCT') !== -1 || _csF.indexOf('OB') !== -1) ? 1 : 0;
@@ -4443,11 +4463,20 @@ function processPrice(sym, price, hi, lo) {
         try { const _st = findRecoveryStructure(s, sym, sig.type, price, atrVal, null); if (_st && _st.ok) sNotExt = 1; } catch (eNe) {}
         const _confScore = sStruct + sMom + sHeld + sHtf + sVol + sNotExt;
         sig._confScore = _confScore;
+        sig._confClass = _confClass;
         sig._confBreakdown = 'str' + sStruct + ' mom' + sMom + ' held' + sHeld + ' htf' + sHtf + ' vol' + sVol + ' ext' + sNotExt;
-        s._confScoreTs = Date.now();
-        const msgCS = '🎚️ CONF-SCORE ' + _confScore + '/6 — ' + tagEarly + ' ' + sig.type.toUpperCase() + ' @ $' + price.toFixed(2) + ' [' + sig._confBreakdown + '] (dormant scorer, log+track only — no firing effect).';
-        log(sym, msgCS);
-        trackBlockedOutcome(sym, msgCS, true);
+        // Surface the latest grade for the push text + /state dashboard (advisory, live to
+        // the human this week — the auto-gate stays dormant until the threshold is proven).
+        s._lastConfScore = _confScore; s._lastConfClass = _confClass;
+        s._lastConfBreakdown = sig._confBreakdown; s._lastConfTs = Date.now();
+        // Stamp rides on every signal (visible in /signals + dashboard). Force-track a
+        // throttled sample for the blocked-side score→outcome join.
+        if (!s._confScoreTs || Date.now() - s._confScoreTs > 180000) {
+          s._confScoreTs = Date.now();
+          const msgCS = '🎚️ CONF-SCORE ' + _confScore + '/6 [' + _confClass + '] — ' + tagEarly + ' ' + sig.type.toUpperCase() + ' @ $' + price.toFixed(2) + ' [' + sig._confBreakdown + '] (dormant validator, grade+track only — no firing effect).';
+          log(sym, msgCS);
+          trackBlockedOutcome(sym, msgCS, true);
+        }
       }
     } catch (eCS) { /* scorer must never affect firing */ }
 
@@ -12887,7 +12916,10 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '4.9-20260720-confscorer', // bump on each deploy — lets /state verify what's live
+    build: '5.0-20260720-conf-advisory', // bump on each deploy — lets /state verify what's live
+    confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
+    confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
+    confBreakdown: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfBreakdown : null,
     chopActive: !!s.chopActive,
     grindLive: !!(s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)),
     grindDir: (s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)) ? s._grindDir : null,
