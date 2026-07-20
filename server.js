@@ -4405,6 +4405,52 @@ function processPrice(sym, price, hi, lo) {
     const isFadeEarly = /ATH|ATL|HI|LO|DIV/.test(tagEarly) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tagEarly);
     const macroContraNow = Date.now();
 
+    // ===== REVERSAL CONFIRMATION SCORER (DORMANT, 2026-07-20) =====
+    // Two weeks of blocked-signal analysis point at one seam: the bot can't cleanly tell a
+    // CHASE from a CONFIRMED reversal. This scorer makes that distinction explicit — 6
+    // orthogonal 0/1 components (each a lesson from the corpus). LOG-ONLY: it changes no
+    // firing decision. It stamps sig._confScore (rides into /signals) AND force-tracks a
+    // virtual outcome tagged "CONF-SCORE N/6" so the nightly can join score→W/L and find
+    // the separating threshold on real data before anything goes live. Scores EVERY
+    // reversal / counter-trend signal (fired or blocked), throttled 3min/symbol vs spam.
+    try {
+      const _cs = conv || { score: 0, factors: [] };
+      const _csF = _cs.factors || [];
+      const _macroDirCs = s.macroEma ? (price > s.macroEma ? 'call' : 'put') : null;
+      const _isCounterTrend = _macroDirCs && _macroDirCs !== sig.type;
+      const _isReversalCls = /ATH|ATL|HI|LO|LHF|LLF|VREV|OBREJ|OBMIT|INVERSAL_BREAK|CHoCH|SWEEP|EXT-FLIP/.test(tagEarly);
+      if (isMT5 && (_isReversalCls || _isCounterTrend) &&
+          (!s._confScoreTs || Date.now() - s._confScoreTs > 180000)) {
+        const iC = sig.type === 'call';
+        // 1. AT STRUCTURE — within 0.4×ATR of OB / Asian H-L / rolling extreme / session extreme, or STRUCT/OB factor
+        let sStruct = (_csF.indexOf('STRUCT') !== -1 || _csF.indexOf('OB') !== -1) ? 1 : 0;
+        if (!sStruct && atrVal > 0) {
+          const near = (lvl) => lvl > 0 && isFinite(lvl) && Math.abs(price - lvl) <= atrVal * 0.4;
+          if (near(s.asianH_locked) || near(s.asianL_locked) || near(s.rollingHigh) || near(s.rollingLow) || near(s.sessionHigh) || near(s.sessionLow)) sStruct = 1;
+          if (Array.isArray(s.orderBlocks)) for (const ob of s.orderBlocks) { if (ob && !ob.mitigated && (near(ob.hi) || near(ob.lo))) { sStruct = 1; break; } }
+        }
+        // 2. MOMENTUM TURNED — histogram moving toward the signal direction
+        const sMom = ((iC && typeof macdHist === 'number' && macdHist > 0) || (!iC && typeof macdHist === 'number' && macdHist < 0)) ? 1 : 0;
+        // 3. MOVE HELD — established recovery off the 30-min extreme (≥0.2%, held ≥10min)
+        const sHeld = recoveryContext(s, price, sig.type) ? 1 : 0;
+        // 4. HTF AGREEMENT — both higher timeframes with the signal
+        const sHtf = (_csF.indexOf('HTF×2') !== -1 || (s.htf1h_dir === sig.type && s.htf4h_dir === sig.type)) ? 1 : 0;
+        // 5. REAL PARTICIPATION — genuine VOL× ≥1.3 (BURST proxy does NOT count)
+        let sVol = 0;
+        for (const f of _csF) { const m = /^VOL.*?×([\d.]+)/.exec(String(f)); if (m && parseFloat(m[1]) >= 1.3) { sVol = 1; break; } }
+        // 6. NOT EXTENDED — structure gate approves the entry (not >1.2×ATR past anchor, room to barrier)
+        let sNotExt = 0;
+        try { const _st = findRecoveryStructure(s, sym, sig.type, price, atrVal, null); if (_st && _st.ok) sNotExt = 1; } catch (eNe) {}
+        const _confScore = sStruct + sMom + sHeld + sHtf + sVol + sNotExt;
+        sig._confScore = _confScore;
+        sig._confBreakdown = 'str' + sStruct + ' mom' + sMom + ' held' + sHeld + ' htf' + sHtf + ' vol' + sVol + ' ext' + sNotExt;
+        s._confScoreTs = Date.now();
+        const msgCS = '🎚️ CONF-SCORE ' + _confScore + '/6 — ' + tagEarly + ' ' + sig.type.toUpperCase() + ' @ $' + price.toFixed(2) + ' [' + sig._confBreakdown + '] (dormant scorer, log+track only — no firing effect).';
+        log(sym, msgCS);
+        trackBlockedOutcome(sym, msgCS, true);
+      }
+    } catch (eCS) { /* scorer must never affect firing */ }
+
     // ===== PHASE 3.91 — EXTENSION GUARD, ALL NON-TRv2 PATHS (2026-07-06) =====
     // 3 documented SLs from entering at the crest of an oversized 15-min impulse on paths
     // without TRv2's EXT-WAIT protection:
@@ -12841,7 +12887,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '4.8-20260720-htfconfirm', // bump on each deploy — lets /state verify what's live
+    build: '4.9-20260720-confscorer', // bump on each deploy — lets /state verify what's live
     chopActive: !!s.chopActive,
     grindLive: !!(s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)),
     grindDir: (s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)) ? s._grindDir : null,
