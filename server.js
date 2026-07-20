@@ -5385,6 +5385,30 @@ function processPrice(sym, price, hi, lo) {
         }
       }
     }
+    // ===== INVERSAL_BREAK CAPITULATION GUARD (2026-07-20) =====
+    // 7/20 07:37 XAU ⬆INVERSAL_BREAK CALL @4029.69 conv 7 fired on a single BURST×3.4 up-tick
+    // (ROC +0.19%) while MACD was -0.752 and RSI 20.2 — a dead-cat inside capitulation, not a
+    // failed break. SL'd -$12.3 as price fell to 4010. IB was never on the MACD-consistency
+    // gate above. Narrow signature (symbol-agnostic, sign+RSI only, NOT a threshold that would
+    // gut the detector): a reversal CALL with MACD still negative AND RSI <30 = the down-move's
+    // momentum is intact and price is mid-capitulation — the break has NOT failed yet. Mirror
+    // for PUT (MACD >0 AND RSI >70). Genuine IB reversals fire with RSI recovering off the
+    // extreme (30-45), so this only cuts the knife-catches.
+    if (/INVERSAL_BREAK|BREAK/.test(tagEarly) && !/RIDE|FAST|TREND|MFLIP/.test(tagEarly)) {
+      const sigMacdB = parseFloat(sig.macd);
+      if (!isNaN(sigMacdB) && typeof rsiV === 'number') {
+        if (sig.type === 'call' && sigMacdB < 0 && rsiV < 30) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🚫 ' + tagEarly + ' CALL BLOCKED — capitulation guard (2026-07-20): MACD ' + sigMacdB.toFixed(3) + ' still bearish + RSI ' + rsiV.toFixed(1) + ' <30. Fresh-low dead-cat, not a failed break — momentum intact, break not failed. (7/20 -$12.3 case.)');
+          return false;
+        }
+        if (sig.type === 'put' && sigMacdB > 0 && rsiV > 70) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🚫 ' + tagEarly + ' PUT BLOCKED — capitulation guard (2026-07-20): MACD +' + sigMacdB.toFixed(3) + ' still bullish + RSI ' + rsiV.toFixed(1) + ' >70. Fresh-high blow-off, not a failed break.');
+          return false;
+        }
+      }
+    }
 
     // ===== SAME-DIRECTION SAME-PRICE DEDUP (added 2026-06-16, task #180) =====
     // 6/16 XAU showed the textbook chop redundancy pattern:
@@ -6179,6 +6203,16 @@ function processPrice(sym, price, hi, lo) {
           return false;
         }
         log(sym, '🎯 FADE-ROC PASSED — ' + tag + ' ' + sig.type.toUpperCase() + ' confirmed at ROC ' + roc3.toFixed(3) + '%.');
+      }
+      // NAS/BTC FADE-ROC MARKERS (DORMANT, 2026-07-18): same hypothesis, per-symbol
+      // thresholds (BTC 0.15% / NAS 0.10% — ROC magnitudes differ per symbol). Log-only:
+      // BTC's W-29 losses were momentum chases not fades (late-cycle block owns that),
+      // and NAS has only 1 day of honest shadow data since the bracket fix. Promote per
+      // symbol when the nightly bucket split matches XAU's evidence.
+      if ((sym === 'BTC' || sym === 'NAS100') && /ATH|ATL|HI|LO|LHF|LLF|VREV|OBREJ|OBMIT/.test(tag) && !/MFLIP|TREND|FAST|BREAK|RIDE|SWEEP/.test(tag)) {
+        const _frThr = sym === 'BTC' ? 0.15 : 0.10;
+        const _frAl2 = (sig.type === 'call' && roc3 >= _frThr) || (sig.type === 'put' && roc3 <= -_frThr);
+        log(sym, '🎯 FADE-ROC marker — ' + tag + ' ' + sig.type.toUpperCase() + ' firing at ROC ' + roc3.toFixed(3) + '% → bucket ' + (_frAl2 ? 'ROC-CONFIRMED' : 'FLAT-EARLY') + ' (dormant, thr ' + _frThr + '%).');
       }
     } catch (eFr) { /* gate must never crash enrichment */ }
     return true;
@@ -12768,7 +12802,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '4.5-20260718-faderoc-live', // bump on each deploy — lets /state verify what's live
+    build: '4.6-20260720-capitguard', // bump on each deploy — lets /state verify what's live
     chopActive: !!s.chopActive,
     grindLive: !!(s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)),
     grindDir: (s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)) ? s._grindDir : null,
