@@ -5285,8 +5285,22 @@ function processPrice(sym, price, hi, lo) {
                       }
                     } catch (eQm) {}
                   }
-                  if (alignedC || _rcC || _qqqMir) {
+                  // ===== HTF-TREND CONFIRMATION OVERRIDE (2026-07-20) =====
+                  // 7/20: BTC rallied +2.5% but conv-7/8 continuation CALLs (11:08 conv-8
+                  // @64,706 → ran +$284) were chop-blocked because a shallow pullback made
+                  // the 30-min drift read flat/negative, while a counter-trend PUT (15:46
+                  // conv-7) leaked through and lost -$91. The inversion: the bypass's raw
+                  // 30-min-drift alignment lags at pullbacks. Fix: when BOTH higher
+                  // timeframes agree with the signal (HTF×2 factor) AND conv ≥7, the trend
+                  // is confirmed on 1h+4h — trust that over the 30-min wiggle. Elite + HTF
+                  // dual-agreement only, so it can't fire low-conv counter-trend chases.
+                  const _htfConfirm = !alignedC && !_rcC && !_qqqMir &&
+                    cCAS >= 7 && cCAF.indexOf('HTF×2') !== -1;
+                  if (alignedC || _rcC || _qqqMir || _htfConfirm) {
                     _crossAssetBypass = true;
+                    if (_htfConfirm) {
+                      log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — ' + sym + ' HTF-trend confirmation bypass (2026-07-20): conv ' + cCAS + ' + HTF×2 (1h+4h both agree) overrides a lagging 30-min drift (' + (dirChgC * 100).toFixed(2) + '%). Trend confirmed on higher TFs.');
+                    }
                     if (_qqqMir) {
                       if (_qqqMirStr && typeof _qqqMirStr.structSl === 'number') { s._structSl = _qqqMirStr.structSl; s._structSlUntil = Date.now() + 5000; }
                       log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — QQQ-MIRROR bypass: QQQ fired same-direction within 15min + conv ' + cCAS + ' + structure-approved entry' + (_qqqMirStr && _qqqMirStr.anchorName ? ' (anchored to ' + _qqqMirStr.anchorName + ' $' + _qqqMirStr.anchor.toFixed(2) + ')' : '') + '. Allowed.');
@@ -5296,7 +5310,7 @@ function processPrice(sym, price, hi, lo) {
                       s._recovUnlockTs = Date.now(); s._recovUnlockDir = sig.type;
                       if (_rcStructC && typeof _rcStructC.structSl === 'number') { s._structSl = _rcStructC.structSl; s._structSlUntil = Date.now() + 5000; }
                       log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — ' + sym + ' cross-asset bypass (Phase 3.97 RECOVERY): conv ' + cCAS + ' + ' + matchCount + '/' + factorSet.length + ' factors (' + matched + ') + ' + _rcC.offPct.toFixed(2) + '% off 30-min extreme (held ' + Math.round(_rcC.ageMin) + 'min)' + (_rcStructC && _rcStructC.anchorName ? ' · anchored to ' + _rcStructC.anchorName + ' $' + _rcStructC.anchor.toFixed(2) + ' · structural SL $' + _rcStructC.structSl.toFixed(2) : '') + '. Allowed.');
-                    } else if (!_qqqMir) {
+                    } else if (!_qqqMir && !_htfConfirm) {
                       log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — ' + sym + ' cross-asset confluence bypass (Phase 3.70): conv ' + cCAS + ' + ' + matchCount + '/' + factorSet.length + ' factors (' + matched + ') + aligned dir (' + (dirChgC * 100).toFixed(2) + '%). Allowed.');
                     }
                   }
@@ -12827,7 +12841,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '4.7-20260720-nasrecov', // bump on each deploy — lets /state verify what's live
+    build: '4.8-20260720-htfconfirm', // bump on each deploy — lets /state verify what's live
     chopActive: !!s.chopActive,
     grindLive: !!(s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)),
     grindDir: (s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)) ? s._grindDir : null,
