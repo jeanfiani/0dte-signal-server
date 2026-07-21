@@ -3946,6 +3946,59 @@ function processPrice(sym, price, hi, lo) {
       }
       s._attemptBurst = _abT;
     } catch (eTop) {}
+
+    // ===== REVERSAL CONFIRMATION SCORER — GRADES EVERY CANDIDATE (moved to top 2026-07-21) =====
+    // User direction: the end state is validator-decides — detectors propose, the validator
+    // disposes. For that, the validator must grade the FULL population, blocked included.
+    // Previously mid-chain, so signals killed by early gates (weekend/R5/regime/EXT-GUARD)
+    // were never graded — the exact set we're blind on. Now first: every candidate gets a
+    // 0-6 grade before any gate can block it. Still advisory/dormant — no firing effect —
+    // but the score→outcome join now covers blocked + fired. Stamps sig._confScore; force-
+    // tracks (throttled 3min/symbol). Six orthogonal components, each a lesson from the corpus.
+    try {
+      if (isMT5) {
+        if (!sig.conv) { try { sig.conv = convictionFor(sig.type); } catch (eCv) {} }
+        const _csV = sig.conv || { score: 0, factors: [] };
+        const _csF = _csV.factors || [];
+        const _tagCS = sig.score || '';
+        const iC = sig.type === 'call';
+        const _macroDirCs = s.macroEma ? (price > s.macroEma ? 'call' : 'put') : null;
+        const _isCounterTrend = _macroDirCs && _macroDirCs !== sig.type;
+        const _isReversalCls = /ATH|ATL|HI|LO|LHF|LLF|VREV|OBREJ|OBMIT|INVERSAL_BREAK|CHoCH|SWEEP|EXT-FLIP/.test(_tagCS);
+        const _confClass = (_isReversalCls || _isCounterTrend) ? 'REV' : 'CONT';
+        // 1. AT STRUCTURE
+        let sStruct = (_csF.indexOf('STRUCT') !== -1 || _csF.indexOf('OB') !== -1) ? 1 : 0;
+        if (!sStruct && atrVal > 0) {
+          const near = (lvl) => lvl > 0 && isFinite(lvl) && Math.abs(price - lvl) <= atrVal * 0.4;
+          if (near(s.asianH_locked) || near(s.asianL_locked) || near(s.rollingHigh) || near(s.rollingLow) || near(s.sessionHigh) || near(s.sessionLow)) sStruct = 1;
+          if (Array.isArray(s.orderBlocks)) for (const ob of s.orderBlocks) { if (ob && !ob.mitigated && (near(ob.hi) || near(ob.lo))) { sStruct = 1; break; } }
+        }
+        // 2. MOMENTUM TURNED
+        const sMom = ((iC && typeof macdHist === 'number' && macdHist > 0) || (!iC && typeof macdHist === 'number' && macdHist < 0)) ? 1 : 0;
+        // 3. MOVE HELD
+        const sHeld = recoveryContext(s, price, sig.type) ? 1 : 0;
+        // 4. HTF AGREEMENT
+        const sHtf = (_csF.indexOf('HTF×2') !== -1 || (s.htf1h_dir === sig.type && s.htf4h_dir === sig.type)) ? 1 : 0;
+        // 5. REAL PARTICIPATION
+        let sVol = 0;
+        for (const f of _csF) { const m = /^VOL.*?×([\d.]+)/.exec(String(f)); if (m && parseFloat(m[1]) >= 1.3) { sVol = 1; break; } }
+        // 6. NOT EXTENDED
+        let sNotExt = 0;
+        try { const _st = findRecoveryStructure(s, sym, sig.type, price, atrVal, null); if (_st && _st.ok) sNotExt = 1; } catch (eNe) {}
+        const _confScore = sStruct + sMom + sHeld + sHtf + sVol + sNotExt;
+        sig._confScore = _confScore;
+        sig._confClass = _confClass;
+        sig._confBreakdown = 'str' + sStruct + ' mom' + sMom + ' held' + sHeld + ' htf' + sHtf + ' vol' + sVol + ' ext' + sNotExt;
+        s._lastConfScore = _confScore; s._lastConfClass = _confClass;
+        s._lastConfBreakdown = sig._confBreakdown; s._lastConfTs = Date.now();
+        if (!s._confScoreTs || Date.now() - s._confScoreTs > 180000) {
+          s._confScoreTs = Date.now();
+          const msgCS = '🎚️ CONF-SCORE ' + _confScore + '/6 [' + _confClass + '] — ' + _tagCS + ' ' + sig.type.toUpperCase() + ' @ $' + price.toFixed(2) + ' [' + sig._confBreakdown + '] (dormant validator, grades ALL candidates incl. blocked — no firing effect).';
+          log(sym, msgCS);
+          trackBlockedOutcome(sym, msgCS, true);
+        }
+      }
+    } catch (eCS) { /* scorer must never affect firing */ }
     // ===== MT5 DAILY SIGNAL SAFETY VALVE (added 2026-06-11, audit v2 A1) =====
     // Equities are capped at MAX_SIG in the main path; MT5 specialists bypassed every cap.
     // Loose valve, not a tight cap — only a runaway day trips it. Sits here (not as an
@@ -4419,66 +4472,8 @@ function processPrice(sym, price, hi, lo) {
     const tagEarly = sig.score || '';
     const isFadeEarly = /ATH|ATL|HI|LO|DIV/.test(tagEarly) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tagEarly);
     const macroContraNow = Date.now();
-
-    // ===== REVERSAL CONFIRMATION SCORER (DORMANT, 2026-07-20) =====
-    // Two weeks of blocked-signal analysis point at one seam: the bot can't cleanly tell a
-    // CHASE from a CONFIRMED reversal. This scorer makes that distinction explicit — 6
-    // orthogonal 0/1 components (each a lesson from the corpus). LOG-ONLY: it changes no
-    // firing decision. It stamps sig._confScore (rides into /signals) AND force-tracks a
-    // virtual outcome tagged "CONF-SCORE N/6" so the nightly can join score→W/L and find
-    // the separating threshold on real data before anything goes live. Scores EVERY
-    // reversal / counter-trend signal (fired or blocked), throttled 3min/symbol vs spam.
-    try {
-      const _cs = conv || { score: 0, factors: [] };
-      const _csF = _cs.factors || [];
-      const _macroDirCs = s.macroEma ? (price > s.macroEma ? 'call' : 'put') : null;
-      const _isCounterTrend = _macroDirCs && _macroDirCs !== sig.type;
-      const _isReversalCls = /ATH|ATL|HI|LO|LHF|LLF|VREV|OBREJ|OBMIT|INVERSAL_BREAK|CHoCH|SWEEP|EXT-FLIP/.test(tagEarly);
-      // VALIDATOR SCOPE (2026-07-20, user decision): grade EVERY MT5 signal. Tag class
-      // REV (reversal/counter-trend) vs CONT (with-trend continuation) so the nightly
-      // derives separate thresholds — the 'held-off-extreme' component is reversal-only,
-      // so CONT signals score on a naturally different scale. Stamp always; force-track
-      // throttled 3min/symbol to bound store volume.
-      const _confClass = (_isReversalCls || _isCounterTrend) ? 'REV' : 'CONT';
-      if (isMT5) {
-        const iC = sig.type === 'call';
-        // 1. AT STRUCTURE — within 0.4×ATR of OB / Asian H-L / rolling extreme / session extreme, or STRUCT/OB factor
-        let sStruct = (_csF.indexOf('STRUCT') !== -1 || _csF.indexOf('OB') !== -1) ? 1 : 0;
-        if (!sStruct && atrVal > 0) {
-          const near = (lvl) => lvl > 0 && isFinite(lvl) && Math.abs(price - lvl) <= atrVal * 0.4;
-          if (near(s.asianH_locked) || near(s.asianL_locked) || near(s.rollingHigh) || near(s.rollingLow) || near(s.sessionHigh) || near(s.sessionLow)) sStruct = 1;
-          if (Array.isArray(s.orderBlocks)) for (const ob of s.orderBlocks) { if (ob && !ob.mitigated && (near(ob.hi) || near(ob.lo))) { sStruct = 1; break; } }
-        }
-        // 2. MOMENTUM TURNED — histogram moving toward the signal direction
-        const sMom = ((iC && typeof macdHist === 'number' && macdHist > 0) || (!iC && typeof macdHist === 'number' && macdHist < 0)) ? 1 : 0;
-        // 3. MOVE HELD — established recovery off the 30-min extreme (≥0.2%, held ≥10min)
-        const sHeld = recoveryContext(s, price, sig.type) ? 1 : 0;
-        // 4. HTF AGREEMENT — both higher timeframes with the signal
-        const sHtf = (_csF.indexOf('HTF×2') !== -1 || (s.htf1h_dir === sig.type && s.htf4h_dir === sig.type)) ? 1 : 0;
-        // 5. REAL PARTICIPATION — genuine VOL× ≥1.3 (BURST proxy does NOT count)
-        let sVol = 0;
-        for (const f of _csF) { const m = /^VOL.*?×([\d.]+)/.exec(String(f)); if (m && parseFloat(m[1]) >= 1.3) { sVol = 1; break; } }
-        // 6. NOT EXTENDED — structure gate approves the entry (not >1.2×ATR past anchor, room to barrier)
-        let sNotExt = 0;
-        try { const _st = findRecoveryStructure(s, sym, sig.type, price, atrVal, null); if (_st && _st.ok) sNotExt = 1; } catch (eNe) {}
-        const _confScore = sStruct + sMom + sHeld + sHtf + sVol + sNotExt;
-        sig._confScore = _confScore;
-        sig._confClass = _confClass;
-        sig._confBreakdown = 'str' + sStruct + ' mom' + sMom + ' held' + sHeld + ' htf' + sHtf + ' vol' + sVol + ' ext' + sNotExt;
-        // Surface the latest grade for the push text + /state dashboard (advisory, live to
-        // the human this week — the auto-gate stays dormant until the threshold is proven).
-        s._lastConfScore = _confScore; s._lastConfClass = _confClass;
-        s._lastConfBreakdown = sig._confBreakdown; s._lastConfTs = Date.now();
-        // Stamp rides on every signal (visible in /signals + dashboard). Force-track a
-        // throttled sample for the blocked-side score→outcome join.
-        if (!s._confScoreTs || Date.now() - s._confScoreTs > 180000) {
-          s._confScoreTs = Date.now();
-          const msgCS = '🎚️ CONF-SCORE ' + _confScore + '/6 [' + _confClass + '] — ' + tagEarly + ' ' + sig.type.toUpperCase() + ' @ $' + price.toFixed(2) + ' [' + sig._confBreakdown + '] (dormant validator, grade+track only — no firing effect).';
-          log(sym, msgCS);
-          trackBlockedOutcome(sym, msgCS, true);
-        }
-      }
-    } catch (eCS) { /* scorer must never affect firing */ }
+    // (Reversal Confirmation Scorer relocated to the top of enrichSig on 2026-07-21 so it
+    // grades EVERY candidate — including signals blocked by earlier gates.)
 
     // ===== PHASE 3.91 — EXTENSION GUARD, ALL NON-TRv2 PATHS (2026-07-06) =====
     // 3 documented SLs from entering at the crest of an oversized 15-min impulse on paths
@@ -12916,7 +12911,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.0-20260720-conf-advisory', // bump on each deploy — lets /state verify what's live
+    build: '5.1-20260721-grade-all', // bump on each deploy — lets /state verify what's live
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
     confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
     confBreakdown: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfBreakdown : null,
