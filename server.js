@@ -2407,6 +2407,12 @@ function logSignal(sym, sig) {
     chop: S[sym].chopActive ? 1 : 0,
     num: sig.num,
     conv: sig.conv || null,
+    // Validator grade (2026-07-21 fix): the scorer stamps these on `sig`, but histEntry
+    // is rebuilt field-by-field so they were dropped — fired signals showed no grade in
+    // /signals (only /state had it), hiding the fired-side of the validator's data. Persist.
+    confScore: (typeof sig._confScore === 'number') ? sig._confScore : null,
+    confClass: sig._confClass || null,
+    confBreakdown: sig._confBreakdown || null,
     // Outcome tracking (added 2026-05-12) — updated by checkExit() when trade flags flip.
     // Boolean fields stay false until TP1/TP2/TP3/SL price is touched. Used by CSV export
     // to surface trade outcome per signal.
@@ -12916,7 +12922,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.1b-20260721-regime-tag', // bump on each deploy — lets /state verify what's live
+    build: '5.1c-20260721-confpersist', // bump on each deploy — lets /state verify what's live
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
     confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
     confBreakdown: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfBreakdown : null,
