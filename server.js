@@ -3993,7 +3993,12 @@ function processPrice(sym, price, hi, lo) {
         s._lastConfBreakdown = sig._confBreakdown; s._lastConfTs = Date.now();
         if (!s._confScoreTs || Date.now() - s._confScoreTs > 180000) {
           s._confScoreTs = Date.now();
-          const msgCS = '🎚️ CONF-SCORE ' + _confScore + '/6 [' + _confClass + '] — ' + _tagCS + ' ' + sig.type.toUpperCase() + ' @ $' + price.toFixed(2) + ' [' + sig._confBreakdown + '] (dormant validator, grades ALL candidates incl. blocked — no firing effect).';
+          // Tag the market REGIME at grade time (2026-07-21): 7/21 data shows the
+          // components flip sign by regime, not symbol — ext wins in chop/range (XAU+NAS
+          // ranged) but loses in trend (BTC trended). Regime tag lets the nightly split
+          // CONF-SCORE by CHOP/GRIND/TREND to test whether the real rule is regime-conditional.
+          const _regCS = s.chopActive ? 'CHOP' : (s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)) ? 'GRIND' : 'TREND';
+          const msgCS = '🎚️ CONF-SCORE ' + _confScore + '/6 [' + _confClass + '/' + _regCS + '] — ' + _tagCS + ' ' + sig.type.toUpperCase() + ' @ $' + price.toFixed(2) + ' [' + sig._confBreakdown + '] (dormant validator, grades ALL candidates incl. blocked — no firing effect).';
           log(sym, msgCS);
           trackBlockedOutcome(sym, msgCS, true);
         }
@@ -12911,7 +12916,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.1-20260721-grade-all', // bump on each deploy — lets /state verify what's live
+    build: '5.1b-20260721-regime-tag', // bump on each deploy — lets /state verify what's live
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
     confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
     confBreakdown: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfBreakdown : null,
