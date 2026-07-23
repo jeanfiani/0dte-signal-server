@@ -4582,12 +4582,30 @@ function processPrice(sym, price, hi, lo) {
         // XAU/BTC keep floor 6 (their conv-5 grind losses were measured on honest
         // brackets and were real). Structure gate below still applies to every fire.
         const _gFloor = (sym === 'NAS100' && typeof rthEtfFresh === 'function' && !rthEtfFresh()) ? 5 : 6;
-        if (_gScore === 5 && _gFloor === 6) {
+        // ===== V-CONT — VALIDATOR-CONFIRMED CONTINUATION (LIVE, 2026-07-24) =====
+        // 7/23 NAS crashed ~$900 and fired ZERO with-trend PUTs: conviction has an
+        // off-hours factor ceiling (~5) so the conv-6 grind floor was unreachable, and
+        // the entry-quality gate measured "extended" from the Asian high — mid-crash
+        // every entry is extended by that anchor. Jean's direction: reversal/continuation
+        // legs can't have full conv factors — let the VALIDATOR override the conv score
+        // when confirmation quality is high. Bar (calibrated on 7/23): structure present
+        // AND both HTFs agree AND confScore ≥4 (i.e. one more of mom/held/vol). On 7/23
+        // this fires the 09:30/10:32/10:51/11:07 blocked winners-or-scratches and still
+        // excludes the 09:59/10:35 bounce-zone losers (3/6) and 2/6 knife-chases.
+        // Waives: grind conv floor + grind entry-quality. All safety gates still apply.
+        const _vCont = !!(sig._cStr === 1 && sig._cHtf === 1 && (sig._confScore || 0) >= 4);
+        if (_gScore === 5 && _gFloor === 6 && !_vCont) {
           const msgG = '🌀 GRIND-DORMANT conv-5 would-fire — ' + tagEarly + ' ' + sig.type.toUpperCase() + ' @ $' + price.toFixed(2) + ' aligned with grind but conv 5 < 6 floor (Phase 3.96). Shadow-tracking to calibrate the floor.';
           log(sym, msgG);
           trackBlockedOutcome(sym, msgG, true);
           Object.assign(s, _emitSnapshot);
           return false;
+        }
+        if (_gScore === 5 && _gFloor === 6 && _vCont) {
+          sig._vContFired = true;
+          const msgVC = '🧭 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' V-CONT conv-floor override @ $' + price.toFixed(2) + ' — validator-confirmed continuation [' + (sig._confBreakdown || '') + '] str+htf×2+score≥4; conv 5 floor waived (live).';
+          log(sym, msgVC);
+          trackBlockedOutcome(sym, msgVC, true);
         }
         if (_gScore < 5) {
           Object.assign(s, _emitSnapshot);
@@ -4602,12 +4620,22 @@ function processPrice(sym, price, hi, lo) {
         // to an OB / Asian level / 30-min extreme, not extended >1.2×ATR past it, with
         // ≥0.5×ATR of room to the next barrier. Pullback re-entries pass; chases wait
         // for the retest (detectors re-fire within minutes).
-        if (_gScore >= _gFloor) {
+        if (_gScore >= _gFloor || _vCont) {
           const _gStr = findRecoveryStructure(s, sym, sig.type, price, atrVal, null);
-          if (_gStr && !_gStr.ok) {
+          if (_gStr && !_gStr.ok && !_vCont) {
             Object.assign(s, _emitSnapshot);
             log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — grind entry-quality (Phase 3.96b): ' + _gStr.reason + '.');
             return false;
+          }
+          if (_gStr && !_gStr.ok && _vCont) {
+            // V-CONT (2026-07-24): validator-confirmed continuation waives the entry-quality
+            // block — "extended beyond Asian high" / "no room to rolling extreme" anchors are
+            // meaningless mid-crash (7/23: they blocked the whole $900 slide). The validator's
+            // str bit already demands a structure anchor near the entry.
+            sig._vContFired = true;
+            const msgVQ = '🧭 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' V-CONT entry-quality override @ $' + price.toFixed(2) + ' — [' + (sig._confBreakdown || '') + '] waives: ' + _gStr.reason + ' (live).';
+            log(sym, msgVQ);
+            trackBlockedOutcome(sym, msgVQ, true);
           }
           if (_gStr && typeof _gStr.structSl === 'number') { s._structSl = _gStr.structSl; s._structSlUntil = Date.now() + 5000; }
         }
@@ -12966,7 +12994,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.2-20260723-revoverride', // bump on each deploy — lets /state verify what's live
+    build: '5.3-20260724-vcont', // bump on each deploy — lets /state verify what's live
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
     confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
     confBreakdown: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfBreakdown : null,
