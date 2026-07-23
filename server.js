@@ -3995,6 +3995,22 @@ function processPrice(sym, price, hi, lo) {
         sig._confScore = _confScore;
         sig._confClass = _confClass;
         sig._confBreakdown = 'str' + sStruct + ' mom' + sMom + ' held' + sHeld + ' htf' + sHtf + ' vol' + sVol + ' ext' + sNotExt;
+        // Stamp individual component bits so downstream gates can reuse them (2026-07-23).
+        // The REVERSAL-OVERRIDE (Confirmed-flip) path reads sig._cStr/_cMom/_cHtf to decide
+        // whether a counter-regime signal is a genuine confirmed reversal worth firing.
+        sig._cStr = sStruct; sig._cMom = sMom; sig._cHeld = sHeld; sig._cHtf = sHtf; sig._cVol = sVol; sig._cExt = sNotExt;
+        // ===== REVERSAL OVERRIDE — CONFIRMED FLIP (LIVE, 2026-07-23, task Jean) =====
+        // Root cause of the 7/22-23 miss: XAU fell ~$79 top-to-bottom but the 5-day STRONG
+        // BULL regime + chop gates vetoed EVERY PUT (conv 5-12), because shorting a bull is
+        // "counter-trend" by the weekly lens even after the intraday trend clearly flipped.
+        // Fix: when structure (str) AND momentum (mom) AND BOTH higher timeframes (htf×2)
+        // all confirm the signal direction, it is a genuine multi-timeframe reversal — waive
+        // the TREND-CONTEXT gates (chop, multi-day regime floor, macro-flip cooldown, macro-
+        // contra) so it can fire against the 5-day regime. STRICTEST setting ("confirmed
+        // flip") per Jean: all three required — htf×2 agreement is itself the anti-chop guard
+        // (both HTFs don't align in a flat range). SAFETY gates (RSI sanity, capitulation,
+        // win-protect, active-trade lockout, cooldowns, SL clamp, TP1 caps) still apply.
+        sig._revOverride = !!(sStruct === 1 && sMom === 1 && sHtf === 1);
         s._lastConfScore = _confScore; s._lastConfClass = _confClass;
         s._lastConfBreakdown = sig._confBreakdown; s._lastConfTs = Date.now();
         if (!s._confScoreTs || Date.now() - s._confScoreTs > 180000) {
@@ -5438,7 +5454,16 @@ function processPrice(sym, price, hi, lo) {
             }
           }
         } catch (eCb) {}
-        if (!_chopVolBypass && !_btcMildChopBypass && !_xauMetalsBypass && !_crossAssetBypass) {
+        // REVERSAL-OVERRIDE chop bypass (2026-07-23): a confirmed flip (str+mom+htf×2) is
+        // not a flat-range fade — let it through chop. htf×2 agreement means the higher
+        // timeframes are directional, so by definition this isn't dead chop.
+        if (sig._revOverride && !_chopVolBypass && !_btcMildChopBypass && !_xauMetalsBypass && !_crossAssetBypass) {
+          sig._revOverrideFired = true;
+          const _roMsg = '🔄 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' REV-OVERRIDE chop bypass @ $' + price.toFixed(2) + ' — confirmed flip [' + (sig._confBreakdown || '') + '] str+mom+htf×2 all agree; waiving chop gate (Confirmed-flip, live).';
+          log(sym, _roMsg);
+          trackBlockedOutcome(sym, _roMsg, true);
+        }
+        if (!sig._revOverride && !_chopVolBypass && !_btcMildChopBypass && !_xauMetalsBypass && !_crossAssetBypass) {
           // ===== PHASE 3.99 — STANDALONE RECOVERY BYPASS (DORMANT, 2026-07-10) =====
           // 7/10 15:49 case: conv-6 RIDE CALL with only 2/4 metals + STRUCT rode the
           // 4073→4114 recovery to TP3 but had no bypass available (metals path needs ≥3,
@@ -5762,7 +5787,15 @@ function processPrice(sym, price, hi, lo) {
                              (regimeDir === 'bull' && sig.type === 'put');
       if (isCounterRegime) {
         const requiredConv = regimeStrength === 2 ? 6 : 5;
-        if (conv.score < requiredConv) {
+        if (conv.score < requiredConv && sig._revOverride) {
+          // REVERSAL-OVERRIDE (2026-07-23): confirmed flip (str+mom+htf×2) is allowed to
+          // fire against the multi-day regime even below the conv floor — this is the exact
+          // case the gate was over-blocking (the 7/22-23 XAU $79 drop, every PUT vetoed).
+          sig._revOverrideFired = true;
+          const _roMsg = '🔄 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' REV-OVERRIDE regime bypass @ $' + price.toFixed(2) + ' — confirmed flip [' + (sig._confBreakdown || '') + '] vs multi-day ' + (regimeStrength === 2 ? 'STRONG' : 'WEAK') + ' ' + regimeDir.toUpperCase() + ' (' + (regimeNetChgPct >= 0 ? '+' : '') + regimeNetChgPct.toFixed(1) + '%); conv ' + conv.score + '<' + requiredConv + ' waived (Confirmed-flip, live).';
+          log(sym, _roMsg);
+          trackBlockedOutcome(sym, _roMsg, true);
+        } else if (conv.score < requiredConv) {
           Object.assign(s, _emitSnapshot);
           const strengthLabel = regimeStrength === 2 ? 'STRONG' : 'WEAK';
           const dirLabel = regimeDir.toUpperCase();
@@ -5860,12 +5893,16 @@ function processPrice(sym, price, hi, lo) {
     const newDirStable = sig.type === 'call'
       ? (s.fullConvSinceCall > 0 && (macroContraNow - s.fullConvSinceCall) >= STABILITY_BYPASS_MS)
       : (s.fullConvSincePut > 0 && (macroContraNow - s.fullConvSincePut) >= STABILITY_BYPASS_MS);
-    if (oppositeFlipRecent && !newDirStable && !oppositeWasFlicker) {
+    if (oppositeFlipRecent && !newDirStable && !oppositeWasFlicker && !sig._revOverride) {
       Object.assign(s, _emitSnapshot);
       const flipAgoMin = Math.round((macroContraNow - oppositeEndTs) / 60000);
       const durMin = Math.round(oppositeDur / 60000);
       log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — macro flip cooldown (opposite alignment lasted ' + durMin + 'min, ended ' + flipAgoMin + 'min ago, need 60min OR 7min stable new alignment OR opposite <30min flicker).');
       return false;
+    }
+    if (oppositeFlipRecent && !newDirStable && !oppositeWasFlicker && sig._revOverride) {
+      sig._revOverrideFired = true;
+      log(sym, '🔄 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' REV-OVERRIDE macro-flip-cooldown bypass — confirmed flip [' + (sig._confBreakdown || '') + '] str+mom+htf×2 (Confirmed-flip, live).');
     }
     if (oppositeFlipRecent && oppositeWasFlicker) {
       const durMin = Math.round(oppositeDur / 60000);
@@ -5880,7 +5917,14 @@ function processPrice(sym, price, hi, lo) {
     const contraBlocked =
       (sig.type === 'call' && macroContraNow < (s.macroContraBlockCallUntil || 0)) ||
       (sig.type === 'put'  && macroContraNow < (s.macroContraBlockPutUntil  || 0));
-    if (contraBlocked) {
+    if (contraBlocked && sig._revOverride) {
+      // REVERSAL-OVERRIDE (2026-07-23): confirmed flip (str+mom+htf×2) bypasses the sticky
+      // macro-contra block — the higher timeframes have flipped, so the prior-trend contra
+      // stamp is stale for this signal.
+      sig._revOverrideFired = true;
+      log(sym, '🔄 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' REV-OVERRIDE macro-contra bypass — confirmed flip [' + (sig._confBreakdown || '') + '] str+mom+htf×2 (Confirmed-flip, live).');
+    }
+    if (contraBlocked && !sig._revOverride) {
       if (isFadeEarly) {
         // Audit finding LOW-4 (added 2026-05-13): log when a fade signal proceeds despite
         // the contra-block — previously this was a silent pass-through making it confusing
@@ -12922,7 +12966,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.1c-20260721-confpersist', // bump on each deploy — lets /state verify what's live
+    build: '5.2-20260723-revoverride', // bump on each deploy — lets /state verify what's live
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
     confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
     confBreakdown: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfBreakdown : null,
