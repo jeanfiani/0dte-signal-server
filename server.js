@@ -4011,6 +4011,25 @@ function processPrice(sym, price, hi, lo) {
         // (both HTFs don't align in a flat range). SAFETY gates (RSI sanity, capitulation,
         // win-protect, active-trade lockout, cooldowns, SL clamp, TP1 caps) still apply.
         sig._revOverride = !!(sStruct === 1 && sMom === 1 && sHtf === 1);
+        // ===== V-REC — POST-CRASH BOUNCE SCALP (LIVE, 2026-07-24, task Jean) =====
+        // Near-bottom bounce: recovery established (held) AT structure (str), after a
+        // ≥2×ATR crash/spike in the recent 2h window. This class grades low (htf still
+        // points the crashed way, mom hasn't turned) so REV-OVERRIDE and V-CONT don't
+        // catch it, and the chop gate blocks it silently — the 7/23 03:01 NAS CALL
+        // (+$80 bounce off the low) was lost exactly this way. Jean's call: fire it as a
+        // TIGHT-STOP SCALP — 0.8×ATR stop caps the knife-catch loss; TP ladder 3×/5×/8×
+        // ATR aims for the sharp V-bounce. Only the chop gate is waived; every safety
+        // gate (RSI, capitulation, same-dir cap, cooldowns, win-protect) still applies.
+        let _vRecCrash = false;
+        try {
+          if (s.macroSnaps && s.macroSnaps.length >= 12 && atrVal > 0) {
+            const _wv = s.macroSnaps.slice(-24); // ~last 2h (5-min snaps)
+            let _vh = -Infinity, _vl = Infinity;
+            for (const _sn of _wv) { if (_sn && _sn.p > 0) { if (_sn.p > _vh) _vh = _sn.p; if (_sn.p < _vl) _vl = _sn.p; } }
+            if (isFinite(_vh) && isFinite(_vl) && (_vh - _vl) >= 2.0 * atrVal) _vRecCrash = true;
+          }
+        } catch (eVR) {}
+        sig._vRec = !!(sStruct === 1 && sHeld === 1 && _vRecCrash);
         s._lastConfScore = _confScore; s._lastConfClass = _confClass;
         s._lastConfBreakdown = sig._confBreakdown; s._lastConfTs = Date.now();
         if (!s._confScoreTs || Date.now() - s._confScoreTs > 180000) {
@@ -5491,7 +5510,15 @@ function processPrice(sym, price, hi, lo) {
           log(sym, _roMsg);
           trackBlockedOutcome(sym, _roMsg, true);
         }
-        if (!sig._revOverride && !_chopVolBypass && !_btcMildChopBypass && !_xauMetalsBypass && !_crossAssetBypass) {
+        if (sig._vRec && !sig._revOverride && !_chopVolBypass && !_btcMildChopBypass && !_xauMetalsBypass && !_crossAssetBypass) {
+          // V-REC post-crash bounce scalp: waive chop gate, arm the tight-stop ladder.
+          sig._vRecFired = true;
+          s._vRecUntil = Date.now() + 5000; // buildCfdTrade → 0.8×ATR SL + 3/5/8×ATR TPs
+          const _vrMsg = '🩹 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' V-REC bounce scalp @ $' + price.toFixed(2) + ' — [' + (sig._confBreakdown || '') + '] recovery+structure after ≥2×ATR move; TIGHT 0.8×ATR stop, TPs 3/5/8×ATR (live). Chop gate waived.';
+          log(sym, _vrMsg);
+          trackBlockedOutcome(sym, _vrMsg, true);
+        }
+        if (!sig._vRec && !sig._revOverride && !_chopVolBypass && !_btcMildChopBypass && !_xauMetalsBypass && !_crossAssetBypass) {
           // ===== PHASE 3.99 — STANDALONE RECOVERY BYPASS (DORMANT, 2026-07-10) =====
           // 7/10 15:49 case: conv-6 RIDE CALL with only 2/4 metals + STRUCT rode the
           // 4073→4114 recovery to TP3 but had no bypass available (metals path needs ≥3,
@@ -11431,6 +11458,10 @@ function buildCfdTrade(type, price, atr, sym) {
   // 5s window). Applied only if TIGHTER than the ATR default — structure never widens risk.
   const _structSlP = (sym && S[sym] && S[sym]._structSlUntil && Date.now() < S[sym]._structSlUntil && typeof S[sym]._structSl === 'number') ? S[sym]._structSl : null;
   if (sym && S[sym]) S[sym]._structSlUntil = 0;
+  // V-REC post-crash bounce scalp (2026-07-24): tight 0.8×ATR stop + 3/5/8×ATR TP
+  // ladder. Small capped loss on a knife-catch, big runner on a real V-bounce. One-shot 5s.
+  const _vRecActive = !!(sym && S[sym] && S[sym]._vRecUntil && Date.now() < S[sym]._vRecUntil);
+  if (sym && S[sym]) S[sym]._vRecUntil = 0;
   // Per-instrument TP/SL policy (multiples of ATR).
   // Default (XAU, BTC): SL=2×, TP1=1.5×, TP2=2.5×, TP3=4×.
   // NAS (updated 2026-05-16, retightened 2026-07-01): NAS futures show cleaner directional
@@ -11440,9 +11471,11 @@ function buildCfdTrade(type, price, atr, sym) {
   // Tightened to 3/4/6× ATR. Keeps TP1 the same (50% hit rate works), makes TP2 hittable
   // on any decent continuation, TP3 achievable on real trend days without needing $400 legs.
   // SL stays tight at 2× ATR — same rationale as before.
-  const mults = isNAS
+  let mults = isNAS
     ? { sl: 2, t1: 3, t2: 4, t3: 6 }
     : { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
+  // V-REC bounce scalp overrides the ladder: tight 0.8×ATR stop, TP1 3× / TP2 5× / TP3 8×ATR.
+  if (_vRecActive) mults = { sl: 0.8, t1: 3, t2: 5, t3: 8 };
   // Minimum $5 for SL and TP1 — prevents noise-level levels during low-ATR periods
   // XAU max $10 cap — keeps risk tight on gold's typical ATR range
   const slDist = isXAU ? Math.min(Math.max(atr * mults.sl, 5), 10) : Math.max(atr * mults.sl, 5);
@@ -12994,7 +13027,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.3-20260724-vcont', // bump on each deploy — lets /state verify what's live
+    build: '5.4-20260724-vrec', // bump on each deploy — lets /state verify what's live
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
     confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
     confBreakdown: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfBreakdown : null,
