@@ -12893,6 +12893,44 @@ app.post('/trade/clear', (req, res) => {
   res.json({ ok: true });
 });
 
+// ===== MANUAL CLOSE COMMAND (2026-07-24) =====
+// The monitor "Close Trade" button POSTs here. Signal Trader POLLS /state/:sym, so we don't
+// push an order — we RAISE A FLAG (s.closeRequest) that the next /state poll surfaces. The
+// EA is responsible for: (1) on poll, if closeRequest.active && closeRequest.id != lastAckId
+// → flatten the open position for that symbol at market; (2) POST /trade/close/ack {sym,id}
+// to confirm. The flag AUTO-EXPIRES after 60s so a missed ack can't trigger a stale close
+// on a much-later poll. Optional shared-secret: if env CLOSE_TOKEN is set, the request must
+// carry the matching token (header 'x-close-token' or body.token) — prevents a stray POST
+// from flattening a live position. This endpoint never touches the broker directly.
+const CLOSE_TOKEN = process.env.CLOSE_TOKEN || '';
+const CLOSE_REQ_TTL_MS = 60000;
+app.post('/trade/close', (req, res) => {
+  const sym = (req.body && req.body.sym || '').toUpperCase();
+  const token = (req.headers['x-close-token'] || (req.body && req.body.token) || '');
+  if (CLOSE_TOKEN && token !== CLOSE_TOKEN) return res.status(403).json({ error: 'bad token' });
+  const s = S[sym];
+  if (!s) return res.status(400).json({ error: 'Unknown symbol' });
+  if (!s.trade || !s.trade.active) return res.status(409).json({ error: 'no active trade', sym });
+  const id = sym + '-' + Date.now();
+  s.closeRequest = { active: true, id, ts: Date.now(), type: s.trade.type || '', ep: s.trade.ep || 0, source: 'manual-monitor' };
+  log(sym, '🛑 MANUAL CLOSE requested via monitor — ' + (s.trade.type || '').toUpperCase() + ' @ $' + (s.trade.ep || 0).toFixed(2) + ' · id ' + id + ' (flag surfaced to poller; awaiting EA ack).');
+  sendPush('🛑 ' + sym + ' CLOSE requested', 'Manual close sent to Signal Trader (' + (s.trade.type || '').toUpperCase() + ' @ $' + (s.trade.ep || 0).toFixed(2) + ') — awaiting fill', 'close-req');
+  res.json({ ok: true, sym, id, closeRequest: s.closeRequest });
+});
+
+// EA acknowledges it has flattened the position → clear the flag (idempotent by id).
+app.post('/trade/close/ack', (req, res) => {
+  const sym = (req.body && req.body.sym || '').toUpperCase();
+  const id = req.body && req.body.id;
+  const s = S[sym];
+  if (!s) return res.status(400).json({ error: 'Unknown symbol' });
+  if (s.closeRequest && (!id || s.closeRequest.id === id)) {
+    log(sym, '✅ CLOSE ack from EA — id ' + (id || s.closeRequest.id) + ' · flattening confirmed.');
+    s.closeRequest = null;
+  }
+  res.json({ ok: true, sym });
+});
+
 // ===== /state/:sym — gate diagnostic endpoint (added 2026-05-20) =====
 // Returns the state vars that the gates read from, so we can debug why a gate
 // fired or didn't fire without parsing logs. Especially useful for the multi-day
@@ -13027,7 +13065,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.4-20260724-vrec', // bump on each deploy — lets /state verify what's live
+    build: '5.6-20260724-firedonly', // bump on each deploy — lets /state verify what's live
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
     confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
     confBreakdown: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfBreakdown : null,
@@ -13048,6 +13086,16 @@ app.get('/state/:sym', (req, res) => {
       tp2Price: s.trade.tp2Price, tp3Price: s.trade.tp3Price,
       ageMin: s.trade.ts ? Math.round((Date.now() - s.trade.ts) / 60000) : null
     } : null,
+    // Manual-close command for the poller (Signal Trader). Auto-expires after 60s so a
+    // missed EA ack can't trigger a stale close on a much-later poll. EA: on closeRequest
+    // .active, flatten this symbol at market, then POST /trade/close/ack {sym,id}.
+    closeRequest: (function () {
+      if (s.closeRequest && s.closeRequest.active) {
+        if (Date.now() - s.closeRequest.ts > CLOSE_REQ_TTL_MS) { s.closeRequest = null; return null; }
+        return { active: true, id: s.closeRequest.id, ageSec: Math.round((Date.now() - s.closeRequest.ts) / 1000), type: s.closeRequest.type, ep: s.closeRequest.ep, source: s.closeRequest.source };
+      }
+      return null;
+    })(),
     dailyLevels: {
       count: (s.dailyLevels || []).length,
       data: s.dailyLevels || []
@@ -13271,7 +13319,23 @@ app.get('/prices', (req, res) => {
         // PHASE 3.78b — ATR-burst proxy (used when real volume unavailable, e.g. XAU)
         atrBurst: atrBurst
       },
-      signals: s.signals.slice(-20),
+      // ===== FIRED-ONLY FEED (2026-07-24, SAFETY) =====
+      // The EA polls /prices and was seeing BLOCKED signals in this array (every entry with
+      // conv.enrichBlocked=true is a signal the gates REJECTED). If the executor iterates
+      // signals[] it would trade rejected setups. Filter to FIRED-ONLY here so a blocked
+      // signal can never reach the executor, regardless of EA logic. The `trade` object below
+      // is already fired-only (set by buildCfdTrade); analytics keep full history via /signals.
+      signals: s.signals.filter(sg => !(sg && sg.conv && (sg.conv.enrichBlocked === true || sg.conv.label === 'BLOCKED'))).slice(-20),
+      // Manual-close command (2026-07-24). Surfaced here because the EA + mobile monitor
+      // both poll /prices. EA: on closeRequest.active, flatten this symbol at market, then
+      // POST /trade/close/ack {sym,id}. Auto-expires 60s.
+      closeRequest: (function () {
+        if (s.closeRequest && s.closeRequest.active) {
+          if (Date.now() - s.closeRequest.ts > CLOSE_REQ_TTL_MS) { s.closeRequest = null; return null; }
+          return { active: true, id: s.closeRequest.id, ageSec: Math.round((Date.now() - s.closeRequest.ts) / 1000), type: s.closeRequest.type, ep: s.closeRequest.ep, source: s.closeRequest.source };
+        }
+        return null;
+      })(),
       trade: s.trade.active ? {
         active: true, type: s.trade.type, ep: s.trade.ep,
         t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl, rev: s.trade.rev,
@@ -13421,7 +13485,7 @@ app.get('/status', (req, res) => {
       signals: s.dailySignalCount,
       chopActive: s.chopActive,
       trade: s.trade.active ? { type: s.trade.type, ep: s.trade.ep, t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl } : null,
-      recentSignals: s.signals.slice(-5),
+      recentSignals: s.signals.filter(sg => !(sg && sg.conv && (sg.conv.enrichBlocked === true || sg.conv.label === 'BLOCKED'))).slice(-5),
       // Blocked-attempt visibility (added 2026-05-22) — surfaces enrichSig gates that
       // suppressed signal emission. Useful for diagnosing over-gating, especially BTC.
       blocked: (s.blockedAttempts || []).length,
