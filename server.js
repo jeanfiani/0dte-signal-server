@@ -4045,6 +4045,27 @@ function processPrice(sym, price, hi, lo) {
         }
       }
     } catch (eCS) { /* scorer must never affect firing */ }
+    // ===== BTC RIDE DISABLED (2026-07-24) — RIDE loser autopsy =====
+    // 2-week fired data: vanilla BTC RIDE/RIDE+MACRO = 3 wins (+$71) vs 18 SL (−$1,742),
+    // ~14% WR, losing at EVERY conviction tier (the worst single loss, −$142, was conv-9).
+    // Cross-asset conviction ("HIGH" from NAS/SPY/QQQ/DXY) doesn't predict BTC's next $150;
+    // RIDE enters on the post-burst exhaustion tick and BTC's $75-142 ATR stop amplifies it.
+    // Disable vanilla RIDE on BTC. EXEMPT the structural overrides — V-REC, REV-OVERRIDE,
+    // and V-CONT — which produced BTC's actual winners (+$212, +$469) by firing on confirmed
+    // structure rather than momentum-chase. STRUCT_VWAP / INVERSAL_BREAK / LHF / CHoCH are
+    // different detectors and unaffected. XAU/NAS RIDE unaffected (XAU +$10, NAS secondary).
+    if (isBTC && /RIDE/.test(tagEarly)) {
+      const _btcRideExempt = sig._vRec || sig._revOverride ||
+        (sig._cStr === 1 && sig._cHtf === 1 && (sig._confScore || 0) >= 4); // V-CONT eligibility
+      if (!_btcRideExempt) {
+        Object.assign(s, _emitSnapshot);
+        const _brMsg = '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — BTC RIDE disabled (loser autopsy 2026-07-24: vanilla BTC RIDE ~14% WR / −$1,671 over 2wk, loses at every conv tier). Overrides (V-REC/REV/V-CONT) exempt; STRUCT/INVERSAL/LHF unaffected.';
+        log(sym, _brMsg);
+        trackBlockedOutcome(sym, _brMsg, true);
+        return false;
+      }
+      log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — BTC RIDE disabled but OVERRIDE-EXEMPT (' + (sig._vRec ? 'V-REC' : sig._revOverride ? 'REV' : 'V-CONT') + ') [' + (sig._confBreakdown || '') + ']. Allowed.');
+    }
     // ===== MT5 DAILY SIGNAL SAFETY VALVE (added 2026-06-11, audit v2 A1) =====
     // Equities are capped at MAX_SIG in the main path; MT5 specialists bypassed every cap.
     // Loose valve, not a tight cap — only a runaway day trips it. Sits here (not as an
@@ -13065,7 +13086,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.6-20260724-firedonly', // bump on each deploy — lets /state verify what's live
+    build: '5.7-20260724-btcride', // bump on each deploy — lets /state verify what's live
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
     confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
     confBreakdown: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfBreakdown : null,
