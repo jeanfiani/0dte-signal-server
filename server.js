@@ -4054,14 +4054,39 @@ function processPrice(sym, price, hi, lo) {
     // and V-CONT — which produced BTC's actual winners (+$212, +$469) by firing on confirmed
     // structure rather than momentum-chase. STRUCT_VWAP / INVERSAL_BREAK / LHF / CHoCH are
     // different detectors and unaffected. XAU/NAS RIDE unaffected (XAU +$10, NAS secondary).
-    if (isBTC && /RIDE/.test(tagEarly)) {
-      const _btcRideExempt = sig._vRec || sig._revOverride ||
+    if ((isBTC || isNAS) && /RIDE/.test(tagEarly)) {
+      const _rideExempt = sig._vRec || sig._revOverride ||
         (sig._cStr === 1 && sig._cHtf === 1 && (sig._confScore || 0) >= 4); // V-CONT eligibility
-      if (!_btcRideExempt) {
+      if (!_rideExempt) {
         Object.assign(s, _emitSnapshot);
-        const _brMsg = '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — BTC RIDE disabled (loser autopsy 2026-07-24: vanilla BTC RIDE ~14% WR / −$1,671 over 2wk, loses at every conv tier). Overrides (V-REC/REV/V-CONT) exempt; STRUCT/INVERSAL/LHF unaffected.';
+        const _brMsg = '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' RIDE disabled (loser autopsy 2026-07-24: vanilla RIDE loses at every conv tier — BTC ~14% WR / −$1,671, NAS ~11% WR / −$261 over 2wk). Overrides (V-REC/REV/V-CONT) exempt; STRUCT/INVERSAL/LHF unaffected. XAU RIDE unaffected.';
         log(sym, _brMsg);
-        trackBlockedOutcome(sym, _brMsg, true);
+        trackBlockedOutcome(sym, _brMsg, true); // control: RIDE's own 1:1 outcome (should keep losing)
+        // ===== SHADOW-FADE EXPERIMENT (2026-07-24) — test "fade the loser" hypothesis =====
+        // Vanilla BTC RIDE is ~14% WR → Jean's idea: the inverse should win. Shadow-track the
+        // FADE at zero risk — opposite direction, RIDE's levels MIRRORED (target = 2×ATR = where
+        // RIDE's SL sat = where price actually went; stop = 1.5×ATR = RIDE's TP1). Tagged with the
+        // market regime because the fade should work in CHOP/GRIND (fading exhaustion) and FAIL in
+        // TREND (fading a real breakout). Promote to a live BTC-RIDE-FADE detector only if ≥30
+        // resolved fades hold ≥65% WR in the non-TREND buckets. Never fires — measurement only.
+        try {
+          if (atrVal > 0 && Array.isArray(s.blockedOutcomes)) {
+            const _fadeType = sig.type === 'call' ? 'put' : 'call';
+            const _fTgt = 2.0 * atrVal, _fStop = 1.5 * atrVal;
+            const _regTag = s.chopActive ? 'CHOP' : (s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)) ? 'GRIND' : 'TREND';
+            s.blockedOutcomes.push({
+              ts: Date.now(), time: ts(), symbol: sym, detector: 'RIDE-FADE', type: _fadeType,
+              price: +price.toFixed(2),
+              virtualTp1: +(_fadeType === 'call' ? price + _fTgt : price - _fTgt).toFixed(2),
+              virtualSl:  +(_fadeType === 'call' ? price - _fStop : price + _fStop).toFixed(2),
+              blockReason: '🔁 ' + sym + '-RIDE-FADE ' + _fadeType.toUpperCase() + ' shadow @ $' + price.toFixed(2) + ' [' + _regTag + '] — inverse of disabled RIDE ' + sig.type.toUpperCase() + ' (target 2×ATR / stop 1.5×ATR, loser-autopsy fade test 7/24).',
+              snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+              tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null,
+              closed: false, closedTs: null, outcome: null
+            });
+            if (s.blockedOutcomes.length > 220) s.blockedOutcomes.shift();
+          }
+        } catch (eFade) {}
         return false;
       }
       log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — BTC RIDE disabled but OVERRIDE-EXEMPT (' + (sig._vRec ? 'V-REC' : sig._revOverride ? 'REV' : 'V-CONT') + ') [' + (sig._confBreakdown || '') + ']. Allowed.');
@@ -7112,8 +7137,15 @@ function processPrice(sym, price, hi, lo) {
         const efFightsBoth = s.htf1h_dir && s.htf4h_dir &&
           !((efCall && (s.htf1h_dir === 'up' || s.htf4h_dir === 'up')) ||
             (!efCall && (s.htf1h_dir === 'down' || s.htf4h_dir === 'down')));
+        // Conviction for the flip (computed once; reused by the BTC conv floor + the fire block).
+        let _efConv = 0; try { _efConv = (convictionFor(EF.dir).score) || 0; } catch (eEC) {}
         let efReason = null;
         if (sym === 'BTC' && btcWeekendClosed()) efReason = 'BTC weekend no-trade window (Phase 4.0): Sat 00:00 → Sun 12:00 ET';
+        // BTC EXT-FLIP conviction floor (2026-07-24, loser autopsy): BTC EXT-FLIP at conv ≤2
+        // went 1W/12SL/−$985 (knife-catches into BTC's ~$200 ATR), while conv ≥3 went 3W/1L
+        // /+~$300. Conviction is a clean discriminator here — require ≥3 on BTC. XAU/NAS EXT-
+        // FLIP unaffected (XAU ~flat, NAS not flagged).
+        else if (isBTC && _efConv < 3) efReason = 'BTC EXT-FLIP conv floor — conv ' + _efConv + ' < 3 (loser autopsy 7/24: conv≤2 = 1W/12SL/−$985; conv≥3 = 3W/1L/+$300)';
         else if (!(EF.burst >= 1.5)) efReason = 'no climax volume (burst ×' + (EF.burst || 0).toFixed(1) + ' < 1.5)';
         // Elite stand-down (2026-07-10): both 7/09 XAU flip losses (-$637/lot combined)
         // faded blocked conv-9/10 signals. An elite-conviction crest block is a TIMING
@@ -13086,7 +13118,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.7-20260724-btcride', // bump on each deploy — lets /state verify what's live
+    build: '5.10-20260724-extflipbtc', // bump on each deploy — lets /state verify what's live
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
     confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
     confBreakdown: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfBreakdown : null,
