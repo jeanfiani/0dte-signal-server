@@ -414,6 +414,10 @@ SYMBOLS.forEach(sym => {
     asianSweepLowTrough: 0,       // lowest price reached below asianL during sweep
     structSweepLastTs: 0,         // cooldown after STRUCT_SWEEP fires (per side)
     structSweepLastDir: null,
+    // Asian-level rejection (DORMANT experiment, 2026-07-27, Jean) — shadow-only
+    _arLowExtreme: 0, _arLowFired: false,   // low test extreme + would-fire-CALL latch
+    _arHighExtreme: 0, _arHighFired: false, // high test extreme + would-fire-PUT latch
+    _arLockDate: null,
     // Phase 3.9 (task #205) — Session lock tracking
     // Track when price first went above/below Asian range — if it stays there >30 min
     // without returning inside, the Asian setup is invalidated for the rest of the session.
@@ -3335,6 +3339,33 @@ function processPrice(sym, price, hi, lo) {
           log(sym, '🔒 STRUCT_SWEEP session-locked — Asian L $' + s.asianL_locked.toFixed(2) + ' broken cleanly (price held below 30+ min). No more Judas plays this session.');
         }
       }
+
+      // ===== ASIAN-LEVEL REJECTION (DORMANT, 2026-07-27, Jean idea) — SHADOW ONLY =====
+      // If price tested within 1×ATR of the Asian LOW (support) and then REJECTED +2×ATR off
+      // the test extreme without cleanly breaking it → log a would-fire CALL and shadow-track.
+      // Symmetric PUT off the Asian HIGH. Measures whether "level holds → reversal" is additive
+      // to STRUCT_SWEEP (which fires on the reclaim). NO firing effect — trackBlockedOutcome only.
+      try {
+        if (atrVal > 0) {
+          if (s._arLockDate !== s.asianLockedDate) { s._arLockDate = s.asianLockedDate; s._arLowExtreme = 0; s._arLowFired = false; s._arHighExtreme = 0; s._arHighFired = false; }
+          // --- Asian LOW → CALL ---
+          if (price < s.asianL_locked - atrVal) { s._arLowExtreme = 0; s._arLowFired = false; } // clean break >1×ATR below: invalidate
+          else if (price <= s.asianL_locked + atrVal) { if (s._arLowExtreme === 0 || price < s._arLowExtreme) s._arLowExtreme = price; } // testing the low
+          if (s._arLowExtreme > 0 && !s._arLowFired && (price - s._arLowExtreme) >= 2 * atrVal) {
+            s._arLowFired = true;
+            const _m = '🟢 ASIAN-REJ CALL (DORMANT) @ $' + price.toFixed(2) + ' — rejected +$' + (price - s._arLowExtreme).toFixed(2) + ' (≥2×ATR $' + (2 * atrVal).toFixed(2) + ') off Asian-low test $' + s._arLowExtreme.toFixed(2) + ' (Asian low $' + s.asianL_locked.toFixed(2) + '). Shadow-only, measuring vs STRUCT_SWEEP.';
+            log(sym, _m); trackBlockedOutcome(sym, _m, true);
+          }
+          // --- Asian HIGH → PUT ---
+          if (price > s.asianH_locked + atrVal) { s._arHighExtreme = 0; s._arHighFired = false; }
+          else if (price >= s.asianH_locked - atrVal) { if (s._arHighExtreme === 0 || price > s._arHighExtreme) s._arHighExtreme = price; }
+          if (s._arHighExtreme > 0 && !s._arHighFired && (s._arHighExtreme - price) >= 2 * atrVal) {
+            s._arHighFired = true;
+            const _m = '🔴 ASIAN-REJ PUT (DORMANT) @ $' + price.toFixed(2) + ' — rejected -$' + (s._arHighExtreme - price).toFixed(2) + ' (≥2×ATR $' + (2 * atrVal).toFixed(2) + ') off Asian-high test $' + s._arHighExtreme.toFixed(2) + ' (Asian high $' + s.asianH_locked.toFixed(2) + '). Shadow-only, measuring vs STRUCT_SWEEP.';
+            log(sym, _m); trackBlockedOutcome(sym, _m, true);
+          }
+        }
+      } catch (eAR) { /* dormant detector must never crash the tick */ }
     }
     // Liquidity pool sweep tracking: detect when nearest pool above/below has been pierced
     if (s.liqPoolsAbove && s.liqPoolsAbove.length > 0) {
@@ -4091,6 +4122,44 @@ function processPrice(sym, price, hi, lo) {
       }
       log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — BTC RIDE disabled but OVERRIDE-EXEMPT (' + (sig._vRec ? 'V-REC' : sig._revOverride ? 'REV' : 'V-CONT') + ') [' + (sig._confBreakdown || '') + ']. Allowed.');
     }
+    // ===== SUPPORT/RESISTANCE PROXIMITY GATE (2026-07-27) — no continuation short into unbroken support =====
+    // Jean case: XAU ⬇RIDE PUT fired @4085.47, only $0.78 above the day low 4084.69, with TP1
+    // ($4082.47) BELOW the low — a bet on a breakdown while sitting ON support. Gold bounced +$9 →
+    // SL. Neither conviction (5) nor the conf score (4/6) caught it — "at structure" scores as GOOD,
+    // but for a PUT leaning on support it's exactly backwards. Rule: block a CONTINUATION put within
+    // 1×ATR ABOVE an unbroken Asian/prior-day LOW (wait for the break); block a CONTINUATION call
+    // within 1×ATR BELOW an unbroken Asian/prior-day HIGH. Fade/reversal detectors are EXEMPT (they
+    // fade extremes by design), as are the structural overrides (V-REC / REV-OVERRIDE).
+    try {
+      const _isContSR = /BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(tagEarly)
+        && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP|LHF|LLF|INVERSAL|CHoCH|OBREJ|OBMIT|EXT-FLIP/.test(tagEarly);
+      if (isMT5 && _isContSR && atrVal > 0 && !sig._vRec && !sig._revOverride) {
+        const _prox = atrVal; // 1×ATR no-fire zone into an unbroken level
+        const _pd = (Array.isArray(s.dailyLevels) && s.dailyLevels.length >= 2) ? s.dailyLevels[s.dailyLevels.length - 2] : null;
+        const _pdLow = _pd && _pd.low > 0 ? _pd.low : null;
+        const _pdHigh = _pd && _pd.high > 0 ? _pd.high : null;
+        const _fin = (v) => typeof v === 'number' && v > 0 && isFinite(v);
+        if (sig.type === 'put') {
+          for (const [_lv, _nm] of [[s.asianL_locked, 'Asian'], [_pdLow, 'prior-day']]) {
+            if (_fin(_lv) && price > _lv && (price - _lv) <= _prox) {
+              Object.assign(s, _emitSnapshot);
+              const _m = '🧱 ' + tagEarly + ' PUT BLOCKED — support-proximity: $' + (price - _lv).toFixed(2) + ' (≤1×ATR $' + _prox.toFixed(2) + ') above UNBROKEN ' + _nm + ' low $' + _lv.toFixed(2) + '. Shorting into support — wait for the break (2026-07-27).';
+              log(sym, _m); trackBlockedOutcome(sym, _m, true);
+              return false;
+            }
+          }
+        } else if (sig.type === 'call') {
+          for (const [_lv, _nm] of [[s.asianH_locked, 'Asian'], [_pdHigh, 'prior-day']]) {
+            if (_fin(_lv) && price < _lv && (_lv - price) <= _prox) {
+              Object.assign(s, _emitSnapshot);
+              const _m = '🧱 ' + tagEarly + ' CALL BLOCKED — resistance-proximity: $' + (_lv - price).toFixed(2) + ' (≤1×ATR $' + _prox.toFixed(2) + ') below UNBROKEN ' + _nm + ' high $' + _lv.toFixed(2) + '. Buying into resistance — wait for the break (2026-07-27).';
+              log(sym, _m); trackBlockedOutcome(sym, _m, true);
+              return false;
+            }
+          }
+        }
+      }
+    } catch (eSR) { /* proximity gate must never crash enrichment */ }
     // ===== MT5 DAILY SIGNAL SAFETY VALVE (added 2026-06-11, audit v2 A1) =====
     // Equities are capped at MAX_SIG in the main path; MT5 specialists bypassed every cap.
     // Loose valve, not a tight cap — only a runaway day trips it. Sits here (not as an
@@ -13118,7 +13187,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.10-20260724-extflipbtc', // bump on each deploy — lets /state verify what's live
+    build: '5.12-20260727-asianrej', // bump on each deploy — lets /state verify what's live
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
     confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
     confBreakdown: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfBreakdown : null,
