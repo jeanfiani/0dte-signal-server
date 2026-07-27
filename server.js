@@ -4160,6 +4160,47 @@ function processPrice(sym, price, hi, lo) {
         }
       }
     } catch (eSR) { /* proximity gate must never crash enrichment */ }
+    // ===== MACD-LINE ALIGNMENT GATE (2026-07-27) — no continuation entry against momentum =====
+    // Two 7/27 XAU fades fired on metals confluence (conv-8, conf 4/6) with the MACD LINE pointing
+    // AGAINST the trade: RIDE+MACRO PUT @ macdL +0.32 (−$7) and STRUCT_VWAP CALL @ macdL −0.37
+    // (−$5) — a daily-direction argument overriding intraday timing. Fade/BREAK detectors already
+    // require macdL alignment; extend it to the momentum-continuation family. CALL needs macdL ≥0,
+    // PUT needs macdL ≤0. STRUCT_* EXCLUDED (net-profitable +$300, enters pre-turn by design — so
+    // it can't be caught here without risking its edge; shadow-test separately if wanted). Fades
+    // excluded (own gate). V-REC / REV overrides exempt.
+    try {
+      const _isContMom = /BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(tagEarly)
+        && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP|LHF|LLF|INVERSAL|CHoCH|OBREJ|OBMIT|EXT-FLIP|STRUCT/.test(tagEarly);
+      if (isMT5 && _isContMom && !sig._vRec && !sig._revOverride) {
+        const _ml = parseFloat(sig.macd);
+        if (!isNaN(_ml) && ((sig.type === 'call' && _ml < 0) || (sig.type === 'put' && _ml > 0))) {
+          // ===== DEFER-AND-CONFIRM (2026-07-27, Jean) — don't reject outright, WAIT for the turn =====
+          // A momentum-against entry is usually early, not wrong. Instead of killing the setup, park
+          // it: stamp the first sighting, and release a later same-direction candidate once momentum
+          // has actually turned toward the trade (histogram accelerating the right way AND the MACD
+          // line closer to zero than at stamp time). Window 30s → 3min: <30s isn't a turn, >3min the
+          // setup is stale. If the line fully flips into alignment this gate never triggers at all.
+          const _nowMd = Date.now();
+          const _md = s._macdDefer;
+          const _fresh = _md && _md.dir === sig.type && (_nowMd - _md.ts) >= 30000 && (_nowMd - _md.ts) <= 180000;
+          const _turning = (sig.type === 'call' && macdAccel > 0) || (sig.type === 'put' && macdAccel < 0);
+          const _improved = _md ? Math.abs(_ml) < Math.abs(_md.macd) : false;
+          if (_fresh && _turning && _improved) {
+            s._macdDefer = null;
+            log(sym, '⏱️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' MACD-DEFER RELEASED — waited ' + Math.round((_nowMd - _md.ts) / 1000) + 's, MACD line ' + (_md.macd >= 0 ? '+' : '') + _md.macd.toFixed(3) + ' → ' + (_ml >= 0 ? '+' : '') + _ml.toFixed(3) + ' (turning toward ' + sig.type.toUpperCase() + ', accel ' + macdAccel.toFixed(3) + '). Momentum confirmed — allowed.');
+          } else {
+            if (!_fresh) s._macdDefer = { dir: sig.type, ts: _nowMd, macd: _ml }; // first sighting → start the clock
+            Object.assign(s, _emitSnapshot);
+            const _waited = _md && _md.dir === sig.type ? Math.round((_nowMd - _md.ts) / 1000) + 's waited' : 'clock started';
+            const _m = '📉 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' DEFERRED — MACD line ' + (_ml >= 0 ? '+' : '') + _ml.toFixed(3) + ' against direction (need ' + (sig.type === 'call' ? '≥0' : '≤0') + '); ' + _waited + ', not turning yet (accel ' + macdAccel.toFixed(3) + '). Releases within 30s-3min if momentum flips (7/27 metals-confluence fade pattern).';
+            log(sym, _m); trackBlockedOutcome(sym, _m, true);
+            return false;
+          }
+        } else if (s._macdDefer && s._macdDefer.dir === sig.type) {
+          s._macdDefer = null; // line fully aligned — clear any pending defer
+        }
+      }
+    } catch (eML) { /* macd-line gate must never crash enrichment */ }
     // ===== MT5 DAILY SIGNAL SAFETY VALVE (added 2026-06-11, audit v2 A1) =====
     // Equities are capped at MAX_SIG in the main path; MT5 specialists bypassed every cap.
     // Loose valve, not a tight cap — only a runaway day trips it. Sits here (not as an
@@ -13187,7 +13228,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.12-20260727-asianrej', // bump on each deploy — lets /state verify what's live
+    build: '5.14-20260727-macddefer', // bump on each deploy — lets /state verify what's live
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
     confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
     confBreakdown: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfBreakdown : null,
