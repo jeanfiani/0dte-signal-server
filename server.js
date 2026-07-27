@@ -4076,6 +4076,10 @@ function processPrice(sym, price, hi, lo) {
         }
       }
     } catch (eCS) { /* scorer must never affect firing */ }
+    // HOTFIX 2026-07-27: `tagEarly` is declared far below (const → temporal dead zone), so the
+    // gates in this section MUST NOT reference it — doing so threw a ReferenceError on every
+    // BTC/NAS candidate and silently killed both symbols' signal flow. Use this local instead.
+    const _tagX = (sig && sig.score) || '';
     // ===== BTC RIDE DISABLED (2026-07-24) — RIDE loser autopsy =====
     // 2-week fired data: vanilla BTC RIDE/RIDE+MACRO = 3 wins (+$71) vs 18 SL (−$1,742),
     // ~14% WR, losing at EVERY conviction tier (the worst single loss, −$142, was conv-9).
@@ -4085,12 +4089,12 @@ function processPrice(sym, price, hi, lo) {
     // and V-CONT — which produced BTC's actual winners (+$212, +$469) by firing on confirmed
     // structure rather than momentum-chase. STRUCT_VWAP / INVERSAL_BREAK / LHF / CHoCH are
     // different detectors and unaffected. XAU/NAS RIDE unaffected (XAU +$10, NAS secondary).
-    if ((isBTC || isNAS) && /RIDE/.test(tagEarly)) {
+    if ((isBTC || isNAS) && /RIDE/.test(_tagX)) {
       const _rideExempt = sig._vRec || sig._revOverride ||
         (sig._cStr === 1 && sig._cHtf === 1 && (sig._confScore || 0) >= 4); // V-CONT eligibility
       if (!_rideExempt) {
         Object.assign(s, _emitSnapshot);
-        const _brMsg = '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' RIDE disabled (loser autopsy 2026-07-24: vanilla RIDE loses at every conv tier — BTC ~14% WR / −$1,671, NAS ~11% WR / −$261 over 2wk). Overrides (V-REC/REV/V-CONT) exempt; STRUCT/INVERSAL/LHF unaffected. XAU RIDE unaffected.';
+        const _brMsg = '🚫 ' + _tagX + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' RIDE disabled (loser autopsy 2026-07-24: vanilla RIDE loses at every conv tier — BTC ~14% WR / −$1,671, NAS ~11% WR / −$261 over 2wk). Overrides (V-REC/REV/V-CONT) exempt; STRUCT/INVERSAL/LHF unaffected. XAU RIDE unaffected.';
         log(sym, _brMsg);
         trackBlockedOutcome(sym, _brMsg, true); // control: RIDE's own 1:1 outcome (should keep losing)
         // ===== SHADOW-FADE EXPERIMENT (2026-07-24) — test "fade the loser" hypothesis =====
@@ -4120,7 +4124,7 @@ function processPrice(sym, price, hi, lo) {
         } catch (eFade) {}
         return false;
       }
-      log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — BTC RIDE disabled but OVERRIDE-EXEMPT (' + (sig._vRec ? 'V-REC' : sig._revOverride ? 'REV' : 'V-CONT') + ') [' + (sig._confBreakdown || '') + ']. Allowed.');
+      log(sym, '↪️ ' + _tagX + ' ' + sig.type.toUpperCase() + ' — BTC RIDE disabled but OVERRIDE-EXEMPT (' + (sig._vRec ? 'V-REC' : sig._revOverride ? 'REV' : 'V-CONT') + ') [' + (sig._confBreakdown || '') + ']. Allowed.');
     }
     // ===== SUPPORT/RESISTANCE PROXIMITY GATE (2026-07-27) — no continuation short into unbroken support =====
     // Jean case: XAU ⬇RIDE PUT fired @4085.47, only $0.78 above the day low 4084.69, with TP1
@@ -4131,8 +4135,8 @@ function processPrice(sym, price, hi, lo) {
     // within 1×ATR BELOW an unbroken Asian/prior-day HIGH. Fade/reversal detectors are EXEMPT (they
     // fade extremes by design), as are the structural overrides (V-REC / REV-OVERRIDE).
     try {
-      const _isContSR = /BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(tagEarly)
-        && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP|LHF|LLF|INVERSAL|CHoCH|OBREJ|OBMIT|EXT-FLIP/.test(tagEarly);
+      const _isContSR = /BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(_tagX)
+        && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP|LHF|LLF|INVERSAL|CHoCH|OBREJ|OBMIT|EXT-FLIP/.test(_tagX);
       if (isMT5 && _isContSR && atrVal > 0 && !sig._vRec && !sig._revOverride) {
         const _prox = atrVal; // 1×ATR no-fire zone into an unbroken level
         const _pd = (Array.isArray(s.dailyLevels) && s.dailyLevels.length >= 2) ? s.dailyLevels[s.dailyLevels.length - 2] : null;
@@ -4143,7 +4147,7 @@ function processPrice(sym, price, hi, lo) {
           for (const [_lv, _nm] of [[s.asianL_locked, 'Asian'], [_pdLow, 'prior-day']]) {
             if (_fin(_lv) && price > _lv && (price - _lv) <= _prox) {
               Object.assign(s, _emitSnapshot);
-              const _m = '🧱 ' + tagEarly + ' PUT BLOCKED — support-proximity: $' + (price - _lv).toFixed(2) + ' (≤1×ATR $' + _prox.toFixed(2) + ') above UNBROKEN ' + _nm + ' low $' + _lv.toFixed(2) + '. Shorting into support — wait for the break (2026-07-27).';
+              const _m = '🧱 ' + _tagX + ' PUT BLOCKED — support-proximity: $' + (price - _lv).toFixed(2) + ' (≤1×ATR $' + _prox.toFixed(2) + ') above UNBROKEN ' + _nm + ' low $' + _lv.toFixed(2) + '. Shorting into support — wait for the break (2026-07-27).';
               log(sym, _m); trackBlockedOutcome(sym, _m, true);
               return false;
             }
@@ -4152,7 +4156,7 @@ function processPrice(sym, price, hi, lo) {
           for (const [_lv, _nm] of [[s.asianH_locked, 'Asian'], [_pdHigh, 'prior-day']]) {
             if (_fin(_lv) && price < _lv && (_lv - price) <= _prox) {
               Object.assign(s, _emitSnapshot);
-              const _m = '🧱 ' + tagEarly + ' CALL BLOCKED — resistance-proximity: $' + (_lv - price).toFixed(2) + ' (≤1×ATR $' + _prox.toFixed(2) + ') below UNBROKEN ' + _nm + ' high $' + _lv.toFixed(2) + '. Buying into resistance — wait for the break (2026-07-27).';
+              const _m = '🧱 ' + _tagX + ' CALL BLOCKED — resistance-proximity: $' + (_lv - price).toFixed(2) + ' (≤1×ATR $' + _prox.toFixed(2) + ') below UNBROKEN ' + _nm + ' high $' + _lv.toFixed(2) + '. Buying into resistance — wait for the break (2026-07-27).';
               log(sym, _m); trackBlockedOutcome(sym, _m, true);
               return false;
             }
@@ -4169,8 +4173,8 @@ function processPrice(sym, price, hi, lo) {
     // it can't be caught here without risking its edge; shadow-test separately if wanted). Fades
     // excluded (own gate). V-REC / REV overrides exempt.
     try {
-      const _isContMom = /BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(tagEarly)
-        && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP|LHF|LLF|INVERSAL|CHoCH|OBREJ|OBMIT|EXT-FLIP|STRUCT/.test(tagEarly);
+      const _isContMom = /BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(_tagX)
+        && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP|LHF|LLF|INVERSAL|CHoCH|OBREJ|OBMIT|EXT-FLIP|STRUCT/.test(_tagX);
       if (isMT5 && _isContMom && !sig._vRec && !sig._revOverride) {
         const _ml = parseFloat(sig.macd);
         if (!isNaN(_ml) && ((sig.type === 'call' && _ml < 0) || (sig.type === 'put' && _ml > 0))) {
@@ -4187,12 +4191,12 @@ function processPrice(sym, price, hi, lo) {
           const _improved = _md ? Math.abs(_ml) < Math.abs(_md.macd) : false;
           if (_fresh && _turning && _improved) {
             s._macdDefer = null;
-            log(sym, '⏱️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' MACD-DEFER RELEASED — waited ' + Math.round((_nowMd - _md.ts) / 1000) + 's, MACD line ' + (_md.macd >= 0 ? '+' : '') + _md.macd.toFixed(3) + ' → ' + (_ml >= 0 ? '+' : '') + _ml.toFixed(3) + ' (turning toward ' + sig.type.toUpperCase() + ', accel ' + macdAccel.toFixed(3) + '). Momentum confirmed — allowed.');
+            log(sym, '⏱️ ' + _tagX + ' ' + sig.type.toUpperCase() + ' MACD-DEFER RELEASED — waited ' + Math.round((_nowMd - _md.ts) / 1000) + 's, MACD line ' + (_md.macd >= 0 ? '+' : '') + _md.macd.toFixed(3) + ' → ' + (_ml >= 0 ? '+' : '') + _ml.toFixed(3) + ' (turning toward ' + sig.type.toUpperCase() + ', accel ' + macdAccel.toFixed(3) + '). Momentum confirmed — allowed.');
           } else {
             if (!_fresh) s._macdDefer = { dir: sig.type, ts: _nowMd, macd: _ml }; // first sighting → start the clock
             Object.assign(s, _emitSnapshot);
             const _waited = _md && _md.dir === sig.type ? Math.round((_nowMd - _md.ts) / 1000) + 's waited' : 'clock started';
-            const _m = '📉 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' DEFERRED — MACD line ' + (_ml >= 0 ? '+' : '') + _ml.toFixed(3) + ' against direction (need ' + (sig.type === 'call' ? '≥0' : '≤0') + '); ' + _waited + ', not turning yet (accel ' + macdAccel.toFixed(3) + '). Releases within 30s-3min if momentum flips (7/27 metals-confluence fade pattern).';
+            const _m = '📉 ' + _tagX + ' ' + sig.type.toUpperCase() + ' DEFERRED — MACD line ' + (_ml >= 0 ? '+' : '') + _ml.toFixed(3) + ' against direction (need ' + (sig.type === 'call' ? '≥0' : '≤0') + '); ' + _waited + ', not turning yet (accel ' + macdAccel.toFixed(3) + '). Releases within 30s-3min if momentum flips (7/27 metals-confluence fade pattern).';
             log(sym, _m); trackBlockedOutcome(sym, _m, true);
             return false;
           }
@@ -4231,7 +4235,7 @@ function processPrice(sym, price, hi, lo) {
     // effectively "today's session vs N hours ago" — close enough to catch obvious
     // directional regimes like today's QQQ +$5/2hr rally.
     {
-      const tagEarlyRG = sig.score || '';
+      const _tagXRG = sig.score || '';
       let regimeNetChgPctRG = null;
       let regimeWindowLabelRG = '';
       if (price > 0) {
@@ -4287,11 +4291,11 @@ function processPrice(sym, price, hi, lo) {
           // regime entirely in strong regime, and during weak only if signal is a fade
           // detector (HI/LO/6/6) — those are the ones that consistently fire counter-trend.
           if (isEq) {
-            const isCounterFade = /HI|LO|6\/6|7\/6/.test(tagEarlyRG);
+            const isCounterFade = /HI|LO|6\/6|7\/6/.test(_tagXRG);
             if (regimeStrengthRG === 2 || isCounterFade) {
               const strengthLabel = regimeStrengthRG === 2 ? 'STRONG' : 'WEAK';
               const dirLabel = regimeDirRG.toUpperCase();
-              log(sym, '🌍 ' + tagEarlyRG + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + strengthLabel + ' ' + dirLabel + ' intraday regime (' + regimeWindowLabelRG + ' ' + (regimeNetChgPctRG >= 0 ? '+' : '') + regimeNetChgPctRG.toFixed(2) + '%): equity counter-trend ' + (isCounterFade ? 'fade' : 'signal') + ' blocked.');
+              log(sym, '🌍 ' + _tagXRG + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + strengthLabel + ' ' + dirLabel + ' intraday regime (' + regimeWindowLabelRG + ' ' + (regimeNetChgPctRG >= 0 ? '+' : '') + regimeNetChgPctRG.toFixed(2) + '%): equity counter-trend ' + (isCounterFade ? 'fade' : 'signal') + ' blocked.');
               return false;
             }
           } else {
@@ -4318,7 +4322,7 @@ function processPrice(sym, price, hi, lo) {
                     if (_ctStr && _ctStr.ok) {
                       _ctWaive = true;
                       if (typeof _ctStr.structSl === 'number') { s._structSl = _ctStr.structSl; s._structSlUntil = Date.now() + 5000; }
-                      log(sym, '↪️ ' + tagEarlyRG + ' ' + sig.type.toUpperCase() + ' — NAS recovery waiver (2026-07-20): conv ' + conv.score + ' + confirmed recovery ' + _ctRec.offPct.toFixed(2) + '% off session low (held ' + Math.round(_ctRec.ageMin) + 'min)' + (_ctStr.anchorName ? ' · anchored to ' + _ctStr.anchorName : '') + '. Regime floor waived.');
+                      log(sym, '↪️ ' + _tagXRG + ' ' + sig.type.toUpperCase() + ' — NAS recovery waiver (2026-07-20): conv ' + conv.score + ' + confirmed recovery ' + _ctRec.offPct.toFixed(2) + '% off session low (held ' + Math.round(_ctRec.ageMin) + 'min)' + (_ctStr.anchorName ? ' · anchored to ' + _ctStr.anchorName : '') + '. Regime floor waived.');
                     }
                   }
                 }
@@ -4327,7 +4331,7 @@ function processPrice(sym, price, hi, lo) {
               Object.assign(s, _emitSnapshot);
               const strengthLabel = regimeStrengthRG === 2 ? 'STRONG' : 'WEAK';
               const dirLabel = regimeDirRG.toUpperCase();
-              log(sym, '🌍 ' + tagEarlyRG + ' ' + sig.type.toUpperCase() + ' BLOCKED — multi-day ' + strengthLabel + ' ' + dirLabel + ' regime (' + regimeWindowLabelRG + ' ' + (regimeNetChgPctRG >= 0 ? '+' : '') + regimeNetChgPctRG.toFixed(1) + '%): counter-direction needs conv ≥' + requiredConv + ', got ' + conv.score + '/7.');
+              log(sym, '🌍 ' + _tagXRG + ' ' + sig.type.toUpperCase() + ' BLOCKED — multi-day ' + strengthLabel + ' ' + dirLabel + ' regime (' + regimeWindowLabelRG + ' ' + (regimeNetChgPctRG >= 0 ? '+' : '') + regimeNetChgPctRG.toFixed(1) + '%): counter-direction needs conv ≥' + requiredConv + ', got ' + conv.score + '/7.');
               return false;
               } // end NAS recovery waiver
             }
@@ -4340,9 +4344,9 @@ function processPrice(sym, price, hi, lo) {
         // (3 losses) fired inside that blind window on a +1.5% call day, the exact pattern
         // the gate had been blocking the day before. If we can't see the tape's direction,
         // counter-trend fades don't fire. Trend-mirror (TMIR) signals are unaffected.
-        const isFadeNoRegime = /HI|LO|6\/6|7\/6/.test(tagEarlyRG);
+        const isFadeNoRegime = /HI|LO|6\/6|7\/6/.test(_tagXRG);
         if (isFadeNoRegime && !String(sig.type).startsWith('exit')) {
-          log(sym, '🌫️ ' + tagEarlyRG + ' ' + sig.type.toUpperCase() + ' BLOCKED — regime unavailable (macroSnaps window < 2h, likely post-restart). No regime reading = no fades (F2).');
+          log(sym, '🌫️ ' + _tagXRG + ' ' + sig.type.toUpperCase() + ' BLOCKED — regime unavailable (macroSnaps window < 2h, likely post-restart). No regime reading = no fades (F2).');
           return false;
         }
       }
@@ -13228,7 +13232,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.14-20260727-macddefer', // bump on each deploy — lets /state verify what's live
+    build: '5.15-20260727-tdzhotfix', // bump on each deploy — lets /state verify what's live
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
     confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
     confBreakdown: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfBreakdown : null,
