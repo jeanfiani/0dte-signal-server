@@ -142,6 +142,37 @@ function saveSubs() { fs.writeFileSync(SUBS_FILE, JSON.stringify(subscriptions, 
 
 // ===== PER-SYMBOL STATE =====
 const S = {};
+
+// ===== BROKER SYMBOL ALIASES (2026-07-28) =====
+// Signal Trader / the EA identify instruments by the BROKER's symbol name, which differs from
+// our canonical keys (e.g. broker "NAS100.fs" vs our "NAS100"). A mismatch means the payload
+// arrives and is silently ignored — the 7/28 case where XAU executed fine but NAS never did.
+// Aliases are additive: /prices publishes BOTH keys (same object) and stamps brokerSymbol, and
+// /state//blocked-outcomes resolve an alias back to the canonical symbol. Override per-symbol
+// with env ALIAS_NAS100 / ALIAS_XAU / ALIAS_BTC / ALIAS_QQQ / ALIAS_SPY.
+const SYMBOL_ALIASES = {
+  NAS100: process.env.ALIAS_NAS100 || 'NAS100.fs',
+  XAU: process.env.ALIAS_XAU || '',
+  BTC: process.env.ALIAS_BTC || '',
+  QQQ: process.env.ALIAS_QQQ || '',
+  SPY: process.env.ALIAS_SPY || ''
+};
+// alias (upper) -> canonical
+const ALIAS_TO_CANON = {};
+for (const _c of Object.keys(SYMBOL_ALIASES)) {
+  const _a = (SYMBOL_ALIASES[_c] || '').trim();
+  if (_a) ALIAS_TO_CANON[_a.toUpperCase()] = _c;
+}
+function resolveSymbol(raw) {
+  if (!raw) return raw;
+  const u = String(raw).toUpperCase();
+  if (S[u]) return u;                       // already canonical
+  if (ALIAS_TO_CANON[u]) return ALIAS_TO_CANON[u];
+  const stripped = u.replace(/[._-][A-Z]+$/, ''); // NAS100.FS -> NAS100, XAUUSD.M -> XAUUSD
+  if (S[stripped]) return stripped;
+  return u;
+}
+
 SYMBOLS.forEach(sym => {
   S[sym] = {
     prices: [], highs: [], lows: [],
@@ -4205,6 +4236,49 @@ function processPrice(sym, price, hi, lo) {
         }
       }
     } catch (eML) { /* macd-line gate must never crash enrichment */ }
+    // ===== BTC INVERSAL_BREAK PUT-SIDE DISABLED (2026-07-28) — 0W/10L =====
+    // Autopsy 7/24 had the BTC INVERSAL PUT side at 0 wins in 9 (−$605, worst stops −229/−181
+    // /−178); held dormant. It lost again overnight 7/27→28 (00:37 @63,176 → SL 63,337, −$161),
+    // making it 0W/10L. Shorting BTC failed-breakouts simply doesn't work — a side with zero
+    // wins in ten attempts can't be fixed with a tighter stop. The CALL side (1W/2SL + 6
+    // scratches, ≈breakeven with TP1 banking) is KEPT. Overrides exempt as always.
+    try {
+      if (isBTC && sig.type === 'put' && /INVERSAL_BREAK/.test(_tagX) && !sig._vRec && !sig._revOverride) {
+        Object.assign(s, _emitSnapshot);
+        const _m = '🚫 ' + _tagX + ' PUT BLOCKED — BTC INVERSAL_BREAK put-side disabled (0W/10L lifetime, −$766; 7/27 −$161). Failed-breakout shorts on BTC never win. CALL side unaffected.';
+        log(sym, _m); trackBlockedOutcome(sym, _m, true);
+        return false;
+      }
+    } catch (eIB) { /* must never crash enrichment */ }
+    // ===== BTC RSI EXHAUSTION FLOOR (2026-07-28) — don't sell the flush low / buy the blow-off =====
+    // 7/27 20:11 STRUCT_LIQ_GRAB PUT fired at RSI 28.7 (MACD −28.9) right at the bottom of a
+    // −0.35% flush and price bounced $250 → −$249.78, the night's biggest loss. The existing
+    // capitulation guard is asymmetric (blocks CALLs at oversold, PUTs at overbought) so nothing
+    // stopped a PUT into oversold. This mirrors the proven QQQ RSI-exhaustion floor (30/70),
+    // ported to BTC where the $150-250 stops make the mistake expensive.
+    // Direction-aware by construction: fades of a LOW fire CALLs (allowed at RSI<30) and fades
+    // of a HIGH fire PUTs (allowed at RSI>70) — only the wrong-side entries are blocked.
+    // Exempt: V-REC / REV-OVERRIDE (post-crash bounces are supposed to buy oversold) and an
+    // active GRIND leg in the signal's direction (a real trend can hold RSI<30 while continuing).
+    try {
+      if (isBTC && typeof rsiV === 'number' && !sig._vRec && !sig._revOverride) {
+        const _grindAligned = !!(s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000) && s._grindDir === sig.type);
+        if (!_grindAligned) {
+          if (sig.type === 'put' && rsiV < 30) {
+            Object.assign(s, _emitSnapshot);
+            const _m = '🛑 ' + _tagX + ' PUT BLOCKED — BTC RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' < 30 (oversold). Selling the flush low — the 7/27 −$250 STRUCT_LIQ_GRAB pattern.';
+            log(sym, _m); trackBlockedOutcome(sym, _m, true);
+            return false;
+          }
+          if (sig.type === 'call' && rsiV > 70) {
+            Object.assign(s, _emitSnapshot);
+            const _m = '🛑 ' + _tagX + ' CALL BLOCKED — BTC RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' > 70 (overbought). Buying the blow-off high.';
+            log(sym, _m); trackBlockedOutcome(sym, _m, true);
+            return false;
+          }
+        }
+      }
+    } catch (eRX) { /* must never crash enrichment */ }
     // ===== MT5 DAILY SIGNAL SAFETY VALVE (added 2026-06-11, audit v2 A1) =====
     // Equities are capped at MAX_SIG in the main path; MT5 specialists bypassed every cap.
     // Loose valve, not a tight cap — only a runaway day trips it. Sits here (not as an
@@ -13072,7 +13146,7 @@ app.post('/trade/clear', (req, res) => {
 const CLOSE_TOKEN = process.env.CLOSE_TOKEN || '';
 const CLOSE_REQ_TTL_MS = 60000;
 app.post('/trade/close', (req, res) => {
-  const sym = (req.body && req.body.sym || '').toUpperCase();
+  const sym = resolveSymbol(req.body && req.body.sym);
   const token = (req.headers['x-close-token'] || (req.body && req.body.token) || '');
   if (CLOSE_TOKEN && token !== CLOSE_TOKEN) return res.status(403).json({ error: 'bad token' });
   const s = S[sym];
@@ -13087,7 +13161,7 @@ app.post('/trade/close', (req, res) => {
 
 // EA acknowledges it has flattened the position → clear the flag (idempotent by id).
 app.post('/trade/close/ack', (req, res) => {
-  const sym = (req.body && req.body.sym || '').toUpperCase();
+  const sym = resolveSymbol(req.body && req.body.sym);
   const id = req.body && req.body.id;
   const s = S[sym];
   if (!s) return res.status(400).json({ error: 'Unknown symbol' });
@@ -13109,7 +13183,7 @@ app.post('/trade/close/ack', (req, res) => {
 //   - Mixed = need more data or per-detector analysis
 // Read-only — no side effects on signal firing.
 app.get('/blocked-outcomes/:sym', (req, res) => {
-  const sym = req.params.sym.toUpperCase();
+  const sym = resolveSymbol(req.params.sym); // broker alias aware
   const s = S[sym];
   if (!s) return res.status(404).json({ error: 'Unknown symbol: ' + sym });
   let outcomes = Array.isArray(s.blockedOutcomes) ? s.blockedOutcomes : [];
@@ -13178,7 +13252,7 @@ app.get('/blocked-outcomes/:sym', (req, res) => {
 });
 
 app.get('/state/:sym', (req, res) => {
-  const sym = req.params.sym.toUpperCase();
+  const sym = resolveSymbol(req.params.sym); // broker alias aware (NAS100.fs -> NAS100)
   const s = S[sym];
   if (!s) return res.status(404).json({ error: 'Unknown symbol: ' + sym });
 
@@ -13232,7 +13306,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.15-20260727-tdzhotfix', // bump on each deploy — lets /state verify what's live
+    build: '5.17-20260728-symalias', // bump on each deploy — lets /state verify what's live
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
     confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
     confBreakdown: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfBreakdown : null,
@@ -13635,7 +13709,18 @@ app.get('/prices', (req, res) => {
       } : null
     };
   });
-  res.json({ vix: vixV, dxy: { price: dxyPrice, dir: dxyDir, roc3: dxyRoc3 }, tlt: { price: tltPrice, dir: tltDir, roc3: tltRoc3 }, slv: { price: slvPrice, dir: slvDir, roc3: slvRoc3 }, gdx: { price: gdxPrice, dir: gdxDir, roc3: gdxRoc3 }, wsConnected: ws && ws.readyState === 1, ts: Date.now(), symbols: data });
+  // Broker-alias publication (2026-07-28): stamp brokerSymbol on every entry, and expose the
+  // SAME object under the broker's key too (e.g. symbols["NAS100.fs"]). An EA that looks itself
+  // up by its chart symbol now finds a match without any EA-side mapping change.
+  try {
+    for (const _c of Object.keys(data)) {
+      const _a = (SYMBOL_ALIASES[_c] || '').trim();
+      data[_c].symbol = _c;
+      data[_c].brokerSymbol = _a || _c;
+      if (_a && !data[_a]) data[_a] = data[_c]; // same reference — no payload duplication cost
+    }
+  } catch (eAl) { /* alias publication must never break /prices */ }
+  res.json({ vix: vixV, dxy: { price: dxyPrice, dir: dxyDir, roc3: dxyRoc3 }, tlt: { price: tltPrice, dir: tltDir, roc3: tltRoc3 }, slv: { price: slvPrice, dir: slvDir, roc3: slvRoc3 }, gdx: { price: gdxPrice, dir: gdxDir, roc3: gdxRoc3 }, wsConnected: ws && ws.readyState === 1, ts: Date.now(), aliases: SYMBOL_ALIASES, symbols: data });
 });
 
 // Status endpoint
