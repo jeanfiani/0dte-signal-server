@@ -1260,6 +1260,18 @@ if (FMP_API_KEY) {
 // Finnhub endpoint: /calendar/economic?from=YYYY-MM-DD&to=YYYY-MM-DD (free tier OK)
 const NEWS_BLACKOUT_BEFORE_MIN = 15;   // block entries this many min BEFORE event
 const NEWS_BLACKOUT_AFTER_MIN  = 30;   // block entries this many min AFTER event
+// ===== POST-NEWS OVERRIDE LOCKOUT (2026-07-29) =====
+// Normal signals resume at +30 min. The OVERRIDES do not: a news print moves price, momentum
+// and BOTH higher timeframes at once, which is precisely the str+mom+htf "confirmed flip"
+// signature REV-OVERRIDE / V-CONT / V-REC are built to trust. That makes an FOMC the most
+// reliable way to manufacture a false 4/6 grade. 7/29 proof: XAU CALL @4105.40 (+56min) and
+// NAS CALL @28,053.38 (+60min), both conf 4/6 [str1 mom1 held1 htf1 vol0], both fired by the
+// overrides, both SL'd immediately (−$18.15 / −$112.23) as the post-Fed fade set in.
+// Rule: for 120 min after a high-impact event, an override may only fire WITH real volume
+// (vol=1). A genuine post-news trend carries participation; a hollow spike doesn't — and both
+// 7/29 losers had vol0. Normal gated signals are untouched.
+const NEWS_OVERRIDE_LOCKOUT_MIN = parseInt(process.env.NEWS_OVERRIDE_LOCKOUT_MIN, 10) || 120;
+let lastHighImpactEvent = { ts: 0, name: null, impact: null };
 let _econCalCache = { events: [], lastFetchTs: 0 };
 async function pollEconomicCalendar() {
   try {
@@ -1328,6 +1340,14 @@ function applyEconomicCalendarBlackout() {
         break;
       }
     }
+  }
+  // ===== LAST HIGH-IMPACT EVENT STAMP (2026-07-29) =====
+  // The blackout only spans −15/+30 min, and events older than that are dropped from the cache
+  // entirely — so after the window closes there's no record an FOMC just happened. The 7/29
+  // post-Fed reversal killed two override fires at +56 and +60 min, well past that horizon.
+  // Latch the event while it IS active so the post-news override lockout can measure age.
+  if (active && eventTs > 0 && eventTs > lastHighImpactEvent.ts) {
+    lastHighImpactEvent = { ts: eventTs, name: eventName || 'high-impact event', impact: impact || null };
   }
   SYMBOLS.forEach(sym => {
     const s = S[sym];
@@ -4150,6 +4170,25 @@ function processPrice(sym, price, hi, lo) {
     // gates in this section MUST NOT reference it — doing so threw a ReferenceError on every
     // BTC/NAS candidate and silently killed both symbols' signal flow. Use this local instead.
     const _tagX = (sig && sig.score) || '';
+    // ===== POST-NEWS OVERRIDE LOCKOUT (2026-07-29) — the 7/29 FOMC guard =====
+    // Within NEWS_OVERRIDE_LOCKOUT_MIN of a high-impact event, strip override privileges from
+    // any signal WITHOUT real volume. We neuter the flags rather than hard-blocking, so a
+    // signal that qualifies on its own merits still fires — only the override rescue is denied.
+    // vol=1 (real VOL×≥1.3) keeps genuine volume-backed post-news trends tradeable.
+    try {
+      if (isMT5 && lastHighImpactEvent.ts > 0) {
+        const _newsAgeMin = (Date.now() - lastHighImpactEvent.ts) / 60000;
+        if (_newsAgeMin >= 0 && _newsAgeMin <= NEWS_OVERRIDE_LOCKOUT_MIN && sig._cVol !== 1) {
+          if (sig._revOverride || sig._vRec) {
+            const _nlMsg = '📰 ' + _tagX + ' ' + sig.type.toUpperCase() + ' OVERRIDE LOCKED OUT — ' + Math.round(_newsAgeMin) + 'min after ' + lastHighImpactEvent.name + ' with vol0 [' + (sig._confBreakdown || '') + ']. News spikes align str+mom+htf artificially; override privileges revoked for ' + NEWS_OVERRIDE_LOCKOUT_MIN + 'min unless real volume confirms (7/29 FOMC: −$18 XAU / −$112 NAS).';
+            log(sym, _nlMsg); trackBlockedOutcome(sym, _nlMsg, true);
+          }
+          sig._newsLockout = true;
+          sig._revOverride = false;   // REV-OVERRIDE cannot rescue a hollow post-news spike
+          sig._vRec = false;          // V-REC likewise
+        }
+      }
+    } catch (eNL) { /* news lockout must never crash enrichment */ }
     // ===== BTC TRADING DISABLED (2026-07-29) =====
     // BTC lost every archived week (−2160 / −685 / −1389) and kept bleeding through four
     // targeted cuts in 48h: RIDE disabled, EXT-FLIP conv floor, INVERSAL put-side, RSI floor.
@@ -4185,9 +4224,15 @@ function processPrice(sym, price, hi, lo) {
     // and V-CONT — which produced BTC's actual winners (+$212, +$469) by firing on confirmed
     // structure rather than momentum-chase. STRUCT_VWAP / INVERSAL_BREAK / LHF / CHoCH are
     // different detectors and unaffected. XAU/NAS RIDE unaffected (XAU +$10, NAS secondary).
-    if ((isBTC || isNAS) && /RIDE/.test(_tagX)) {
+    // NAS RIDE RE-ENABLED (2026-07-29, Jean): the autopsy lumped NAS in with BTC, but the cost
+    // was −$261 vs BTC's −$1,742 — BTC was the real problem. Chop-flag review: 3 of 4 known NAS
+    // RIDE losers fired with chop:1, while 7/29's blocked winner (15:20 PUT @27,785, TP1 in 21s
+    // on the 800-pt FOMC collapse) was chop:0. The existing chop gate already blocks RIDE while
+    // chopActive (RIDE isn't in isFadeAllowedInChop), so re-enabling NAS gives "RIDE only outside
+    // chop" for free — provided the chop BYPASSES can't leak it back in (closed below).
+    if (isBTC && /RIDE/.test(_tagX)) {
       const _rideExempt = sig._vRec || sig._revOverride ||
-        (sig._cStr === 1 && sig._cHtf === 1 && (sig._confScore || 0) >= 4); // V-CONT eligibility
+        (sig._cStr === 1 && sig._cHtf === 1 && (sig._confScore || 0) >= 4 && !sig._newsLockout); // V-CONT eligibility
       if (!_rideExempt) {
         Object.assign(s, _emitSnapshot);
         const _brMsg = '🚫 ' + _tagX + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' RIDE disabled (loser autopsy 2026-07-24: vanilla RIDE loses at every conv tier — BTC ~14% WR / −$1,671, NAS ~11% WR / −$261 over 2wk). Overrides (V-REC/REV/V-CONT) exempt; STRUCT/INVERSAL/LHF unaffected. XAU RIDE unaffected.';
@@ -4887,7 +4932,10 @@ function processPrice(sym, price, hi, lo) {
         // this fires the 09:30/10:32/10:51/11:07 blocked winners-or-scratches and still
         // excludes the 09:59/10:35 bounce-zone losers (3/6) and 2/6 knife-chases.
         // Waives: grind conv floor + grind entry-quality. All safety gates still apply.
-        const _vCont = !!(sig._cStr === 1 && sig._cHtf === 1 && (sig._confScore || 0) >= 4);
+        // !sig._newsLockout (2026-07-29): V-CONT is computed independently of _revOverride/_vRec,
+        // so the post-news lockout must be applied here too — otherwise V-CONT alone would still
+        // have waived the entry-quality gate for the 7/29 NAS FOMC CALL (it did exactly that).
+        const _vCont = !!(sig._cStr === 1 && sig._cHtf === 1 && (sig._confScore || 0) >= 4 && !sig._newsLockout);
         if (_gScore === 5 && _gFloor === 6 && !_vCont) {
           const msgG = '🌀 GRIND-DORMANT conv-5 would-fire — ' + tagEarly + ' ' + sig.type.toUpperCase() + ' @ $' + price.toFixed(2) + ' aligned with grind but conv 5 < 6 floor (Phase 3.96). Shadow-tracking to calibrate the floor.';
           log(sym, msgG);
@@ -5776,6 +5824,19 @@ function processPrice(sym, price, hi, lo) {
             }
           }
         } catch (eCb) {}
+        // ===== RIDE MAY NEVER BYPASS CHOP (2026-07-29, Jean) =====
+        // Re-enabling NAS RIDE relies on the chop gate to keep it out of ranges — 3 of 4 known
+        // NAS RIDE losers fired with chop:1, while 7/29's blocked winner was chop:0. But the
+        // VOL≥1.5 / BTC-mild / XAU-metals / cross-asset bypasses could leak RIDE straight back
+        // into chop and recreate exactly those losses. RIDE (incl. RIDE+MACRO) is therefore
+        // barred from ALL chop bypasses. The structural overrides (V-REC / REV-OVERRIDE) are
+        // unaffected — those are confirmed-reversal entries, not momentum chases.
+        if (/RIDE/.test(tagEarly) && !sig._vRec && !sig._revOverride &&
+            (_chopVolBypass || _btcMildChopBypass || _xauMetalsBypass || _crossAssetBypass)) {
+          _chopVolBypass = false; _btcMildChopBypass = false; _xauMetalsBypass = false; _crossAssetBypass = false;
+          const _rvMsg = '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — chop bypass REVOKED for RIDE (2026-07-29): RIDE must respect chop mode. Overrides (V-REC/REV) still exempt.';
+          log(sym, _rvMsg); trackBlockedOutcome(sym, _rvMsg, true);
+        }
         // REVERSAL-OVERRIDE chop bypass (2026-07-23): a confirmed flip (str+mom+htf×2) is
         // not a flat-range fade — let it through chop. htf×2 agreement means the higher
         // timeframes are directional, so by definition this isn't dead chop.
@@ -13348,7 +13409,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.20-20260729-fadefix', // bump on each deploy — lets /state verify what's live
+    build: '5.22-20260729-newsguard', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
     confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
