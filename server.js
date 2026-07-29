@@ -143,6 +143,18 @@ function saveSubs() { fs.writeFileSync(SUBS_FILE, JSON.stringify(subscriptions, 
 // ===== PER-SYMBOL STATE =====
 const S = {};
 
+// ===== BTC KILL-SWITCH — V-REC ONLY (2026-07-29) =====
+// Default OFF: after 4 losing weeks every BTC detector is dormant EXCEPT V-REC (the post-crash
+// bounce scalp, +$470 and +$212 TP3s — the only BTC path with a proven edge). Flip to "true" in
+// Railway env to re-enable the full BTC book without a code change. Dormant detectors still RUN
+// and every candidate is graded + shadow-tracked, so re-enabling stays an evidence decision.
+const BTC_TRADING_ENABLED = process.env.BTC_TRADING_ENABLED === 'true';
+
+// Blocked-outcomes ring size. Raised 500 -> 1500 (2026-07-29): NAS alone burns ~136 entries in
+// 5h, so a 200-entry pull reached back only 5 hours and the RIDE-FADE experiment could never
+// accumulate its 30-sample bar in a single fetch. 1500 ~= 2-3 days of multi-symbol block volume.
+const BLOCKED_OUTCOMES_CAP = parseInt(process.env.BLOCKED_OUTCOMES_CAP, 10) || 1500;
+
 // ===== BROKER SYMBOL ALIASES (2026-07-28) =====
 // Signal Trader / the EA identify instruments by the BROKER's symbol name, which differs from
 // our canonical keys (e.g. broker "NAS100.fs" vs our "NAS100"). A mismatch means the payload
@@ -1663,12 +1675,39 @@ function trackBlockedOutcome(sym, msg, force) {
   // Raised 200 → 500 (2026-07-13): forced elite/dormant tracking + spam-retry entries can
   // burn 170+ slots in a single volatile session (7/13 XAU breakdown), rolling the morning's
   // missed winners out of the store before the evening audit. ~250KB/symbol at 500.
-  if (s.blockedOutcomes.length > 500) s.blockedOutcomes.shift();
+  if (s.blockedOutcomes.length > BLOCKED_OUTCOMES_CAP) s.blockedOutcomes.shift();
 }
 
 // Update tracked block outcomes on each tick — snapshots + TP1/SL hit detection.
 // Called from the tick processor for each symbol. Mirrors the BE-trail logic of real
 // signals: TP1 hit → SL trails to entry → if reversed, outcome = 'scratch' (BE, no loss).
+// ===== RIDE-FADE SHADOW LOGGER (2026-07-24, shared 2026-07-29) =====
+// Records the INVERSE of every disabled RIDE candidate at zero risk: opposite direction with
+// RIDE's levels mirrored (target 2xATR = where RIDE's stop sat = where price actually went;
+// stop 1.5xATR = RIDE's TP1). Regime-tagged because the thesis is that fading exhaustion works
+// in CHOP/GRIND and fails in TREND. Extracted to a shared helper so it can also run for BTC
+// while BTC is dormant (the dormant gate returns before the RIDE block, which was silently
+// starving the experiment of its most important data). Never fires — measurement only.
+function emitRideFadeShadow(sym, s, sig, price, atrVal) {
+  try {
+    if (!(atrVal > 0) || !s || !Array.isArray(s.blockedOutcomes)) return;
+    const fadeType = sig.type === 'call' ? 'put' : 'call';
+    const tgt = 2.0 * atrVal, stop = 1.5 * atrVal;
+    const regTag = s.chopActive ? 'CHOP' : (s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)) ? 'GRIND' : 'TREND';
+    s.blockedOutcomes.push({
+      ts: Date.now(), time: ts(), symbol: sym, detector: 'RIDE-FADE', type: fadeType,
+      price: +price.toFixed(2),
+      virtualTp1: +(fadeType === 'call' ? price + tgt : price - tgt).toFixed(2),
+      virtualSl:  +(fadeType === 'call' ? price - stop : price + stop).toFixed(2),
+      blockReason: '\u{1F501} ' + sym + '-RIDE-FADE ' + fadeType.toUpperCase() + ' shadow @ $' + price.toFixed(2) + ' [' + regTag + '] — inverse of disabled RIDE ' + sig.type.toUpperCase() + ' (target 2xATR / stop 1.5xATR, loser-autopsy fade test 7/24).',
+      snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+      tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null,
+      closed: false, closedTs: null, outcome: null
+    });
+    if (s.blockedOutcomes.length > BLOCKED_OUTCOMES_CAP) s.blockedOutcomes.shift();
+  } catch (e) { /* shadow logging must never affect firing */ }
+}
+
 function updateBlockedOutcomes(sym, price) {
   const s = S[sym];
   if (!s || !Array.isArray(s.blockedOutcomes) || s.blockedOutcomes.length === 0) return;
@@ -4111,6 +4150,32 @@ function processPrice(sym, price, hi, lo) {
     // gates in this section MUST NOT reference it — doing so threw a ReferenceError on every
     // BTC/NAS candidate and silently killed both symbols' signal flow. Use this local instead.
     const _tagX = (sig && sig.score) || '';
+    // ===== BTC TRADING DISABLED (2026-07-29) =====
+    // BTC lost every archived week (−2160 / −685 / −1389) and kept bleeding through four
+    // targeted cuts in 48h: RIDE disabled, EXT-FLIP conv floor, INVERSAL put-side, RSI floor.
+    // The night of 7/28→29 it lost another −$503 via CHoCH (−$202) and LHF (−$300) — detectors
+    // none of those guards covered — shorting into a 63.5k→64.0k rally. The problem isn't any
+    // one detector: BTC's ~$180 ATR turns every wrong entry into a $200-300 stop, and no
+    // repeatable edge has survived audit. Stop trading it; keep GRADING it (the scorer above
+    // already ran, and every candidate is shadow-tracked) so re-enabling is an evidence call.
+    // REVERSIBLE WITHOUT A DEPLOY: set env BTC_TRADING_ENABLED=true.
+    // V-REC EXEMPTION (Jean, 2026-07-29): V-REC is the ONE BTC path with a demonstrated edge —
+    // the post-crash bounce scalp produced the two largest wins in the dataset (+$470 TP3 on
+    // 7/24, +$212 TP3 on 7/24) on a tight 0.8×ATR stop. Everything else on BTC goes dormant;
+    // V-REC stays live and now carries BTC alone, so its record will be unambiguous.
+    if (isBTC && !BTC_TRADING_ENABLED && !sig._vRec) {
+      Object.assign(s, _emitSnapshot);
+      const _m = '⛔ ' + _tagX + ' ' + sig.type.toUpperCase() + ' BLOCKED — BTC dormant except V-REC (2026-07-29): 4 straight losing weeks + −$503 on 7/28-29 (CHoCH/LHF shorts into a rally). Shadow-tracking continues; set BTC_TRADING_ENABLED=true to re-enable all.';
+      log(sym, _m); trackBlockedOutcome(sym, _m, true);
+      // Keep the RIDE-FADE experiment alive on BTC (2026-07-29): this gate returns before the
+      // RIDE block below, so without this call BTC — the instrument the fade test was BUILT for
+      // (−$1,742 of RIDE losses) — would contribute zero paired samples while dormant.
+      if (/RIDE/.test(_tagX)) emitRideFadeShadow(sym, s, sig, price, atrVal);
+      return false;
+    }
+    if (isBTC && !BTC_TRADING_ENABLED && sig._vRec) {
+      log(sym, '🩹 ' + _tagX + ' ' + sig.type.toUpperCase() + ' V-REC LIVE on dormant BTC — post-crash bounce [' + (sig._confBreakdown || '') + '], tight 0.8×ATR stop. The only BTC path still trading.');
+    }
     // ===== BTC RIDE DISABLED (2026-07-24) — RIDE loser autopsy =====
     // 2-week fired data: vanilla BTC RIDE/RIDE+MACRO = 3 wins (+$71) vs 18 SL (−$1,742),
     // ~14% WR, losing at EVERY conviction tier (the worst single loss, −$142, was conv-9).
@@ -4128,31 +4193,7 @@ function processPrice(sym, price, hi, lo) {
         const _brMsg = '🚫 ' + _tagX + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' RIDE disabled (loser autopsy 2026-07-24: vanilla RIDE loses at every conv tier — BTC ~14% WR / −$1,671, NAS ~11% WR / −$261 over 2wk). Overrides (V-REC/REV/V-CONT) exempt; STRUCT/INVERSAL/LHF unaffected. XAU RIDE unaffected.';
         log(sym, _brMsg);
         trackBlockedOutcome(sym, _brMsg, true); // control: RIDE's own 1:1 outcome (should keep losing)
-        // ===== SHADOW-FADE EXPERIMENT (2026-07-24) — test "fade the loser" hypothesis =====
-        // Vanilla BTC RIDE is ~14% WR → Jean's idea: the inverse should win. Shadow-track the
-        // FADE at zero risk — opposite direction, RIDE's levels MIRRORED (target = 2×ATR = where
-        // RIDE's SL sat = where price actually went; stop = 1.5×ATR = RIDE's TP1). Tagged with the
-        // market regime because the fade should work in CHOP/GRIND (fading exhaustion) and FAIL in
-        // TREND (fading a real breakout). Promote to a live BTC-RIDE-FADE detector only if ≥30
-        // resolved fades hold ≥65% WR in the non-TREND buckets. Never fires — measurement only.
-        try {
-          if (atrVal > 0 && Array.isArray(s.blockedOutcomes)) {
-            const _fadeType = sig.type === 'call' ? 'put' : 'call';
-            const _fTgt = 2.0 * atrVal, _fStop = 1.5 * atrVal;
-            const _regTag = s.chopActive ? 'CHOP' : (s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)) ? 'GRIND' : 'TREND';
-            s.blockedOutcomes.push({
-              ts: Date.now(), time: ts(), symbol: sym, detector: 'RIDE-FADE', type: _fadeType,
-              price: +price.toFixed(2),
-              virtualTp1: +(_fadeType === 'call' ? price + _fTgt : price - _fTgt).toFixed(2),
-              virtualSl:  +(_fadeType === 'call' ? price - _fStop : price + _fStop).toFixed(2),
-              blockReason: '🔁 ' + sym + '-RIDE-FADE ' + _fadeType.toUpperCase() + ' shadow @ $' + price.toFixed(2) + ' [' + _regTag + '] — inverse of disabled RIDE ' + sig.type.toUpperCase() + ' (target 2×ATR / stop 1.5×ATR, loser-autopsy fade test 7/24).',
-              snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
-              tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null,
-              closed: false, closedTs: null, outcome: null
-            });
-            if (s.blockedOutcomes.length > 220) s.blockedOutcomes.shift();
-          }
-        } catch (eFade) {}
+        emitRideFadeShadow(sym, s, sig, price, atrVal); // paired inverse — see helper
         return false;
       }
       log(sym, '↪️ ' + _tagX + ' ' + sig.type.toUpperCase() + ' — BTC RIDE disabled but OVERRIDE-EXEMPT (' + (sig._vRec ? 'V-REC' : sig._revOverride ? 'REV' : 'V-CONT') + ') [' + (sig._confBreakdown || '') + ']. Allowed.');
@@ -7328,7 +7369,8 @@ function processPrice(sym, price, hi, lo) {
         // Conviction for the flip (computed once; reused by the BTC conv floor + the fire block).
         let _efConv = 0; try { _efConv = (convictionFor(EF.dir).score) || 0; } catch (eEC) {}
         let efReason = null;
-        if (sym === 'BTC' && btcWeekendClosed()) efReason = 'BTC weekend no-trade window (Phase 4.0): Sat 00:00 → Sun 12:00 ET';
+        if (sym === 'BTC' && !BTC_TRADING_ENABLED) efReason = 'BTC TRADING DISABLED (2026-07-29) — set BTC_TRADING_ENABLED=true to re-enable';
+        else if (sym === 'BTC' && btcWeekendClosed()) efReason = 'BTC weekend no-trade window (Phase 4.0): Sat 00:00 → Sun 12:00 ET';
         // BTC EXT-FLIP conviction floor (2026-07-24, loser autopsy): BTC EXT-FLIP at conv ≤2
         // went 1W/12SL/−$985 (knife-catches into BTC's ~$200 ATR), while conv ≥3 went 3W/1L
         // /+~$300. Conviction is a clean discriminator here — require ≥3 on BTC. XAU/NAS EXT-
@@ -13245,7 +13287,7 @@ app.get('/blocked-outcomes/:sym', (req, res) => {
     entries: (function () {
       let e = outcomes;
       if (req.query.outcome) e = e.filter(o => o.outcome === String(req.query.outcome));
-      const lim = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 400);
+      const lim = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 1500);
       return e.slice(-lim);
     })()
   });
@@ -13306,7 +13348,8 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.17-20260728-symalias', // bump on each deploy — lets /state verify what's live
+    build: '5.20-20260729-fadefix', // bump on each deploy — lets /state verify what's live
+    btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
     confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
     confBreakdown: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfBreakdown : null,
