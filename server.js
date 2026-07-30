@@ -4141,13 +4141,34 @@ function processPrice(sym, price, hi, lo) {
         // TIGHT-STOP SCALP — 0.8×ATR stop caps the knife-catch loss; TP ladder 3×/5×/8×
         // ATR aims for the sharp V-bounce. Only the chop gate is waived; every safety
         // gate (RSI, capitulation, same-dir cap, cooldowns, win-protect) still applies.
+        // ===== V-REC TIGHTENED (2026-07-30) — must be a REAL post-crash bounce =====
+        // The old test was "2h high-low RANGE ≥ 2×ATR", which a merely volatile or choppy two
+        // hours satisfies. Result: _vRec was set on almost every candidate — today's −$6.57
+        // TREND loser, both 7/29 FOMC losers AND the winners — so it was useless as a
+        // discriminator and, worse, it was the flag gating BTC's "V-REC only" mode and the
+        // MACD-gate exemption. Now it requires an actual directional flush that we are bouncing
+        // off, all three of:
+        //   1. a swing of ≥2×ATR inside the 2h window,
+        //   2. the correct SEQUENCE — for a CALL the low must come AFTER the high (a decline we
+        //      are buying), for a PUT the high must come after the low (a spike we are fading),
+        //   3. price still WITHIN 1.5×ATR of that extreme — i.e. we're at the bounce, not
+        //      arriving an hour late mid-range.
         let _vRecCrash = false;
         try {
           if (s.macroSnaps && s.macroSnaps.length >= 12 && atrVal > 0) {
             const _wv = s.macroSnaps.slice(-24); // ~last 2h (5-min snaps)
-            let _vh = -Infinity, _vl = Infinity;
-            for (const _sn of _wv) { if (_sn && _sn.p > 0) { if (_sn.p > _vh) _vh = _sn.p; if (_sn.p < _vl) _vl = _sn.p; } }
-            if (isFinite(_vh) && isFinite(_vl) && (_vh - _vl) >= 2.0 * atrVal) _vRecCrash = true;
+            let _vh = -Infinity, _vl = Infinity, _hiIdx = -1, _loIdx = -1;
+            for (let _i = 0; _i < _wv.length; _i++) {
+              const _p = _wv[_i] && _wv[_i].p;
+              if (!(_p > 0)) continue;
+              if (_p > _vh) { _vh = _p; _hiIdx = _i; }
+              if (_p < _vl) { _vl = _p; _loIdx = _i; }
+            }
+            if (isFinite(_vh) && isFinite(_vl) && (_vh - _vl) >= 2.0 * atrVal) {
+              _vRecCrash = iC
+                ? (_loIdx > _hiIdx && (price - _vl) <= 1.5 * atrVal)   // flushed down, buying the low
+                : (_hiIdx > _loIdx && (_vh - price) <= 1.5 * atrVal);  // spiked up, fading the high
+            }
           }
         } catch (eVR) {}
         sig._vRec = !!(sStruct === 1 && sHeld === 1 && _vRecCrash);
@@ -4301,7 +4322,23 @@ function processPrice(sym, price, hi, lo) {
       const _isStructMom = /STRUCT/.test(_tagX);
       const _isContMom = _isStructMom || (/BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(_tagX)
         && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP|LHF|LLF|INVERSAL|CHoCH|OBREJ|OBMIT|EXT-FLIP|STRUCT/.test(_tagX));
-      if (isMT5 && _isContMom && !sig._vRec && !sig._revOverride) {
+      // ===== OVERRIDE EXEMPTION REMOVED FOR CONTINUATION ENTRIES (2026-07-30, Jean) =====
+      // The gate used to skip anything carrying _revOverride / _vRec. That hole fired today's
+      // only XAU loss: 10:46 ⬆TREND CALL @4106.91 with macdL −0.670 — a CONTINUATION entry that
+      // escaped the momentum check because _revOverrideFired was set. It ran 6.57 against
+      // (adverseFrac 1.09) and stopped out. Same shape as the 7/29 FOMC pair (−$18 / −$112).
+      // A continuation entry is a bet that momentum PERSISTS, so firing it against the MACD line
+      // is self-contradictory no matter which override waved it through.
+      // The _vRec EXEMPTION IS ALSO REMOVED, and this matters: _vRec is only "str1 + held1 +
+      // a ≥2×ATR move in the last 2h", which on a volatile day is true of almost every candidate
+      // (it was set on today's −$6.57 loser, on BOTH 7/29 FOMC losers, and on today's winners).
+      // Exempting it would have left this gate doing nothing at all. The narrower _vRecFired flag
+      // can't be used here — it's stamped later, in the chop gate. Deferring costs V-REC nothing
+      // real: a genuine post-crash bounce turns MACD within a minute or two and releases.
+      // The fade family (EXT-FLIP / LHF / LLF / VREV / ATH / ATL / CHoCH / INVERSAL) was never in
+      // _isContMom and stays untouched — 4 of the last 5 EXT-FLIP fires had MACD against them,
+      // including the 7/29 +$17.12 TP3.
+      if (isMT5 && _isContMom) {
         const _ml = parseFloat(sig.macd);
         if (!isNaN(_ml) && ((sig.type === 'call' && _ml < 0) || (sig.type === 'put' && _ml > 0))) {
           // ===== DEFER-AND-CONFIRM (2026-07-27, Jean) — don't reject outright, WAIT for the turn =====
@@ -13447,7 +13484,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.24-20260730-structmacd', // bump on each deploy — lets /state verify what's live
+    build: '5.26-20260730-vrectight', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
     confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
