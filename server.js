@@ -4286,12 +4286,21 @@ function processPrice(sym, price, hi, lo) {
     // AGAINST the trade: RIDE+MACRO PUT @ macdL +0.32 (−$7) and STRUCT_VWAP CALL @ macdL −0.37
     // (−$5) — a daily-direction argument overriding intraday timing. Fade/BREAK detectors already
     // require macdL alignment; extend it to the momentum-continuation family. CALL needs macdL ≥0,
-    // PUT needs macdL ≤0. STRUCT_* EXCLUDED (net-profitable +$300, enters pre-turn by design — so
-    // it can't be caught here without risking its edge; shadow-test separately if wanted). Fades
-    // excluded (own gate). V-REC / REV overrides exempt.
+    // PUT needs macdL ≤0. Fades excluded (own gate). V-REC / REV overrides exempt.
+    // ===== STRUCT FAMILY ADDED (2026-07-30, Jean) =====
+    // STRUCT was originally excluded as "net-profitable, enters pre-turn by design". That call
+    // was wrong twice: XAU STRUCT_VWAP CALL 7/27 @macdL −0.369 (−$5.04) and 7/29 21:10 @macdL
+    // −0.634 (−$10.28) — both bought with momentum still bearish, both SL'd within minutes. The
+    // profitability argument also collapsed: STRUCT_VWAP's +$305 was essentially one BTC TP3
+    // (+$469 on 7/24) and BTC is now dormant. STRUCT now gets the same DEFER-AND-CONFIRM as the
+    // continuation family — it isn't rejected, it waits up to 3min for the MACD line to turn its
+    // way and fires on the confirmation. NOTE: this also captures STRUCT_SWEEP / STRUCT_LIQ_GRAB,
+    // which are reversal detectors that legitimately fire before the turn — watch their fire
+    // count; if it drops, narrow this to /STRUCT_VWAP/ only.
     try {
-      const _isContMom = /BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(_tagX)
-        && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP|LHF|LLF|INVERSAL|CHoCH|OBREJ|OBMIT|EXT-FLIP|STRUCT/.test(_tagX);
+      const _isStructMom = /STRUCT/.test(_tagX);
+      const _isContMom = _isStructMom || (/BREAK|FAST|TREND|MFLIP|RIDE|6\/6|SUST|SQZ/.test(_tagX)
+        && !/VREV|ATH|ATL|HI|LO|DIV|SWEEP|LHF|LLF|INVERSAL|CHoCH|OBREJ|OBMIT|EXT-FLIP|STRUCT/.test(_tagX));
       if (isMT5 && _isContMom && !sig._vRec && !sig._revOverride) {
         const _ml = parseFloat(sig.macd);
         if (!isNaN(_ml) && ((sig.type === 'call' && _ml < 0) || (sig.type === 'put' && _ml > 0))) {
@@ -10325,6 +10334,10 @@ function processPrice(sym, price, hi, lo) {
       // Track best price for trailing stop
       if (isLong && price > t.bestPrice) t.bestPrice = price;
       if (!isLong && price < t.bestPrice) t.bestPrice = price;
+      // MAE (2026-07-29): worst adverse excursion — the metric for "did the entry hold".
+      if (typeof t.worstPrice !== 'number') t.worstPrice = t.ep;
+      if (isLong && price < t.worstPrice) t.worstPrice = price;
+      if (!isLong && price > t.worstPrice) t.worstPrice = price;
 
       // TP1 hit — lock small profit (changed 2026-07-02: was pure breakeven; see checkExit)
       if (!t.tp1Hit && ((isLong && price >= t.tp1) || (!isLong && price <= t.tp1))) {
@@ -10502,7 +10515,7 @@ function processPrice(sym, price, hi, lo) {
             const revTp2 = revDir === 'long' ? price + revTp2Dist : price - revTp2Dist;
             const revTp3 = revDir === 'long' ? price + revTp3Dist : price - revTp3Dist;
 
-            s.trv2Trade = { dir: revDir, ep: price, ts: now3, sl: revSl, tp1: revTp1, tp2: revTp2, tp3: revTp3, tp1Hit: false, tp2Hit: false, tp3Hit: false, bestPrice: price, atr: trv2Atr, trailSl: 0, isCfd: true };
+            s.trv2Trade = { dir: revDir, ep: price, ts: now3, sl: revSl, tp1: revTp1, tp2: revTp2, tp3: revTp3, tp1Hit: false, tp2Hit: false, tp3Hit: false, bestPrice: price, worstPrice: price, atr: trv2Atr, trailSl: 0, isCfd: true };
             s.trv2Dir = revDir;
             s.trv2DirTs = now3;
             s.trv2LastSignalTs = now3;
@@ -10528,7 +10541,7 @@ function processPrice(sym, price, hi, lo) {
             s.signals.push(revSig); logSignal(sym, revSig);
             log(sym, '🔄 TRv2 AUTO-REVERSE ' + revDir.toUpperCase() + ' +MACRO — $' + price.toFixed(2) + ' · TP1 $' + revTp1.toFixed(2) + ' · TP2 $' + revTp2.toFixed(2) + ' · TP3 $' + revTp3.toFixed(2) + ' · SL $' + revSl.toFixed(2) + ' [#' + s.dailySignalCount + ']');
             sendPush('🔄 ' + sym + ' REVERSE ' + revDir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · TP1 $' + revTp1.toFixed(2) + ' · SL $' + revSl.toFixed(2), 'signal');
-            s.trade = { active: true, type: revType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, ts: Date.now(), pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: revSl, tp1Price: revTp1, tp2Price: revTp2, tp3Price: revTp3, atr: trv2Atr, bestPrice: price, trailSl: 0 };
+            s.trade = { active: true, type: revType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, ts: Date.now(), pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: revSl, tp1Price: revTp1, tp2Price: revTp2, tp3Price: revTp3, atr: trv2Atr, bestPrice: price, worstPrice: price, trailSl: 0 };
           } else {
             log(sym, '⏭️ TRv2 no auto-reverse — ' + (revWithMacro ? 'ROC too weak' : 'would reverse AGAINST macro (' + (s.macroEma ? '$' + s.macroEma.toFixed(2) : 'null') + ')'));
           }
@@ -10945,13 +10958,13 @@ function processPrice(sym, price, hi, lo) {
         // enrichSig passed — fire normally
         // Phase 3.29: trv2Trade is set HERE (was previously up at line ~7905 before
         // enrichSig). This ensures the TP1/TP2/TP3 hit tracker only watches real entries.
-        s.trv2Trade = { dir: dir, ep: price, ts: now3, sl: sl, tp1: tp1, tp2: tp2, tp3: tp3, tp1Hit: false, tp2Hit: false, tp3Hit: false, bestPrice: price, atr: trv2Atr, trailSl: 0, isCfd: true };
+        s.trv2Trade = { dir: dir, ep: price, ts: now3, sl: sl, tp1: tp1, tp2: tp2, tp3: tp3, tp1Hit: false, tp2Hit: false, tp3Hit: false, bestPrice: price, worstPrice: price, atr: trv2Atr, trailSl: 0, isCfd: true };
         log(sym, '🚀 TRv2 ENTRY ' + dir.toUpperCase() + (withMacro ? ' +MACRO' : '') + ' — $' + price.toFixed(2) + ' > EMA $' + tEma.toFixed(2) + ' (+' + spreadPct.toFixed(3) + '%) · ATR $' + trv2Atr.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2) + ' [#' + s.dailySignalCount + ']');
         sendPush('🚀 ' + sym + ' ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2), 'signal');
         // 2026-07-17 audit: TRv2 builds its trade manually (no buildCfdTrade), so any
         // one-shot flags armed during this signal's enrichment must be cleared here.
         s._scalpUntil = 0; s._structSlUntil = 0;
-        s.trade = { active: true, type: sigType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, ts: Date.now(), pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: sl, tp1Price: tp1, tp2Price: tp2, tp3Price: tp3, atr: trv2Atr, bestPrice: price, trailSl: 0 };
+        s.trade = { active: true, type: sigType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, ts: Date.now(), pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: sl, tp1Price: tp1, tp2Price: tp2, tp3Price: tp3, atr: trv2Atr, bestPrice: price, worstPrice: price, trailSl: 0 };
         s.signals.push(sig);
         logSignal(sym, sig);
         return;
@@ -11891,7 +11904,7 @@ function buildCfdTrade(type, price, atr, sym) {
       tp2Price: tp2,                    // new (further) — stretch target OK to extend
       tp3Price: tp3,                    // new (further) — stretch target OK to extend
       atr: atr,
-      bestPrice: oldTrade.bestPrice || price,  // keep best-price tracking
+      bestPrice: oldTrade.bestPrice || price, worstPrice: oldTrade.worstPrice || price,  // keep best-price tracking
       trailSl: oldTrade.trailSl || 0,
       isCfd: true,
       scalp: _scalp || oldTrade.scalp || false
@@ -11904,7 +11917,7 @@ function buildCfdTrade(type, price, atr, sym) {
     lastETs: 0,
     ts: Date.now(),  // entry timestamp — used by reversal-warning hold gate
     slPrice: sl, tp1Price: tp1, tp2Price: tp2, tp3Price: tp3,
-    atr: atr, bestPrice: price, trailSl: 0,
+    atr: atr, bestPrice: price, worstPrice: price, trailSl: 0,
     isCfd: true,
     scalp: _scalp
   };
@@ -11944,6 +11957,25 @@ function updateSignalOutcome(sym, finalPrice) {
   const t = s.trade;
   if (!t) return;
   const now = Date.now();
+  // ===== MAE — MAX ADVERSE EXCURSION (2026-07-29, Jean) =====
+  // "Perfect execution" = fired, ZERO drawdown, straight to TP1 then TP3 (7/29 XAU EXT-FLIP).
+  // MAE is that quality expressed as a number: how far price ran AGAINST the entry before
+  // working. mae 0 = the entry never went underwater. Recorded in $ and in ATR units so it's
+  // comparable across XAU/BTC/NAS, plus adverseFrac = how much of the stop budget it consumed
+  // (>1 would have been a stop-out). This is the metric to optimise entries against — it
+  // separates "right direction, right price" from "right direction, too early".
+  try {
+    if (typeof t.worstPrice === 'number' && t.ep > 0) {
+      const _adv = t.type === 'call' ? (t.ep - t.worstPrice) : (t.worstPrice - t.ep);
+      const _mae = Math.max(0, _adv);
+      const _atr = t.atr > 0 ? t.atr : null;
+      const _slDist = (typeof t.slPrice === 'number' && t.slPrice > 0) ? Math.abs(t.ep - t.slPrice) : null;
+      entry.outcomes.mae = +_mae.toFixed(2);
+      entry.outcomes.maeAtr = _atr ? +(_mae / _atr).toFixed(2) : null;
+      entry.outcomes.adverseFrac = _slDist ? +(_mae / _slDist).toFixed(2) : null;
+      entry.outcomes.cleanEntry = _slDist ? (_mae <= _slDist * 0.10) : (_mae === 0); // ≤10% of stop used
+    }
+  } catch (eMae) { /* MAE recording must never affect outcome stamping */ }
   if (t.t1 && !entry.outcomes.tp1Hit) {
     entry.outcomes.tp1Hit = true; entry.outcomes.tp1HitTs = now;
   }
@@ -12037,6 +12069,9 @@ function checkExit(sym, price) {
     // Track best price for trailing
     if (iC && price > t.bestPrice) t.bestPrice = price;
     if (!iC && price < t.bestPrice) t.bestPrice = price;
+    if (typeof t.worstPrice !== 'number') t.worstPrice = t.ep;
+    if (iC && price < t.worstPrice) t.worstPrice = price;
+    if (!iC && price > t.worstPrice) t.worstPrice = price;
 
     // TP1 hit → lock small profit (changed 2026-07-02: was pure breakeven).
     // ~1/3 of fired trades were ending as BE scratches — e.g. 7/02 XAU peaked +$5.04 and
@@ -12678,6 +12713,9 @@ function processTicks(symbols) {
       // Track best price for trailing
       if (t.type === 'call' && price > t.bestPrice) t.bestPrice = price;
       if (t.type === 'put' && price < t.bestPrice) t.bestPrice = price;
+      if (typeof t.worstPrice !== 'number') t.worstPrice = t.ep;
+      if (t.type === 'call' && price < t.worstPrice) t.worstPrice = price;
+      if (t.type === 'put' && price > t.worstPrice) t.worstPrice = price;
 
       // Trailing stop logic — ratchet up as profit grows
       const bestPnl = t.type === 'call' ? t.bestPrice - t.ep : t.ep - t.bestPrice;
@@ -13409,7 +13447,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.22-20260729-newsguard', // bump on each deploy — lets /state verify what's live
+    build: '5.24-20260730-structmacd', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
     confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
@@ -13693,6 +13731,7 @@ app.get('/prices', (req, res) => {
         trailSl: s.trade.trailSl || null,
         atr: s.trade.atr || null,
         bestPrice: s.trade.bestPrice || null,
+        worstPrice: s.trade.worstPrice || null,
         // OTE (Optimal Trade Entry) fields — EA uses oteLimit as limit-order price with
         // fallback to delayed-market entry if oteExpiry passes without fill. Only set for
         // DIV/ATH/ATL/BREAK signals (the "patient" detectors where waiting for retracement
