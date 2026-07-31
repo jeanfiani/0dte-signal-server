@@ -1711,6 +1711,11 @@ function trackBlockedOutcome(sym, msg, force) {
 function emitRideFadeShadow(sym, s, sig, price, atrVal) {
   try {
     if (!(atrVal > 0) || !s || !Array.isArray(s.blockedOutcomes)) return;
+    // Throttle (2026-07-31, with the dormant-gate spam fix): one fade sample per
+    // direction per 3 min — clustered repeat candidates are one setup, not N samples.
+    s._rideFadeTrackTs = s._rideFadeTrackTs || {};
+    if (Date.now() - (s._rideFadeTrackTs[sig.type] || 0) < 180000) return;
+    s._rideFadeTrackTs[sig.type] = Date.now();
     const fadeType = sig.type === 'call' ? 'put' : 'call';
     const tgt = 2.0 * atrVal, stop = 1.5 * atrVal;
     const regTag = s.chopActive ? 'CHOP' : (s._grindDir && s._grindTs && (Date.now() - s._grindTs < 90000)) ? 'GRIND' : 'TREND';
@@ -1727,6 +1732,48 @@ function emitRideFadeShadow(sym, s, sig, price, atrVal) {
     if (s.blockedOutcomes.length > BLOCKED_OUTCOMES_CAP) s.blockedOutcomes.shift();
   } catch (e) { /* shadow logging must never affect firing */ }
 }
+
+// ===== PERSISTENT COHORT TALLY (2026-07-31) =====
+// The blocked-outcomes buffer is a 1500-entry ring — on 7/31 a BTC BREAK spam flood
+// churned it in hours and destroyed the RIDE-FADE cohort's ~8 resolved samples (62.5%
+// WR, now unverifiable). This tally is the fix for the LOSS side: every resolving
+// shadow entry that belongs to a named experiment bumps a per-symbol/per-cohort W/L/S
+// counter that survives buffer churn AND deploys (persisted to DATA_DIR every 30s,
+// loaded on boot). Detail can still be lost; the score cannot.
+const COHORT_TALLY_FILE = path.join(DATA_DIR, 'cohort_tally.json');
+let cohortTally = {};
+try { cohortTally = JSON.parse(fs.readFileSync(COHORT_TALLY_FILE, 'utf8')) || {}; } catch (e) { cohortTally = {}; }
+let _ctDirty = false;
+function cohortFor(reason) {
+  if (/RIDE-FADE/.test(reason)) return 'RIDE-FADE';
+  if (/FADE-EASE/.test(reason)) return 'FADE-EASE';
+  if (/V-CONT/.test(reason)) return 'V-CONT';
+  if (/REV-OVERRIDE/.test(reason)) return 'REV-OVERRIDE';
+  if (/BTC dormant except V-REC/.test(reason)) return null; // generic dormant block — NOT the V-REC cohort
+  if (/V-REC/.test(reason)) return 'V-REC';
+  if (/ASIAN-REJ/.test(reason)) return 'ASIAN-REJ';
+  if (/session-extreme/.test(reason)) return 'SESS-EXTREME';
+  if (/EXT-GUARD/.test(reason)) return 'EXT-GUARD';
+  if (/DEFERRED/.test(reason)) return 'MACD-DEFER';
+  if (/macro not (CALL|PUT)-aligned/.test(reason)) return 'MACRO-NOT-ALIGNED';
+  return null; // everything else stays buffer-only
+}
+function bumpCohortTally(sym, reason, outcome) {
+  try {
+    const c = cohortFor(reason || '');
+    if (!c || !outcome) return;
+    cohortTally[sym] = cohortTally[sym] || {};
+    const t = cohortTally[sym][c] = cohortTally[sym][c] || { win: 0, loss: 0, scratch: 0, no_resolve: 0, lastTs: 0 };
+    if (typeof t[outcome] !== 'number') t[outcome] = 0;
+    t[outcome]++; t.lastTs = Date.now();
+    _ctDirty = true;
+  } catch (e) { /* tally must never affect tracking */ }
+}
+setInterval(() => {
+  if (!_ctDirty) return;
+  _ctDirty = false;
+  try { fs.writeFileSync(COHORT_TALLY_FILE, JSON.stringify(cohortTally)); } catch (e) {}
+}, 30000).unref();
 
 function updateBlockedOutcomes(sym, price) {
   const s = S[sym];
@@ -1761,6 +1808,7 @@ function updateBlockedOutcomes(sym, price) {
       else b.outcome = 'no_resolve';
       b.closed = true;
       b.closedTs = now;
+      bumpCohortTally(b.symbol || sym, b.blockReason, b.outcome); // persistent cohort score (2026-07-31)
     }
   }
 }
@@ -4226,7 +4274,20 @@ function processPrice(sym, price, hi, lo) {
     if (isBTC && !BTC_TRADING_ENABLED && !sig._vRec) {
       Object.assign(s, _emitSnapshot);
       const _m = '⛔ ' + _tagX + ' ' + sig.type.toUpperCase() + ' BLOCKED — BTC dormant except V-REC (2026-07-29): 4 straight losing weeks + −$503 on 7/28-29 (CHoCH/LHF shorts into a rally). Shadow-tracking continues; set BTC_TRADING_ENABLED=true to re-enable all.';
-      log(sym, _m); trackBlockedOutcome(sym, _m, true);
+      // SPAM FIX (2026-07-31): this gate force-tracked EVERY dormant candidate. BREAK emits
+      // candidates every 2-3s during a coil escape → 122 tracked entries in 4.5min on 7/31,
+      // and 1,352 of the 1,500-cap store was BREAK — churning out the RIDE-FADE cohort
+      // history this dormancy was specifically supposed to feed (~11 resolved samples lost).
+      // Dedupe: ONE tracked shadow entry per detector+direction per 3 minutes. Logging is
+      // untouched; only the store write is throttled.
+      let _dtOk = true;
+      try {
+        s._dormantTrackTs = s._dormantTrackTs || {};
+        const _dtK = (_tagX || 'x') + ':' + sig.type;
+        if (Date.now() - (s._dormantTrackTs[_dtK] || 0) < 180000) _dtOk = false;
+        else s._dormantTrackTs[_dtK] = Date.now();
+      } catch (eDT) {}
+      log(sym, _m); if (_dtOk) trackBlockedOutcome(sym, _m, true);
       // Keep the RIDE-FADE experiment alive on BTC (2026-07-29): this gate returns before the
       // RIDE block below, so without this call BTC — the instrument the fade test was BUILT for
       // (−$1,742 of RIDE losses) — would contribute zero paired samples while dormant.
@@ -13610,8 +13671,9 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.29-20260731-fade-ease', // bump on each deploy — lets /state verify what's live
+    build: '5.31-20260731-cohort-tally', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
+    cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
     confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
     confBreakdown: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfBreakdown : null,
