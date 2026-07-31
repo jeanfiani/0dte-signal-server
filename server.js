@@ -4948,6 +4948,73 @@ function processPrice(sym, price, hi, lo) {
       }
     } catch (e) { /* extension guard must never crash enrichment */ }
 
+    // ===== SESSION-EXTREME CHASE BLOCK — ALL DETECTOR PATHS (BUG FIX 2026-07-31) =====
+    // The SESSION HIGH CALL BLOCKER (~line 11500, built from 14 QQQ + 10 SPY top-tick
+    // losers) was always meant to be a system-wide rule: the bot is NOT allowed to buy
+    // the session high or sell the session low — that IS the entry-price policy. But it
+    // was wired to the core conviction path's `fireCall` flag (declared ~line 11440),
+    // so all 46 detector emits through enrichSig bypassed it. 7/30 18:49 INVERSAL_BREAK
+    // CALL fired at $4110.61 with the session high at $4111.01 — 0.0097% away, TEN TIMES
+    // inside the 0.05% threshold — and went straight to SL (MAE 4.77×ATR, adverseFrac
+    // 1.00). EXT-GUARD couldn't catch it (needs a ≥1.5×ATR 15-min impulse; the drift
+    // into the top was 0.9×ATR). This gate closes the hole for every path and adds the
+    // missing PUT-at-session-low mirror. Geometry: only the CHASING direction is
+    // blocked — a PUT at the high / CALL at the low is a fade and passes untouched.
+    // Placed AFTER EXT-GUARD so violent crests still get its richer block + flip-arm;
+    // this catches the slow drifts EXT-GUARD is blind to. Blocks arm/refresh the
+    // EXT-FLIP candidate the same way, so the reversal signal still gets set up.
+    try {
+      if (isMT5 && s.sessionHigh > 0 && s.sessionLow > 0 && s.sessionLow < Infinity) {
+        const _seRange = s.sessionHigh - s.sessionLow;
+        const _seMinRange = isBTC ? 50 : isNAS ? 20 : 2; // same floors as the core blocker
+        const _seCall = sig.type === 'call';
+        if (_seRange > _seMinRange) {
+          const _sePct = _seCall
+            ? ((s.sessionHigh - price) / s.sessionHigh) * 100
+            : ((price - s.sessionLow) / price) * 100;
+          // BREAKOUT EXEMPTION (Jean, 2026-07-31): "if it breaks the session high it's
+          // allowed — but absolutely not going without breaking the session high/low
+          // first." A live break means the extreme itself just advanced: price punching
+          // through updates sessionHigh/LowUpdateTs on the same tick (line ~2734). So a
+          // CALL is a legitimate breakout if the high advanced within the last 90s, and
+          // a chase if the extreme is stale and price merely drifted back near it.
+          // 18:49 loser check: its high had held ~3min ("extreme $4111.01 held 3min" on
+          // the 18:50 flip-arm) → stale → still blocked.
+          const _seBrkTs = _seCall ? (s.sessionHighUpdateTs || 0) : (s.sessionLowUpdateTs || 0);
+          const _seLiveBreak = _seBrkTs > 0 && (Date.now() - _seBrkTs) < 90000;
+          if (_sePct < 0.05 && !_seLiveBreak) {
+            // Arm/refresh the opposite EXT-FLIP candidate (mirrors the EXT-GUARD arm) —
+            // blocking the chase must not also lose the reversal. Re-blocks REFRESH the
+            // extreme but keep the original armTs, so the 3-min stabilization clock isn't
+            // reset by every repeat candidate at the top.
+            try {
+              const _fDir = _seCall ? 'put' : 'call';
+              const _fExt = _seCall ? s.sessionHigh : s.sessionLow;
+              if (!s.extFlip || s.extFlip.dir !== _fDir) {
+                let _fBurst = 0;
+                for (const _fF of ((conv && conv.factors) || [])) {
+                  const _fM = /^(?:VOL≥1|BURST)×([\d.]+)/.exec(_fF);
+                  if (_fM) { _fBurst = parseFloat(_fM[1]); break; }
+                }
+                if (_fBurst === 0 && atrVal > 0 && Array.isArray(s.vrevSnaps)) {
+                  const _bC = Date.now() - 180000;
+                  let _bH = -Infinity, _bL = Infinity, _bN = 0;
+                  for (const _bS of s.vrevSnaps) { if (_bS && _bS.ts > _bC && _bS.p > 0) { if (_bS.p > _bH) _bH = _bS.p; if (_bS.p < _bL) _bL = _bS.p; _bN++; } }
+                  if (_bN >= 3 && isFinite(_bH) && isFinite(_bL)) _fBurst = (_bH - _bL) / (atrVal * 0.6);
+                }
+                s.extFlip = { dir: _fDir, extreme: _fExt, armTs: Date.now(),
+                              burst: _fBurst, atr: atrVal, srcConv: (conv && conv.score) || 0,
+                              src: tagEarly + ' ' + sig.type.toUpperCase() + ' session-extreme block' };
+              } else if (_fDir === 'put' && _fExt > s.extFlip.extreme) { s.extFlip.extreme = _fExt; }
+                else if (_fDir === 'call' && _fExt < s.extFlip.extreme) { s.extFlip.extreme = _fExt; }
+            } catch (eSF) {}
+            log(sym, '🛑 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — session-extreme chase: $' + price.toFixed(2) + ' is ' + _sePct.toFixed(3) + '% from session ' + (_seCall ? 'high $' + s.sessionHigh.toFixed(2) : 'low $' + s.sessionLow.toFixed(2)) + ' (range $' + _seRange.toFixed(2) + '). ' + (_seCall ? 'Buying the top' : 'Selling the bottom') + ' is not allowed — all-paths fix 2026-07-31.');
+            return false;
+          }
+        }
+      }
+    } catch (eSE) { /* session-extreme gate must never crash enrichment */ }
+
     // ===== PHASE 3.96 — GRIND CONVICTION FLOOR (2026-07-06) =====
     // Applies ONLY while GRIND-LIVE is fresh (chop suspended by the grind override —
     // never during naturally-trending markets, where conv-5s keep firing as before).
@@ -5010,20 +5077,28 @@ function processPrice(sym, price, hi, lo) {
         // for the retest (detectors re-fire within minutes).
         if (_gScore >= _gFloor || _vCont) {
           const _gStr = findRecoveryStructure(s, sym, sig.type, price, atrVal, null);
-          if (_gStr && !_gStr.ok && !_vCont) {
+          if (_gStr && !_gStr.ok) {
+            // ===== V-CONT ENTRY-QUALITY WAIVER REVOKED (2026-07-31) =====
+            // Was: validator-confirmed continuation waived this block, on the 7/23 theory that
+            // "extended beyond Asian high" is meaningless mid-crash. Live results killed it.
+            // Deduped record 1W/2L, and the losses are causally attributable to the waiver:
+            //   7/31 05:25 XAU TREND PUT @4052.55 — waived "extended $59.27 (>1.2xATR) beyond
+            //     Asian high $4111.82, wait for the retest". Session low was $4050.39. It shorted
+            //     $2.16 off the bottom, MAE 3.67xATR, adverseFrac 1.00 (zero favourable
+            //     excursion — straight to SL). The gate had it exactly right.
+            //   7/30 05:08 XAU TREND CALL cluster @~4068 — same waiver, same outcome.
+            // The whole point of this gate is entry price; waiving it is self-defeating. The
+            // conv-floor half of V-CONT (line ~4992) is untouched — no separate evidence yet.
+            // Still stamped + shadow-tracked so we can measure what the revocation costs.
+            if (_vCont) {
+              sig._vContEqBlocked = true;
+              const msgVQ = '🧭 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' V-CONT entry-quality waiver REVOKED @ $' + price.toFixed(2) + ' — [' + (sig._confBreakdown || '') + '] would have waived: ' + _gStr.reason + ' (shadow-only since 7/31; live record was 1W/2L).';
+              log(sym, msgVQ);
+              trackBlockedOutcome(sym, msgVQ, true);
+            }
             Object.assign(s, _emitSnapshot);
             log(sym, '🚫 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — grind entry-quality (Phase 3.96b): ' + _gStr.reason + '.');
             return false;
-          }
-          if (_gStr && !_gStr.ok && _vCont) {
-            // V-CONT (2026-07-24): validator-confirmed continuation waives the entry-quality
-            // block — "extended beyond Asian high" / "no room to rolling extreme" anchors are
-            // meaningless mid-crash (7/23: they blocked the whole $900 slide). The validator's
-            // str bit already demands a structure anchor near the entry.
-            sig._vContFired = true;
-            const msgVQ = '🧭 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' V-CONT entry-quality override @ $' + price.toFixed(2) + ' — [' + (sig._confBreakdown || '') + '] waives: ' + _gStr.reason + ' (live).';
-            log(sym, msgVQ);
-            trackBlockedOutcome(sym, msgVQ, true);
           }
           if (_gStr && typeof _gStr.structSl === 'number') { s._structSl = _gStr.structSl; s._structSlUntil = Date.now() + 5000; }
         }
@@ -13484,7 +13559,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.26-20260730-vrectight', // bump on each deploy — lets /state verify what's live
+    build: '5.28-20260731-sessextreme-allpaths', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
     confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
