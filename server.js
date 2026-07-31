@@ -5008,7 +5008,7 @@ function processPrice(sym, price, hi, lo) {
               } else if (_fDir === 'put' && _fExt > s.extFlip.extreme) { s.extFlip.extreme = _fExt; }
                 else if (_fDir === 'call' && _fExt < s.extFlip.extreme) { s.extFlip.extreme = _fExt; }
             } catch (eSF) {}
-            log(sym, '🛑 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — session-extreme chase: $' + price.toFixed(2) + ' is ' + _sePct.toFixed(3) + '% from session ' + (_seCall ? 'high $' + s.sessionHigh.toFixed(2) : 'low $' + s.sessionLow.toFixed(2)) + ' (range $' + _seRange.toFixed(2) + '). ' + (_seCall ? 'Buying the top' : 'Selling the bottom') + ' is not allowed — all-paths fix 2026-07-31.');
+            log(sym, '🛑 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — session-extreme chase: $' + price.toFixed(2) + ' is ' + _sePct.toFixed(3) + '% from session ' + (_seCall ? 'high $' + s.sessionHigh.toFixed(2) : 'low $' + s.sessionLow.toFixed(2)) + ' (range $' + _seRange.toFixed(2) + ', extreme stale ' + Math.round((Date.now() - _seBrkTs) / 60000) + 'min). ' + (_seCall ? 'Buying the top' : 'Selling the bottom') + ' without breaking it is not allowed — all-paths fix 2026-07-31.');
             return false;
           }
         }
@@ -7869,10 +7869,33 @@ function processPrice(sym, price, hi, lo) {
     } catch (e) {}
     const lhfPutHtfReversalOk = (s.htf1h_dir === 'down' && convictionFor('put').score >= 5) ||
                                 (s.htf1h_dir === 'flat' && _lhfPutRegimeAligned && convictionFor('put').score >= 5);
-    const lhfPutMacroOk  = macroAlignedFor('put') ||
+    // ===== FADE-AT-EXTREME EASE (2026-07-31, Jean) =====
+    // Companion to the 5.28b session-extreme chase block: that gate forbids CHASING a
+    // stale extreme; this one eases FADING it. 7/30 overnight: LHF PUTs at $4106.24 and
+    // $4106.72 — $5-6 under the $4111.82 top of a $61 slide — were both blocked by
+    // "macro not PUT-aligned" and both hit TP1 in shadow. Overnight the strict macro
+    // requirement (6/7 aligned incl. QQQ+SPY) is structurally unsatisfiable with the
+    // ETFs closed, so the exact fades Jean wants ("a put fired around 4106-10 would
+    // have been perfect") die at this gate. Ease: within 0.15% of the session high
+    // (≈$6 on gold — covers the 4106-4110 band against a 4111.82 top), the extreme
+    // STALE ≥3min (never fade a live breakout — mirrors the chase gate's freshness
+    // test), and conv ≥5 so the rest of the board still broadly agrees. The macro-not
+    // family's only overnight loss (23:48, 0.86% off the high) stays blocked — the
+    // ease window is 6x tighter. All other LHF gates (RSI 35-60, MACD ≤0, ROC,
+    // distance, cooldowns) still apply in full.
+    let _lhfFadeAtHigh = false;
+    try {
+      if (s.sessionHigh > 0 && price <= s.sessionHigh) {
+        const _fePct = ((s.sessionHigh - price) / s.sessionHigh) * 100;
+        const _feStale = (s.sessionHighUpdateTs || 0) > 0 && (Date.now() - s.sessionHighUpdateTs) >= 180000;
+        _lhfFadeAtHigh = _fePct <= 0.15 && _feStale && convictionFor('put').score >= 5;
+      }
+    } catch (eFE) {}
+    const _lhfMacroBase  = macroAlignedFor('put') ||
       (s.fullConvSincePut > 0 && (tSoftMacro - s.fullConvSincePut) >= SOFT_MACRO_STABLE_MS && convictionFor('put').score >= SOFT_MACRO_THR) ||
       lhfPutObOk ||
       lhfPutHtfReversalOk;
+    const lhfPutMacroOk  = _lhfMacroBase || _lhfFadeAtHigh;
     const lhfPutFlipOk   = flipCoolFor('put');
     const lhfPutWinOk    = winProtectDir !== 'call';
     if (lhfPutTimingOk && lhfPutDistOk && lhfPutRangeOk && lhfPutCoolOk &&
@@ -7883,6 +7906,14 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = 'put'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'put'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇LHF', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        // FADE-AT-EXTREME cohort stamp — only when the ease was DECISIVE (macro base failed).
+        if (_lhfFadeAtHigh && !_lhfMacroBase) {
+          try {
+            const _feMsg = '🎯 ⬇LHF PUT FADE-EASE FIRED @ $' + price.toFixed(2) + ' — ' + (((s.sessionHigh - price) / s.sessionHigh) * 100).toFixed(3) + '% under stale session high $' + s.sessionHigh.toFixed(2) + ' (held ' + Math.round((Date.now() - (s.sessionHighUpdateTs || Date.now())) / 60000) + 'min); macro-alignment gate eased (2026-07-31, conv≥5).';
+            log(sym, _feMsg);
+            trackBlockedOutcome(sym, _feMsg, true);
+          } catch (eFT) {}
+        }
         if (!enrichSig(sig)) return; s.signals.push(sig);
         logSignal(sym, sig);
         if (isMT5) {
@@ -7998,10 +8029,22 @@ function processPrice(sym, price, hi, lo) {
     } catch (e) {}
     const llfCallHtfReversalOk = (s.htf1h_dir === 'up' && convictionFor('call').score >= 5) ||
                                  (s.htf1h_dir === 'flat' && _llfCallRegimeAligned && convictionFor('call').score >= 5);
-    const llfCallMacroOk  = macroAlignedFor('call') ||
+    // FADE-AT-EXTREME EASE — LLF CALL mirror (2026-07-31, Jean). See LHF PUT site above
+    // for full rationale. Within 0.15% above a STALE session low (≥3min, never fade a
+    // live breakdown), conv ≥5 → macro-alignment gate eased. All other gates unchanged.
+    let _llfFadeAtLow = false;
+    try {
+      if (s.sessionLow > 0 && s.sessionLow < Infinity && price >= s.sessionLow) {
+        const _fePctL = ((price - s.sessionLow) / price) * 100;
+        const _feStaleL = (s.sessionLowUpdateTs || 0) > 0 && (Date.now() - s.sessionLowUpdateTs) >= 180000;
+        _llfFadeAtLow = _fePctL <= 0.15 && _feStaleL && convictionFor('call').score >= 5;
+      }
+    } catch (eFEL) {}
+    const _llfMacroBase  = macroAlignedFor('call') ||
       (s.fullConvSinceCall > 0 && (tSoftMacro - s.fullConvSinceCall) >= SOFT_MACRO_STABLE_MS && convictionFor('call').score >= SOFT_MACRO_THR) ||
       llfCallObOk ||
       llfCallHtfReversalOk;
+    const llfCallMacroOk  = _llfMacroBase || _llfFadeAtLow;
     const llfCallFlipOk   = flipCoolFor('call');
     const llfCallWinOk    = winProtectDir !== 'put';
     // ===== PHASE 3.92 — LLF FRESHNESS GATE (2026-07-06) =====
@@ -8038,6 +8081,14 @@ function processPrice(sym, price, hi, lo) {
         s.lastSignalDir = 'call'; s.lastSignalTs = now2; s.lastNTs = now2;
         s.lastSameDir = 'call'; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
         const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆LLF', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+        // FADE-AT-EXTREME cohort stamp — only when the ease was DECISIVE (macro base failed).
+        if (_llfFadeAtLow && !_llfMacroBase) {
+          try {
+            const _feMsgL = '🎯 ⬆LLF CALL FADE-EASE FIRED @ $' + price.toFixed(2) + ' — ' + (((price - s.sessionLow) / price) * 100).toFixed(3) + '% over stale session low $' + s.sessionLow.toFixed(2) + ' (held ' + Math.round((Date.now() - (s.sessionLowUpdateTs || Date.now())) / 60000) + 'min); macro-alignment gate eased (2026-07-31, conv≥5).';
+            log(sym, _feMsgL);
+            trackBlockedOutcome(sym, _feMsgL, true);
+          } catch (eFTL) {}
+        }
         if (!enrichSig(sig)) return; s.signals.push(sig);
         logSignal(sym, sig);
         if (isMT5) {
@@ -13559,7 +13610,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.28-20260731-sessextreme-allpaths', // bump on each deploy — lets /state verify what's live
+    build: '5.29-20260731-fade-ease', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
     confClass: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfClass : null,
