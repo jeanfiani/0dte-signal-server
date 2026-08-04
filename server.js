@@ -1655,6 +1655,21 @@ function trackBlockedOutcome(sym, msg, force) {
   if (tagMatch) detector = tagMatch[1];
   else if (/V-REV/.test(msg)) detector = 'VREV';
   else if (/RSI hard/.test(msg)) detector = 'RSI-FLOOR';
+  // ===== GLOBAL SPAM DEDUPE (2026-08-03) =====
+  // The 35-min cooldown above only throttles NON-force writes, and most call sites pass
+  // force=true. Result: XAU INVERSAL_BREAK contra-blocks tracked every 2s (11:50 on 8/3),
+  // BTC BREAK 122 entries/4.5min on 7/31 — churning the 1500 ring and evicting forensic
+  // data (today it ate the morning-crash window before it could be analyzed). Clustered
+  // repeat candidates are ONE setup: dedupe to one entry per cohort-or-detector+direction
+  // per 3 minutes, force included. Named cohort stamps (RIDE-FADE, FADE-EASE, V-CONT…)
+  // key by cohort so they never collide with the generic stamp of the same signal.
+  try {
+    const _gdCoh = (typeof cohortFor === 'function' ? cohortFor(msg) : null) || detector;
+    s._trackDedupe = s._trackDedupe || {};
+    const _gdK = _gdCoh + '|' + type;
+    if (now - (s._trackDedupe[_gdK] || 0) < 180000) return;
+    s._trackDedupe[_gdK] = now;
+  } catch (eGD) {}
   const price = s.prices[s.prices.length - 1];
   if (!isFinite(price) || price <= 0) return;
   // Per-symbol virtual TP1/SL distances — match real-signal scales
@@ -2968,10 +2983,22 @@ function processPrice(sym, price, hi, lo) {
           // 1.0% threshold missed most of those windows. 0.7% catches more legitimate
           // trend periods without firing on every minor wiggle.
           const dirThr = (sym === 'XAU') ? 0.5 : (sym === 'BTC') ? 0.7 : (sym === 'NAS100') ? 0.6 : 0.4;
-          if (dirMovePct > dirThr) {
+          // ===== ATR-DENOMINATED BAR (2026-08-03, unit-mismatch fix) =====
+          // The percent bars were calibrated in June's volatility. On 8/3 XAU ATR was
+          // ~$2.40 (0.06% of price) — the 0.5% bar demanded an 8.4×ATR 30-min burst, so
+          // a $52 stepped trend day (every 30-min leg 1.3-4.3×ATR) NEVER tripped it and
+          // chopActive stayed true through the entire slide AND the recovery. Same class
+          // of miss on 7/23 NAS (-$900) and 7/31 XAU morning. Regime must be measured in
+          // units of current volatility: trip at whichever is LOWER, the legacy percent
+          // bar (binds in high-vol) or 3×ATR (binds in low-vol). Today: $10.22 ≥ $7.20
+          // → chop OFF at 08:51, four with-trend PUTs release into the slide.
+          const _atr57 = (typeof s._atr === 'number' && s._atr > 0) ? s._atr : 0;
+          const _dirMoveAbs = Math.abs(price - snap30.p);
+          const _bar57 = Math.min(snap30.p * dirThr / 100, _atr57 > 0 ? 3 * _atr57 : Infinity);
+          if (_dirMoveAbs > _bar57) {
             s.chopActive = false;
             s.trendCount = 0;
-            log(sym, '📈 TREND OVERRIDE (Phase 3.57) — 30min directional move ' + dirMovePct.toFixed(2) + '% > ' + dirThr + '% threshold. chopActive forced OFF.');
+            log(sym, '📈 TREND OVERRIDE (Phase 3.57) — 30min directional move $' + _dirMoveAbs.toFixed(2) + ' (' + dirMovePct.toFixed(2) + '%, ' + (_atr57 > 0 ? (_dirMoveAbs / _atr57).toFixed(1) + '×ATR' : 'ATR n/a') + ') > bar $' + _bar57.toFixed(2) + '. chopActive forced OFF.');
           }
         }
       }
@@ -3007,7 +3034,14 @@ function processPrice(sym, price, hi, lo) {
           // slide, 7/13 -2% US session) never qualified while chopActive stayed true
           // throughout. NAS bar = 0.4%; XAU/BTC keep 0.8%.
           const grindBar = sym === 'NAS100' ? 0.4 : 0.8;
-          const driftAligned = (driftPct >= grindBar && s.htf1h_dir === 'up') || (driftPct <= -grindBar && s.htf1h_dir === 'down');
+          // ATR-DENOMINATED BAR (2026-08-03) — same unit-mismatch fix as Phase 3.57 above.
+          // 0.8%/3h on 8/3 gold = $32 = 13.5×ATR: unreachable. New: trip at whichever is
+          // lower, the legacy percent bar or 5×ATR of 3h drift (today's $19 = 7.9×ATR ✓).
+          // HTF 1h+4h agreement requirement unchanged — this only fixes the denominator.
+          const _atrG = (typeof s._atr === 'number' && s._atr > 0) ? s._atr : 0;
+          const _driftAbs = s.lastPrice - oldest.p;
+          const _grindBarAbs = Math.min(oldest.p * grindBar / 100, _atrG > 0 ? 5 * _atrG : Infinity);
+          const driftAligned = (_driftAbs >= _grindBarAbs && s.htf1h_dir === 'up') || (-_driftAbs >= _grindBarAbs && s.htf1h_dir === 'down');
           if (driftAligned) {
             s.chopActive = false;
             s.chopCount = 0; s.trendCount = 0;
@@ -6019,14 +6053,21 @@ function processPrice(sym, price, hi, lo) {
           const _rvMsg = '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' — chop bypass REVOKED for RIDE (2026-07-29): RIDE must respect chop mode. Overrides (V-REC/REV) still exempt.';
           log(sym, _rvMsg); trackBlockedOutcome(sym, _rvMsg, true);
         }
-        // REVERSAL-OVERRIDE chop bypass (2026-07-23): a confirmed flip (str+mom+htf×2) is
-        // not a flat-range fade — let it through chop. htf×2 agreement means the higher
-        // timeframes are directional, so by definition this isn't dead chop.
+        // ===== REV-OVERRIDE CHOP BYPASS REVOKED (2026-08-03) =====
+        // Was live 7/23–8/03: a confirmed flip (str+mom+htf×2) waived the chop gate. The
+        // persistent cohort tally ended the argument: 0W/1L/1S since Friday, ~1W/2L/2S
+        // lifetime, and the 7/31 13:56 XAU CALL it enabled (adverseFrac 1.05, −$5.26)
+        // was a top-buy the chop gate had correctly refused. Same disease as the V-CONT
+        // entry-quality waiver (0W/6L, revoked 7/31): validator confidence does not
+        // outrank the protective gate. Now shadow-only — stamps the would-fire so the
+        // REV-OVERRIDE cohort keeps accruing; the signal falls through to the normal
+        // chop block below. Clearing _revOverride here also closes the RIDE loophole
+        // ("Overrides still exempt" in the RIDE bypass revocation above).
         if (sig._revOverride && !_chopVolBypass && !_btcMildChopBypass && !_xauMetalsBypass && !_crossAssetBypass) {
-          sig._revOverrideFired = true;
-          const _roMsg = '🔄 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' REV-OVERRIDE chop bypass @ $' + price.toFixed(2) + ' — confirmed flip [' + (sig._confBreakdown || '') + '] str+mom+htf×2 all agree; waiving chop gate (Confirmed-flip, live).';
+          const _roMsg = '🔄 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' REV-OVERRIDE chop bypass REVOKED @ $' + price.toFixed(2) + ' — confirmed flip [' + (sig._confBreakdown || '') + '] would have waived chop (shadow-only since 8/03; live record 1W/2L/2S).';
           log(sym, _roMsg);
           trackBlockedOutcome(sym, _roMsg, true);
+          sig._revOverride = false; // fall through to the chop block
         }
         if (sig._vRec && !sig._revOverride && !_chopVolBypass && !_btcMildChopBypass && !_xauMetalsBypass && !_crossAssetBypass) {
           // V-REC post-crash bounce scalp: waive chop gate, arm the tight-stop ladder.
@@ -7618,7 +7659,12 @@ function processPrice(sym, price, hi, lo) {
         // went 1W/12SL/−$985 (knife-catches into BTC's ~$200 ATR), while conv ≥3 went 3W/1L
         // /+~$300. Conviction is a clean discriminator here — require ≥3 on BTC. XAU/NAS EXT-
         // FLIP unaffected (XAU ~flat, NAS not flagged).
-        else if (isBTC && _efConv < 3) efReason = 'BTC EXT-FLIP conv floor — conv ' + _efConv + ' < 3 (loser autopsy 7/24: conv≤2 = 1W/12SL/−$985; conv≥3 = 3W/1L/+$300)';
+        // EXTENDED TO ALL SYMBOLS 2026-08-03 (was BTC-only): the 5.28b session-extreme gate
+        // arms EXT-FLIP on every extreme-chase block, so XAU flip frequency jumped ~1/week →
+        // 3/day and the floor became load-bearing everywhere. 8/2-8/3 XAU: conv 3 flip WON
+        // (trail), conv 1 and conv 0 flips both went straight to SL. Matches the BTC autopsy
+        // (conv≤2 = 1W/12SL/−$985; conv≥3 = 3W/1L/+$300).
+        else if (_efConv < 3) efReason = 'EXT-FLIP conv floor — conv ' + _efConv + ' < 3 (BTC autopsy 7/24: conv≤2 = 1W/12SL/−$985; conv≥3 = 3W/1L/+$300; XAU 8/2-3: conv≤1 = 0W/2SL)';
         else if (!(EF.burst >= 1.5)) efReason = 'no climax volume (burst ×' + (EF.burst || 0).toFixed(1) + ' < 1.5)';
         // Elite stand-down (2026-07-10): both 7/09 XAU flip losses (-$637/lot combined)
         // faded blocked conv-9/10 signals. An elite-conviction crest block is a TIMING
@@ -13671,7 +13717,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.31-20260731-cohort-tally', // bump on each deploy — lets /state verify what's live
+    build: '5.33-20260803-chop-atr-bars', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
