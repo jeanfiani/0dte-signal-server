@@ -1762,6 +1762,8 @@ let _ctDirty = false;
 function cohortFor(reason) {
   if (/RIDE-FADE/.test(reason)) return 'RIDE-FADE';
   if (/FADE-EASE/.test(reason)) return 'FADE-EASE';
+  if (/QQQ-FADE-MIRROR/.test(reason)) return 'QQQ-FADE-MIRROR';
+  if (/NAS-LIVE-BREAK/.test(reason)) return 'NAS-LIVE-BREAK';
   if (/V-CONT/.test(reason)) return 'V-CONT';
   if (/REV-OVERRIDE/.test(reason)) return 'REV-OVERRIDE';
   if (/BTC dormant except V-REC/.test(reason)) return null; // generic dormant block — NOT the V-REC cohort
@@ -2706,7 +2708,9 @@ function logSignal(sym, sig) {
     const s = S[sym];
     if (s) {
       if (!Array.isArray(s.recentFires)) s.recentFires = [];
-      s.recentFires.push({ ts: Date.now(), type: sig.type });
+      // score added 2026-08-04: the NAS QQQ-fade-mirror needs to distinguish QQQ FADE
+      // fires (HI/LO/ATH/ATL/DIV/6-6) from momentum fires when deciding to ease.
+      s.recentFires.push({ ts: Date.now(), type: sig.type, score: sig.score || '' });
       // Trim entries older than 60 min (window is 30 min, keep some buffer for analysis)
       const cutoff = Date.now() - 3600000;
       s.recentFires = s.recentFires.filter(f => f.ts > cutoff);
@@ -4977,7 +4981,15 @@ function processPrice(sym, price, hi, lo) {
     } catch (eAt) {}
 
     const tagEarly = sig.score || '';
-    const isFadeEarly = /ATH|ATL|HI|LO|DIV/.test(tagEarly) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tagEarly);
+    // LHF|LLF added 2026-08-04: the other two fade regexes (isFadeForOb line ~5131, the
+    // MACD-gate exemption) both include LHF|LLF; this one was never extended when the
+    // local fades were added. Consequence: the macro contra-block treated LHF/LLF as
+    // momentum — and at a stale session high the macro was CALL-aligned minutes earlier
+    // BY DEFINITION (that's what made the high), so the sticky 45-min PUT contra-block
+    // silently killed every FADE-EASE release. 23 stamps 7/31–8/3, zero reached history:
+    // stamped → contra-blocked → return-before-push. A fade at an extreme REQUIRES the
+    // prior trend to have been against it; the contra stamp is its precondition, not a veto.
+    const isFadeEarly = /ATH|ATL|HI|LO|DIV|LHF|LLF/.test(tagEarly) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tagEarly);
     const macroContraNow = Date.now();
     // (Reversal Confirmation Scorer relocated to the top of enrichSig on 2026-07-21 so it
     // grades EVERY candidate — including signals blocked by earlier gates.)
@@ -5172,7 +5184,27 @@ function processPrice(sym, price, hi, lo) {
         // for the retest (detectors re-fire within minutes).
         if (_gScore >= _gFloor || _vCont) {
           const _gStr = findRecoveryStructure(s, sym, sig.type, price, atrVal, null);
-          if (_gStr && !_gStr.ok) {
+          // ===== NAS LIVE-BREAK WAIVER (2026-08-04) =====
+          // 8/4: NAS ran +$1,009 (+3.5%) and this gate blocked EVERY with-trend entry all
+          // day with "extended $1,046 beyond Asian low" / "no room to rolling ATH $1.25
+          // away" — on a breakout day the Asian anchor never updates, so everything is
+          // "extended", and price is always "at" the ATH it keeps breaking. NAS ONLY
+          // (Jean: XAU ranges, NAS trends — keep the tight anchors on XAU): while the
+          // session extreme in the signal's direction advanced within the last 90s (same
+          // live-break test as the 5.28b chase gate), the stale anchors are moot — waive.
+          let _gLiveBreak = false;
+          try {
+            if (isNAS && _gStr && !_gStr.ok) {
+              const _gBkTs = sig.type === 'call' ? (s.sessionHighUpdateTs || 0) : (s.sessionLowUpdateTs || 0);
+              _gLiveBreak = _gBkTs > 0 && (Date.now() - _gBkTs) < 90000;
+              if (_gLiveBreak) {
+                const _gLbMsg = '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' NAS-LIVE-BREAK grind entry-quality waived @ $' + price.toFixed(2) + ' — session extreme advanced <90s ago; stale-anchor objection (' + _gStr.reason + ') is moot on a breakout leg (2026-08-04).';
+                log(sym, _gLbMsg);
+                trackBlockedOutcome(sym, _gLbMsg, true);
+              }
+            }
+          } catch (eGLB) {}
+          if (_gStr && !_gStr.ok && !_gLiveBreak) {
             // ===== V-CONT ENTRY-QUALITY WAIVER REVOKED (2026-07-31) =====
             // Was: validator-confirmed continuation waived this block, on the 7/23 theory that
             // "extended beyond Asian high" is meaningless mid-crash. Live results killed it.
@@ -7990,19 +8022,42 @@ function processPrice(sym, price, hi, lo) {
     // family's only overnight loss (23:48, 0.86% off the high) stays blocked — the
     // ease window is 6x tighter. All other LHF gates (RSI 35-60, MACD ≤0, ROC,
     // distance, cooldowns) still apply in full.
+    // SCOPED TO XAU ONLY (2026-08-04, Jean: "you are mixing nas and xau"): the ease went
+    // 10W/0L on XAU and 0W/1L/6S on NAS (8/4: eased PUTs into a +3.5% NAS grind whose
+    // "stale" high broke 7min later). XAU mean-reverts at its extremes; NAS trends
+    // through them. NAS gets the QQQ-FADE-MIRROR below instead — the equity engine's
+    // regime gates (STRONG-BULL fade block, RSI>70, ROC) decide when fading the Nasdaq
+    // is sane, which they proved today by refusing every QQQ fade on a +5% SPY week.
     let _lhfFadeAtHigh = false;
     try {
-      if (s.sessionHigh > 0 && price <= s.sessionHigh) {
+      if (isXAU && s.sessionHigh > 0 && price <= s.sessionHigh) {
         const _fePct = ((s.sessionHigh - price) / s.sessionHigh) * 100;
         const _feStale = (s.sessionHighUpdateTs || 0) > 0 && (Date.now() - s.sessionHighUpdateTs) >= 180000;
         _lhfFadeAtHigh = _fePct <= 0.15 && _feStale && convictionFor('put').score >= 5;
       }
     } catch (eFE) {}
+    // ===== QQQ-FADE-MIRROR (NAS only, 2026-08-04, Jean's design) =====
+    // A FIRED same-direction QQQ FADE (HI/LO/ATH/ATL/DIV/6-6) within 15min eases the
+    // NAS LHF macro-alignment gate the way session-extreme proximity eases XAU's. QQQ
+    // is the same index run through the equity engine, whose fade gates were calibrated
+    // on QQQ/SPY data (incl. the original session-high blocker + the STRONG-BULL regime
+    // fade block). NAS's own fade shadows went 0W/39L on 8/4 while QQQ's gates said
+    // no-fade all day — QQQ's judgment is the missing brain for NAS fades. conv ≥5 and
+    // all other LHF gates (RSI window, MACD ≤0, ROC, cooldowns) still apply.
+    let _lhfQqqMirror = false;
+    try {
+      if (isNAS && convictionFor('put').score >= 5) {
+        const _qS = S['QQQ'];
+        const _qFade = (_qS && Array.isArray(_qS.recentFires)) ? _qS.recentFires.filter(f =>
+          f && f.type === 'put' && (Date.now() - f.ts) < 900000 && /HI|LO|ATH|ATL|DIV|6\/6/.test(f.score || '')) : [];
+        _lhfQqqMirror = _qFade.length >= 1;
+      }
+    } catch (eQF) {}
     const _lhfMacroBase  = macroAlignedFor('put') ||
       (s.fullConvSincePut > 0 && (tSoftMacro - s.fullConvSincePut) >= SOFT_MACRO_STABLE_MS && convictionFor('put').score >= SOFT_MACRO_THR) ||
       lhfPutObOk ||
       lhfPutHtfReversalOk;
-    const lhfPutMacroOk  = _lhfMacroBase || _lhfFadeAtHigh;
+    const lhfPutMacroOk  = _lhfMacroBase || _lhfFadeAtHigh || _lhfQqqMirror;
     const lhfPutFlipOk   = flipCoolFor('put');
     const lhfPutWinOk    = winProtectDir !== 'call';
     if (lhfPutTimingOk && lhfPutDistOk && lhfPutRangeOk && lhfPutCoolOk &&
@@ -8020,6 +8075,14 @@ function processPrice(sym, price, hi, lo) {
             log(sym, _feMsg);
             trackBlockedOutcome(sym, _feMsg, true);
           } catch (eFT) {}
+        }
+        // QQQ-FADE-MIRROR cohort stamp — only when the mirror was DECISIVE.
+        if (_lhfQqqMirror && !_lhfMacroBase && !_lhfFadeAtHigh) {
+          try {
+            const _qmMsg = '🪞 ⬇LHF PUT QQQ-FADE-MIRROR FIRED @ $' + price.toFixed(2) + ' — QQQ fired a same-direction fade within 15min; NAS macro-alignment gate eased (2026-08-04, conv≥5).';
+            log(sym, _qmMsg);
+            trackBlockedOutcome(sym, _qmMsg, true);
+          } catch (eQT) {}
         }
         if (!enrichSig(sig)) return; s.signals.push(sig);
         logSignal(sym, sig);
@@ -8139,19 +8202,29 @@ function processPrice(sym, price, hi, lo) {
     // FADE-AT-EXTREME EASE — LLF CALL mirror (2026-07-31, Jean). See LHF PUT site above
     // for full rationale. Within 0.15% above a STALE session low (≥3min, never fade a
     // live breakdown), conv ≥5 → macro-alignment gate eased. All other gates unchanged.
+    // XAU only + NAS QQQ-mirror — see LHF PUT site above (2026-08-04 scoping).
     let _llfFadeAtLow = false;
     try {
-      if (s.sessionLow > 0 && s.sessionLow < Infinity && price >= s.sessionLow) {
+      if (isXAU && s.sessionLow > 0 && s.sessionLow < Infinity && price >= s.sessionLow) {
         const _fePctL = ((price - s.sessionLow) / price) * 100;
         const _feStaleL = (s.sessionLowUpdateTs || 0) > 0 && (Date.now() - s.sessionLowUpdateTs) >= 180000;
         _llfFadeAtLow = _fePctL <= 0.15 && _feStaleL && convictionFor('call').score >= 5;
       }
     } catch (eFEL) {}
+    let _llfQqqMirror = false;
+    try {
+      if (isNAS && convictionFor('call').score >= 5) {
+        const _qSL = S['QQQ'];
+        const _qFadeL = (_qSL && Array.isArray(_qSL.recentFires)) ? _qSL.recentFires.filter(f =>
+          f && f.type === 'call' && (Date.now() - f.ts) < 900000 && /HI|LO|ATH|ATL|DIV|6\/6/.test(f.score || '')) : [];
+        _llfQqqMirror = _qFadeL.length >= 1;
+      }
+    } catch (eQFL) {}
     const _llfMacroBase  = macroAlignedFor('call') ||
       (s.fullConvSinceCall > 0 && (tSoftMacro - s.fullConvSinceCall) >= SOFT_MACRO_STABLE_MS && convictionFor('call').score >= SOFT_MACRO_THR) ||
       llfCallObOk ||
       llfCallHtfReversalOk;
-    const llfCallMacroOk  = _llfMacroBase || _llfFadeAtLow;
+    const llfCallMacroOk  = _llfMacroBase || _llfFadeAtLow || _llfQqqMirror;
     const llfCallFlipOk   = flipCoolFor('call');
     const llfCallWinOk    = winProtectDir !== 'put';
     // ===== PHASE 3.92 — LLF FRESHNESS GATE (2026-07-06) =====
@@ -8195,6 +8268,14 @@ function processPrice(sym, price, hi, lo) {
             log(sym, _feMsgL);
             trackBlockedOutcome(sym, _feMsgL, true);
           } catch (eFTL) {}
+        }
+        // QQQ-FADE-MIRROR cohort stamp — only when the mirror was DECISIVE.
+        if (_llfQqqMirror && !_llfMacroBase && !_llfFadeAtLow) {
+          try {
+            const _qmMsgL = '🪞 ⬆LLF CALL QQQ-FADE-MIRROR FIRED @ $' + price.toFixed(2) + ' — QQQ fired a same-direction fade within 15min; NAS macro-alignment gate eased (2026-08-04, conv≥5).';
+            log(sym, _qmMsgL);
+            trackBlockedOutcome(sym, _qmMsgL, true);
+          } catch (eQTL) {}
         }
         if (!enrichSig(sig)) return; s.signals.push(sig);
         logSignal(sym, sig);
@@ -13717,7 +13798,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.33-20260803-chop-atr-bars', // bump on each deploy — lets /state verify what's live
+    build: '5.35-20260804-lhf-fade-class', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
