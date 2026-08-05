@@ -1763,7 +1763,7 @@ function cohortFor(reason) {
   if (/RIDE-FADE/.test(reason)) return 'RIDE-FADE';
   if (/FADE-EASE/.test(reason)) return 'FADE-EASE';
   if (/QQQ-FADE-MIRROR/.test(reason)) return 'QQQ-FADE-MIRROR';
-  if (/NAS-LIVE-BREAK/.test(reason)) return 'NAS-LIVE-BREAK';
+  if (/LIVE-BREAK/.test(reason)) return 'LIVE-BREAK'; // matches old NAS-LIVE-BREAK stamps too
   if (/V-CONT/.test(reason)) return 'V-CONT';
   if (/REV-OVERRIDE/.test(reason)) return 'REV-OVERRIDE';
   if (/BTC dormant except V-REC/.test(reason)) return null; // generic dormant block — NOT the V-REC cohort
@@ -2996,7 +2996,14 @@ function processPrice(sym, price, hi, lo) {
           // units of current volatility: trip at whichever is LOWER, the legacy percent
           // bar (binds in high-vol) or 3×ATR (binds in low-vol). Today: $10.22 ≥ $7.20
           // → chop OFF at 08:51, four with-trend PUTs release into the slide.
-          const _atr57 = (typeof s._atr === 'number' && s._atr > 0) ? s._atr : 0;
+          // ATR REFERENCE FROZEN AT SESSION OPEN (2026-08-05): on 8/5 gold ran +$200 and
+          // intraday ATR inflated $2.40 → ~$7, raising this bar $7.20 → $21 mid-rally —
+          // the goalposts moved at the speed of the ball and the afternoon legs ($11-12
+          // per 30min) never tripped it. The bar's job is "is this move big relative to
+          // NORMAL vol", so the reference must be the session-open ATR, not the trend-
+          // inflated live one. min() keeps whichever is smaller for safety.
+          const _atr57live = (typeof s._atr === 'number' && s._atr > 0) ? s._atr : 0;
+          const _atr57 = (s._atrSessOpen > 0) ? Math.min(_atr57live || Infinity, s._atrSessOpen) : _atr57live;
           const _dirMoveAbs = Math.abs(price - snap30.p);
           const _bar57 = Math.min(snap30.p * dirThr / 100, _atr57 > 0 ? 3 * _atr57 : Infinity);
           if (_dirMoveAbs > _bar57) {
@@ -3007,6 +3014,31 @@ function processPrice(sym, price, hi, lo) {
         }
       }
     } catch (e) {}
+
+    // ===== TREND-DAY LATCH (2026-08-05, Jean: "it was clearly not a chop day") =====
+    // The base detector reads 30s/2.5min texture and the escapes read single windows —
+    // none of them can make the DAY-level judgment a human makes at a glance. This can:
+    // when the session range is ≥5× the session-open ATR (8/5: $138 vs $12-20 needed —
+    // unambiguous) AND price is holding within 1.5×ATR of the session extreme, this is
+    // a trend day pressing its edge, not chop — suppress chop while that remains true.
+    // On genuine range days session range stays 2-3×ATR and the latch never arms. The
+    // session-extreme chase gate still governs WHICH direction may fire at the edge.
+    try {
+      if (s.chopActive && s.sessionHigh > 0 && s.sessionLow > 0 && s.sessionLow < Infinity) {
+        const _tdAtr = (s._atrSessOpen > 0) ? s._atrSessOpen : ((typeof s._atr === 'number' && s._atr > 0) ? s._atr : 0);
+        if (_tdAtr > 0) {
+          const _tdRange = s.sessionHigh - s.sessionLow;
+          const _tdNearEdge = (s.sessionHigh - price) <= 1.5 * _tdAtr || (price - s.sessionLow) <= 1.5 * _tdAtr;
+          if (_tdRange >= 6 * _tdAtr && _tdNearEdge) { // 6x (not 5x): a range of exactly 5xATR with price at the edge is still ambiguous; 6x is unambiguous trend-day territory
+            s.chopActive = false; s.trendCount = 0;
+            if (!s._tdLatchLogTs || Date.now() - s._tdLatchLogTs > 300000) {
+              s._tdLatchLogTs = Date.now();
+              log(sym, '📈 TREND-DAY LATCH — session range $' + _tdRange.toFixed(2) + ' ≥ 6×ATRopen ($' + (6 * _tdAtr).toFixed(2) + ') and price at the edge; chop suppressed (2026-08-05).');
+            }
+          }
+        }
+      }
+    } catch (eTD) {}
 
     // ===== PHASE 3.96 — GRIND-LIVE TREND-AWARE CHOP SUSPENSION (promoted 2026-07-06) =====
     // Promoted from the 7/02 dormant experiment after 4 documented grind sessions
@@ -3042,7 +3074,8 @@ function processPrice(sym, price, hi, lo) {
           // 0.8%/3h on 8/3 gold = $32 = 13.5×ATR: unreachable. New: trip at whichever is
           // lower, the legacy percent bar or 5×ATR of 3h drift (today's $19 = 7.9×ATR ✓).
           // HTF 1h+4h agreement requirement unchanged — this only fixes the denominator.
-          const _atrG = (typeof s._atr === 'number' && s._atr > 0) ? s._atr : 0;
+          const _atrGlive = (typeof s._atr === 'number' && s._atr > 0) ? s._atr : 0;
+          const _atrG = (s._atrSessOpen > 0) ? Math.min(_atrGlive || Infinity, s._atrSessOpen) : _atrGlive; // session-open ATR ref (2026-08-05, see 3.57)
           const _driftAbs = s.lastPrice - oldest.p;
           const _grindBarAbs = Math.min(oldest.p * grindBar / 100, _atrG > 0 ? 5 * _atrG : Infinity);
           const driftAligned = (_driftAbs >= _grindBarAbs && s.htf1h_dir === 'up') || (-_driftAbs >= _grindBarAbs && s.htf1h_dir === 'down');
@@ -5194,11 +5227,17 @@ function processPrice(sym, price, hi, lo) {
           // live-break test as the 5.28b chase gate), the stale anchors are moot — waive.
           let _gLiveBreak = false;
           try {
-            if (isNAS && _gStr && !_gStr.ok) {
+            // EXTENDED TO XAU 2026-08-05 (was NAS-only per the 8/04 profile split): 8/05
+            // gold ran +$200 with ~40 with-trend CALLs blocked while the session high
+            // advanced all day — the identical failure NAS had on 8/04. The waiver is
+            // regime-TRIGGERED (extreme advanced <90s), not symbol-typed: on XAU range
+            // days the extreme goes stale and the waiver is inert, so the tight-anchor
+            // profile is preserved exactly when it matters.
+            if ((isNAS || isXAU) && _gStr && !_gStr.ok) {
               const _gBkTs = sig.type === 'call' ? (s.sessionHighUpdateTs || 0) : (s.sessionLowUpdateTs || 0);
               _gLiveBreak = _gBkTs > 0 && (Date.now() - _gBkTs) < 90000;
               if (_gLiveBreak) {
-                const _gLbMsg = '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' NAS-LIVE-BREAK grind entry-quality waived @ $' + price.toFixed(2) + ' — session extreme advanced <90s ago; stale-anchor objection (' + _gStr.reason + ') is moot on a breakout leg (2026-08-04).';
+                const _gLbMsg = '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' LIVE-BREAK grind entry-quality waived @ $' + price.toFixed(2) + ' — session extreme advanced <90s ago; stale-anchor objection (' + _gStr.reason + ') is moot on a breakout leg (2026-08-05, NAS+XAU).';
                 log(sym, _gLbMsg);
                 trackBlockedOutcome(sym, _gLbMsg, true);
               }
@@ -13510,6 +13549,7 @@ setInterval(() => {
       s.dailySignalCount = 0; s.lastSignalDir = null; s.lastSignalTs = 0;
       s.nC = 0; s.nP = 0; s.nBl = 0;
       s.chopShort = []; s.chopLong = []; s.chopCount = 0; s.trendCount = 0; s.chopActive = false;
+      s._atrSessOpen = s._atr || 0; // 2026-08-05: freeze the chop-escape ATR reference at session open — intraday ATR inflation must not raise the trend bars mid-trend
       s.signals = []; s.tickBuf = []; // in-memory today array cleared — full history persisted in signalHistory[]
       s.crossAssetDir = null; s.crossAssetTs = 0;
       s.sessionHigh = -Infinity; s.sessionLow = Infinity; s.rsiAtSessionHigh = 50; s.rsiAtSessionLow = 50;
@@ -13798,7 +13838,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.35-20260804-lhf-fade-class', // bump on each deploy — lets /state verify what's live
+    build: '5.37-20260805-livebreak-xau', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
