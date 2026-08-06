@@ -5447,7 +5447,7 @@ function processPrice(sym, price, hi, lo) {
     // we never want to block an exit.
     if (!String(sig.type).startsWith('exit')) {
       const tagP2 = sig.score || '';
-      const isFadeP2 = /VREV|LHF|LLF|OBREJ|OBMIT|STRUCT_SWEEP|STRUCT_LIQ_GRAB|STRUCT_OB_FILL|INVERSAL_BREAK/.test(tagP2);
+      const isFadeP2 = /VREV|LHF|LLF|OBREJ|OBMIT|RETEST|STRUCT_SWEEP|STRUCT_LIQ_GRAB|STRUCT_OB_FILL|INVERSAL_BREAK/.test(tagP2);
       const isP2Mt5 = isXAU || isBTC || isNAS;
 
       // ── 2.1: News Blackout Gate (task #189)
@@ -5826,7 +5826,7 @@ function processPrice(sym, price, hi, lo) {
     // pattern. Block all other detectors (BREAK, FAST, TREND, RIDE, ATH, ATL, HI, LO,
     // MFLIP, 6/6, DIV, TMIR, etc.).
     if ((isNAS || isBTC || isXAU) && s.chopActive) {
-      const isFadeAllowedInChop = /VREV|LHF|LLF|OBREJ|OBMIT|STRUCT_SWEEP|STRUCT_LIQ_GRAB|STRUCT_OB_FILL|INVERSAL_BREAK/.test(tagEarly);
+      const isFadeAllowedInChop = /VREV|LHF|LLF|OBREJ|OBMIT|RETEST|STRUCT_SWEEP|STRUCT_LIQ_GRAB|STRUCT_OB_FILL|INVERSAL_BREAK/.test(tagEarly);
       if (!isFadeAllowedInChop) {
         // ===== PHASE 3.54 REVISED — VOL>=1.5x BYPASS (2026-06-26, task #249) =====
         // Pro research: "Low-grade on volume → trade the break." Volume confirmation
@@ -8395,6 +8395,84 @@ function processPrice(sym, price, hi, lo) {
         s.llfCallMacroBlocks = s.llfCallMacroBlocks.filter(b => b.ts > cutoff);
       }
     }
+
+    // ===== RETEST-HI / RETEST-LO — BROKEN-EXTREME ZONE FADE (LIVE, 2026-08-06, Jean) =====
+    // 8/6 case: session high 4284.74 failed, price fell ~2.5×ATR, then stalled 48min at
+    // 4273-74 — the underside of the 4275-85 zone. A textbook OB short that no detector
+    // owned: FADE-EASE needs ≤0.15% from the extreme, LHF's window ends $8 off, momentum
+    // PUTs need the drop already underway. Jean: the old OB signal (removed 6/11, 0% WR)
+    // failed because it entered at market with ATR stops and no fade-easing existed; the
+    // easing machinery is what was missing. This is the level-anchored version: STALE
+    // extreme (≥30min) + price parked in the retest band (0.5-3×ATR from it) + momentum
+    // stalled (|ROC| small) + conv ≥5 → fade with SL anchored BEYOND the extreme.
+    // Tags contain HI/LO deliberately → classified as fades by the contra-block, MACD
+    // gate and chase gate. One fire per extreme value, 45-min cooldown. Replay: fires
+    // 8/6 10:43 PUT @4274.24 (MAE ~$0.3, TP1+TP2) vs the actual 11:53 entry @4245.97.
+    try {
+      // XAU + BTC ONLY (2026-08-06, Jean: "NAS doesn't work with OB at all") — NAS trends
+      // through its levels rather than respecting them; its OB history (0% WR pre-6/11,
+      // ATH-put 0W/9L shadow) agrees. On BTC the dormant gate still intercepts fires and
+      // shadow-tracks them, so BTC accrues a RETEST cohort at zero risk toward its
+      // reopening bar (>=60% over >=30 samples).
+      if ((isXAU || isBTC) && cool && atrVal > 0 && s.sessionHigh > 0 && s.sessionLow > 0 && s.sessionLow < Infinity) {
+        const _rtAtr = (s._atrSessOpen > 0) ? Math.max(atrVal, s._atrSessOpen) : atrVal;
+        const _rtNow = Date.now();
+        const _rtCool = (_rtNow - (s._rtLastTs || 0)) > 45 * 60000;
+        const _rtStall = Math.abs(roc3) <= 0.05; // parked, not thrusting either way
+        // --- PUT: underside retest of a stale session high ---
+        const _rtHiDist = s.sessionHigh - price;
+        if (_rtCool && _rtStall && (s.sessionHighUpdateTs || 0) > 0 && (_rtNow - s.sessionHighUpdateTs) >= 30 * 60000 &&
+            _rtHiDist >= 0.5 * _rtAtr && _rtHiDist <= 3.0 * _rtAtr && s._rtHiFiredAt !== s.sessionHigh &&
+            convictionFor('put').score >= 5 && flipCoolFor('put') && winProtectDir !== 'call') {
+          let _rtSlDist = (s.sessionHigh + 0.15 * _rtAtr) - price;
+          if (_rtSlDist < 1.0 * _rtAtr) _rtSlDist = 1.0 * _rtAtr;
+          if (_rtSlDist <= 2.5 * _rtAtr) {
+            s._rtHiFiredAt = s.sessionHigh; s._rtLastTs = _rtNow;
+            s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
+            if (s.lastSignalDir === 'call') s.lastReversalTs = _rtNow;
+            s.lastSignalDir = 'put'; s.lastSignalTs = _rtNow; s.lastNTs = _rtNow;
+            const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇RETEST-HI', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+            if (enrichSig(sig)) {
+              s.signals.push(sig); logSignal(sym, sig);
+              const _slP = price + _rtSlDist;
+              const _tp1 = price - Math.min(_rtSlDist * 1.5, isXAU ? 5 : isBTC ? 100 : isNAS ? 50 : 0.5);
+              s.trade = buildCfdTrade('put', price, atrVal, sym);
+              s.trade.slPrice = +_slP.toFixed(2); s.trade.tp1Price = +_tp1.toFixed(2);
+              s.trade.tp2Price = +(price - _rtSlDist * 3).toFixed(2); s.trade.tp3Price = +(price - _rtSlDist * 5).toFixed(2);
+              sig.sl = _slP.toFixed(2); sig.tp1 = _tp1.toFixed(2); sig.tp2 = s.trade.tp2Price.toFixed(2); sig.tp3 = s.trade.tp3Price.toFixed(2);
+              log(sym, '🧲 RETEST-HI PUT — $' + _rtHiDist.toFixed(2) + ' under stale session high $' + s.sessionHigh.toFixed(2) + ' (held ' + Math.round((_rtNow - s.sessionHighUpdateTs) / 60000) + 'min) · SL anchored $' + _slP.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+              sendPush('🧲 ' + sym + ' RETEST-HI PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · underside of $' + s.sessionHigh.toFixed(2), 'signal');
+            }
+          }
+        }
+        // --- CALL mirror: topside retest of a stale session low ---
+        const _rtLoDist = price - s.sessionLow;
+        if (_rtCool && _rtStall && (s.sessionLowUpdateTs || 0) > 0 && (_rtNow - s.sessionLowUpdateTs) >= 30 * 60000 &&
+            _rtLoDist >= 0.5 * _rtAtr && _rtLoDist <= 3.0 * _rtAtr && s._rtLoFiredAt !== s.sessionLow &&
+            convictionFor('call').score >= 5 && flipCoolFor('call') && winProtectDir !== 'put') {
+          let _rtSlDistL = price - (s.sessionLow - 0.15 * _rtAtr);
+          if (_rtSlDistL < 1.0 * _rtAtr) _rtSlDistL = 1.0 * _rtAtr;
+          if (_rtSlDistL <= 2.5 * _rtAtr) {
+            s._rtLoFiredAt = s.sessionLow; s._rtLastTs = _rtNow;
+            s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
+            if (s.lastSignalDir === 'put') s.lastReversalTs = _rtNow;
+            s.lastSignalDir = 'call'; s.lastSignalTs = _rtNow; s.lastNTs = _rtNow;
+            const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆RETEST-LO', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+            if (enrichSig(sig)) {
+              s.signals.push(sig); logSignal(sym, sig);
+              const _slPL = price - _rtSlDistL;
+              const _tp1L = price + Math.min(_rtSlDistL * 1.5, isXAU ? 5 : isBTC ? 100 : isNAS ? 50 : 0.5);
+              s.trade = buildCfdTrade('call', price, atrVal, sym);
+              s.trade.slPrice = +_slPL.toFixed(2); s.trade.tp1Price = +_tp1L.toFixed(2);
+              s.trade.tp2Price = +(price + _rtSlDistL * 3).toFixed(2); s.trade.tp3Price = +(price + _rtSlDistL * 5).toFixed(2);
+              sig.sl = _slPL.toFixed(2); sig.tp1 = _tp1L.toFixed(2); sig.tp2 = s.trade.tp2Price.toFixed(2); sig.tp3 = s.trade.tp3Price.toFixed(2);
+              log(sym, '🧲 RETEST-LO CALL — $' + _rtLoDist.toFixed(2) + ' over stale session low $' + s.sessionLow.toFixed(2) + ' (held ' + Math.round((_rtNow - s.sessionLowUpdateTs) / 60000) + 'min) · SL anchored $' + _slPL.toFixed(2) + ' [#' + s.dailySignalCount + ']');
+              sendPush('🧲 ' + sym + ' RETEST-LO CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · topside of $' + s.sessionLow.toFixed(2), 'signal');
+            }
+          }
+        }
+      }
+    } catch (eRT) { /* retest detector must never crash the tick */ }
 
     // ===== LHF/LLF PERSISTENCE DETECTOR (added 2026-05-28) =====
     // When LHF/LLF has been blocked 80+ times in last 10 min (macro-only blocks — meaning
@@ -13838,7 +13916,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.37-20260805-livebreak-xau', // bump on each deploy — lets /state verify what's live
+    build: '5.38b-20260806-retest-xau-btcshadow', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
