@@ -5050,7 +5050,12 @@ function processPrice(sym, price, hi, lo) {
           const _egRange = _egHi - _egLo;
           if (_egRange >= 1.5 * atrVal) {
             const _egPos = (price - _egLo) / _egRange;
-            const _egCrest = sig.type === 'call' ? _egPos >= 0.9 : _egPos <= 0.1;
+            // 90% → 80% (2026-08-07): with the trend-day doors open (latch + live-break
+            // waivers), EXT-GUARD is the only crest police left, and 90% let three chases
+            // through in three days, all adverseFrac ≥1.0: 8/5 19:38 FAST @84% (−$9.23),
+            // 8/6 11:10 NAS RIDE at the V-top (−$77.85), 8/7 09:42 RIDE @~100% into the
+            // parabolic ATH, conf 1/6 (−$13.53 in 4min). Retest ~40% is still the entry.
+            const _egCrest = sig.type === 'call' ? _egPos >= 0.8 : _egPos <= 0.2;
             if (_egCrest) {
               const _egRetest = sig.type === 'call' ? (_egHi - _egRange * 0.4) : (_egLo + _egRange * 0.4);
               // ===== EXT-FLIP ARM (Phase 3.93, 2026-07-06) =====
@@ -8096,7 +8101,12 @@ function processPrice(sym, price, hi, lo) {
       (s.fullConvSincePut > 0 && (tSoftMacro - s.fullConvSincePut) >= SOFT_MACRO_STABLE_MS && convictionFor('put').score >= SOFT_MACRO_THR) ||
       lhfPutObOk ||
       lhfPutHtfReversalOk;
-    const lhfPutMacroOk  = _lhfMacroBase || _lhfFadeAtHigh || _lhfQqqMirror;
+    // NAS FADES REQUIRE THE QQQ MIRROR — EXCLUSIVE (2026-08-06, Jean's "QQQ is the brain"
+    // design completed): 8/5-8/6 overnight, NAS fade CALLs fired through the BASE macro
+    // paths while QQQ was closed (00:56 LLF −$35, 05:48 CHoCH −$35, both adverseFrac ≥1.0),
+    // while the day's fade WINNER (14:51 LLF, adverseFrac 0.45) came during RTH with QQQ
+    // trading. On NAS the base paths are no longer sufficient: no QQQ fade fire → no NAS fade.
+    const lhfPutMacroOk  = isNAS ? _lhfQqqMirror : (_lhfMacroBase || _lhfFadeAtHigh);
     const lhfPutFlipOk   = flipCoolFor('put');
     const lhfPutWinOk    = winProtectDir !== 'call';
     if (lhfPutTimingOk && lhfPutDistOk && lhfPutRangeOk && lhfPutCoolOk &&
@@ -8263,7 +8273,8 @@ function processPrice(sym, price, hi, lo) {
       (s.fullConvSinceCall > 0 && (tSoftMacro - s.fullConvSinceCall) >= SOFT_MACRO_STABLE_MS && convictionFor('call').score >= SOFT_MACRO_THR) ||
       llfCallObOk ||
       llfCallHtfReversalOk;
-    const llfCallMacroOk  = _llfMacroBase || _llfFadeAtLow || _llfQqqMirror;
+    // NAS: QQQ mirror exclusive — see LHF PUT site above (2026-08-06).
+    const llfCallMacroOk  = isNAS ? _llfQqqMirror : (_llfMacroBase || _llfFadeAtLow);
     const llfCallFlipOk   = flipCoolFor('call');
     const llfCallWinOk    = winProtectDir !== 'put';
     // ===== PHASE 3.92 — LLF FRESHNESS GATE (2026-07-06) =====
@@ -13916,7 +13927,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.38b-20260806-retest-xau-btcshadow', // bump on each deploy — lets /state verify what's live
+    build: '5.40-20260807-extguard-80', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
