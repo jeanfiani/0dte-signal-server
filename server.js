@@ -1760,6 +1760,7 @@ let cohortTally = {};
 try { cohortTally = JSON.parse(fs.readFileSync(COHORT_TALLY_FILE, 'utf8')) || {}; } catch (e) { cohortTally = {}; }
 let _ctDirty = false;
 function cohortFor(reason) {
+  if (/CLIMAX-FLIP/.test(reason)) return 'CLIMAX-FLIP';
   if (/RIDE-FADE/.test(reason)) return 'RIDE-FADE';
   if (/FADE-EASE/.test(reason)) return 'FADE-EASE';
   if (/QQQ-FADE-MIRROR/.test(reason)) return 'QQQ-FADE-MIRROR';
@@ -7746,7 +7747,26 @@ function processPrice(sym, price, hi, lo) {
         // faded blocked conv-9/10 signals. An elite-conviction crest block is a TIMING
         // objection, not a direction one — don't fade the metals board.
         else if ((EF.srcConv || 0) >= 8) efReason = 'armed by a conv-' + EF.srcConv + ' block — elite conviction says trend, not reversal; standing down';
-        else if (efFightsBoth) efReason = 'no HTF agrees with the flip (1h=' + s.htf1h_dir + ', 4h=' + s.htf4h_dir + ') — counter-trend flips are 0W/7L lifetime';
+        else if (efFightsBoth) {
+          // ===== CLIMAX-FLIP (DORMANT, 2026-08-07, Jean) =====
+          // The HTF veto makes parabolic tops unfadeable: on a blow-off day both HTFs
+          // agree upward BY DEFINITION (8/7: 4366 top, RSI@high 81, price fell $36 —
+          // no put mechanism could reach it). The 0W/7L that earned this veto were
+          // MID-TREND flips; this measures whether true CLIMAX flips differ: day range
+          // ≥6×ATRopen (trend-day latch bar) + RSI at the extreme ≥75/≤25 + burst ≥2 +
+          // flip extreme within 1×ATR of the session extreme. Shadow-only; rare by design.
+          try {
+            const _cxAtr = (s._atrSessOpen > 0) ? s._atrSessOpen : efAtr;
+            const _cxRange = (s.sessionHigh > 0 && s.sessionLow > 0 && s.sessionLow < Infinity) ? (s.sessionHigh - s.sessionLow) : 0;
+            const _cxRsiExt = efCall ? (s.rsiAtSessionLow || 50) : (s.rsiAtSessionHigh || 50);
+            const _cxNearExt = efCall ? Math.abs(EF.extreme - s.sessionLow) <= _cxAtr : Math.abs(s.sessionHigh - EF.extreme) <= _cxAtr;
+            if (_cxAtr > 0 && _cxRange >= 6 * _cxAtr && (efCall ? _cxRsiExt <= 25 : _cxRsiExt >= 75) && (EF.burst || 0) >= 2 && _cxNearExt) {
+              const _cxMsg = '🌋 EXT-FLIP ' + EF.dir.toUpperCase() + ' CLIMAX-FLIP DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — blow-off extreme $' + EF.extreme.toFixed(2) + ' (RSI@ext ' + _cxRsiExt.toFixed(0) + ', burst ×' + (EF.burst || 0).toFixed(1) + ', day range ' + (_cxRange / _cxAtr).toFixed(1) + '×ATR); HTF veto would be waived (dormant 2026-08-07; mid-trend flips 0W/7L are the baseline this must beat).';
+              log(sym, _cxMsg); trackBlockedOutcome(sym, _cxMsg, true);
+            }
+          } catch (eCX) {}
+          efReason = 'no HTF agrees with the flip (1h=' + s.htf1h_dir + ', 4h=' + s.htf4h_dir + ') — counter-trend flips are 0W/7L lifetime';
+        }
         else if (efCall && rsiV > 55) efReason = 'RSI ' + rsiV.toFixed(1) + ' > 55 — nothing oversold to bounce';
         else if (!efCall && rsiV < 45) efReason = 'RSI ' + rsiV.toFixed(1) + ' < 45 — nothing overbought to fade';
         else if (!(efSlDist > 0) || efSlDist > efSlCap || !(efAtr > 0)) efReason = 'stop budget: $' + efSlDist.toFixed(2) + ' to extreme exceeds cap $' + efSlCap.toFixed(2);
@@ -13927,7 +13947,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.40-20260807-extguard-80', // bump on each deploy — lets /state verify what's live
+    build: '5.41-20260807-climax-flip-dormant', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
