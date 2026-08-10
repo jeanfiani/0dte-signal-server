@@ -1763,6 +1763,7 @@ function cohortFor(reason) {
   if (/CLIMAX-FLIP/.test(reason)) return 'CLIMAX-FLIP';
   if (/RETEST-HI|RETEST-LO/.test(reason)) return 'RETEST';
   if (/ZONE-OB/.test(reason)) return 'ZONE-OB';
+  if (/QQQ-REV-GATE/.test(reason)) return 'QQQ-REV-GATE';
   if (/RIDE-FADE/.test(reason)) return 'RIDE-FADE';
   if (/FADE-EASE/.test(reason)) return 'FADE-EASE';
   if (/QQQ-FADE-MIRROR/.test(reason)) return 'QQQ-FADE-MIRROR';
@@ -5163,6 +5164,27 @@ function processPrice(sym, price, hi, lo) {
       }
     } catch (eSE) { /* session-extreme gate must never crash enrichment */ }
 
+    // ===== NAS REVERSALS REQUIRE QQQ CONFIRMATION (2026-08-11, Jean) =====
+    // Completes the QQQ-brain rule: 5.39 covered NAS LHF/LLF fades; INVERSAL_BREAK found
+    // the unpoliced lane and went −$68 / +$30 / −$92 over its last three fires (8/10:
+    // sold the flush low at adverseFrac 1.00 before a +$100 bounce), BREAK-put shadow
+    // 2W/33L. NAS reversal-class entries (INVERSAL_BREAK, CHoCH) now require a same-
+    // direction QQQ fade fire within 15min — the equity engine's calibrated judgment —
+    // or they block (shadow-tracked, own cohort).
+    try {
+      if (isNAS && /INVERSAL_BREAK|CHoCH/.test(tagEarly)) {
+        const _qR = S['QQQ'];
+        const _qRf = (_qR && Array.isArray(_qR.recentFires)) ? _qR.recentFires.filter(f =>
+          f && f.type === sig.type && (Date.now() - f.ts) < 900000 && /HI|LO|ATH|ATL|DIV|6\/6/.test(f.score || '')) : [];
+        if (_qRf.length === 0) {
+          Object.assign(s, _emitSnapshot);
+          log(sym, '🪞 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — QQQ-REV-GATE: NAS reversal without a same-direction QQQ fade within 15min (QQQ is the brain, 2026-08-11).');
+          return false;
+        }
+        log(sym, '🪞 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' QQQ-REV-GATE passed — same-direction QQQ fade within 15min.');
+      }
+    } catch (eQR) { /* QQQ-REV gate must never crash enrichment */ }
+
     // ===== PHASE 3.96 — GRIND CONVICTION FLOOR (2026-07-06) =====
     // Applies ONLY while GRIND-LIVE is fresh (chop suspended by the grind override —
     // never during naturally-trending markets, where conv-5s keep firing as before).
@@ -8495,7 +8517,10 @@ function processPrice(sym, price, hi, lo) {
     // unmitigated zone ≥15min old with conv ≥5, stamp a dormant would-fire with the
     // anchored-stop plan. XAU+BTC only (8/6: NAS trends through its levels). Shadow-only.
     try {
-      if ((isXAU || isBTC) && atrVal > 0 && Array.isArray(s.macroSnaps) && s.macroSnaps.length >= 12) {
+      // NAS included 2026-08-11 (shadow costs nothing): the "NAS doesn't do OB" rule came
+      // from FIRED fades with bad mechanics — the zones themselves were never measured.
+      // Its per-symbol ZONE-OB tally will confirm the rule or overturn it with data.
+      if (isMT5 && atrVal > 0 && Array.isArray(s.macroSnaps) && s.macroSnaps.length >= 12) {
         const _zNow = Date.now();
         if (!s._zoneObLastBuild || _zNow - s._zoneObLastBuild > 60000) {
           s._zoneObLastBuild = _zNow;
@@ -13979,7 +14004,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.44-20260811-zone-ob-dormant', // bump on each deploy — lets /state verify what's live
+    build: '5.45-20260811-qqq-rev-gate', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
