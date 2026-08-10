@@ -12343,8 +12343,14 @@ function buildCfdTrade(type, price, atr, sym) {
   // only 0.017% of price — too small to be a meaningful first target. $30 floor matches
   // ~3× ATR with typical NAS ATR ~10, only kicks in during low-vol periods.
   const tp1Dist = isXAU ? 5.0 : isNAS ? Math.max(atr * mults.t1, 30) : Math.max(atr * mults.t1, 5);
-  const tp2Dist = atr * mults.t2;
-  const tp3Dist = atr * mults.t3;
+  // ===== MONOTONIC LADDER GUARD (2026-08-10, Jean's catch) =====
+  // XAU's TP1 is a FIXED $5 while TP2/TP3 are ATR-scaled — whenever ATR < $1.25
+  // (or 0 during the ~15-tick warmup after every restart) the ladder INVERTS: TP2/TP3
+  // land nearer than TP1, or at the entry itself, and stamp instantly. This is the
+  // 7/30 anomaly (tp2+tp3 12ms apart, tp1 never) and the 8/10 signal Jean caught
+  // (TP3 hit before TP1). TP2/TP3 must always sit beyond TP1, whatever ATR says.
+  const tp2Dist = Math.max(atr * mults.t2, tp1Dist * 1.6);
+  const tp3Dist = Math.max(atr * mults.t3, tp1Dist * 2.5);
   let sl = iC ? price - slDist : price + slDist;
   // Phase 3.97: structural SL override — use the level-based stop when it's a real level
   // behind the entry and tighter than (or equal to) the ATR-based default.
@@ -13947,7 +13953,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.41-20260807-climax-flip-dormant', // bump on each deploy — lets /state verify what's live
+    build: '5.42-20260810-monotonic-ladder', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
