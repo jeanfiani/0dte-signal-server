@@ -1761,6 +1761,8 @@ try { cohortTally = JSON.parse(fs.readFileSync(COHORT_TALLY_FILE, 'utf8')) || {}
 let _ctDirty = false;
 function cohortFor(reason) {
   if (/CLIMAX-FLIP/.test(reason)) return 'CLIMAX-FLIP';
+  if (/RETEST-HI|RETEST-LO/.test(reason)) return 'RETEST';
+  if (/ZONE-OB/.test(reason)) return 'ZONE-OB';
   if (/RIDE-FADE/.test(reason)) return 'RIDE-FADE';
   if (/FADE-EASE/.test(reason)) return 'FADE-EASE';
   if (/QQQ-FADE-MIRROR/.test(reason)) return 'QQQ-FADE-MIRROR';
@@ -8459,21 +8461,11 @@ function processPrice(sym, price, hi, lo) {
           if (_rtSlDist < 1.0 * _rtAtr) _rtSlDist = 1.0 * _rtAtr;
           if (_rtSlDist <= 2.5 * _rtAtr) {
             s._rtHiFiredAt = s.sessionHigh; s._rtLastTs = _rtNow;
-            s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
-            if (s.lastSignalDir === 'call') s.lastReversalTs = _rtNow;
-            s.lastSignalDir = 'put'; s.lastSignalTs = _rtNow; s.lastNTs = _rtNow;
-            const sig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇RETEST-HI', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-            if (enrichSig(sig)) {
-              s.signals.push(sig); logSignal(sym, sig);
-              const _slP = price + _rtSlDist;
-              const _tp1 = price - Math.min(_rtSlDist * 1.5, isXAU ? 5 : isBTC ? 100 : isNAS ? 50 : 0.5);
-              s.trade = buildCfdTrade('put', price, atrVal, sym);
-              s.trade.slPrice = +_slP.toFixed(2); s.trade.tp1Price = +_tp1.toFixed(2);
-              s.trade.tp2Price = +(price - _rtSlDist * 3).toFixed(2); s.trade.tp3Price = +(price - _rtSlDist * 5).toFixed(2);
-              sig.sl = _slP.toFixed(2); sig.tp1 = _tp1.toFixed(2); sig.tp2 = s.trade.tp2Price.toFixed(2); sig.tp3 = s.trade.tp3Price.toFixed(2);
-              log(sym, '🧲 RETEST-HI PUT — $' + _rtHiDist.toFixed(2) + ' under stale session high $' + s.sessionHigh.toFixed(2) + ' (held ' + Math.round((_rtNow - s.sessionHighUpdateTs) / 60000) + 'min) · SL anchored $' + _slP.toFixed(2) + ' [#' + s.dailySignalCount + ']');
-              sendPush('🧲 ' + sym + ' RETEST-HI PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · underside of $' + s.sessionHigh.toFixed(2), 'signal');
-            }
+            // DORMANT (2026-08-11, Jean): shadow-only while the cohort accrues — the 8/10
+            // 4320 OB miss suggests the stall filter may be mis-tuned; measure first. No
+            // signal counters touched, so other detectors' cooldowns are unaffected.
+            const _rtMsgP = '🧲 ⬇RETEST-HI PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — $' + _rtHiDist.toFixed(2) + ' under stale session high $' + s.sessionHigh.toFixed(2) + ' (held ' + Math.round((_rtNow - (s.sessionHighUpdateTs || _rtNow)) / 60000) + 'min) · SL would anchor $' + (price + _rtSlDist).toFixed(2) + '.';
+            log(sym, _rtMsgP); trackBlockedOutcome(sym, _rtMsgP, true);
           }
         }
         // --- CALL mirror: topside retest of a stale session low ---
@@ -8485,25 +8477,59 @@ function processPrice(sym, price, hi, lo) {
           if (_rtSlDistL < 1.0 * _rtAtr) _rtSlDistL = 1.0 * _rtAtr;
           if (_rtSlDistL <= 2.5 * _rtAtr) {
             s._rtLoFiredAt = s.sessionLow; s._rtLastTs = _rtNow;
-            s.lastAT = 'call'; s.nC++; s.dailySignalCount++;
-            if (s.lastSignalDir === 'put') s.lastReversalTs = _rtNow;
-            s.lastSignalDir = 'call'; s.lastSignalTs = _rtNow; s.lastNTs = _rtNow;
-            const sig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆RETEST-LO', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
-            if (enrichSig(sig)) {
-              s.signals.push(sig); logSignal(sym, sig);
-              const _slPL = price - _rtSlDistL;
-              const _tp1L = price + Math.min(_rtSlDistL * 1.5, isXAU ? 5 : isBTC ? 100 : isNAS ? 50 : 0.5);
-              s.trade = buildCfdTrade('call', price, atrVal, sym);
-              s.trade.slPrice = +_slPL.toFixed(2); s.trade.tp1Price = +_tp1L.toFixed(2);
-              s.trade.tp2Price = +(price + _rtSlDistL * 3).toFixed(2); s.trade.tp3Price = +(price + _rtSlDistL * 5).toFixed(2);
-              sig.sl = _slPL.toFixed(2); sig.tp1 = _tp1L.toFixed(2); sig.tp2 = s.trade.tp2Price.toFixed(2); sig.tp3 = s.trade.tp3Price.toFixed(2);
-              log(sym, '🧲 RETEST-LO CALL — $' + _rtLoDist.toFixed(2) + ' over stale session low $' + s.sessionLow.toFixed(2) + ' (held ' + Math.round((_rtNow - s.sessionLowUpdateTs) / 60000) + 'min) · SL anchored $' + _slPL.toFixed(2) + ' [#' + s.dailySignalCount + ']');
-              sendPush('🧲 ' + sym + ' RETEST-LO CALL #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · topside of $' + s.sessionLow.toFixed(2), 'signal');
-            }
+            // DORMANT (2026-08-11) — see RETEST-HI above.
+            const _rtMsgL = '🧲 ⬆RETEST-LO CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — $' + _rtLoDist.toFixed(2) + ' over stale session low $' + s.sessionLow.toFixed(2) + ' (held ' + Math.round((_rtNow - (s.sessionLowUpdateTs || _rtNow)) / 60000) + 'min) · SL would anchor $' + (price - _rtSlDistL).toFixed(2) + '.';
+            log(sym, _rtMsgL); trackBlockedOutcome(sym, _rtMsgL, true);
           }
         }
       }
     } catch (eRT) { /* retest detector must never crash the tick */ }
+
+    // ===== ZONE-OB — DISPLACEMENT-ORIGIN ZONE MAP (DORMANT, 2026-08-11, Jean) =====
+    // First piece of the zones-first architecture: "anticipate buy and sell zones, fire
+    // when the important gates pass." Builds an SMC-style order-block map from the 5-min
+    // macroSnaps: a displacement leg (≥1.2×ATR in one 5-min step) marks its ORIGIN range
+    // (the 2 snaps before it) as a zone — demand under an up-leg, supply over a down-leg
+    // (Jean's OB M10/M30 concept, approximated at the data's granularity). Zones live
+    // until mitigated (price closes through the far side). When price RETURNS to an
+    // unmitigated zone ≥15min old with conv ≥5, stamp a dormant would-fire with the
+    // anchored-stop plan. XAU+BTC only (8/6: NAS trends through its levels). Shadow-only.
+    try {
+      if ((isXAU || isBTC) && atrVal > 0 && Array.isArray(s.macroSnaps) && s.macroSnaps.length >= 12) {
+        const _zNow = Date.now();
+        if (!s._zoneObLastBuild || _zNow - s._zoneObLastBuild > 60000) {
+          s._zoneObLastBuild = _zNow;
+          const _zs = s.macroSnaps.filter(sn => sn && sn.p > 0);
+          const _zones = [];
+          for (let i = 2; i < _zs.length; i++) {
+            const _move = _zs[i].p - _zs[i - 1].p;
+            if (Math.abs(_move) >= 1.2 * atrVal) {
+              const _zhi = Math.max(_zs[i - 2].p, _zs[i - 1].p) + 0.15 * atrVal;
+              const _zlo = Math.min(_zs[i - 2].p, _zs[i - 1].p) - 0.15 * atrVal;
+              _zones.push({ hi: _zhi, lo: _zlo, dir: _move > 0 ? 'call' : 'put', ts: _zs[i - 1].ts, disp: Math.abs(_move) / atrVal });
+            }
+          }
+          // mitigation: drop zones price has closed through the far side of since formation
+          s._zoneObs = _zones.filter(z => {
+            for (const sn of _zs) {
+              if (sn.ts > z.ts + 300000 && (z.dir === 'call' ? sn.p < z.lo - 0.3 * atrVal : sn.p > z.hi + 0.3 * atrVal)) return false;
+            }
+            return true;
+          }).slice(-6);
+        }
+        s._zoneTouched = s._zoneTouched || {};
+        for (const z of (s._zoneObs || [])) {
+          if (s._zoneTouched[z.ts] || (_zNow - z.ts) < 15 * 60000) continue;
+          const _inZone = price <= z.hi && price >= z.lo;
+          if (_inZone && convictionFor(z.dir).score >= 5) {
+            s._zoneTouched[z.ts] = true;
+            const _zSl = z.dir === 'call' ? z.lo - 0.15 * atrVal : z.hi + 0.15 * atrVal;
+            const _zMsg = '🗺️ ZONE-OB ' + (z.dir === 'call' ? 'BUY' : 'SELL') + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — ' + (z.dir === 'call' ? 'demand' : 'supply') + ' zone $' + z.lo.toFixed(2) + '-$' + z.hi.toFixed(2) + ' (displacement ' + z.disp.toFixed(1) + '×ATR, formed ' + Math.round((_zNow - z.ts) / 60000) + 'min ago) · SL would anchor $' + _zSl.toFixed(2) + '.';
+            log(sym, _zMsg); trackBlockedOutcome(sym, _zMsg, true);
+          }
+        }
+      }
+    } catch (eZO) { /* zone map must never crash the tick */ }
 
     // ===== LHF/LLF PERSISTENCE DETECTOR (added 2026-05-28) =====
     // When LHF/LLF has been blocked 80+ times in last 10 min (macro-only blocks — meaning
@@ -13953,7 +13979,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.42-20260810-monotonic-ladder', // bump on each deploy — lets /state verify what's live
+    build: '5.44-20260811-zone-ob-dormant', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
