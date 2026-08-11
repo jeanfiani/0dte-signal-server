@@ -8572,7 +8572,10 @@ function processPrice(sym, price, hi, lo) {
           s._zoneObs = _zones.filter(z => {
             for (const cd of s._m5) { if (cd.ts > z.ts && (z.dir === 'call' ? cd.c < z.lo - 0.2 * atrVal : cd.c > z.hi + 0.2 * atrVal)) return false; }
             return true;
-          }).slice(-10);
+          }); // TEST PHASE 2026-08-11: keep ALL unmitigated zones (was slice(-10) — evicted
+          // the 4396-4405 supply shelf before the 12:00 retest at Jean's ideal 4397 entry).
+          // Mitigation filter above already prunes dead zones; hard safety cap 60.
+          if (s._zoneObs.length > 60) s._zoneObs = s._zoneObs.slice(-60);
         }
         // --- touch detection (unchanged contract: one dormant stamp per zone) ---
         s._zoneTouched = s._zoneTouched || {};
@@ -14077,7 +14080,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.48b-20260811-zonemap-api', // bump on each deploy — lets /state verify what's live
+    build: '5.49-20260811-zones-keep-all', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     zoneMap: (S[sym] && S[sym]._zoneObs || []).map(z => ({ kind: z.kind || 'OB', tf: z.tf || '', dir: z.dir, lo: +z.lo.toFixed(2), hi: +z.hi.toFixed(2), ageMin: Math.round((Date.now() - z.ts) / 60000) })), // live FVG/OB zones (2026-08-11)
