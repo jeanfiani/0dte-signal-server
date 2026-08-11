@@ -1764,6 +1764,7 @@ function cohortFor(reason) {
   if (/RETEST-HI|RETEST-LO/.test(reason)) return 'RETEST';
   if (/ZONE-OB/.test(reason)) return 'ZONE-OB';
   if (/QQQ-REV-GATE/.test(reason)) return 'QQQ-REV-GATE';
+  if (/NAS-OVERNIGHT/.test(reason)) return 'NAS-OVERNIGHT';
   if (/RIDE-FADE/.test(reason)) return 'RIDE-FADE';
   if (/FADE-EASE/.test(reason)) return 'FADE-EASE';
   if (/QQQ-FADE-MIRROR/.test(reason)) return 'QQQ-FADE-MIRROR';
@@ -5184,6 +5185,22 @@ function processPrice(sym, price, hi, lo) {
         log(sym, '🪞 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' QQQ-REV-GATE passed — same-direction QQQ fade within 15min.');
       }
     } catch (eQR) { /* QQQ-REV gate must never crash enrichment */ }
+
+    // ===== NAS OVERNIGHT STAND-DOWN (2026-08-11, Jean) =====
+    // The last unsupervised NAS lane: overnight MOMENTUM (fades/reversals already need
+    // QQQ, which is closed overnight — but RIDE/TREND ran free). Record since 8/2:
+    // every overnight NAS fire lost — IB CALL −$68, LLF −$35, CHoCH −$35, 8/10 21:49
+    // RIDE −$24 (adverseFrac 1.03, RSI-67 crest, 11min to SL, fired THROUGH the 5.45
+    // stack). 0W/4L, −$162, all adverseFrac ≥1.0. The architecture's own logic: QQQ is
+    // NAS's brain; when the brain sleeps, NAS sleeps. Shadow-tracked for the reopen case.
+    try {
+      if (isNAS && typeof rthEtfFresh === 'function' && !rthEtfFresh()) {
+        Object.assign(s, _emitSnapshot);
+        const _noMsg = '🌙 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — NAS-OVERNIGHT stand-down: QQQ closed, no confirmation available (overnight fires 0W/4L −$162 since 8/2; 2026-08-11).';
+        log(sym, _noMsg);
+        return false;
+      }
+    } catch (eNO) { /* overnight gate must never crash enrichment */ }
 
     // ===== PHASE 3.96 — GRIND CONVICTION FLOOR (2026-07-06) =====
     // Applies ONLY while GRIND-LIVE is fresh (chop suspended by the grind override —
@@ -14004,7 +14021,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.45-20260811-qqq-rev-gate', // bump on each deploy — lets /state verify what's live
+    build: '5.46-20260811-nas-overnight-standdown', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
