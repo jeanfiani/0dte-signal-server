@@ -1765,6 +1765,8 @@ function cohortFor(reason) {
   if (/ZONE-OB/.test(reason)) return 'ZONE-OB';
   if (/QQQ-REV-GATE/.test(reason)) return 'QQQ-REV-GATE';
   if (/NAS-OVERNIGHT/.test(reason)) return 'NAS-OVERNIGHT';
+  if (/LIQ-POOL/.test(reason)) return 'LIQ-POOL';
+  if (/CHOCH-V2/.test(reason)) return 'CHOCH-V2';
   if (/RIDE-FADE/.test(reason)) return 'RIDE-FADE';
   if (/FADE-EASE/.test(reason)) return 'FADE-EASE';
   if (/QQQ-FADE-MIRROR/.test(reason)) return 'QQQ-FADE-MIRROR';
@@ -8524,53 +8526,107 @@ function processPrice(sym, price, hi, lo) {
       }
     } catch (eRT) { /* retest detector must never crash the tick */ }
 
-    // ===== ZONE-OB — DISPLACEMENT-ORIGIN ZONE MAP (DORMANT, 2026-08-11, Jean) =====
-    // First piece of the zones-first architecture: "anticipate buy and sell zones, fire
-    // when the important gates pass." Builds an SMC-style order-block map from the 5-min
-    // macroSnaps: a displacement leg (≥1.2×ATR in one 5-min step) marks its ORIGIN range
-    // (the 2 snaps before it) as a zone — demand under an up-leg, supply over a down-leg
-    // (Jean's OB M10/M30 concept, approximated at the data's granularity). Zones live
-    // until mitigated (price closes through the far side). When price RETURNS to an
-    // unmitigated zone ≥15min old with conv ≥5, stamp a dormant would-fire with the
-    // anchored-stop plan. XAU+BTC only (8/6: NAS trends through its levels). Shadow-only.
+    // ===== ZONE-OB v2 — TRUE OHLC FVG + ORDER BLOCKS, M5/M10/M15 (DORMANT, 2026-08-11) =====
+    // Upgrade from close-snapshot approximation to real candle logic, ported from the MIT
+    // reference implementation (joshyattridge/smart-money-concepts):
+    //   FVG:  bullish when candle[i-2].high < candle[i].low (gap left by displacement);
+    //         bearish mirrored. Zone = the gap itself.
+    //   OB:   last opposing candle before a displacement that closes beyond its extreme
+    //         with body >= 0.8xATR. Zone = that candle's full range.
+    // Candles are aggregated incrementally per tick into M5 (72 kept = 6h); M10/M15 are
+    // derived from M5. Zones die when a candle CLOSES through the far side. Touch of an
+    // unmitigated zone >=15min old with conv >=5 -> dormant stamp, one per zone. All
+    // symbols (shadow). Same ZONE-OB cohort; messages now carry type+TF for sub-analysis.
     try {
-      // NAS included 2026-08-11 (shadow costs nothing): the "NAS doesn't do OB" rule came
-      // from FIRED fades with bad mechanics — the zones themselves were never measured.
-      // Its per-symbol ZONE-OB tally will confirm the rule or overturn it with data.
-      if (isMT5 && atrVal > 0 && Array.isArray(s.macroSnaps) && s.macroSnaps.length >= 12) {
+      if (isMT5 && atrVal > 0) {
         const _zNow = Date.now();
-        if (!s._zoneObLastBuild || _zNow - s._zoneObLastBuild > 60000) {
+        // --- incremental M5 candle aggregation from live ticks ---
+        const _zBkt = Math.floor(_zNow / 300000);
+        if (!s._m5cur || s._m5cur.b !== _zBkt) {
+          if (s._m5cur && s._m5cur.n > 0) {
+            s._m5 = s._m5 || [];
+            s._m5.push({ o: s._m5cur.o, h: s._m5cur.h, l: s._m5cur.l, c: s._m5cur.c, ts: s._m5cur.b * 300000 });
+            if (s._m5.length > 72) s._m5.shift();
+          }
+          s._m5cur = { b: _zBkt, o: price, h: price, l: price, c: price, n: 0 };
+        }
+        s._m5cur.h = Math.max(s._m5cur.h, price); s._m5cur.l = Math.min(s._m5cur.l, price);
+        s._m5cur.c = price; s._m5cur.n++;
+        // --- rebuild zone map once per minute from closed candles ---
+        if ((!s._zoneObLastBuild || _zNow - s._zoneObLastBuild > 60000) && (s._m5 || []).length >= 9) {
           s._zoneObLastBuild = _zNow;
-          const _zs = s.macroSnaps.filter(sn => sn && sn.p > 0);
+          const _agg = (cs, f) => { const out = []; for (let i = 0; i + f <= cs.length; i += f) { const seg = cs.slice(i, i + f); out.push({ o: seg[0].o, h: Math.max(...seg.map(x => x.h)), l: Math.min(...seg.map(x => x.l)), c: seg[seg.length - 1].c, ts: seg[0].ts }); } return out; };
           const _zones = [];
-          for (let i = 2; i < _zs.length; i++) {
-            const _move = _zs[i].p - _zs[i - 1].p;
-            if (Math.abs(_move) >= 1.2 * atrVal) {
-              const _zhi = Math.max(_zs[i - 2].p, _zs[i - 1].p) + 0.15 * atrVal;
-              const _zlo = Math.min(_zs[i - 2].p, _zs[i - 1].p) - 0.15 * atrVal;
-              _zones.push({ hi: _zhi, lo: _zlo, dir: _move > 0 ? 'call' : 'put', ts: _zs[i - 1].ts, disp: Math.abs(_move) / atrVal });
+          for (const [tf, cs] of [['M5', s._m5], ['M10', _agg(s._m5, 2)], ['M15', _agg(s._m5, 3)]]) {
+            for (let i = 2; i < cs.length; i++) {
+              const a = cs[i - 2], b = cs[i - 1], c = cs[i];
+              // FVG (3-candle gap with displacement middle candle)
+              if (a.h < c.l && (c.l - a.h) >= 0.3 * atrVal && Math.abs(b.c - b.o) >= 0.8 * atrVal) _zones.push({ hi: c.l, lo: a.h, dir: 'call', ts: c.ts, kind: 'FVG', tf });
+              if (a.l > c.h && (a.l - c.h) >= 0.3 * atrVal && Math.abs(b.c - b.o) >= 0.8 * atrVal) _zones.push({ hi: a.l, lo: c.h, dir: 'put', ts: c.ts, kind: 'FVG', tf });
+              // OB (opposing candle before displacement closing beyond its extreme)
+              if (b.c < b.o && c.c > b.h && (c.c - c.o) >= 0.8 * atrVal) _zones.push({ hi: b.h, lo: b.l, dir: 'call', ts: c.ts, kind: 'OB', tf });
+              if (b.c > b.o && c.c < b.l && (c.o - c.c) >= 0.8 * atrVal) _zones.push({ hi: b.h, lo: b.l, dir: 'put', ts: c.ts, kind: 'OB', tf });
             }
           }
-          // mitigation: drop zones price has closed through the far side of since formation
+          // mitigation: a later M5 CLOSE through the far side kills the zone
           s._zoneObs = _zones.filter(z => {
-            for (const sn of _zs) {
-              if (sn.ts > z.ts + 300000 && (z.dir === 'call' ? sn.p < z.lo - 0.3 * atrVal : sn.p > z.hi + 0.3 * atrVal)) return false;
-            }
+            for (const cd of s._m5) { if (cd.ts > z.ts && (z.dir === 'call' ? cd.c < z.lo - 0.2 * atrVal : cd.c > z.hi + 0.2 * atrVal)) return false; }
             return true;
-          }).slice(-6);
+          }).slice(-10);
         }
+        // --- touch detection (unchanged contract: one dormant stamp per zone) ---
         s._zoneTouched = s._zoneTouched || {};
         for (const z of (s._zoneObs || [])) {
-          if (s._zoneTouched[z.ts] || (_zNow - z.ts) < 15 * 60000) continue;
-          const _inZone = price <= z.hi && price >= z.lo;
-          if (_inZone && convictionFor(z.dir).score >= 5) {
-            s._zoneTouched[z.ts] = true;
+          const _zk = z.kind + z.tf + z.ts;
+          if (s._zoneTouched[_zk] || (_zNow - z.ts) < 15 * 60000) continue;
+          if (price <= z.hi && price >= z.lo && convictionFor(z.dir).score >= 5) {
+            s._zoneTouched[_zk] = true;
             const _zSl = z.dir === 'call' ? z.lo - 0.15 * atrVal : z.hi + 0.15 * atrVal;
-            const _zMsg = '🗺️ ZONE-OB ' + (z.dir === 'call' ? 'BUY' : 'SELL') + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — ' + (z.dir === 'call' ? 'demand' : 'supply') + ' zone $' + z.lo.toFixed(2) + '-$' + z.hi.toFixed(2) + ' (displacement ' + z.disp.toFixed(1) + '×ATR, formed ' + Math.round((_zNow - z.ts) / 60000) + 'min ago) · SL would anchor $' + _zSl.toFixed(2) + '.';
+            const _zMsg = '🗺️ ZONE-OB ' + (z.dir === 'call' ? 'BUY' : 'SELL') + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — ' + z.kind + ' ' + z.tf + ' ' + (z.dir === 'call' ? 'demand' : 'supply') + ' $' + z.lo.toFixed(2) + '-$' + z.hi.toFixed(2) + ' (formed ' + Math.round((_zNow - z.ts) / 60000) + 'min ago) · SL would anchor $' + _zSl.toFixed(2) + '.';
             log(sym, _zMsg); trackBlockedOutcome(sym, _zMsg, true);
           }
         }
       }
+        // ===== LIQUIDITY POOLS + CHOCH v2 (DORMANT, 2026-08-11, ported from smart-money-concepts) =====
+        // liquidity(): fractal swing highs/lows on M5; >=2 swings within 0.15xATR = an
+        // equal-highs/lows pool (stop cluster). A SWEEP (price pierces pool >0.1xATR)
+        // followed by an M5 close back through it = the reclaim -> dormant fade stamp.
+        // bos_choch(): a close beyond the last opposing swing = structure shift stamp.
+        try {
+          if ((s._m5 || []).length >= 7) {
+            const _cs = s._m5, _sw = { hi: [], lo: [] };
+            for (let i2 = 2; i2 < _cs.length - 2; i2++) {
+              if (_cs[i2].h > _cs[i2-1].h && _cs[i2].h > _cs[i2-2].h && _cs[i2].h > _cs[i2+1].h && _cs[i2].h > _cs[i2+2].h) _sw.hi.push(_cs[i2]);
+              if (_cs[i2].l < _cs[i2-1].l && _cs[i2].l < _cs[i2-2].l && _cs[i2].l < _cs[i2+1].l && _cs[i2].l < _cs[i2+2].l) _sw.lo.push(_cs[i2]);
+            }
+            s._liqTouched = s._liqTouched || {};
+            const _last = _cs[_cs.length - 1];
+            for (const [arr, side] of [[_sw.hi, 'hi'], [_sw.lo, 'lo']]) {
+              for (let a2 = 0; a2 < arr.length - 1; a2++) {
+                const lv = side === 'hi' ? arr[a2].h : arr[a2].l;
+                const eq = arr.filter(x => Math.abs((side === 'hi' ? x.h : x.l) - lv) <= 0.15 * atrVal);
+                if (eq.length >= 2) {
+                  const key = side + Math.round(lv * 10);
+                  const swept = side === 'hi' ? (_last.h > lv + 0.1 * atrVal && _last.c < lv) : (_last.l < lv - 0.1 * atrVal && _last.c > lv);
+                  if (swept && !s._liqTouched[key]) {
+                    s._liqTouched[key] = true;
+                    const _lm = '💧 LIQ-POOL ' + (side === 'hi' ? 'SELL' : 'BUY') + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — equal-' + (side === 'hi' ? 'highs' : 'lows') + ' pool $' + lv.toFixed(2) + ' (' + eq.length + ' swings) swept and reclaimed.';
+                    log(sym, _lm); trackBlockedOutcome(sym, _lm, true);
+                  }
+                }
+              }
+            }
+            const _lh = _sw.hi[_sw.hi.length - 1], _ll = _sw.lo[_sw.lo.length - 1];
+            if (_lh && _ll) {
+              if (_last.c > _lh.h && s._msTrend !== 'up') { s._msTrend = 'up';
+                const _cm = '🔀 CHOCH-V2 CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — M5 close above last swing high $' + _lh.h.toFixed(2) + ' (structure shift up).';
+                log(sym, _cm); trackBlockedOutcome(sym, _cm, true); }
+              if (_last.c < _ll.l && s._msTrend !== 'down') { s._msTrend = 'down';
+                const _cm2 = '🔀 CHOCH-V2 PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — M5 close below last swing low $' + _ll.l.toFixed(2) + ' (structure shift down).';
+                log(sym, _cm2); trackBlockedOutcome(sym, _cm2, true); }
+            }
+          }
+        } catch (eLQ) {}
     } catch (eZO) { /* zone map must never crash the tick */ }
 
     // ===== LHF/LLF PERSISTENCE DETECTOR (added 2026-05-28) =====
@@ -14021,7 +14077,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.46-20260811-nas-overnight-standdown', // bump on each deploy — lets /state verify what's live
+    build: '5.48-20260811-liq-choch-v2', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
