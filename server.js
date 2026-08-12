@@ -1765,6 +1765,7 @@ function cohortFor(reason) {
   if (/ZONE-OB/.test(reason)) return 'ZONE-OB';
   if (/QQQ-REV-GATE/.test(reason)) return 'QQQ-REV-GATE';
   if (/NAS-OVERNIGHT/.test(reason)) return 'NAS-OVERNIGHT';
+  if (/ZONE-DEFER/.test(reason)) return 'ZONE-DEFER';
   if (/LIQ-POOL/.test(reason)) return 'LIQ-POOL';
   if (/CHOCH-V2/.test(reason)) return 'CHOCH-V2';
   if (/RIDE-FADE/.test(reason)) return 'RIDE-FADE';
@@ -1862,6 +1863,15 @@ function updateBlockedOutcomes(sym, price) {
   const now = Date.now();
   for (const b of s.blockedOutcomes) {
     if (b.closed) continue;
+    // ZONE-DEFER pairs (2026-08-12): track is PENDING until price retests the zone entry.
+    if (b.pendingFill != null) {
+      const _pf = (b.type === 'call' && price <= b.pendingFill) || (b.type === 'put' && price >= b.pendingFill);
+      if (_pf) { b.pendingFill = null; b.filledTs = now; }
+      else {
+        if ((now - b.ts) / 60000 >= 20) { b.outcome = 'no_resolve'; b.closed = true; b.closedTs = now; b.blockReason += ' [never retested — runaway]'; }
+        continue;
+      }
+    }
     const elapsedMin = (now - b.ts) / 60000;
     // Take snapshots at 5/15/30/60 min
     if (b.snaps.p5m == null && elapsedMin >= 5) b.snaps.p5m = +price.toFixed(2);
@@ -2740,6 +2750,37 @@ function logSignal(sym, sig) {
         // by distance gives this fire its own honest levels.
         const slD = Math.abs(t.ep - t.slPrice), tp1D = Math.abs(t.tp1Price - t.ep);
         const tp2D = Math.abs(t.tp2Price - t.ep), tp3D = Math.abs(t.tp3Price - t.ep);
+        // ===== ZONE-DEFER PAIRED STAMP (Layer 1, 2026-08-12, Jean) =====
+        // For every real fire, if an unmitigated same-direction zone sits 0.15-2xATR
+        // behind entry, open a PENDING virtual track at the zone edge with the same TP
+        // ladder and a zone-anchored stop. Head-to-head: real entry vs zone entry on
+        // identical signals. Also logs when the real TP ladder conflicts with an
+        // opposing zone (Layer 2 sanity telemetry).
+        try {
+          const _za = t.atr || 0;
+          if (_za > 0 && Array.isArray(st._zoneObs)) {
+            const _zBehind = st._zoneObs.filter(z => z.dir === sig.type &&
+              (iC ? (ep - z.hi) >= 0.15 * _za && (ep - z.hi) <= 2 * _za : (z.lo - ep) >= 0.15 * _za && (z.lo - ep) <= 2 * _za))
+              .sort((a, b2) => iC ? (b2.hi - a.hi) : (a.lo - b2.lo))[0];
+            if (_zBehind) {
+              const _zEp = iC ? _zBehind.hi : _zBehind.lo;
+              const _zSl = iC ? _zBehind.lo - 0.15 * _za : _zBehind.hi + 0.15 * _za;
+              st.blockedOutcomes = st.blockedOutcomes || [];
+              st.blockedOutcomes.push({
+                ts: _fireTs, time: ts(), symbol: sym, detector: 'ZONE-DEFER', type: sig.type,
+                price: _zEp, virtualTp1: iC ? _zEp + tp1D : _zEp - tp1D, virtualSl: _zSl,
+                pendingFill: _zEp,
+                blockReason: '🔗 ZONE-DEFER PAIR — real fire @$' + ep.toFixed(2) + ' vs zone entry @$' + _zEp.toFixed(2) + ' (' + (_zBehind.kind || 'OB') + ' ' + (_zBehind.tf || '') + ' behind, SL anchored $' + _zSl.toFixed(2) + '); paired test (2026-08-12).',
+                snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+                tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null,
+                closed: false, closedTs: null, outcome: null
+              });
+            }
+            const _zAhead = st._zoneObs.find(z => z.dir !== sig.type &&
+              (iC ? z.lo > ep && z.lo < ep + tp2D : z.hi < ep && z.hi > ep - tp2D));
+            if (_zAhead) log(sym, '🧭 ZONE-TP NOTE — ' + sig.type.toUpperCase() + ' TP2 path crosses opposing ' + (_zAhead.kind || 'OB') + ' ' + (_zAhead.tf || '') + ' $' + _zAhead.lo.toFixed(2) + '-$' + _zAhead.hi.toFixed(2) + ' (Layer 2 telemetry).');
+          }
+        } catch (eZD) {}
         st.cfdTracks = st.cfdTracks || [];
         st.cfdTracks.push({
           entry: histEntry, type: sig.type, ep: ep, ts: _fireTs,
@@ -14171,7 +14212,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.52-20260812-gex-engine', // bump on each deploy — lets /state verify what's live
+    build: '5.53-20260812-zone-defer-pairs', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     gexLevels: sym === 'NAS100' || sym === 'QQQ' ? _gexLevels : undefined, // QQQ dealer gamma map (2026-08-12)
