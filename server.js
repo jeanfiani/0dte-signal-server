@@ -1799,6 +1799,21 @@ setInterval(() => {
   try { fs.writeFileSync(COHORT_TALLY_FILE, JSON.stringify(cohortTally)); } catch (e) {}
 }, 30000).unref();
 
+// ===== ZONE MAP PERSISTENCE (2026-08-12) — zones/candles survive restarts like the tally =====
+const ZONE_MAP_FILE = path.join(DATA_DIR, 'zone_map.json');
+let _zoneRestore = {};
+try { _zoneRestore = JSON.parse(fs.readFileSync(ZONE_MAP_FILE, 'utf8')) || {}; } catch (e) { _zoneRestore = {}; }
+setInterval(() => {
+  try {
+    const out = {};
+    for (const sy of ['XAU', 'BTC', 'NAS100']) {
+      const st = S[sy]; if (!st) continue;
+      out[sy] = { zones: st._zoneObs || [], touched: st._zoneTouched || {}, m5: (st._m5 || []).slice(-72), msTrend: st._msTrend || null };
+    }
+    fs.writeFileSync(ZONE_MAP_FILE, JSON.stringify(out));
+  } catch (e) {}
+}, 60000).unref();
+
 function updateBlockedOutcomes(sym, price) {
   const s = S[sym];
   if (!s || !Array.isArray(s.blockedOutcomes) || s.blockedOutcomes.length === 0) return;
@@ -8540,6 +8555,12 @@ function processPrice(sym, price, hi, lo) {
     try {
       if (isMT5 && atrVal > 0) {
         const _zNow = Date.now();
+        // restore persisted map once per boot (2026-08-12)
+        if (!s._zoneRestored) {
+          s._zoneRestored = true;
+          const _zr = _zoneRestore && _zoneRestore[sym];
+          if (_zr) { s._m5 = _zr.m5 || []; s._zoneObs = _zr.zones || []; s._zoneTouched = _zr.touched || {}; s._msTrend = _zr.msTrend || s._msTrend; }
+        }
         // --- incremental M5 candle aggregation from live ticks ---
         const _zBkt = Math.floor(_zNow / 300000);
         if (!s._m5cur || s._m5cur.b !== _zBkt) {
@@ -8569,10 +8590,18 @@ function processPrice(sym, price, hi, lo) {
             }
           }
           // mitigation: a later M5 CLOSE through the far side kills the zone
+          const _prevZ = s._zoneObs || []; // capture BEFORE reassignment (merge source)
           s._zoneObs = _zones.filter(z => {
             for (const cd of s._m5) { if (cd.ts > z.ts && (z.dir === 'call' ? cd.c < z.lo - 0.2 * atrVal : cd.c > z.hi + 0.2 * atrVal)) return false; }
             return true;
-          }); // TEST PHASE 2026-08-11: keep ALL unmitigated zones (was slice(-10) — evicted
+          });
+          // MERGE survivors (2026-08-12): zones older than the 6h _m5 window can no longer
+          // be re-derived — keep prior unmitigated zones not already in the fresh set.
+          const _lastC = s._m5[s._m5.length - 1];
+          const _prevKeep = _prevZ.filter(z => z && !_zones.some(n2z => n2z.ts === z.ts && n2z.kind === z.kind && n2z.tf === z.tf) &&
+            (_lastC ? (z.dir === 'call' ? _lastC.c > z.lo - 0.2 * atrVal : _lastC.c < z.hi + 0.2 * atrVal) : true));
+          s._zoneObs = s._zoneObs.concat(_prevKeep);
+          // TEST PHASE 2026-08-11: keep ALL unmitigated zones (was slice(-10) — evicted
           // the 4396-4405 supply shelf before the 12:00 retest at Jean's ideal 4397 entry).
           // Mitigation filter above already prunes dead zones; hard safety cap 60.
           if (s._zoneObs.length > 60) s._zoneObs = s._zoneObs.slice(-60);
@@ -14025,6 +14054,26 @@ app.get('/blocked-outcomes/:sym', (req, res) => {
   });
 });
 
+// ===== ADMIN: MANUAL LEVEL INJECTION (2026-08-12) =====
+// For feed-outage recovery (8/11: 5h dark, Asian levels locked on partial data).
+// Usage: /admin/asian?sym=XAU&hi=4401.65&lo=4367.24&key=jean2026
+// Sets the locked Asian levels for today and widens session H/L if narrower.
+app.get('/admin/asian', (req, res) => {
+  try {
+    if (req.query.key !== (process.env.ADMIN_KEY || 'jean2026')) return res.status(403).json({ ok: false, err: 'bad key' });
+    const sym = String(req.query.sym || 'XAU').toUpperCase();
+    const hi = parseFloat(req.query.hi), lo = parseFloat(req.query.lo);
+    const st = S[sym];
+    if (!st || !isFinite(hi) || !isFinite(lo) || lo >= hi) return res.status(400).json({ ok: false, err: 'bad params' });
+    st.asianH_locked = hi; st.asianL_locked = lo;
+    st.asianLockedDate = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+    if (st.sessionHigh < hi) { st.sessionHigh = hi; st.sessionHighUpdateTs = st.sessionHighUpdateTs || Date.now() - 3600000; }
+    if (st.sessionLow > lo) { st.sessionLow = lo; st.sessionLowUpdateTs = st.sessionLowUpdateTs || Date.now() - 3600000; }
+    log(sym, '🛠️ ADMIN: Asian levels manually set — H $' + hi.toFixed(2) + ' / L $' + lo.toFixed(2) + ' (feed-outage recovery).');
+    return res.json({ ok: true, sym, asianH: hi, asianL: lo });
+  } catch (e) { return res.status(500).json({ ok: false, err: String(e && e.message) }); }
+});
+
 app.get('/state/:sym', (req, res) => {
   const sym = resolveSymbol(req.params.sym); // broker alias aware (NAS100.fs -> NAS100)
   const s = S[sym];
@@ -14080,7 +14129,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.49-20260811-zones-keep-all', // bump on each deploy — lets /state verify what's live
+    build: '5.51-20260812-zonemap-persist', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     zoneMap: (S[sym] && S[sym]._zoneObs || []).map(z => ({ kind: z.kind || 'OB', tf: z.tf || '', dir: z.dir, lo: +z.lo.toFixed(2), hi: +z.hi.toFixed(2), ageMin: Math.round((Date.now() - z.ts) / 60000) })), // live FVG/OB zones (2026-08-11)
