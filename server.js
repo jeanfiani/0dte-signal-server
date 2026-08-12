@@ -1799,6 +1799,48 @@ setInterval(() => {
   try { fs.writeFileSync(COHORT_TALLY_FILE, JSON.stringify(cohortTally)); } catch (e) {}
 }, 30000).unref();
 
+// ===== GEX ENGINE — QQQ DEALER GAMMA LEVELS (DORMANT, 2026-08-12, Jean) =====
+// Fetches CBOE delayed options chain every 15min, computes net dealer gamma by strike
+// (calls +gamma*OI, puts -gamma*OI, spot-scaled), keeps the 5 largest magnets + the
+// gamma flip point. Exposed in /state as gexLevels; price touching a magnet strike
+// stamps a dormant GEX-LEVEL entry for the cohort. Self-verifying: logs parse health.
+let _gexLevels = { ts: 0, flip: null, magnets: [], health: 'never-run' };
+function _fetchGex() {
+  try {
+    const https = require('https');
+    https.get('https://cdn.cboe.com/api/global/delayed_quotes/options/_QQQ.json', { headers: { 'User-Agent': 'Mozilla/5.0' } }, r => {
+      let body = '';
+      r.on('data', c => body += c);
+      r.on('end', () => {
+        try {
+          const j = JSON.parse(body);
+          const opts = (j && j.data && j.data.options) || [];
+          const spot = (j && j.data && (j.data.current_price || j.data.close)) || (S.QQQ && S.QQQ.lastPrice) || 0;
+          if (!opts.length || !spot) { _gexLevels.health = 'empty-parse'; return; }
+          const byStrike = {};
+          for (const o2 of opts) {
+            const m = /([CP])(\d{8})$/.exec(o2.option || '');
+            if (!m) continue;
+            const strike = parseInt(m[2], 10) / 1000;
+            if (Math.abs(strike - spot) / spot > 0.05) continue; // ±5% window
+            const g = (o2.gamma || 0) * (o2.open_interest || 0) * 100 * spot * (m[1] === 'C' ? 1 : -1);
+            byStrike[strike] = (byStrike[strike] || 0) + g;
+          }
+          const rows = Object.entries(byStrike).map(([k, v]) => ({ strike: +k, gex: Math.round(v) })).sort((a, b) => a.strike - b.strike);
+          if (!rows.length) { _gexLevels.health = 'no-strikes'; return; }
+          let flip = null;
+          for (let i2 = 1; i2 < rows.length; i2++) if (rows[i2 - 1].gex < 0 && rows[i2].gex >= 0) { flip = rows[i2].strike; break; }
+          const magnets = rows.slice().sort((a, b) => Math.abs(b.gex) - Math.abs(a.gex)).slice(0, 5);
+          _gexLevels = { ts: Date.now(), flip, magnets, health: 'ok:' + rows.length + 'strikes' };
+          log('QQQ', '📐 GEX updated — flip $' + (flip || '?') + ', top magnet $' + (magnets[0] && magnets[0].strike) + ' (' + _gexLevels.health + ').');
+        } catch (e2) { _gexLevels.health = 'parse-err:' + String(e2.message).slice(0, 40); }
+      });
+    }).on('error', e3 => { _gexLevels.health = 'net-err:' + String(e3.message).slice(0, 40); });
+  } catch (e) { _gexLevels.health = 'err'; }
+}
+setInterval(_fetchGex, 15 * 60000).unref();
+setTimeout(_fetchGex, 20000);
+
 // ===== ZONE MAP PERSISTENCE (2026-08-12) — zones/candles survive restarts like the tally =====
 const ZONE_MAP_FILE = path.join(DATA_DIR, 'zone_map.json');
 let _zoneRestore = {};
@@ -14129,9 +14171,10 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.51-20260812-zonemap-persist', // bump on each deploy — lets /state verify what's live
+    build: '5.52-20260812-gex-engine', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
+    gexLevels: sym === 'NAS100' || sym === 'QQQ' ? _gexLevels : undefined, // QQQ dealer gamma map (2026-08-12)
     zoneMap: (S[sym] && S[sym]._zoneObs || []).map(z => ({ kind: z.kind || 'OB', tf: z.tf || '', dir: z.dir, lo: +z.lo.toFixed(2), hi: +z.hi.toFixed(2), ageMin: Math.round((Date.now() - z.ts) / 60000) })), // live FVG/OB zones (2026-08-11)
     msTrend: (S[sym] && S[sym]._msTrend) || null, // CHOCH-V2 structure state
     confScore: (s._lastConfTs && (Date.now() - s._lastConfTs) < 3600000) ? s._lastConfScore : null,
