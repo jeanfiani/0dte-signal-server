@@ -1258,7 +1258,7 @@ if (FMP_API_KEY) {
 // Chair speeches). Tracks the next event's time and current blackout status. Phase 2
 // gates will read s.newsBlackout.active to block entries 15min before/30min after.
 // Finnhub endpoint: /calendar/economic?from=YYYY-MM-DD&to=YYYY-MM-DD (free tier OK)
-const NEWS_BLACKOUT_BEFORE_MIN = 15;   // block entries this many min BEFORE event
+const NEWS_BLACKOUT_BEFORE_MIN = 30;   // 15 -> 30 (2026-08-13, Jean: PPI-day put fired 10min pre-release and SL'd — either the 15min window was too thin or the event ts parsing missed; 30min covers positioning drift before releases)
 const NEWS_BLACKOUT_AFTER_MIN  = 30;   // block entries this many min AFTER event
 // ===== POST-NEWS OVERRIDE LOCKOUT (2026-07-29) =====
 // Normal signals resume at +30 min. The OVERRIDES do not: a news print moves price, momentum
@@ -14250,7 +14250,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.54b-20260813-shutdown-flush', // bump on each deploy — lets /state verify what's live
+    build: '5.55-20260813-news-30min', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     gexLevels: sym === 'NAS100' || sym === 'QQQ' ? _gexLevels : undefined, // QQQ dealer gamma map (2026-08-12)
