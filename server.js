@@ -1858,6 +1858,22 @@ setInterval(() => {
   } catch (e) {}
 }, 60000).unref();
 
+// GRACEFUL SHUTDOWN FLUSH (2026-08-13): Railway sends SIGTERM on redeploy/restart —
+// write the zone map + cohort tally one last time so not even the 60s save window is lost.
+function _flushPersist() {
+  try {
+    const out = {};
+    for (const sy of ['XAU', 'BTC', 'NAS100']) {
+      const st = S[sy]; if (!st) continue;
+      out[sy] = { zones: st._zoneObs || [], touched: st._zoneTouched || {}, m5: (st._m5 || []).slice(-72), msTrend: st._msTrend || null };
+    }
+    fs.writeFileSync(ZONE_MAP_FILE, JSON.stringify(out));
+    fs.writeFileSync(COHORT_TALLY_FILE, JSON.stringify(cohortTally));
+  } catch (e) {}
+}
+process.on('SIGTERM', () => { _flushPersist(); process.exit(0); });
+process.on('SIGINT', () => { _flushPersist(); process.exit(0); });
+
 function updateBlockedOutcomes(sym, price) {
   const s = S[sym];
   if (!s || !Array.isArray(s.blockedOutcomes) || s.blockedOutcomes.length === 0) return;
@@ -14234,7 +14250,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.54-20260813-zone-veto', // bump on each deploy — lets /state verify what's live
+    build: '5.54b-20260813-shutdown-flush', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     gexLevels: sym === 'NAS100' || sym === 'QQQ' ? _gexLevels : undefined, // QQQ dealer gamma map (2026-08-12)
