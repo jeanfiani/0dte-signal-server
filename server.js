@@ -1766,6 +1766,7 @@ function cohortFor(reason) {
   if (/QQQ-REV-GATE/.test(reason)) return 'QQQ-REV-GATE';
   if (/NAS-OVERNIGHT/.test(reason)) return 'NAS-OVERNIGHT';
   if (/ZONE-DEFER/.test(reason)) return 'ZONE-DEFER';
+  if (/ZONE-VETO/.test(reason)) return 'ZONE-VETO';
   if (/LIQ-POOL/.test(reason)) return 'LIQ-POOL';
   if (/CHOCH-V2/.test(reason)) return 'CHOCH-V2';
   if (/RIDE-FADE/.test(reason)) return 'RIDE-FADE';
@@ -5301,6 +5302,27 @@ function processPrice(sym, price, hi, lo) {
         return false;
       }
     } catch (eNO) { /* overnight gate must never crash enrichment */ }
+
+    // ===== ZONE VETO — LAYER 3 OF THE OB/FVG MIX (2026-08-13, Jean) =====
+    // No fire when a fresh OPPOSING unmitigated zone blocks the path just ahead:
+    // 8/13 01:18 IB CALL @4402.73 bought directly beneath the mapped 4405.72-4414.05
+    // supply shelf (drawn 3h earlier) — adverseFrac 1.03, −$11.83, the 6th loser in a
+    // row at ≥1.0 while every winner sits ≤0.5. Rule: opposing zone edge within
+    // 1.2×ATR ahead in the signal direction → block. Protective gate (those are 5-for-5
+    // this month); blocks self-measure via the shadow tracker for the revert case.
+    try {
+      if (isMT5 && atrVal > 0 && Array.isArray(s._zoneObs) && s._zoneObs.length) {
+        const _zvC = sig.type === 'call';
+        const _zv = s._zoneObs.find(z => z && z.dir !== sig.type &&
+          (_zvC ? (z.lo >= price && z.lo <= price + 1.2 * atrVal) : (z.hi <= price && z.hi >= price - 1.2 * atrVal)));
+        if (_zv) {
+          Object.assign(s, _emitSnapshot);
+          const _zvMsg = '🚧 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ZONE-VETO: opposing ' + (_zv.kind || 'OB') + ' ' + (_zv.tf || '') + ' $' + _zv.lo.toFixed(2) + '-$' + _zv.hi.toFixed(2) + ' sits ' + (_zvC ? (_zv.lo - price) : (price - _zv.hi)).toFixed(2) + ' ahead (<1.2×ATR) — path runs into mapped ' + (_zvC ? 'supply' : 'demand') + ' (Layer 3, 2026-08-13).';
+          log(sym, _zvMsg); trackBlockedOutcome(sym, _zvMsg, true);
+          return false;
+        }
+      }
+    } catch (eZV) { /* zone veto must never crash enrichment */ }
 
     // ===== PHASE 3.96 — GRIND CONVICTION FLOOR (2026-07-06) =====
     // Applies ONLY while GRIND-LIVE is fresh (chop suspended by the grind override —
@@ -14212,7 +14234,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.53-20260812-zone-defer-pairs', // bump on each deploy — lets /state verify what's live
+    build: '5.54-20260813-zone-veto', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     gexLevels: sym === 'NAS100' || sym === 'QQQ' ? _gexLevels : undefined, // QQQ dealer gamma map (2026-08-12)
