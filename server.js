@@ -149,6 +149,7 @@ const S = {};
 // Railway env to re-enable the full BTC book without a code change. Dormant detectors still RUN
 // and every candidate is graded + shadow-tracked, so re-enabling stays an evidence decision.
 const BTC_TRADING_ENABLED = process.env.BTC_TRADING_ENABLED === 'true';
+const CAPITAL_MODE = process.env.CAPITAL_MODE !== 'false'; // 2026-08-14 (Jean): capital-building mode — full close at TP2, no TP3 runner. Set CAPITAL_MODE=false on Railway to restore the runner.
 
 // Blocked-outcomes ring size. Raised 500 -> 1500 (2026-07-29): NAS alone burns ~136 entries in
 // 5h, so a 200-entry pull reached back only 5 hours and the RIDE-FADE experiment could never
@@ -8367,7 +8368,7 @@ function processPrice(sym, price, hi, lo) {
             const tp1CapL = isXAU ? 5 : isBTC ? 100 : isNAS ? 50 : 0.50;
             const tp1P = price - Math.min(slDist * 1.5, tp1CapL);
             const tp2P = price - slDist * 3.0;
-            const tp3P = price - slDist * 5.0;
+            const tp3P = CAPITAL_MODE ? tp2P : price - slDist * 5.0;
             s.trade = buildCfdTrade('put', price, atrVal, sym);
             s.trade.slPrice = +lhfSlPrice.toFixed(2);
             s.trade.tp1Price = +tp1P.toFixed(2);
@@ -8566,7 +8567,7 @@ function processPrice(sym, price, hi, lo) {
             const tp1CapL = isXAU ? 5 : isBTC ? 100 : isNAS ? 50 : 0.50;
             const tp1P = price + Math.min(slDist * 1.5, tp1CapL);
             const tp2P = price + slDist * 3.0;
-            const tp3P = price + slDist * 5.0;
+            const tp3P = CAPITAL_MODE ? tp2P : price + slDist * 5.0;
             s.trade = buildCfdTrade('call', price, atrVal, sym);
             s.trade.slPrice = +llfSlPrice.toFixed(2);
             s.trade.tp1Price = +tp1P.toFixed(2);
@@ -12657,7 +12658,7 @@ function buildCfdTrade(type, price, atr, sym) {
   // 7/30 anomaly (tp2+tp3 12ms apart, tp1 never) and the 8/10 signal Jean caught
   // (TP3 hit before TP1). TP2/TP3 must always sit beyond TP1, whatever ATR says.
   const tp2Dist = Math.max(atr * mults.t2, tp1Dist * 1.6);
-  const tp3Dist = Math.max(atr * mults.t3, tp1Dist * 2.5);
+  const tp3Dist = CAPITAL_MODE ? tp2Dist : Math.max(atr * mults.t3, tp1Dist * 2.5); // capital mode: TP3=TP2 -> EA exits fully at TP2
   let sl = iC ? price - slDist : price + slDist;
   // Phase 3.97: structural SL override — use the level-based stop when it's a real level
   // behind the entry and tighter than (or equal to) the ATR-based default.
@@ -14280,7 +14281,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.57-20260814-zone-perm-dormant', // bump on each deploy — lets /state verify what's live
+    build: '5.58-20260814-capital-mode-tp2', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     gexLevels: sym === 'NAS100' || sym === 'QQQ' ? _gexLevels : undefined, // QQQ dealer gamma map (2026-08-12)
