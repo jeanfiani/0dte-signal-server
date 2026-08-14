@@ -1767,6 +1767,7 @@ function cohortFor(reason) {
   if (/NAS-OVERNIGHT/.test(reason)) return 'NAS-OVERNIGHT';
   if (/ZONE-DEFER/.test(reason)) return 'ZONE-DEFER';
   if (/ZONE-VETO/.test(reason)) return 'ZONE-VETO';
+  if (/ZONE-PERM/.test(reason)) return 'ZONE-PERM';
   if (/LIQ-POOL/.test(reason)) return 'LIQ-POOL';
   if (/CHOCH-V2/.test(reason)) return 'CHOCH-V2';
   if (/RIDE-FADE/.test(reason)) return 'RIDE-FADE';
@@ -7920,7 +7921,16 @@ function processPrice(sym, price, hi, lo) {
         // 3/day and the floor became load-bearing everywhere. 8/2-8/3 XAU: conv 3 flip WON
         // (trail), conv 1 and conv 0 flips both went straight to SL. Matches the BTC autopsy
         // (conv≤2 = 1W/12SL/−$985; conv≥3 = 3W/1L/+$300).
-        else if (_efConv < 3) efReason = 'EXT-FLIP conv floor — conv ' + _efConv + ' < 3 (BTC autopsy 7/24: conv≤2 = 1W/12SL/−$985; conv≥3 = 3W/1L/+$300; XAU 8/2-3: conv≤1 = 0W/2SL)';
+        else if (_efConv < 3) {
+          try {
+            const _zpf = Array.isArray(s._zoneObs) && s._zoneObs.find(z => z && z.dir === EF.dir && price >= z.lo && price <= z.hi);
+            if (_zpf) {
+              const _zpfMsg = '🔓 EXT-FLIP ' + EF.dir.toUpperCase() + ' ZONE-PERM DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — conv ' + _efConv + ' < 3 waived by mapped ' + (EF.dir === 'put' ? 'supply' : 'demand') + ' ' + (_zpf.kind || 'OB') + ' ' + (_zpf.tf || '') + ' $' + _zpf.lo.toFixed(2) + '-$' + _zpf.hi.toFixed(2) + ' (dormant 2026-08-14, 8/13 4363 case).';
+              log(sym, _zpfMsg); trackBlockedOutcome(sym, _zpfMsg, true);
+            }
+          } catch (eZP) {}
+          efReason = 'EXT-FLIP conv floor — conv ' + _efConv + ' < 3 (BTC autopsy 7/24: conv≤2 = 1W/12SL/−$985; conv≥3 = 3W/1L/+$300; XAU 8/2-3: conv≤1 = 0W/2SL)';
+        }
         else if (!(EF.burst >= 1.5)) efReason = 'no climax volume (burst ×' + (EF.burst || 0).toFixed(1) + ' < 1.5)';
         // Elite stand-down (2026-07-10): both 7/09 XAU flip losses (-$637/lot combined)
         // faded blocked conv-9/10 signals. An elite-conviction crest block is a TIMING
@@ -8276,7 +8286,19 @@ function processPrice(sym, price, hi, lo) {
       if (isXAU && s.sessionHigh > 0 && price <= s.sessionHigh) {
         const _fePct = ((s.sessionHigh - price) / s.sessionHigh) * 100;
         const _feStale = (s.sessionHighUpdateTs || 0) > 0 && (Date.now() - s.sessionHighUpdateTs) >= 180000;
-        _lhfFadeAtHigh = _fePct <= 0.15 && _feStale && convictionFor('put').score >= 5;
+        const _feWin = _fePct <= 0.15 && _feStale;
+        _lhfFadeAtHigh = _feWin && convictionFor('put').score >= 5;
+        // ZONE-PERM (DORMANT, 2026-08-14): 8/13 4363 double-top — 278 LHF PUT macro-blocks
+        // at the touch because put-conviction was 0-2 (conviction is trend-following; it
+        // CANNOT exist at a fresh top). Zone-confluence substitutes: in the fade window
+        // with conv<5 but price INSIDE mapped supply -> stamp the would-fire.
+        if (_feWin && !_lhfFadeAtHigh && Array.isArray(s._zoneObs)) {
+          const _zpz = s._zoneObs.find(z => z && z.dir === 'put' && price >= z.lo && price <= z.hi);
+          if (_zpz) {
+            const _zpMsg = '🔓 ⬇LHF PUT ZONE-PERM DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — fade window at stale session high, conv<5 waived by mapped supply ' + (_zpz.kind || 'OB') + ' ' + (_zpz.tf || '') + ' $' + _zpz.lo.toFixed(2) + '-$' + _zpz.hi.toFixed(2) + ' (dormant 2026-08-14).';
+            log(sym, _zpMsg); trackBlockedOutcome(sym, _zpMsg, true);
+          }
+        }
       }
     } catch (eFE) {}
     // ===== QQQ-FADE-MIRROR (NAS only, 2026-08-04, Jean's design) =====
@@ -8456,7 +8478,15 @@ function processPrice(sym, price, hi, lo) {
       if (isXAU && s.sessionLow > 0 && s.sessionLow < Infinity && price >= s.sessionLow) {
         const _fePctL = ((price - s.sessionLow) / price) * 100;
         const _feStaleL = (s.sessionLowUpdateTs || 0) > 0 && (Date.now() - s.sessionLowUpdateTs) >= 180000;
-        _llfFadeAtLow = _fePctL <= 0.15 && _feStaleL && convictionFor('call').score >= 5;
+        const _feWinL = _fePctL <= 0.15 && _feStaleL;
+        _llfFadeAtLow = _feWinL && convictionFor('call').score >= 5;
+        if (_feWinL && !_llfFadeAtLow && Array.isArray(s._zoneObs)) {
+          const _zpzL = s._zoneObs.find(z => z && z.dir === 'call' && price >= z.lo && price <= z.hi);
+          if (_zpzL) {
+            const _zpMsgL = '🔓 ⬆LLF CALL ZONE-PERM DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — fade window at stale session low, conv<5 waived by mapped demand ' + (_zpzL.kind || 'OB') + ' ' + (_zpzL.tf || '') + ' $' + _zpzL.lo.toFixed(2) + '-$' + _zpzL.hi.toFixed(2) + ' (dormant 2026-08-14).';
+            log(sym, _zpMsgL); trackBlockedOutcome(sym, _zpMsgL, true);
+          }
+        }
       }
     } catch (eFEL) {}
     let _llfQqqMirror = false;
@@ -14250,7 +14280,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.56-20260814-zone-stamp-fix', // bump on each deploy — lets /state verify what's live
+    build: '5.57-20260814-zone-perm-dormant', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     gexLevels: sym === 'NAS100' || sym === 'QQQ' ? _gexLevels : undefined, // QQQ dealer gamma map (2026-08-12)
