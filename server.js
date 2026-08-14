@@ -8735,7 +8735,7 @@ function processPrice(sym, price, hi, lo) {
           if (price <= z.hi && price >= z.lo && convictionFor(z.dir).score >= 5) {
             s._zoneTouched[_zk] = true;
             const _zSl = z.dir === 'call' ? z.lo - 0.15 * atrVal : z.hi + 0.15 * atrVal;
-            const _zMsg = '🗺️ ZONE-OB ' + (z.dir === 'call' ? 'BUY' : 'SELL') + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — ' + z.kind + ' ' + z.tf + ' ' + (z.dir === 'call' ? 'demand' : 'supply') + ' $' + z.lo.toFixed(2) + '-$' + z.hi.toFixed(2) + ' (formed ' + Math.round((_zNow - z.ts) / 60000) + 'min ago) · SL would anchor $' + _zSl.toFixed(2) + '.';
+            const _zMsg = '🗺️ ZONE-OB ' + (z.dir === 'call' ? 'CALL' : 'PUT') + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — ' + z.kind + ' ' + z.tf + ' ' + (z.dir === 'call' ? 'demand' : 'supply') + ' $' + z.lo.toFixed(2) + '-$' + z.hi.toFixed(2) + ' (formed ' + Math.round((_zNow - z.ts) / 60000) + 'min ago) · SL would anchor $' + _zSl.toFixed(2) + '.';
             log(sym, _zMsg); trackBlockedOutcome(sym, _zMsg, true);
           }
         }
@@ -8763,7 +8763,7 @@ function processPrice(sym, price, hi, lo) {
                   const swept = side === 'hi' ? (_last.h > lv + 0.1 * atrVal && _last.c < lv) : (_last.l < lv - 0.1 * atrVal && _last.c > lv);
                   if (swept && !s._liqTouched[key]) {
                     s._liqTouched[key] = true;
-                    const _lm = '💧 LIQ-POOL ' + (side === 'hi' ? 'SELL' : 'BUY') + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — equal-' + (side === 'hi' ? 'highs' : 'lows') + ' pool $' + lv.toFixed(2) + ' (' + eq.length + ' swings) swept and reclaimed.';
+                    const _lm = '💧 LIQ-POOL ' + (side === 'hi' ? 'PUT' : 'CALL') + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — equal-' + (side === 'hi' ? 'highs' : 'lows') + ' pool $' + lv.toFixed(2) + ' (' + eq.length + ' swings) swept and reclaimed.';
                     log(sym, _lm); trackBlockedOutcome(sym, _lm, true);
                   }
                 }
@@ -14250,7 +14250,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.55-20260813-news-30min', // bump on each deploy — lets /state verify what's live
+    build: '5.56-20260814-zone-stamp-fix', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     gexLevels: sym === 'NAS100' || sym === 'QQQ' ? _gexLevels : undefined, // QQQ dealer gamma map (2026-08-12)
