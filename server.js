@@ -1769,6 +1769,7 @@ function cohortFor(reason) {
   if (/ZONE-DEFER/.test(reason)) return 'ZONE-DEFER';
   if (/ZONE-VETO/.test(reason)) return 'ZONE-VETO';
   if (/ZONE-PERM/.test(reason)) return 'ZONE-PERM';
+  if (/CHOP-BREAK/.test(reason)) return 'CHOP-BREAK';
   if (/LIQ-POOL/.test(reason)) return 'LIQ-POOL';
   if (/CHOCH-V2/.test(reason)) return 'CHOCH-V2';
   if (/RIDE-FADE/.test(reason)) return 'RIDE-FADE';
@@ -6391,6 +6392,29 @@ function processPrice(sym, price, hi, lo) {
               }
             }
           } catch (e6) {}
+          // ===== CHOP-BREAK (DORMANT, 2026-08-17, Jean) — the launch-bar exemption =====
+          // 8/17 09:38 XAU RIDE+MACRO CALL conv 7 @ 4390.84: chop:1 blocked the exact bar
+          // where compression broke into the +$36 NY rally (10:07 conv-5 same story; fired
+          // 10:15 only after chop cleared — caught the middle, missed the launch). The chop
+          // flag is a LAGGING regime detector: it stays high precisely at the compression→
+          // trend flip, the single most profitable bar of a trend day. Hypothesis: conv ≥ 7
+          // (full cross-asset agreement) + price exiting a mapped same-direction zone marks
+          // a genuine regime break, not chop noise. Same family as last week's 12:00/4397
+          // miss. DORMANT: stamps the would-fire (CHOP-BREAK cohort), signal still blocks.
+          try {
+            const _cbConv = (conv && conv.score) || 0;
+            if (_cbConv >= 7 && Array.isArray(s._zoneObs)) {
+              const _cbM = 0.5 * (atrVal > 0 ? atrVal : 1);
+              const _cbZ = s._zoneObs.find(z => z && z.dir === sig.type &&
+                (sig.type === 'call' ? (price >= z.lo && price <= z.hi + _cbM)
+                                     : (price >= z.lo - _cbM && price <= z.hi)));
+              if (_cbZ) {
+                const _cbMsg = '⚡ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' CHOP-BREAK DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — conv ' + _cbConv + ' ≥ 7 exiting mapped ' + (sig.type === 'put' ? 'supply' : 'demand') + ' ' + (_cbZ.kind || 'OB') + ' ' + (_cbZ.tf || '') + ' $' + _cbZ.lo.toFixed(2) + '-$' + _cbZ.hi.toFixed(2) + ' — chop gate would be waived at the regime break (dormant 2026-08-17, 09:38 launch-bar case).';
+                log(sym, _cbMsg);
+                trackBlockedOutcome(sym, _cbMsg, true);
+              }
+            }
+          } catch (eCB) {}
           Object.assign(s, _emitSnapshot);
           log(sym, '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' chop mode active (only V-REV / LHF / LLF / OBREJ / OBMIT allowed in chop; other detectors consistently lose in flat range).');
           return false;
@@ -14314,7 +14338,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.60-20260817-pnl-ledger', // bump on each deploy — lets /state verify what's live
+    build: '5.61-20260817-chop-break', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
