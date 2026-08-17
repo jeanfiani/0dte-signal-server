@@ -1760,6 +1760,12 @@ const COHORT_TALLY_FILE = path.join(DATA_DIR, 'cohort_tally.json');
 let cohortTally = {};
 try { cohortTally = JSON.parse(fs.readFileSync(COHORT_TALLY_FILE, 'utf8')) || {}; } catch (e) { cohortTally = {}; }
 let _ctDirty = false;
+// TREND-CONT ease (2026-08-17): with-trend location-gate waiver while the trend-day
+// latch is fresh (<10min). Only the three location gates consult this — nothing else.
+function tdLatchEase(s, sigType) {
+  try { return !!(s && s._tdLatch && s._tdLatch.dir === sigType && (Date.now() - s._tdLatch.ts) < 600000); }
+  catch (e) { return false; }
+}
 function cohortFor(reason) {
   if (/CLIMAX-FLIP/.test(reason)) return 'CLIMAX-FLIP';
   if (/RETEST-HI|RETEST-LO/.test(reason)) return 'RETEST';
@@ -3172,17 +3178,27 @@ function processPrice(sym, price, hi, lo) {
     // a trend day pressing its edge, not chop — suppress chop while that remains true.
     // On genuine range days session range stays 2-3×ATR and the latch never arms. The
     // session-extreme chase gate still governs WHICH direction may fire at the edge.
+    // EXTENDED 2026-08-17 (Jean): the latch now also records WHICH edge is being pressed
+    // (s._tdLatch = {dir, ts}) and is computed regardless of chopActive, because 8/17 showed
+    // the location gates (session-extreme chase / support-proximity / session-range bias)
+    // blocking an entire with-trend continuation lane on a stair-step trend day: NAS puts
+    // blocked 13W/1L (tracker-graded) during the 30235→30075 grind — on a trend day
+    // "at the low" is the continuation entry, not a fade location. Those three gates ease
+    // for WITH-TREND signals while the latch is fresh (see tdLatchEase). Counter-trend
+    // signals get no ease; all other gates unaffected.
     try {
-      if (s.chopActive && s.sessionHigh > 0 && s.sessionLow > 0 && s.sessionLow < Infinity) {
+      if (s.sessionHigh > 0 && s.sessionLow > 0 && s.sessionLow < Infinity) {
         const _tdAtr = (s._atrSessOpen > 0) ? s._atrSessOpen : ((typeof s._atr === 'number' && s._atr > 0) ? s._atr : 0);
         if (_tdAtr > 0) {
           const _tdRange = s.sessionHigh - s.sessionLow;
-          const _tdNearEdge = (s.sessionHigh - price) <= 1.5 * _tdAtr || (price - s.sessionLow) <= 1.5 * _tdAtr;
-          if (_tdRange >= 6 * _tdAtr && _tdNearEdge) { // 6x (not 5x): a range of exactly 5xATR with price at the edge is still ambiguous; 6x is unambiguous trend-day territory
-            s.chopActive = false; s.trendCount = 0;
+          const _tdNearHi = (s.sessionHigh - price) <= 1.5 * _tdAtr;
+          const _tdNearLo = (price - s.sessionLow) <= 1.5 * _tdAtr;
+          if (_tdRange >= 6 * _tdAtr && (_tdNearHi || _tdNearLo)) { // 6x (not 5x): a range of exactly 5xATR with price at the edge is still ambiguous; 6x is unambiguous trend-day territory
+            s._tdLatch = { dir: _tdNearHi ? 'call' : 'put', ts: Date.now() }; // edge pressed = with-trend direction
+            if (s.chopActive) { s.chopActive = false; s.trendCount = 0; }
             if (!s._tdLatchLogTs || Date.now() - s._tdLatchLogTs > 300000) {
               s._tdLatchLogTs = Date.now();
-              log(sym, '📈 TREND-DAY LATCH — session range $' + _tdRange.toFixed(2) + ' ≥ 6×ATRopen ($' + (6 * _tdAtr).toFixed(2) + ') and price at the edge; chop suppressed (2026-08-05).');
+              log(sym, '📈 TREND-DAY LATCH (' + s._tdLatch.dir.toUpperCase() + ' edge) — session range $' + _tdRange.toFixed(2) + ' ≥ 6×ATRopen ($' + (6 * _tdAtr).toFixed(2) + ') and price at the edge; chop suppressed + location gates eased for with-trend continuation (2026-08-05, ext. 2026-08-17).');
             }
           }
         }
@@ -4562,7 +4578,9 @@ function processPrice(sym, price, hi, lo) {
         const _pdLow = _pd && _pd.low > 0 ? _pd.low : null;
         const _pdHigh = _pd && _pd.high > 0 ? _pd.high : null;
         const _fin = (v) => typeof v === 'number' && v > 0 && isFinite(v);
-        if (sig.type === 'put') {
+        if (tdLatchEase(s, sig.type)) {
+          log(sym, '📈 ' + _tagX + ' ' + sig.type.toUpperCase() + ' TREND-CONT EASE — support/resistance-proximity waived: trend-day latch pressing the ' + (sig.type === 'put' ? 'low' : 'high') + ' — levels break on trend days (2026-08-17, 8/17 NAS 12:24/13:11 case).');
+        } else if (sig.type === 'put') {
           for (const [_lv, _nm] of [[s.asianL_locked, 'Asian'], [_pdLow, 'prior-day']]) {
             if (_fin(_lv) && price > _lv && (price - _lv) <= _prox) {
               Object.assign(s, _emitSnapshot);
@@ -5280,7 +5298,11 @@ function processPrice(sym, price, hi, lo) {
           // happened with intraday ATR COMPRESSED below session open — Asian drift reads as
           // 'advancing highs'. A real breakout EXPANDS ATR; drift doesn't get the exemption.
           const _seLiveBreak = _seBrkTs > 0 && (Date.now() - _seBrkTs) < 90000 && !(s._atrSessOpen > 0 && atrVal < 0.9 * s._atrSessOpen);
-          if (_sePct < 0.05 && !_seLiveBreak) {
+          const _seTdEase = tdLatchEase(s, sig.type);
+          if (_seTdEase && _sePct < 0.05 && !_seLiveBreak) {
+            log(sym, '📈 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' TREND-CONT EASE — session-extreme chase waived: trend-day latch, with-trend continuation at the pressed edge (2026-08-17, 8/17 NAS 13:05 case).');
+          }
+          if (_sePct < 0.05 && !_seLiveBreak && !_seTdEase) {
             // Arm/refresh the opposite EXT-FLIP candidate (mirrors the EXT-GUARD arm) —
             // blocking the chase must not also lose the reversal. Re-blocks REFRESH the
             // extreme but keep the original armTs, so the 3-min stabilization clock isn't
@@ -7014,14 +7036,18 @@ function processPrice(sym, price, hi, lo) {
           }
         } catch (eEc) {}
         // PUT in lower half + NOT making new low = stale exhausted move
-        if (!_eliteCont && sig.type === 'put' && inLowerHalf && !freshNewLow) {
+        const _srTdEase = tdLatchEase(s, sig.type);
+        if (_srTdEase && ((sig.type === 'put' && inLowerHalf && !freshNewLow) || (sig.type === 'call' && inUpperHalf && !freshNewHigh))) {
+          log(sym, '📈 ' + tag + ' ' + sig.type.toUpperCase() + ' TREND-CONT EASE — session-range bias waived: trend-day latch, stair-step continuation is not \'stale\' on a trend day (2026-08-17, 8/17 NAS 12:44 case).');
+        }
+        if (!_srTdEase && !_eliteCont && sig.type === 'put' && inLowerHalf && !freshNewLow) {
           Object.assign(s, _emitSnapshot);
           const pctFromHigh = ((s.sessionHigh - price) / sessionRange * 100).toFixed(0);
           log(sym, '🚫 ' + tag + ' PUT BLOCKED — session-range bias: price $' + price.toFixed(2) + ' is in lower half of session range ($' + s.sessionLow.toFixed(2) + '-$' + s.sessionHigh.toFixed(2) + ', ' + pctFromHigh + '% off high) and NOT making new low — move is stale.');
           return false;
         }
         // CALL in upper half + NOT making new high = stale
-        if (!_eliteCont && sig.type === 'call' && inUpperHalf && !freshNewHigh) {
+        if (!_srTdEase && !_eliteCont && sig.type === 'call' && inUpperHalf && !freshNewHigh) {
           Object.assign(s, _emitSnapshot);
           const pctFromLow = ((price - s.sessionLow) / sessionRange * 100).toFixed(0);
           log(sym, '🚫 ' + tag + ' CALL BLOCKED — session-range bias: price $' + price.toFixed(2) + ' is in upper half of session range ($' + s.sessionLow.toFixed(2) + '-$' + s.sessionHigh.toFixed(2) + ', ' + pctFromLow + '% off low) and NOT making new high — move is stale.');
@@ -7402,12 +7428,14 @@ function processPrice(sym, price, hi, lo) {
     if (etMin >= 1020 && etMin < 1080) return; // NAS100 closed 5-6 PM ET
   } else {
     if (etMin < 570 || etMin >= 955) return;
-    // Midday dead zone — 12:00-14:00 ET (720-840 min). QQQ: 43% win, SPY: 42% win.
-    // Lunch chop kills both instruments. Block regular signals during this window.
-    if (etMin >= 720 && etMin < 840 && (cS >= THR || pS >= THR)) {
-      log(sym, 'Midday block: ' + etMin + ' min ET — lunch chop zone (12:00-14:00)');
-      return;
-    }
+    // ===== MIDDAY LUNCH BLOCK RETIRED (2026-08-17, Jean) =====
+    // Was: hard block 12:00-14:00 ET (QQQ 43% / SPY 42% win at the time it was built).
+    // Retired because (a) it was built early on thin evidence, and (b) it silenced QQQ
+    // over lunch — and QQQ is the SUPERVISOR: NAS reversal entries (QQQ-REV-GATE, 5.45)
+    // require a same-direction QQQ fade within 15min, so a mute supervisor structurally
+    // blocked the NAS lane during lunch trends (8/17: NAS 30235→30075 breakdown, QQQ
+    // couldn't confirm anything 12:00-14:00). The conf/chop/location gates that now
+    // exist judge lunch signals on quality instead of clock.
   }
   if (!isMT5 && etMin >= 945 && (cS >= THR || pS >= THR)) return;
 
@@ -14338,7 +14366,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.61-20260817-chop-break', // bump on each deploy — lets /state verify what's live
+    build: '5.62-20260817-trend-cont', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
