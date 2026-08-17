@@ -5250,7 +5250,11 @@ function processPrice(sym, price, hi, lo) {
           // 18:49 loser check: its high had held ~3min ("extreme $4111.01 held 3min" on
           // the 18:50 flip-arm) → stale → still blocked.
           const _seBrkTs = _seCall ? (s.sessionHighUpdateTs || 0) : (s.sessionLowUpdateTs || 0);
-          const _seLiveBreak = _seBrkTs > 0 && (Date.now() - _seBrkTs) < 90000;
+          // THIN-TAPE SUSPENSION (2026-08-17, ×50 accounting): every crest entry that slid
+          // through this exemption (8/5 FAST, 8/7 09:42, 8/17 03:40 ≈ −$1,400 real combined)
+          // happened with intraday ATR COMPRESSED below session open — Asian drift reads as
+          // 'advancing highs'. A real breakout EXPANDS ATR; drift doesn't get the exemption.
+          const _seLiveBreak = _seBrkTs > 0 && (Date.now() - _seBrkTs) < 90000 && !(s._atrSessOpen > 0 && atrVal < 0.9 * s._atrSessOpen);
           if (_sePct < 0.05 && !_seLiveBreak) {
             // Arm/refresh the opposite EXT-FLIP candidate (mirrors the EXT-GUARD arm) —
             // blocking the chase must not also lose the reversal. Re-blocks REFRESH the
@@ -5422,7 +5426,7 @@ function processPrice(sym, price, hi, lo) {
             // profile is preserved exactly when it matters.
             if ((isNAS || isXAU) && _gStr && !_gStr.ok) {
               const _gBkTs = sig.type === 'call' ? (s.sessionHighUpdateTs || 0) : (s.sessionLowUpdateTs || 0);
-              _gLiveBreak = _gBkTs > 0 && (Date.now() - _gBkTs) < 90000;
+              _gLiveBreak = _gBkTs > 0 && (Date.now() - _gBkTs) < 90000 && !(s._atrSessOpen > 0 && atrVal < 0.9 * s._atrSessOpen); // thin-tape suspension 2026-08-17
               if (_gLiveBreak) {
                 const _gLbMsg = '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' LIVE-BREAK grind entry-quality waived @ $' + price.toFixed(2) + ' — session extreme advanced <90s ago; stale-anchor objection (' + _gStr.reason + ') is moot on a breakout leg (2026-08-05, NAS+XAU).';
                 log(sym, _gLbMsg);
@@ -7932,6 +7936,7 @@ function processPrice(sym, price, hi, lo) {
           } catch (eZP) {}
           efReason = 'EXT-FLIP conv floor — conv ' + _efConv + ' < 3 (BTC autopsy 7/24: conv≤2 = 1W/12SL/−$985; conv≥3 = 3W/1L/+$300; XAU 8/2-3: conv≤1 = 0W/2SL)';
         }
+        else if (_efConv === 3 && !(Array.isArray(s._zoneObs) && s._zoneObs.some(z => z && z.dir === EF.dir && price >= z.lo && price <= z.hi))) efReason = 'EXT-FLIP conv 3 (floor minimum) without mapped zone confluence — flips at the threshold need the map to agree (8/16 23:13 PUT fought the trend from empty space, −$323 real; 2026-08-17)';
         else if (!(EF.burst >= 1.5)) efReason = 'no climax volume (burst ×' + (EF.burst || 0).toFixed(1) + ' < 1.5)';
         // Elite stand-down (2026-07-10): both 7/09 XAU flip losses (-$637/lot combined)
         // faded blocked conv-9/10 signals. An elite-conviction crest block is a TIMING
@@ -14281,7 +14286,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.58-20260814-capital-mode-tp2', // bump on each deploy — lets /state verify what's live
+    build: '5.59-20260817-thin-tape-c3zone', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     gexLevels: sym === 'NAS100' || sym === 'QQQ' ? _gexLevels : undefined, // QQQ dealer gamma map (2026-08-12)
