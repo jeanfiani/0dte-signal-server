@@ -1860,6 +1860,29 @@ setInterval(() => {
   } catch (e) {}
 }, 60000).unref();
 
+// ===== REALIZED P&L LEDGER (2026-08-17, Jean) — exact weekly P&L in account terms =====
+// Books the EA's actual management: +50% of the TP1 distance when TP1 hits, and the
+// remaining fraction at the real close price (captures BE-trails as ~0, full SLs as -1x,
+// TP2/TP3 closes at their true distance). XAU multiplier x50 per Jean 2026-08-17.
+const PNL_MULT = { XAU: parseFloat(process.env.PNL_MULT_XAU || '50'), NAS100: parseFloat(process.env.PNL_MULT_NAS || '1'), BTC: parseFloat(process.env.PNL_MULT_BTC || '1') };
+const PNL_LEDGER_FILE = path.join(DATA_DIR, 'pnl_ledger.json');
+let pnlLedger = {};
+try { pnlLedger = JSON.parse(fs.readFileSync(PNL_LEDGER_FILE, 'utf8')) || {}; } catch (e) { pnlLedger = {}; }
+let _plDirty = false;
+function bookPnl(sym, amount, kind) {
+  try {
+    if (!isFinite(amount)) return;
+    const d = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+    pnlLedger[d] = pnlLedger[d] || {};
+    const row = pnlLedger[d][sym] = pnlLedger[d][sym] || { pnl: 0, t1Legs: 0, closes: 0 };
+    row.pnl = +(row.pnl + amount).toFixed(2);
+    if (kind === 't1') row.t1Legs++; else row.closes++;
+    _plDirty = true;
+    log(sym, '💰 P&L booked: ' + (amount >= 0 ? '+' : '') + '$' + amount.toFixed(2) + ' (' + kind + ') — day total $' + row.pnl.toFixed(2));
+  } catch (e) {}
+}
+setInterval(() => { if (_plDirty) { _plDirty = false; try { fs.writeFileSync(PNL_LEDGER_FILE, JSON.stringify(pnlLedger)); } catch (e) {} } }, 30000).unref();
+
 // GRACEFUL SHUTDOWN FLUSH (2026-08-13): Railway sends SIGTERM on redeploy/restart —
 // write the zone map + cohort tally one last time so not even the 60s save window is lost.
 function _flushPersist() {
@@ -1871,6 +1894,7 @@ function _flushPersist() {
     }
     fs.writeFileSync(ZONE_MAP_FILE, JSON.stringify(out));
     fs.writeFileSync(COHORT_TALLY_FILE, JSON.stringify(cohortTally));
+    fs.writeFileSync(PNL_LEDGER_FILE, JSON.stringify(pnlLedger));
   } catch (e) {}
 }
 process.on('SIGTERM', () => { _flushPersist(); process.exit(0); });
@@ -12796,6 +12820,8 @@ function updateSignalOutcome(sym, finalPrice) {
   } catch (eMae) { /* MAE recording must never affect outcome stamping */ }
   if (t.t1 && !entry.outcomes.tp1Hit) {
     entry.outcomes.tp1Hit = true; entry.outcomes.tp1HitTs = now;
+    // book the realized TP1 half (2026-08-17)
+    if (t.tp1Price > 0 && t.ep > 0) bookPnl(sym, 0.5 * Math.abs(t.tp1Price - t.ep) * (PNL_MULT[sym] || 1), 't1');
   }
   if (t.t2 && !entry.outcomes.tp2Hit) {
     entry.outcomes.tp2Hit = true; entry.outcomes.tp2HitTs = now;
@@ -12805,6 +12831,7 @@ function updateSignalOutcome(sym, finalPrice) {
       // t.sl was set via the TP3 path (line ~4005) — TP2 already hit, then TP3
       entry.outcomes.tp3Hit = true; entry.outcomes.tp3HitTs = now;
       entry.outcomes.closePrice = finalPrice;
+      if (t.ep > 0 && finalPrice > 0) bookPnl(sym, 0.5 * (t.type === 'call' ? finalPrice - t.ep : t.ep - finalPrice) * (PNL_MULT[sym] || 1), 'close');
       // Mark post-TP3 cooldown for this direction (added 2026-05-14). 90 min block on
       // same-direction signals — the move is exhausted, chasing it leads to losers
       // (5/14 signal #2 SL'd 32 min after signal #1 hit TP3 in same direction).
@@ -12814,6 +12841,7 @@ function updateSignalOutcome(sym, finalPrice) {
       // Real stop loss (before TP2)
       entry.outcomes.slHit = true; entry.outcomes.slHitTs = now;
       entry.outcomes.closePrice = finalPrice;
+      if (t.ep > 0 && finalPrice > 0) bookPnl(sym, (entry.outcomes.tp1Hit ? 0.5 : 1.0) * (t.type === 'call' ? finalPrice - t.ep : t.ep - finalPrice) * (PNL_MULT[sym] || 1), 'close');
     }
   }
   // Persist after outcome update (added 2026-05-14). Outcomes are critical for audit —
@@ -14286,9 +14314,10 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.59-20260817-thin-tape-c3zone', // bump on each deploy — lets /state verify what's live
+    build: '5.60-20260817-pnl-ledger', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
-    cohortTally: cohortTally[sym] || {}, // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
+    cohortTally: cohortTally[sym] || {},
+    pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     gexLevels: sym === 'NAS100' || sym === 'QQQ' ? _gexLevels : undefined, // QQQ dealer gamma map (2026-08-12)
     zoneMap: (S[sym] && S[sym]._zoneObs || []).map(z => ({ kind: z.kind || 'OB', tf: z.tf || '', dir: z.dir, lo: +z.lo.toFixed(2), hi: +z.hi.toFixed(2), ageMin: Math.round((Date.now() - z.ts) / 60000) })), // live FVG/OB zones (2026-08-11)
     msTrend: (S[sym] && S[sym]._msTrend) || null, // CHOCH-V2 structure state
