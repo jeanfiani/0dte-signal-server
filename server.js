@@ -1776,6 +1776,7 @@ function cohortFor(reason) {
   if (/ZONE-VETO/.test(reason)) return 'ZONE-VETO';
   if (/ZONE-PERM/.test(reason)) return 'ZONE-PERM';
   if (/CHOP-BREAK/.test(reason)) return 'CHOP-BREAK';
+  if (/EG-RETEST/.test(reason)) return 'EG-RETEST';
   if (/chop mode active/.test(reason)) return 'CHOP-GATE'; // the main \ud83c\udf0a block — force-tracked since 5.63 (was sample-only: the most-used gate had the least data)
   if (/LIQ-POOL/.test(reason)) return 'LIQ-POOL';
   if (/CHOCH-V2/.test(reason)) return 'CHOCH-V2';
@@ -5252,6 +5253,37 @@ function processPrice(sym, price, hi, lo) {
                               burst: _fBurst, atr: atrVal, srcConv: (conv && conv.score) || 0,
                               src: tagEarly + ' ' + sig.type.toUpperCase() + ' crest-block' };
               } catch (eF) {}
+              // ===== EG-RETEST ARM (DORMANT, 2026-08-18, Jean) =====
+              // EXT-GUARD computes the correct entry and throws it away: on the 8/18
+              // 4405→4360 slide it blocked with-trend puts at 10:41/10:45/10:57/11:15,
+              // each naming a retest price — and ALL FOUR retests printed before the
+              // next leg down. A stair-step trend day offers no entry EXCEPT that
+              // retest (mid-impulse → EXT-GUARD; mid-bounce → MACD-DEFER). Arm a
+              // pending virtual entry at the computed retest (ZONE-DEFER pendingFill
+              // mechanics: fills only on touch, 20-min runaway expiry, then graded on
+              // the standard virtual bracket). SL anchored beyond the impulse extreme.
+              // DORMANT: counting only. Throttle: one per symbol+direction per 5min.
+              try {
+                s._egRetestTs = s._egRetestTs || {};
+                if (Date.now() - (s._egRetestTs[sig.type] || 0) >= 300000) {
+                  s._egRetestTs[sig.type] = Date.now();
+                  const _egT1 = sym === 'XAU' ? 5 : sym === 'BTC' ? 50 : sym === 'NAS100' ? 30 : 0.3;
+                  const _egSlD = Math.max(atrVal, _egRange * 0.25);
+                  s.blockedOutcomes = s.blockedOutcomes || [];
+                  s.blockedOutcomes.push({
+                    ts: Date.now(), time: ts(), symbol: sym, detector: 'EG-RETEST', type: sig.type,
+                    price: +_egRetest.toFixed(2),
+                    virtualTp1: +(sig.type === 'call' ? _egRetest + _egT1 : _egRetest - _egT1).toFixed(2),
+                    virtualSl: +(sig.type === 'call' ? _egRetest - _egSlD : _egRetest + _egSlD).toFixed(2),
+                    pendingFill: +_egRetest.toFixed(2),
+                    blockReason: '🪃 EG-RETEST ' + sig.type.toUpperCase() + ' ARMED (dormant) @ $' + _egRetest.toFixed(2) + ' — EXT-GUARD refused the crest @ $' + price.toFixed(2) + ' (' + Math.round(_egPos * 100) + '% of $' + _egRange.toFixed(2) + ' impulse); pending entry at its own computed retest, SL $' + _egSlD.toFixed(2) + ' beyond (2026-08-18).',
+                    snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+                    tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null,
+                    closed: false, closedTs: null, outcome: null
+                  });
+                  log(sym, '🪃 EG-RETEST ' + sig.type.toUpperCase() + ' armed @ $' + _egRetest.toFixed(2) + ' (dormant pending-fill, 20min window).');
+                }
+              } catch (eER) {}
               Object.assign(s, _emitSnapshot);
               log(sym, '⏳ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — EXT-GUARD (Phase 3.91): entering at ' + Math.round(_egPos * 100) + '% of a $' + _egRange.toFixed(2) + ' 15-min impulse (' + (_egRange / atrVal).toFixed(1) + '×ATR). Chasing the crest of an oversized move; retest ~$' + _egRetest.toFixed(2) + ' would be the entry. EXT-FLIP candidate armed ' + (sig.type === 'call' ? 'PUT' : 'CALL') + '.');
               return false;
@@ -8386,10 +8418,21 @@ function processPrice(sym, price, hi, lo) {
         // at the touch because put-conviction was 0-2 (conviction is trend-following; it
         // CANNOT exist at a fresh top). Zone-confluence substitutes: in the fade window
         // with conv<5 but price INSIDE mapped supply -> stamp the would-fire.
+        // ===== ZONE-PERM PROMOTED TO LIVE — PUT SIDE ONLY (2026-08-18, Jean) =====
+        // "for me the best entry was 4405 — remove macro gate when price is at session
+        // highest, with a short SL." Four consecutive tops missed to the same macro lag
+        // (8/13 4363, 8/14 4397, 8/17 4435, 8/18 4405); the 8/18 10:19 stamp graded WIN.
+        // Zone confluence substitutes for conviction (conviction is trend-following and
+        // structurally 0-2 at a fresh top); the tight SL (0.8×ATR, min $2 — V-REC
+        // precedent) caps the cost of being wrong at the extreme. Every other LHF gate
+        // (RSI 35-60, MACD ≤0, ROC, distance, cooldowns, fade-window staleness) still
+        // applies. LLF CALL mirror stays DORMANT. Watch: bench if live cohort opens 0W/3L.
         if (_feWin && !_lhfFadeAtHigh && Array.isArray(s._zoneObs)) {
           const _zpz = s._zoneObs.find(z => z && z.dir === 'put' && price >= z.lo && price <= z.hi);
           if (_zpz) {
-            const _zpMsg = '🔓 ⬇LHF PUT ZONE-PERM DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — fade window at stale session high, conv<5 waived by mapped supply ' + (_zpz.kind || 'OB') + ' ' + (_zpz.tf || '') + ' $' + _zpz.lo.toFixed(2) + '-$' + _zpz.hi.toFixed(2) + ' (dormant 2026-08-14).';
+            _lhfFadeAtHigh = true; // waive macro like FADE-EASE — zone replaces conv≥5
+            s._zpFadeTs = Date.now(); s._zpFadeZoneHi = _zpz.hi; // trade builder: tight SL
+            const _zpMsg = '🔓 ⬇LHF PUT ZONE-PERM LIVE-FIRING @ $' + price.toFixed(2) + ' — fade window at stale session high, conv<5 waived by mapped supply ' + (_zpz.kind || 'OB') + ' ' + (_zpz.tf || '') + ' $' + _zpz.lo.toFixed(2) + '-$' + _zpz.hi.toFixed(2) + ' · tight SL armed (promoted 2026-08-18).';
             log(sym, _zpMsg); trackBlockedOutcome(sym, _zpMsg, true);
           }
         }
@@ -8453,7 +8496,17 @@ function processPrice(sym, price, hi, lo) {
         if (isMT5) {
           // Tight SL at local high + buffer; TPs scaled off that SL distance for 1:1.5/3/5 R:R.
           // Trade object uses *Price keys (slPrice/tp1Price/...); sig keys are sl/tp1/... strings.
-          const lhfSlPrice = localHi6 + lhfSlBuffer;
+          let lhfSlPrice = localHi6 + lhfSlBuffer;
+          // ZONE-PERM tight SL (2026-08-18, Jean: "with a short SL"): cap the stop at
+          // 0.8×ATR (min $2) — V-REC's tight-stop precedent. TP1/TP2 scale off slDist
+          // below, so the whole ladder tightens into a scalp automatically.
+          if (s._zpFadeTs && Date.now() - s._zpFadeTs < 10000) {
+            const _zpTight = Math.max(0.8 * (atrVal > 0 ? atrVal : 2.5), 2);
+            if (lhfSlPrice - price > _zpTight) {
+              lhfSlPrice = price + _zpTight;
+              log(sym, '✂️ ZONE-PERM tight SL — $' + lhfSlPrice.toFixed(2) + ' (0.8×ATR cap $' + _zpTight.toFixed(2) + ') instead of local-high default.');
+            }
+          }
           const slDist = lhfSlPrice - price;
           if (slDist > 0) {
             // TP1 cap (2026-07-14): structural R inflates R-based TP1 past the reachable
@@ -8859,8 +8912,54 @@ function processPrice(sym, price, hi, lo) {
           if (price <= z.hi && price >= z.lo && convictionFor(z.dir).score >= 5) {
             s._zoneTouched[_zk] = true;
             const _zSl = z.dir === 'call' ? z.lo - 0.15 * atrVal : z.hi + 0.15 * atrVal;
-            const _zMsg = '🗺️ ZONE-OB ' + (z.dir === 'call' ? 'CALL' : 'PUT') + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — ' + z.kind + ' ' + z.tf + ' ' + (z.dir === 'call' ? 'demand' : 'supply') + ' $' + z.lo.toFixed(2) + '-$' + z.hi.toFixed(2) + ' (formed ' + Math.round((_zNow - z.ts) / 60000) + 'min ago) · SL would anchor $' + _zSl.toFixed(2) + '.';
-            log(sym, _zMsg); trackBlockedOutcome(sym, _zMsg, true);
+            // ===== ZONE-OB NAS PUT PROMOTED TO LIVE (2026-08-18, Jean) =====
+            // "same for nas — 0 puts today on a huge, obvious drawdown." Two straight
+            // trend-down days the QQQ-supervised lanes fired nothing (QQQ itself mute)
+            // while ZONE-OB supply-retest put stamps kept winning: 8/17 4W/1S, 8/18
+            // 04:33+04:55 wins — NAS's best cohort. NOT the XAU fade promotion: NAS
+            // trends through extremes (FADE-EASE 0W/1L/6S, scoped out 8/4); this is
+            // WITH-TREND continuation at a supply retest, EXT-FLIP-style specialized
+            // lane. Own gates: conv≥5 (touch contract), 1h-down or trend-day-latch-put,
+            // no news blackout, no active trade, 20min lane cooldown, 30s global dedupe,
+            // tight SL = min(zone anchor, 0.8×ATR floor $15). CALL side + XAU/BTC stay
+            // DORMANT. Bench rule: 0W/3L live and it reverts to a stamp.
+            let _zFired = false;
+            try {
+              if (sym === 'NAS100' && z.dir === 'put' &&
+                  (s.htf1h_dir === 'down' || tdLatchEase(s, 'put')) &&
+                  !(s.newsBlackout && s.newsBlackout.active) &&
+                  !(s.trade && s.trade.active) &&
+                  (_zNow - (s._zobLastFireTs || 0)) >= 1200000 &&
+                  (_zNow - (s.lastNTs || 0)) >= 30000) {
+                const _zSlDist = Math.min(_zSl - price, Math.max(0.8 * atrVal, 15));
+                if (_zSlDist > 0) {
+                  s._zobLastFireTs = _zNow;
+                  s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
+                  if (s.lastSignalDir === 'call') s.lastReversalTs = _zNow;
+                  s.lastSignalDir = 'put'; s.lastSignalTs = _zNow; s.lastNTs = _zNow;
+                  const sigZ = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇ZONE-OB', rsi: (typeof rsiV === 'number' ? rsiV.toFixed(1) : '0'), macd: (typeof macdL === 'number' ? macdL.toFixed(3) : '0'), roc: '0.000%', num: s.dailySignalCount };
+                  try { const _zc = convictionFor('put'); sigZ.conv = { score: _zc.score, label: _zc.score >= 5 ? 'HIGH' : 'MOD', factors: _zc.factors }; } catch (eZC) {}
+                  s.signals.push(sigZ); logSignal(sym, sigZ);
+                  const _zT1 = Math.max(Math.min(_zSlDist * 1.5, 50), 30);
+                  const _zT2 = Math.max(_zSlDist * 2.5, _zT1 * 1.6);
+                  const _zT3 = CAPITAL_MODE ? _zT2 : Math.max(_zSlDist * 4.0, _zT1 * 2.5);
+                  s.trade = buildCfdTrade('put', price, atrVal, sym);
+                  s.trade.slPrice = +(price + _zSlDist).toFixed(2);
+                  s.trade.tp1Price = +(price - _zT1).toFixed(2);
+                  s.trade.tp2Price = +(price - _zT2).toFixed(2);
+                  s.trade.tp3Price = +(price - _zT3).toFixed(2);
+                  sigZ.sl = s.trade.slPrice.toFixed(2); sigZ.tp1 = s.trade.tp1Price.toFixed(2); sigZ.tp2 = s.trade.tp2Price.toFixed(2); sigZ.tp3 = s.trade.tp3Price.toFixed(2);
+                  _zFired = true;
+                  const _zFm = '🗺️ ZONE-OB PUT LIVE-FIRING @ $' + price.toFixed(2) + ' — ' + z.kind + ' ' + z.tf + ' supply $' + z.lo.toFixed(2) + '-$' + z.hi.toFixed(2) + ' retest, with-trend (1h ' + s.htf1h_dir + ') · tight SL $' + s.trade.slPrice.toFixed(2) + ' · TP1 $' + s.trade.tp1Price.toFixed(2) + ' (promoted 2026-08-18) [#' + s.dailySignalCount + '].';
+                  log(sym, _zFm); trackBlockedOutcome(sym, _zFm, true);
+                  sendPush('🗺️ NAS100 ZONE-OB PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · supply retest with-trend · SL $' + s.trade.slPrice.toFixed(2) + ' · TP1 $' + s.trade.tp1Price.toFixed(2), 'signal');
+                }
+              }
+            } catch (eZF) { /* zone promotion must never crash the tick */ }
+            if (!_zFired) {
+              const _zMsg = '🗺️ ZONE-OB ' + (z.dir === 'call' ? 'CALL' : 'PUT') + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — ' + z.kind + ' ' + z.tf + ' ' + (z.dir === 'call' ? 'demand' : 'supply') + ' $' + z.lo.toFixed(2) + '-$' + z.hi.toFixed(2) + ' (formed ' + Math.round((_zNow - z.ts) / 60000) + 'min ago) · SL would anchor $' + _zSl.toFixed(2) + '.';
+              log(sym, _zMsg); trackBlockedOutcome(sym, _zMsg, true);
+            }
           }
         }
       }
@@ -8977,7 +9076,7 @@ function processPrice(sym, price, hi, lo) {
               const tp1Dist = Math.min(slDist * 1.5, tp1Cap);
               const tp1P = price - tp1Dist;
               const tp2P = price - slDist * 2.5;
-              const tp3P = price - slDist * 4.0;
+              const tp3P = CAPITAL_MODE ? tp2P : price - slDist * 4.0; // capital mode: TP3=TP2 (2026-08-18 — this site missed the 8/14 patch)
               s.trade = buildCfdTrade('put', price, atrVal, sym);
               s.trade.slPrice = +lhfSlPrice.toFixed(2);
               s.trade.tp1Price = +tp1P.toFixed(2);
@@ -9047,7 +9146,7 @@ function processPrice(sym, price, hi, lo) {
               const tp1Dist = Math.min(slDist * 1.5, tp1Cap);
               const tp1P = price + tp1Dist;
               const tp2P = price + slDist * 2.5;
-              const tp3P = price + slDist * 4.0;
+              const tp3P = CAPITAL_MODE ? tp2P : price + slDist * 4.0; // capital mode: TP3=TP2 (2026-08-18 — this site missed the 8/14 patch)
               s.trade = buildCfdTrade('call', price, atrVal, sym);
               s.trade.slPrice = +llfSlPrice.toFixed(2);
               s.trade.tp1Price = +tp1P.toFixed(2);
@@ -9484,7 +9583,7 @@ function processPrice(sym, price, hi, lo) {
                     const tp1CapC = isXAU ? 5 : isBTC ? 100 : isNAS ? 50 : 0.50;
                     const tp1P = price - Math.min(slDist * 1.5, tp1CapC);
                     const tp2P = price - slDist * 2.5;
-                    const tp3P = price - slDist * 4.0;
+                    const tp3P = CAPITAL_MODE ? tp2P : price - slDist * 4.0; // capital mode: TP3=TP2 (2026-08-18 — this site missed the 8/14 patch)
                     s.trade = buildCfdTrade('put', price, atrVal, sym);
                     s.trade.slPrice = +chSl.toFixed(2);
                     s.trade.tp1Price = +tp1P.toFixed(2);
@@ -9549,7 +9648,7 @@ function processPrice(sym, price, hi, lo) {
                     const tp1CapC = isXAU ? 5 : isBTC ? 100 : isNAS ? 50 : 0.50;
                     const tp1P = price + Math.min(slDist * 1.5, tp1CapC);
                     const tp2P = price + slDist * 2.5;
-                    const tp3P = price + slDist * 4.0;
+                    const tp3P = CAPITAL_MODE ? tp2P : price + slDist * 4.0; // capital mode: TP3=TP2 (2026-08-18 — this site missed the 8/14 patch)
                     s.trade = buildCfdTrade('call', price, atrVal, sym);
                     s.trade.slPrice = +chSl.toFixed(2);
                     s.trade.tp1Price = +tp1P.toFixed(2);
@@ -9740,7 +9839,7 @@ function processPrice(sym, price, hi, lo) {
           const tp1Dist = Math.min(slDist * 1.5, tp1Cap);
           const tp1P = price - tp1Dist;
           const tp2P = price - slDist * 2.5;
-          const tp3P = price - slDist * 4.0;
+          const tp3P = CAPITAL_MODE ? tp2P : price - slDist * 4.0; // capital mode: TP3=TP2 (2026-08-18 — this site missed the 8/14 patch)
           s.trade = buildCfdTrade('put', price, atrVal, sym);
           s.trade.slPrice = +ibSl.toFixed(2);
           s.trade.tp1Price = +tp1P.toFixed(2);
@@ -9783,7 +9882,7 @@ function processPrice(sym, price, hi, lo) {
           const tp1Dist = Math.min(slDist * 1.5, tp1Cap);
           const tp1P = price + tp1Dist;
           const tp2P = price + slDist * 2.5;
-          const tp3P = price + slDist * 4.0;
+          const tp3P = CAPITAL_MODE ? tp2P : price + slDist * 4.0; // capital mode: TP3=TP2 (2026-08-18 — this site missed the 8/14 patch)
           s.trade = buildCfdTrade('call', price, atrVal, sym);
           s.trade.slPrice = +ibSl.toFixed(2);
           s.trade.tp1Price = +tp1P.toFixed(2);
@@ -10040,7 +10139,7 @@ function processPrice(sym, price, hi, lo) {
           s.trade.slPrice = +coilSL.toFixed(2);
           const tp1P = dir === 'call' ? price + coilRange * 2 : price - coilRange * 2;
           const tp2P = dir === 'call' ? price + coilRange * 4 : price - coilRange * 4;
-          const tp3P = dir === 'call' ? price + coilRange * 8 : price - coilRange * 8;
+          const tp3P = CAPITAL_MODE ? tp2P : (dir === 'call' ? price + coilRange * 8 : price - coilRange * 8); // capital mode: TP3=TP2 (2026-08-18)
           s.trade.tp1Price = +tp1P.toFixed(2);
           s.trade.tp2Price = +tp2P.toFixed(2);
           s.trade.tp3Price = +tp3P.toFixed(2);
@@ -10166,7 +10265,7 @@ function processPrice(sym, price, hi, lo) {
         const tp1Dist = Math.min(slDist * 1.5, tp1Cap);
         const tp1P = dir === 'put' ? price - tp1Dist : price + tp1Dist;
         const tp2P = dir === 'put' ? price - slDist * 2.5 : price + slDist * 2.5;
-        const tp3P = dir === 'put' ? price - slDist * 4.0 : price + slDist * 4.0;
+        const tp3P = CAPITAL_MODE ? tp2P : (dir === 'put' ? price - slDist * 4.0 : price + slDist * 4.0); // capital mode: TP3=TP2 (2026-08-18)
         s.trade = buildCfdTrade(dir, price, atrVal, sym);
         s.trade.slPrice = +slPrice.toFixed(2);
         s.trade.tp1Price = +tp1P.toFixed(2);
@@ -11787,7 +11886,7 @@ function processPrice(sym, price, hi, lo) {
         // when the floor kicks in.
         const tp1Dist = Math.max(trv2Atr * entMults.t1, tp1Floor);
         const tp2Dist = Math.max(trv2Atr * entMults.t2, tp1Dist * (entMults.t2 / entMults.t1));
-        const tp3Dist = Math.max(trv2Atr * entMults.t3, tp1Dist * (entMults.t3 / entMults.t1));
+        const tp3Dist = CAPITAL_MODE ? tp2Dist : Math.max(trv2Atr * entMults.t3, tp1Dist * (entMults.t3 / entMults.t1)); // capital mode: TP3=TP2 (2026-08-18)
         const tp1 = dir === 'long' ? price + tp1Dist : price - tp1Dist;
         const tp2 = dir === 'long' ? price + tp2Dist : price - tp2Dist;
         const tp3 = dir === 'long' ? price + tp3Dist : price - tp3Dist;
@@ -14395,7 +14494,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.64-20260818-midnight-carryover', // bump on each deploy — lets /state verify what's live
+    build: '5.68-20260818-zone-ob-nas-put-live', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
