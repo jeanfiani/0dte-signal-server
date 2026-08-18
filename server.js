@@ -1776,6 +1776,7 @@ function cohortFor(reason) {
   if (/ZONE-VETO/.test(reason)) return 'ZONE-VETO';
   if (/ZONE-PERM/.test(reason)) return 'ZONE-PERM';
   if (/CHOP-BREAK/.test(reason)) return 'CHOP-BREAK';
+  if (/chop mode active/.test(reason)) return 'CHOP-GATE'; // the main \ud83c\udf0a block — force-tracked since 5.63 (was sample-only: the most-used gate had the least data)
   if (/LIQ-POOL/.test(reason)) return 'LIQ-POOL';
   if (/CHOCH-V2/.test(reason)) return 'CHOCH-V2';
   if (/RIDE-FADE/.test(reason)) return 'RIDE-FADE';
@@ -6425,20 +6426,31 @@ function processPrice(sym, price, hi, lo) {
           // miss. DORMANT: stamps the would-fire (CHOP-BREAK cohort), signal still blocks.
           try {
             const _cbConv = (conv && conv.score) || 0;
-            if (_cbConv >= 7 && Array.isArray(s._zoneObs)) {
+            // Session-aware floor (2026-08-18, Jean): overnight conviction has a structural
+            // ceiling of ~5-6 (SLV/GDX/TLT/SPY/QQQ closed) — the 8/17 21:40 PUT @4421.36
+            // that missed the 4435→4395 breakdown scored conv 5 near the overnight max,
+            // so a flat 7-floor is unreachable exactly when XAU trends overnight. Same
+            // fix as RECOV-6 (2026-07-13): 7 RTH, 5 overnight. Zone requirement unchanged.
+            const _cbFloor = (typeof rthEtfFresh === 'function' && rthEtfFresh()) ? 7 : 5;
+            if (_cbConv >= _cbFloor && Array.isArray(s._zoneObs)) {
               const _cbM = 0.5 * (atrVal > 0 ? atrVal : 1);
               const _cbZ = s._zoneObs.find(z => z && z.dir === sig.type &&
                 (sig.type === 'call' ? (price >= z.lo && price <= z.hi + _cbM)
                                      : (price >= z.lo - _cbM && price <= z.hi)));
               if (_cbZ) {
-                const _cbMsg = '⚡ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' CHOP-BREAK DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — conv ' + _cbConv + ' ≥ 7 exiting mapped ' + (sig.type === 'put' ? 'supply' : 'demand') + ' ' + (_cbZ.kind || 'OB') + ' ' + (_cbZ.tf || '') + ' $' + _cbZ.lo.toFixed(2) + '-$' + _cbZ.hi.toFixed(2) + ' — chop gate would be waived at the regime break (dormant 2026-08-17, 09:38 launch-bar case).';
+                const _cbMsg = '⚡ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' CHOP-BREAK DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — conv ' + _cbConv + ' ≥ ' + _cbFloor + ' (session-aware floor) exiting mapped ' + (sig.type === 'put' ? 'supply' : 'demand') + ' ' + (_cbZ.kind || 'OB') + ' ' + (_cbZ.tf || '') + ' $' + _cbZ.lo.toFixed(2) + '-$' + _cbZ.hi.toFixed(2) + ' — chop gate would be waived at the regime break (dormant 2026-08-17, 09:38 launch-bar case).';
                 log(sym, _cbMsg);
                 trackBlockedOutcome(sym, _cbMsg, true);
               }
             }
           } catch (eCB) {}
           Object.assign(s, _emitSnapshot);
-          log(sym, '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' chop mode active (only V-REV / LHF / LLF / OBREJ / OBMIT allowed in chop; other detectors consistently lose in flat range).');
+          // Force-tracked since 5.63 (2026-08-18, Jean: "how many saves vs misses from the chop
+          // gate?" — answer was unknowable: sample-only tracking, no cohort). The 3-min global
+          // dedupe (2026-08-03) keys this by CHOP-GATE+direction, so spam cannot churn the ring.
+          const _chopMsg = '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' chop mode active (only V-REV / LHF / LLF / OBREJ / OBMIT allowed in chop; other detectors consistently lose in flat range).';
+          trackBlockedOutcome(sym, _chopMsg, true);
+          log(sym, _chopMsg);
           return false;
         }
       }
@@ -14230,6 +14242,12 @@ app.get('/blocked-outcomes/:sym', (req, res) => {
   // Date filtering (added 2026-07-02): ?days=N (last N days) or ?from=YYYY-MM-DD&to=YYYY-MM-DD.
   // Prevents mixed-regime analysis — e.g. compare gates before/after the 6/30 loosening.
   const q = req.query || {};
+  // ?reason= substring filter (2026-08-18): count a specific gate's saves/misses directly,
+  // e.g. ?reason=chop%20mode%20active — applies to summary AND entries.
+  if (q.reason) {
+    const _rq = String(q.reason).toLowerCase();
+    outcomes = outcomes.filter(o => (o.blockReason || '').toLowerCase().indexOf(_rq) !== -1);
+  }
   if (q.days && isFinite(parseFloat(q.days))) {
     const cutoffTs = Date.now() - parseFloat(q.days) * 86400000;
     outcomes = outcomes.filter(o => o.ts >= cutoffTs);
@@ -14366,7 +14384,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.62-20260817-trend-cont', // bump on each deploy — lets /state verify what's live
+    build: '5.63-20260818-chop-audit', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
