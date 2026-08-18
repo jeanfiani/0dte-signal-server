@@ -14115,7 +14115,18 @@ setInterval(() => {
       }
       // Always reset cooldown so first signal of new day isn't blocked by yesterday's timestamp
       s.trv2LastSignalTs = 0;
-      s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
+      // ===== MIDNIGHT TRADE CARRY-OVER (2026-08-18, Jean) =====
+      // This reset used to wipe s.trade UNCONDITIONALLY — for every symbol, including BTC
+      // despite the preserve-BTC comment above. Any trade open at 00:00 ET silently lost
+      // all management: no TP/SL stamping, no P&L booking, signal stuck 'Open' forever,
+      // and it vanished from /signals/today when the date rolled. An open position does
+      // not care what day it is: preserve it, keep managing it, and let /signals/today
+      // carry the signal over until the trade closes.
+      if (s.trade && s.trade.active) {
+        log(sym, '🌙 Daily reset — active ' + String(s.trade.type || '').toUpperCase() + ' trade @ $' + (+s.trade.ep || 0).toFixed(2) + ' PRESERVED across midnight: management, TP/SL stamping and P&L booking continue (2026-08-18).');
+      } else {
+        s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
+      }
     });
     saveRollingLevels(); // Persist rolling ATH/ATL data across restarts
     saveSignalHistory(); // Flush signal history before daily reset
@@ -14384,7 +14395,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.63-20260818-chop-audit', // bump on each deploy — lets /state verify what's live
+    build: '5.64-20260818-midnight-carryover', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
@@ -14956,12 +14967,25 @@ app.get('/admin/seed-daily-levels', (req, res) => {
 app.get('/signals/today', (req, res) => {
   const today = todayDateET();
   const todaySignals = signalHistory.filter(h => h.date === today);
+  // Midnight carry-over (2026-08-18): a trade open across 00:00 ET keeps its signal
+  // visible here (flagged carryOver:true, prepended) until the trade closes.
+  const carryOver = [];
+  SYMBOLS.forEach(sym => {
+    try {
+      const st = S[sym];
+      if (st && st.trade && st.trade.active && st.lastHistEntry &&
+          st.lastHistEntry.symbol === sym && st.lastHistEntry.date !== today) {
+        carryOver.push(Object.assign({ carryOver: true }, st.lastHistEntry));
+      }
+    } catch (e) {}
+  });
+  const all = carryOver.concat(todaySignals);
   const bySymbol = {};
   SYMBOLS.forEach(sym => {
-    const symSigs = todaySignals.filter(h => h.symbol === sym);
-    if (symSigs.length > 0) bySymbol[sym] = symSigs.length;
+    const n = all.filter(h => h.symbol === sym).length;
+    if (n > 0) bySymbol[sym] = n;
   });
-  res.json({ date: today, total: todaySignals.length, bySymbol: bySymbol, signals: todaySignals });
+  res.json({ date: today, total: all.length, carryOver: carryOver.length, bySymbol: bySymbol, signals: all });
 });
 
 // CSV export — legacy endpoint (must be before /:date)
