@@ -1769,6 +1769,7 @@ function tdLatchEase(s, sigType) {
 function cohortFor(reason) {
   if (/CLIMAX-FLIP/.test(reason)) return 'CLIMAX-FLIP';
   if (/RETEST-HI|RETEST-LO/.test(reason)) return 'RETEST';
+  if (/ZONE-OB-RT/.test(reason)) return 'ZONE-OB-RT'; // re-touch sub-cohort (2026-08-19)
   if (/ZONE-OB/.test(reason)) return 'ZONE-OB';
   if (/QQQ-REV-GATE/.test(reason)) return 'QQQ-REV-GATE';
   if (/NAS-OVERNIGHT/.test(reason)) return 'NAS-OVERNIGHT';
@@ -1776,6 +1777,7 @@ function cohortFor(reason) {
   if (/ZONE-VETO/.test(reason)) return 'ZONE-VETO';
   if (/ZONE-PERM/.test(reason)) return 'ZONE-PERM';
   if (/CHOP-BREAK/.test(reason)) return 'CHOP-BREAK';
+  if (/EG-RETEST-Z/.test(reason)) return 'EG-RETEST-Z'; // zone-anchored variant, paired test (2026-08-19)
   if (/EG-RETEST/.test(reason)) return 'EG-RETEST';
   if (/chop mode active/.test(reason)) return 'CHOP-GATE'; // the main \ud83c\udf0a block — force-tracked since 5.63 (was sample-only: the most-used gate had the least data)
   if (/LIQ-POOL/.test(reason)) return 'LIQ-POOL';
@@ -5282,6 +5284,38 @@ function processPrice(sym, price, hi, lo) {
                     closed: false, closedTs: null, outcome: null
                   });
                   log(sym, '🪃 EG-RETEST ' + sig.type.toUpperCase() + ' armed @ $' + _egRetest.toFixed(2) + ' (dormant pending-fill, 20min window).');
+                  // ===== EG-RETEST-Z — ZONE-ANCHORED VARIANT (paired test, 2026-08-19, Jean) =====
+                  // 8/18 21:00 case: the 40% arithmetic retest filled at 4339.82 mid-bounce
+                  // and its SL (4345.24) sat within $1 of where the bounce actually died —
+                  // the mapped supply shelf. Reactions terminate at STRUCTURE, not at
+                  // percentages of the last candle swing. When a same-direction zone sits
+                  // between the retest and the impulse extreme, arm a SECOND pending entry
+                  // at the zone edge with the SL beyond the ZONE. Both variants run on
+                  // every qualifying block — head-to-head, cohorts decide, nothing missed.
+                  try {
+                    if (Array.isArray(s._zoneObs)) {
+                      const _ezZ = s._zoneObs.filter(z2 => z2 && z2.dir === sig.type &&
+                        (sig.type === 'put' ? (z2.lo >= _egRetest - 0.2 * atrVal && z2.lo <= _egHi)
+                                            : (z2.hi <= _egRetest + 0.2 * atrVal && z2.hi >= _egLo)))
+                        .sort((a2, b2) => sig.type === 'put' ? (a2.lo - b2.lo) : (b2.hi - a2.hi))[0];
+                      if (_ezZ) {
+                        const _ezEp = sig.type === 'put' ? _ezZ.lo : _ezZ.hi;
+                        const _ezSl = sig.type === 'put' ? _ezZ.hi + 0.2 * atrVal : _ezZ.lo - 0.2 * atrVal;
+                        s.blockedOutcomes.push({
+                          ts: Date.now(), time: ts(), symbol: sym, detector: 'EG-RETEST-Z', type: sig.type,
+                          price: +_ezEp.toFixed(2),
+                          virtualTp1: +(sig.type === 'call' ? _ezEp + _egT1 : _ezEp - _egT1).toFixed(2),
+                          virtualSl: +_ezSl.toFixed(2),
+                          pendingFill: +_ezEp.toFixed(2),
+                          blockReason: '🧲 EG-RETEST-Z ' + sig.type.toUpperCase() + ' ARMED (dormant, paired) @ $' + _ezEp.toFixed(2) + ' — zone-anchored variant: ' + (_ezZ.kind || 'OB') + ' ' + (_ezZ.tf || '') + ' $' + _ezZ.lo.toFixed(2) + '-$' + _ezZ.hi.toFixed(2) + ' between retest $' + _egRetest.toFixed(2) + ' and extreme; SL beyond zone $' + _ezSl.toFixed(2) + ' (2026-08-19).',
+                          snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+                          tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null,
+                          closed: false, closedTs: null, outcome: null
+                        });
+                        log(sym, '🧲 EG-RETEST-Z ' + sig.type.toUpperCase() + ' armed @ $' + _ezEp.toFixed(2) + ' (zone edge, SL $' + _ezSl.toFixed(2) + ', paired with 40% retest).');
+                      }
+                    }
+                  } catch (eEZ) {}
                 }
               } catch (eER) {}
               Object.assign(s, _emitSnapshot);
@@ -8914,9 +8948,21 @@ function processPrice(sym, price, hi, lo) {
         s._zoneTouched = s._zoneTouched || {};
         for (const z of (s._zoneObs || [])) {
           const _zk = z.kind + z.tf + z.ts;
-          if (s._zoneTouched[_zk] || (_zNow - z.ts) < 15 * 60000) continue;
+          // RE-TOUCH ENABLED (2026-08-19, Jean): was one-stamp-per-zone forever — the
+          // 8/18 20:17 bounce died at the 4344-48 breakdown-origin supply and the engine
+          // couldn't say so because that shelf had already spent its single stamp hours
+          // earlier. A zone that matters at noon still matters at 20:00. Re-touches
+          // stamp after a 90-min per-zone cool-off into their own ZONE-OB-RT cohort
+          // (dormant everywhere; the NAS live lane keeps firing on FIRST touch only
+          // until ZONE-OB-RT earns promotion).
+          if ((_zNow - z.ts) < 15 * 60000) continue;
+          const _ltRaw = s._zoneTouched[_zk];
+          const _lt = _ltRaw === true ? _zNow : (_ltRaw || 0);
+          if (_ltRaw === true) s._zoneTouched[_zk] = _zNow; // migrate legacy boolean
+          if (_lt > 0 && (_zNow - _lt) < 90 * 60000) continue;
+          const _isReTouch = _lt > 0;
           if (price <= z.hi && price >= z.lo && convictionFor(z.dir).score >= 5) {
-            s._zoneTouched[_zk] = true;
+            s._zoneTouched[_zk] = _zNow;
             const _zSl = z.dir === 'call' ? z.lo - 0.15 * atrVal : z.hi + 0.15 * atrVal;
             // ===== ZONE-OB NAS PUT PROMOTED TO LIVE (2026-08-18, Jean) =====
             // "same for nas — 0 puts today on a huge, obvious drawdown." Two straight
@@ -8936,7 +8982,7 @@ function processPrice(sym, price, hi, lo) {
               // low; a break within the last 90s (live breakdown) is the only way through.
               const _zSeLo = (s.sessionLow > 0 && s.sessionLow < Infinity) ? ((price - s.sessionLow) / price) * 100 : 999;
               const _zSeFresh = (s.sessionLowUpdateTs || 0) > 0 && (_zNow - s.sessionLowUpdateTs) < 90000;
-              if (sym === 'NAS100' && z.dir === 'put' &&
+              if (sym === 'NAS100' && z.dir === 'put' && !_isReTouch &&
                   !(_zSeLo < 0.05 && !_zSeFresh) &&
                   (s.htf1h_dir === 'down' || tdLatchEase(s, 'put')) &&
                   !(s.newsBlackout && s.newsBlackout.active) &&
@@ -8969,7 +9015,7 @@ function processPrice(sym, price, hi, lo) {
               }
             } catch (eZF) { /* zone promotion must never crash the tick */ }
             if (!_zFired) {
-              const _zMsg = '🗺️ ZONE-OB ' + (z.dir === 'call' ? 'CALL' : 'PUT') + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — ' + z.kind + ' ' + z.tf + ' ' + (z.dir === 'call' ? 'demand' : 'supply') + ' $' + z.lo.toFixed(2) + '-$' + z.hi.toFixed(2) + ' (formed ' + Math.round((_zNow - z.ts) / 60000) + 'min ago) · SL would anchor $' + _zSl.toFixed(2) + '.';
+              const _zMsg = '🗺️ ZONE-OB' + (_isReTouch ? '-RT' : '') + ' ' + (z.dir === 'call' ? 'CALL' : 'PUT') + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — ' + z.kind + ' ' + z.tf + ' ' + (z.dir === 'call' ? 'demand' : 'supply') + ' $' + z.lo.toFixed(2) + '-$' + z.hi.toFixed(2) + ' (formed ' + Math.round((_zNow - z.ts) / 60000) + 'min ago) · SL would anchor $' + _zSl.toFixed(2) + '.';
               log(sym, _zMsg); trackBlockedOutcome(sym, _zMsg, true);
             }
           }
@@ -14506,7 +14552,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.69-20260819-chase-no-exceptions', // bump on each deploy — lets /state verify what's live
+    build: '5.70-20260819-retouch-egz-paired', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
