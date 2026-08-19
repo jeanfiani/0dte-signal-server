@@ -5331,11 +5331,17 @@ function processPrice(sym, price, hi, lo) {
           // happened with intraday ATR COMPRESSED below session open — Asian drift reads as
           // 'advancing highs'. A real breakout EXPANDS ATR; drift doesn't get the exemption.
           const _seLiveBreak = _seBrkTs > 0 && (Date.now() - _seBrkTs) < 90000 && !(s._atrSessOpen > 0 && atrVal < 0.9 * s._atrSessOpen);
-          const _seTdEase = tdLatchEase(s, sig.type);
-          if (_seTdEase && _sePct < 0.05 && !_seLiveBreak) {
-            log(sym, '📈 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' TREND-CONT EASE — session-extreme chase waived: trend-day latch, with-trend continuation at the pressed edge (2026-08-17, 8/17 NAS 13:05 case).');
-          }
-          if (_sePct < 0.05 && !_seLiveBreak && !_seTdEase) {
+          // ===== TREND-CONT CHASE EASE REVOKED (2026-08-19, Jean) =====
+          // Lived 2 days. 8/18 19:36 TREND PUT @4330.22: EXT-GUARD refused every
+          // mid-impulse entry all evening, then the latch ease waived THIS gate at a
+          // 10-min-old defended session low — bottom-tick fire, $5.12 bounce, SL,
+          // adverseFrac 1.02. Jean: the unbroken-extreme rule "should be applied to
+          // every signal, no exception." The gate's built-in fresh-break window
+          // (_seLiveBreak, 90s after a real break) IS the sanctioned way through —
+          // ride the break, never the defended extreme. Latch still eases
+          // support-proximity and session-range bias (8/17 NAS 12:24/12:44 evidence);
+          // those judge location vs LEVELS, this one judges the live extreme itself.
+          if (_sePct < 0.05 && !_seLiveBreak) {
             // Arm/refresh the opposite EXT-FLIP candidate (mirrors the EXT-GUARD arm) —
             // blocking the chase must not also lose the reversal. Re-blocks REFRESH the
             // extreme but keep the original armTs, so the 3-min stabilization clock isn't
@@ -8925,7 +8931,13 @@ function processPrice(sym, price, hi, lo) {
             // DORMANT. Bench rule: 0W/3L live and it reverts to a stamp.
             let _zFired = false;
             try {
+              // Session-extreme chase rule applies here too (2026-08-19, Jean: "every
+              // signal, no exception"): no put fire within 0.05% of an unbroken session
+              // low; a break within the last 90s (live breakdown) is the only way through.
+              const _zSeLo = (s.sessionLow > 0 && s.sessionLow < Infinity) ? ((price - s.sessionLow) / price) * 100 : 999;
+              const _zSeFresh = (s.sessionLowUpdateTs || 0) > 0 && (_zNow - s.sessionLowUpdateTs) < 90000;
               if (sym === 'NAS100' && z.dir === 'put' &&
+                  !(_zSeLo < 0.05 && !_zSeFresh) &&
                   (s.htf1h_dir === 'down' || tdLatchEase(s, 'put')) &&
                   !(s.newsBlackout && s.newsBlackout.active) &&
                   !(s.trade && s.trade.active) &&
@@ -14494,7 +14506,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.68-20260818-zone-ob-nas-put-live', // bump on each deploy — lets /state verify what's live
+    build: '5.69-20260819-chase-no-exceptions', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
