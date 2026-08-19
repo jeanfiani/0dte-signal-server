@@ -1777,6 +1777,7 @@ function cohortFor(reason) {
   if (/ZONE-VETO/.test(reason)) return 'ZONE-VETO';
   if (/ZONE-PERM/.test(reason)) return 'ZONE-PERM';
   if (/CHOP-BREAK/.test(reason)) return 'CHOP-BREAK';
+  if (/SE-RETEST/.test(reason)) return 'SE-RETEST'; // chase-gate bounce-entry arm, Jean's design (2026-08-19)
   if (/EG-RETEST-Z/.test(reason)) return 'EG-RETEST-Z'; // zone-anchored variant, paired test (2026-08-19)
   if (/EG-RETEST/.test(reason)) return 'EG-RETEST';
   if (/chop mode active/.test(reason)) return 'CHOP-GATE'; // the main \ud83c\udf0a block — force-tracked since 5.63 (was sample-only: the most-used gate had the least data)
@@ -1922,7 +1923,7 @@ function updateBlockedOutcomes(sym, price) {
       const _pf = (b.type === 'call' && price <= b.pendingFill) || (b.type === 'put' && price >= b.pendingFill);
       if (_pf) { b.pendingFill = null; b.filledTs = now; }
       else {
-        if ((now - b.ts) / 60000 >= 20) { b.outcome = 'no_resolve'; b.closed = true; b.closedTs = now; b.blockReason += ' [never retested — runaway]'; }
+        if ((now - b.ts) / 60000 >= (b.pendingExpiryMin || 20)) { b.outcome = 'no_resolve'; b.closed = true; b.closedTs = now; b.blockReason += ' [never retested — runaway]'; }
         continue;
       }
     }
@@ -5401,6 +5402,56 @@ function processPrice(sym, price, hi, lo) {
               } else if (_fDir === 'put' && _fExt > s.extFlip.extreme) { s.extFlip.extreme = _fExt; }
                 else if (_fDir === 'call' && _fExt < s.extFlip.extreme) { s.extFlip.extreme = _fExt; }
             } catch (eSF) {}
+            // ===== SE-RETEST ARM (DORMANT, 2026-08-19 — Jean's design) =====
+            // "instead of canceling the whole signal we just wait for the price to go
+            // [back up] within a time frame of 15 minutes and fire on hitting it." The
+            // chase gate blocks a with-trend entry AT the unbroken extreme; rather than
+            // discarding the signal, arm a pending entry at the BOUNCE: the nearest
+            // mapped same-direction zone edge above/below (structure caps reactions —
+            // the 8/18 4346 bounce died at the 4344-48 supply shelf), else extreme +
+            // 1×ATR when no zone is mapped within 3×ATR. 15-min window (Jean's spec),
+            // SL beyond the structure. With-trend blocks only; throttled 5min/direction.
+            try {
+              const _srTrendOk = sig.type === 'put'
+                ? (s.htf1h_dir === 'down' || tdLatchEase(s, 'put'))
+                : (s.htf1h_dir === 'up' || tdLatchEase(s, 'call'));
+              s._seRetestTs = s._seRetestTs || {};
+              if (_srTrendOk && atrVal > 0 && Date.now() - (s._seRetestTs[sig.type] || 0) >= 300000) {
+                s._seRetestTs[sig.type] = Date.now();
+                const _srExt = _seCall ? s.sessionHigh : s.sessionLow;
+                let _srEp = null, _srSl = null, _srSrc = null;
+                if (Array.isArray(s._zoneObs)) {
+                  const _srZ = s._zoneObs.filter(z2 => z2 && z2.dir === sig.type &&
+                    (sig.type === 'put' ? (z2.lo > price && z2.lo <= price + 3 * atrVal)
+                                        : (z2.hi < price && z2.hi >= price - 3 * atrVal)))
+                    .sort((a2, b2) => sig.type === 'put' ? (a2.lo - b2.lo) : (b2.hi - a2.hi))[0];
+                  if (_srZ) {
+                    _srEp = sig.type === 'put' ? _srZ.lo : _srZ.hi;
+                    _srSl = sig.type === 'put' ? _srZ.hi + 0.2 * atrVal : _srZ.lo - 0.2 * atrVal;
+                    _srSrc = (_srZ.kind || 'OB') + ' ' + (_srZ.tf || '') + ' $' + _srZ.lo.toFixed(2) + '-$' + _srZ.hi.toFixed(2);
+                  }
+                }
+                if (_srEp === null) {
+                  _srEp = sig.type === 'put' ? _srExt + atrVal : _srExt - atrVal;
+                  _srSl = sig.type === 'put' ? _srEp + 1.2 * atrVal : _srEp - 1.2 * atrVal;
+                  _srSrc = '1×ATR bounce off extreme $' + _srExt.toFixed(2) + ' (no zone mapped)';
+                }
+                const _srT1 = sym === 'XAU' ? 5 : sym === 'BTC' ? 50 : sym === 'NAS100' ? 30 : 0.3;
+                s.blockedOutcomes = s.blockedOutcomes || [];
+                s.blockedOutcomes.push({
+                  ts: Date.now(), time: ts(), symbol: sym, detector: 'SE-RETEST', type: sig.type,
+                  price: +_srEp.toFixed(2),
+                  virtualTp1: +(sig.type === 'call' ? _srEp + _srT1 : _srEp - _srT1).toFixed(2),
+                  virtualSl: +_srSl.toFixed(2),
+                  pendingFill: +_srEp.toFixed(2), pendingExpiryMin: 15,
+                  blockReason: '⏫ SE-RETEST ' + sig.type.toUpperCase() + ' ARMED (dormant, Jean 2026-08-19) @ $' + _srEp.toFixed(2) + ' — chase gate refused the unbroken extreme @ $' + price.toFixed(2) + '; waiting for the bounce into ' + _srSrc + ' · 15min window · SL $' + _srSl.toFixed(2) + '.',
+                  snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+                  tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null,
+                  closed: false, closedTs: null, outcome: null
+                });
+                log(sym, '⏫ SE-RETEST ' + sig.type.toUpperCase() + ' armed @ $' + _srEp.toFixed(2) + ' (' + _srSrc + ') — dormant, 15min window.');
+              }
+            } catch (eSR) {}
             log(sym, '🛑 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — session-extreme chase: $' + price.toFixed(2) + ' is ' + _sePct.toFixed(3) + '% from session ' + (_seCall ? 'high $' + s.sessionHigh.toFixed(2) : 'low $' + s.sessionLow.toFixed(2)) + ' (range $' + _seRange.toFixed(2) + ', extreme stale ' + Math.round((Date.now() - _seBrkTs) / 60000) + 'min). ' + (_seCall ? 'Buying the top' : 'Selling the bottom') + ' without breaking it is not allowed — all-paths fix 2026-07-31.');
             return false;
           }
@@ -14552,7 +14603,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.70-20260819-retouch-egz-paired', // bump on each deploy — lets /state verify what's live
+    build: '5.71-20260819-se-retest-jean', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
