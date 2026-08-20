@@ -14567,6 +14567,28 @@ app.post('/trade/close/ack', (req, res) => {
 //   - High loss-rate on blocked signals = gates are correctly filtering, keep tight
 //   - Mixed = need more data or per-detector analysis
 // Read-only — no side effects on signal firing.
+// ===== EA FAST LANE (2026-08-19, Jean: signal 4502.70 -> filled 4506.13, 30s late) =====
+// Ultra-compact poll target so the EA can run a 1s timer without parsing /state's
+// full JSON. ?since=<last seen trade ts> -> {n:0} (~15 bytes) when nothing new.
+// Response carries the trade ladder AND any pending closeRequest, so one cheap poll
+// covers both entry and managed exits (early-protect / time-stop / manual close).
+app.get('/ea/:sym', (req, res) => {
+  const sym = resolveSymbol(req.params.sym);
+  const s = S[sym];
+  if (!s) return res.status(404).json({ error: 'unknown' });
+  const t = s.trade;
+  const since = parseInt(req.query.since, 10) || 0;
+  const cr = (s.closeRequest && s.closeRequest.active) ? s.closeRequest.id : null;
+  if (!t || !t.active || !t.ts || t.ts <= since) {
+    return res.json({ n: 0, ts: Date.now(), close: cr });
+  }
+  res.json({
+    n: 1, id: t.ts, type: t.type || '', ep: +t.ep || 0,
+    sl: +t.slPrice || 0, tp1: +t.tp1Price || 0, tp2: +t.tp2Price || 0, tp3: +t.tp3Price || 0,
+    age: Math.round((Date.now() - t.ts) / 1000), ts: Date.now(), close: cr
+  });
+});
+
 app.get('/blocked-outcomes/:sym', (req, res) => {
   const sym = resolveSymbol(req.params.sym); // broker alias aware
   const s = S[sym];
@@ -14717,7 +14739,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.77-20260819-tick-rate-meter', // bump on each deploy — lets /state verify what's live
+    build: '5.78-20260819-ea-fast-lane', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
