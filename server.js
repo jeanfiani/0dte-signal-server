@@ -1676,7 +1676,11 @@ function trackBlockedOutcome(sym, msg, force) {
   // Per-symbol virtual TP1/SL distances — match real-signal scales
   let tp1Dist;
   if (sym === 'XAU') tp1Dist = 5;
-  else if (sym === 'BTC') tp1Dist = 50;
+  // BTC ATR-SCALED BRACKETS (2026-08-19, Jean): fixed ±$50 vs ATR $200-400 graded the
+  // 8/19 64K→68K rally's blocked calls as losses/scratches (+$400 move = "scratch") —
+  // every BTC gate audit since the bench has been measured with a ruler shorter than
+  // the noise. Bracket now tracks the real TP1 scale: max($50, 1.2×ATR).
+  else if (sym === 'BTC') tp1Dist = Math.max(50, 1.2 * ((s._atr > 0 ? s._atr : 0)));
   // NAS 10 → 30 (2026-07-17): real NAS trades use TP1 = max(3×ATR, $30); the $10
   // virtual bracket scored every blocked PUT as stopped on 40-pt bounces during the
   // 7/16-17 overnight -545pt slide — systematically marking real winners as losses
@@ -5376,6 +5380,11 @@ function processPrice(sym, price, hi, lo) {
           // ride the break, never the defended extreme. Latch still eases
           // support-proximity and session-range bias (8/17 NAS 12:24/12:44 evidence);
           // those judge location vs LEVELS, this one judges the live extreme itself.
+          if (_sePct < 0.05 && _seLiveBreak) {
+            // Live-break passage (2026-08-19): remember the waiver so the trade born in
+            // the next few seconds can be tagged as a BREAKOUT entry (time-stop below).
+            s._lbWaiverTs = Date.now();
+          }
           if (_sePct < 0.05 && !_seLiveBreak) {
             // Arm/refresh the opposite EXT-FLIP candidate (mirrors the EXT-GUARD arm) —
             // blocking the chase must not also lose the reversal. Re-blocks REFRESH the
@@ -5506,6 +5515,20 @@ function processPrice(sym, price, hi, lo) {
     try {
       if (isMT5 && atrVal > 0 && Array.isArray(s._zoneObs) && s._zoneObs.length) {
         const _zvC = sig.type === 'call';
+        // ===== TREND-CONT EASE FOR ZONE-VETO (2026-08-19, Jean: "MAKE IT EASE") =====
+        // Third trend-day offense in one week: 8/17 NAS puts (12:04 would-win vetoed),
+        // 8/18 XAU 10:08 put (macro-eased fade vetoed, then -$40 slide), 8/19 the launch
+        // itself — 08:43/08:51 breakout CALLs vetoed by fresh overhead FVGs during the
+        // 4376→4412 explosion, both graded immediate wins. On latched trend days,
+        // opposing zones just ahead are the footprints of the move, not barriers —
+        // price mitigates them within minutes. Ease is WITH-TREND only while the latch
+        // is fresh; range days (all 61 lifetime saves) are untouched, counter-trend
+        // signals still fully vetoed. Eases are logged for the audit trail.
+        if (tdLatchEase(s, sig.type)) {
+          const _zvE = s._zoneObs.find(z => z && z.dir !== sig.type &&
+            (_zvC ? (z.lo >= price && z.lo <= price + 1.2 * atrVal) : (z.hi <= price && z.hi >= price - 1.2 * atrVal)));
+          if (_zvE) log(sym, '📈 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' TREND-CONT EASE — ZONE-VETO waived: opposing ' + (_zvE.kind || 'OB') + ' ' + (_zvE.tf || '') + ' ahead ignored, trend-day latch with-trend (2026-08-19, 8/19 launch case).');
+        } else {
         const _zv = s._zoneObs.find(z => z && z.dir !== sig.type &&
           (_zvC ? (z.lo >= price && z.lo <= price + 1.2 * atrVal) : (z.hi <= price && z.hi >= price - 1.2 * atrVal)));
         if (_zv) {
@@ -5513,6 +5536,7 @@ function processPrice(sym, price, hi, lo) {
           const _zvMsg = '🚧 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ZONE-VETO: opposing ' + (_zv.kind || 'OB') + ' ' + (_zv.tf || '') + ' $' + _zv.lo.toFixed(2) + '-$' + _zv.hi.toFixed(2) + ' sits ' + (_zvC ? (_zv.lo - price) : (price - _zv.hi)).toFixed(2) + ' ahead (<1.2×ATR) — path runs into mapped ' + (_zvC ? 'supply' : 'demand') + ' (Layer 3, 2026-08-13).';
           log(sym, _zvMsg); trackBlockedOutcome(sym, _zvMsg, true);
           return false;
+        }
         }
       }
     } catch (eZV) { /* zone veto must never crash enrichment */ }
@@ -8993,8 +9017,83 @@ function processPrice(sym, price, hi, lo) {
           // TEST PHASE 2026-08-11: keep ALL unmitigated zones (was slice(-10) — evicted
           // the 4396-4405 supply shelf before the 12:00 retest at Jean's ideal 4397 entry).
           // Mitigation filter above already prunes dead zones; hard safety cap 60.
+          // MAX AGE 1500min (2026-08-19, Jean): M5-M15 zones are intraday structures —
+          // after a full session cycle the level has been re-auctioned and the zone is
+          // spent. Stale zones were still ACTIVE inputs (ZONE-VETO, ZONE-PERM, EG-RETEST-Z,
+          // SE-RETEST anchors, NAS live lane, EXT-FLIP confluence), so this is risk
+          // pruning, not display cleanup.
+          s._zoneObs = s._zoneObs.filter(z => z && (_zNow - z.ts) < 1500 * 60000);
           if (s._zoneObs.length > 60) s._zoneObs = s._zoneObs.slice(-60);
         }
+        // ===== BREAKOUT TIME-STOP (2026-08-19, Jean) =====
+        // 8/19 16:57 TREND CALL @4523.40: fired through the live-break window (fresh
+        // session-high break — the sanctioned door), then went NOWHERE: +$0.4 peak,
+        // flat 30min, full SL −$256. Jean: "it was not a bad move [to fire] — protect
+        // the trade earlier." A +$3 BE-protect would NOT have saved it (never reached
+        // +$3); what diagnoses it is TIME: a breakout that shows no progress has lost
+        // its premise. Rule: a live-break-tagged trade that hasn't moved ≥0.5×ATR
+        // favorable within 15min and hasn't hit TP1 → server issues the EA close
+        // command (~flat exit instead of full stop). Scoped to live-break entries ONLY.
+        try {
+          const _tb = s.trade;
+          if (_tb && _tb.active) {
+            if (_tb._lbEntry === undefined) {
+              _tb._lbEntry = !!(s._lbWaiverTs && _tb.ts && (_tb.ts - s._lbWaiverTs) >= 0 && (_tb.ts - s._lbWaiverTs) < 10000);
+              if (_tb._lbEntry) log(sym, '🏷️ Trade tagged BREAKOUT (live-break entry) — 15min progress check armed (2026-08-19).');
+              // Liquidity stamp at fire (2026-08-19, Jean): tick-rate now vs session avg.
+              try {
+                _tb._tickRateAtFire = Math.round(s._tickRate || 0);
+                _tb._tickRateSessAvg = Math.round(s._tickRateSess || 0);
+                const _tkRatio = (s._tickRateSess > 0) ? (s._tickRate / s._tickRateSess) : null;
+                _tb._tickRatio = _tkRatio != null ? +_tkRatio.toFixed(2) : null;
+                if (s.lastHistEntry && s.lastHistEntry.symbol === sym) {
+                  s.lastHistEntry.tickRateAtFire = _tb._tickRateAtFire;
+                  s.lastHistEntry.tickRatio = _tb._tickRatio;
+                }
+                log(sym, '📶 Liquidity at fire — ' + _tb._tickRateAtFire + ' ticks/min vs session avg ' + _tb._tickRateSessAvg + (_tkRatio != null ? ' (×' + _tkRatio.toFixed(2) + ')' : '') + (_tb._lbEntry ? ' [BREAKOUT entry]' : '') + '.');
+              } catch (eTS) {}
+            }
+            if (_tb._lbEntry && !_tb.t1 && !_tb._lbStop && _tb.ep > 0 && atrVal > 0 &&
+                (_zNow - _tb.ts) > 900000 &&
+                !(s.closeRequest && s.closeRequest.active)) {
+              const _tbFav = _tb.type === 'call' ? price - _tb.ep : _tb.ep - price;
+              if (_tbFav < 0.5 * atrVal) {
+                _tb._lbStop = true;
+                const _tbId = 'lbstop-' + Date.now();
+                s.closeRequest = { active: true, id: _tbId, ts: Date.now(), type: _tb.type || '', ep: _tb.ep || 0, source: 'breakout-time-stop' };
+                const _tbMsg = '⏱️ BREAKOUT TIME-STOP — ' + String(_tb.type || '').toUpperCase() + ' @ $' + (+_tb.ep).toFixed(2) + ' showed ' + _tbFav.toFixed(2) + ' (<0.5×ATR $' + (0.5 * atrVal).toFixed(2) + ') after 15min; live-break premise dead, EA close requested (~flat exit vs full SL) [id ' + _tbId + '].';
+                log(sym, _tbMsg);
+                sendPush('⏱️ ' + sym + ' breakout time-stop', 'Closing stalled ' + String(_tb.type || '').toUpperCase() + ' @ $' + price.toFixed(2) + ' (entry $' + (+_tb.ep).toFixed(2) + ')', 'signal');
+              }
+            }
+          }
+        } catch (eTB) { /* time-stop must never crash the tick */ }
+        // ===== EARLY PROTECT — JEAN'S +$3 RULE (2026-08-19) =====
+        // 8/19 16:57 CALL @4523.40 corrected by Jean: it ran +$4.00 to the Asian high
+        // 4527.40 ($1 short of TP1), reversed, and took the FULL −$5.12 stop. The
+        // priceSnaps hid the spike (point samples, not the path — same trap as the
+        // 8/17 'trade:null' lesson). Rule: once a trade has shown ≥60% of its TP1
+        // distance in favorable movement (XAU: +$3 of the $5 TP1), it may no longer
+        // round-trip to a loss — if favorable movement decays back to ≤10% of TP1
+        // distance, the server issues the EA close (~breakeven exit). Peak tracked
+        // tick-by-tick server-side, so between-snapshot spikes are never missed again.
+        try {
+          const _ept = s.trade;
+          if (_ept && _ept.active && _ept.ep > 0) {
+            const _epFav = _ept.type === 'call' ? price - _ept.ep : _ept.ep - price;
+            if (_epFav > (_ept._pkFav || 0)) _ept._pkFav = _epFav;
+            const _epT1d = (typeof _ept.tp1Price === 'number' && _ept.tp1Price > 0) ? Math.abs(_ept.tp1Price - _ept.ep) : 0;
+            if (!_ept.t1 && !_ept._epStop && _epT1d > 0 &&
+                (_ept._pkFav || 0) >= 0.6 * _epT1d && _epFav <= 0.1 * _epT1d &&
+                !(s.closeRequest && s.closeRequest.active)) {
+              _ept._epStop = true;
+              const _epId = 'protect-' + Date.now();
+              s.closeRequest = { active: true, id: _epId, ts: Date.now(), type: _ept.type || '', ep: _ept.ep || 0, source: 'early-protect' };
+              log(sym, '🛡️ EARLY PROTECT — ' + String(_ept.type || '').toUpperCase() + ' @ $' + (+_ept.ep).toFixed(2) + ' peaked +$' + (_ept._pkFav || 0).toFixed(2) + ' (≥60% of TP1 $' + _epT1d.toFixed(2) + ') then decayed to +$' + _epFav.toFixed(2) + '; EA close requested — a trade that nearly reached TP1 may not round-trip to a stop (Jean 2026-08-19) [id ' + _epId + '].');
+              sendPush('🛡️ ' + sym + ' early protect', 'Closing ' + String(_ept.type || '').toUpperCase() + ' near BE @ $' + price.toFixed(2) + ' (peaked +$' + (_ept._pkFav || 0).toFixed(2) + ')', 'signal');
+            }
+          }
+        } catch (eEP) { /* early-protect must never crash the tick */ }
         // --- touch detection (unchanged contract: one dormant stamp per zone) ---
         s._zoneTouched = s._zoneTouched || {};
         for (const z of (s._zoneObs || [])) {
@@ -13764,6 +13863,21 @@ function processTicks(symbols) {
     if (!price || isNaN(price) || price <= 0) { s.tickBuf = []; return; } // Guard bad data
     const hi = Math.max(...s.tickBuf.map(t => t.h || t.p));
     const lo = Math.min(...s.tickBuf.map(t => t.l || t.p));
+    // ===== TICK-RATE LIQUIDITY METER (2026-08-19, Jean's volume idea) =====
+    // XAU has no true volume feed; tick density is the 24h participation proxy.
+    // Rolling 60s tick count -> per-minute rate EMA (fast, α=0.3) + session-long
+    // average (slow, α=0.02). Ratio fast/slow = "how thick is the tape right now
+    // vs today's norm". Measurement only — stamped on every fire (below); after
+    // ~a week the winners/losers split picks the gate threshold empirically.
+    try {
+      const _tkNow = Date.now();
+      s._tkWin = s._tkWin || [];
+      s._tkWin.push({ ts: _tkNow, n: s.tickBuf.length });
+      while (s._tkWin.length && _tkNow - s._tkWin[0].ts > 60000) s._tkWin.shift();
+      const _tkRate = s._tkWin.reduce((a, b) => a + b.n, 0); // ticks in last 60s
+      s._tickRate = s._tickRate == null ? _tkRate : 0.7 * s._tickRate + 0.3 * _tkRate;
+      s._tickRateSess = s._tickRateSess == null ? _tkRate : 0.98 * s._tickRateSess + 0.02 * _tkRate;
+    } catch (eTK) {}
     s.tickBuf = [];
     processPrice(sym, price, hi, lo);
 
@@ -14603,7 +14717,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.71-20260819-se-retest-jean', // bump on each deploy — lets /state verify what's live
+    build: '5.77-20260819-tick-rate-meter', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
