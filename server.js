@@ -1650,6 +1650,17 @@ function trackBlockedOutcome(sym, msg, force) {
   const typeMatch = msg.match(/\b(CALL|PUT)\b/);
   if (!typeMatch) return; // can't determine direction — skip
   const type = typeMatch[1].toLowerCase();
+  // ===== BTC COUNTER-TREND TRACKING RETIRED (2026-08-21, Jean) =====
+  // "remove all the counter-trend signals definitely, not even needed as dormant."
+  // 2-day verdict at honest ATR brackets: counter-trend puts into the melt went
+  // ~46W/370L across every detector (BREAK-put 10/89, TREND-put 12/64, HI-put 6/44,
+  // SWEEP-put 0/16, RIDE-FADE 12/60) — settled science, and 1,276 entries in 2 days
+  // were churning the ring. Only WITH-TREND (signal matches 1h HTF) stays dormant;
+  // weekend review decides its future. XAU/NAS tracking unaffected.
+  if (sym === 'BTC') {
+    const _btcWT = (type === 'call' && s.htf1h_dir === 'up') || (type === 'put' && s.htf1h_dir === 'down');
+    if (!_btcWT) return;
+  }
   // Parse detector tag — try common patterns
   let detector = 'unknown';
   const tagMatch = msg.match(/[⬆⬇]?(RIDE|BREAK|BREAKOUT|LHF|LLF|FAST|ATH|ATL|VREV|MFLIP|HI|LO|DIV|SWEEP|TREND)/);
@@ -1729,6 +1740,11 @@ function trackBlockedOutcome(sym, msg, force) {
 // while BTC is dormant (the dormant gate returns before the RIDE block, which was silently
 // starving the experiment of its most important data). Never fires — measurement only.
 function emitRideFadeShadow(sym, s, sig, price, atrVal) {
+  // FORMALLY DISMISSED 2026-08-21 (Jean): the fade-the-loser experiment finished
+  // 12W/60L — inverting a bad signal produces a differently-bad signal, not a good
+  // one. Counter-trend by construction, so retired with the rest. No-op retained
+  // so call sites need no changes; cohort history preserved in the tally.
+  return;
   try {
     if (!(atrVal > 0) || !s || !Array.isArray(s.blockedOutcomes)) return;
     // Throttle (2026-07-31, with the dormant-gate spam fix): one fade sample per
@@ -14781,7 +14797,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.80-20260821-grind05-zoneperm-call', // bump on each deploy — lets /state verify what's live
+    build: '5.81-20260821-btc-wt-only', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
