@@ -1880,7 +1880,14 @@ setInterval(() => {
 // Books the EA's actual management: +50% of the TP1 distance when TP1 hits, and the
 // remaining fraction at the real close price (captures BE-trails as ~0, full SLs as -1x,
 // TP2/TP3 closes at their true distance). XAU multiplier x50 per Jean 2026-08-17.
-const PNL_MULT = { XAU: parseFloat(process.env.PNL_MULT_XAU || '50'), NAS100: parseFloat(process.env.PNL_MULT_NAS || '1'), BTC: parseFloat(process.env.PNL_MULT_BTC || '1') };
+const PNL_MULT = { XAU: parseFloat(process.env.PNL_MULT_XAU || '50'), NAS100: parseFloat(process.env.PNL_MULT_NAS || '30'), BTC: parseFloat(process.env.PNL_MULT_BTC || '1') }; // NAS ×30 per Jean 2026-08-20
+const NAS_WIDE_SL = parseFloat(process.env.NAS_WIDE_SL || '25'); // NAS stops wider than this book at 20x, else 30x (Jean 2026-08-20: "if SL is high we will take 20X only")
+function pnlMultFor(sym, t) {
+  try {
+    if (sym === 'NAS100' && t && t.ep > 0 && t.slPrice > 0 && Math.abs(t.ep - t.slPrice) > NAS_WIDE_SL) return 20;
+  } catch (e) {}
+  return PNL_MULT[sym] || 1;
+}
 const PNL_LEDGER_FILE = path.join(DATA_DIR, 'pnl_ledger.json');
 let pnlLedger = {};
 try { pnlLedger = JSON.parse(fs.readFileSync(PNL_LEDGER_FILE, 'utf8')) || {}; } catch (e) { pnlLedger = {}; }
@@ -3242,8 +3249,13 @@ function processPrice(sym, price, hi, lo) {
           // Per-symbol drift bar (2026-07-13): NAS grinds at ~0.4%/3h — HALF the 0.8%
           // bar calibrated on XAU/BTC. Two documented NAS trend days (7/12 overnight
           // slide, 7/13 -2% US session) never qualified while chopActive stayed true
-          // throughout. NAS bar = 0.4%; XAU/BTC keep 0.8%.
-          const grindBar = sym === 'NAS100' ? 0.4 : 0.8;
+          // throughout. NAS bar = 0.4%; BTC keeps 0.8%.
+          // XAU 0.8 -> 0.5 (2026-08-21, Jean): two consecutive ATH melt-up nights
+          // (8/19 + 8/20, 4510->4554) drifted 0.5-0.6%/3h with both HTFs up — real
+          // persistent grind under the 7/06-calibrated bar: 8 would-win RIDE+MACRO
+          // calls blocked 18:41-01:50 vs 2 good blocks. Both-HTF agreement + conv
+          // floors unchanged; the 00:20-01:15 pullback (~0.3%/3h) stays chopped.
+          const grindBar = sym === 'NAS100' ? 0.4 : sym === 'XAU' ? 0.5 : 0.8;
           // ATR-DENOMINATED BAR (2026-08-03) — same unit-mismatch fix as Phase 3.57 above.
           // 0.8%/3h on 8/3 gold = $32 = 13.5×ATR: unreachable. New: trip at whichever is
           // lower, the legacy percent bar or 5×ATR of 3h drift (today's $19 = 7.9×ATR ✓).
@@ -3260,7 +3272,7 @@ function processPrice(sym, price, hi, lo) {
             s._grindTs = nowG; // freshness stamp — machine flip-guard + enrichSig floor key off this
             if (!s._grindLogTs || nowG - s._grindLogTs > 5 * 60 * 1000) { // throttle: 1 log / 5 min
               s._grindLogTs = nowG;
-              log(sym, '🌀 GRIND-LIVE (Phase 3.96) — chop SUSPENDED: 1h+4h both ' + s.htf1h_dir.toUpperCase() + ' + 3h drift ' + (driftPct >= 0 ? '+' : '') + driftPct.toFixed(2) + '% (≥0.8%). With-trend ' + (s._grindDir === 'call' ? 'CALLs' : 'PUTs') + ' need conv ≥6 · full TP ladder active.');
+              log(sym, '🌀 GRIND-LIVE (Phase 3.96) — chop SUSPENDED: 1h+4h both ' + s.htf1h_dir.toUpperCase() + ' + 3h drift ' + (driftPct >= 0 ? '+' : '') + driftPct.toFixed(2) + '% (≥' + grindBar + '%). With-trend ' + (s._grindDir === 'call' ? 'CALLs' : 'PUTs') + ' need conv ≥6 · full TP ladder active.');
             }
           }
         }
@@ -8742,11 +8754,27 @@ function processPrice(sym, price, hi, lo) {
         const _feStaleL = (s.sessionLowUpdateTs || 0) > 0 && (Date.now() - s.sessionLowUpdateTs) >= 180000;
         const _feWinL = _fePctL <= 0.15 && _feStaleL;
         _llfFadeAtLow = _feWinL && convictionFor('call').score >= 5;
+        // ===== ZONE-PERM CALL MIRROR PROMOTED — WITH HOLD-CONFIRMATION (2026-08-21, Jean) =====
+        // 8/20-21 overnight taught the split inside this detector: 0-for-9 fading zones
+        // price was actively falling THROUGH (00:41-01:16), 4-for-4 buying the zone whose
+        // low had been probed and DEFENDED (01:20+). Same signal, opposite outcomes — the
+        // discriminator is whether the low has held. Live condition: session low unbroken
+        // ≥10min (the falling-knife phase makes new lows every few minutes and never
+        // qualifies). Sub-10min touches keep stamping dormant so the cohort measures the
+        // boundary. Tight SL mirror armed (0.8×ATR, as the PUT side since 5.66).
         if (_feWinL && !_llfFadeAtLow && Array.isArray(s._zoneObs)) {
           const _zpzL = s._zoneObs.find(z => z && z.dir === 'call' && price >= z.lo && price <= z.hi);
           if (_zpzL) {
-            const _zpMsgL = '🔓 ⬆LLF CALL ZONE-PERM DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — fade window at stale session low, conv<5 waived by mapped demand ' + (_zpzL.kind || 'OB') + ' ' + (_zpzL.tf || '') + ' $' + _zpzL.lo.toFixed(2) + '-$' + _zpzL.hi.toFixed(2) + ' (dormant 2026-08-14).';
-            log(sym, _zpMsgL); trackBlockedOutcome(sym, _zpMsgL, true);
+            const _lowHeldMin = (s.sessionLowUpdateTs || 0) > 0 ? (Date.now() - s.sessionLowUpdateTs) / 60000 : 0;
+            if (_lowHeldMin >= 10) {
+              _llfFadeAtLow = true; // waive macro — zone + held low replace conv≥5
+              s._zpFadeTsL = Date.now();
+              const _zpMsgL = '🔓 ⬆LLF CALL ZONE-PERM LIVE-FIRING @ $' + price.toFixed(2) + ' — stale session low HELD ' + Math.round(_lowHeldMin) + 'min, conv<5 waived by mapped demand ' + (_zpzL.kind || 'OB') + ' ' + (_zpzL.tf || '') + ' $' + _zpzL.lo.toFixed(2) + '-$' + _zpzL.hi.toFixed(2) + ' · tight SL armed (promoted 2026-08-21).';
+              log(sym, _zpMsgL); trackBlockedOutcome(sym, _zpMsgL, true);
+            } else {
+              const _zpMsgL = '🔓 ⬆LLF CALL ZONE-PERM DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — fade window at stale session low, conv<5 waived by mapped demand ' + (_zpzL.kind || 'OB') + ' ' + (_zpzL.tf || '') + ' $' + _zpzL.lo.toFixed(2) + '-$' + _zpzL.hi.toFixed(2) + ' (low held only ' + Math.round(_lowHeldMin) + 'min < 10 — hold-confirmation not met, dormant).';
+              log(sym, _zpMsgL); trackBlockedOutcome(sym, _zpMsgL, true);
+            }
           }
         }
       }
@@ -8821,7 +8849,16 @@ function processPrice(sym, price, hi, lo) {
         if (!enrichSig(sig)) return; s.signals.push(sig);
         logSignal(sym, sig);
         if (isMT5) {
-          const llfSlPrice = localLo6 - lhfSlBuffer;
+          let llfSlPrice = localLo6 - lhfSlBuffer;
+          // ZONE-PERM tight SL mirror (2026-08-21): cap at 0.8×ATR (min $2) when the
+          // zone-permission ease drove this fire — same as the PUT side since 5.66.
+          if (s._zpFadeTsL && Date.now() - s._zpFadeTsL < 10000) {
+            const _zpTightL = Math.max(0.8 * (atrVal > 0 ? atrVal : 2.5), 2);
+            if (price - llfSlPrice > _zpTightL) {
+              llfSlPrice = price - _zpTightL;
+              log(sym, '✂️ ZONE-PERM tight SL — $' + llfSlPrice.toFixed(2) + ' (0.8×ATR cap $' + _zpTightL.toFixed(2) + ') instead of local-low default.');
+            }
+          }
           const slDist = price - llfSlPrice;
           if (slDist > 0) {
             // TP1 cap (2026-07-14): mirror of the LHF PUT site above.
@@ -9139,7 +9176,12 @@ function processPrice(sym, price, hi, lo) {
                   !(s.trade && s.trade.active) &&
                   (_zNow - (s._zobLastFireTs || 0)) >= 1200000 &&
                   (_zNow - (s.lastNTs || 0)) >= 30000) {
-                const _zSlDist = Math.min(_zSl - price, Math.max(0.8 * atrVal, 15));
+                // SL width fix (2026-08-20): day-1 went 1W/3L because the live lane wore a
+                // 0.8×ATR cap while the dormant cohort that earned promotion was graded with
+                // ZONE-ANCHORED stops — on NAS (ATR $20-30) the cap halved the stop and all
+                // three SLs were bounce-wicks the anchor survives (13:47: wicked -$13, then
+                // price fell $90). Now: zone anchor, capped 1.5×ATR, floor $15.
+                const _zSlDist = Math.min(_zSl - price, Math.max(1.5 * atrVal, 15));
                 if (_zSlDist > 0) {
                   s._zobLastFireTs = _zNow;
                   s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
@@ -13192,7 +13234,7 @@ function updateSignalOutcome(sym, finalPrice) {
   if (t.t1 && !entry.outcomes.tp1Hit) {
     entry.outcomes.tp1Hit = true; entry.outcomes.tp1HitTs = now;
     // book the realized TP1 half (2026-08-17)
-    if (t.tp1Price > 0 && t.ep > 0) bookPnl(sym, 0.5 * Math.abs(t.tp1Price - t.ep) * (PNL_MULT[sym] || 1), 't1');
+    if (t.tp1Price > 0 && t.ep > 0) bookPnl(sym, 0.5 * Math.abs(t.tp1Price - t.ep) * pnlMultFor(sym, t), 't1');
   }
   if (t.t2 && !entry.outcomes.tp2Hit) {
     entry.outcomes.tp2Hit = true; entry.outcomes.tp2HitTs = now;
@@ -13202,7 +13244,7 @@ function updateSignalOutcome(sym, finalPrice) {
       // t.sl was set via the TP3 path (line ~4005) — TP2 already hit, then TP3
       entry.outcomes.tp3Hit = true; entry.outcomes.tp3HitTs = now;
       entry.outcomes.closePrice = finalPrice;
-      if (t.ep > 0 && finalPrice > 0) bookPnl(sym, 0.5 * (t.type === 'call' ? finalPrice - t.ep : t.ep - finalPrice) * (PNL_MULT[sym] || 1), 'close');
+      if (t.ep > 0 && finalPrice > 0) bookPnl(sym, 0.5 * (t.type === 'call' ? finalPrice - t.ep : t.ep - finalPrice) * pnlMultFor(sym, t), 'close');
       // Mark post-TP3 cooldown for this direction (added 2026-05-14). 90 min block on
       // same-direction signals — the move is exhausted, chasing it leads to losers
       // (5/14 signal #2 SL'd 32 min after signal #1 hit TP3 in same direction).
@@ -13212,7 +13254,7 @@ function updateSignalOutcome(sym, finalPrice) {
       // Real stop loss (before TP2)
       entry.outcomes.slHit = true; entry.outcomes.slHitTs = now;
       entry.outcomes.closePrice = finalPrice;
-      if (t.ep > 0 && finalPrice > 0) bookPnl(sym, (entry.outcomes.tp1Hit ? 0.5 : 1.0) * (t.type === 'call' ? finalPrice - t.ep : t.ep - finalPrice) * (PNL_MULT[sym] || 1), 'close');
+      if (t.ep > 0 && finalPrice > 0) bookPnl(sym, (entry.outcomes.tp1Hit ? 0.5 : 1.0) * (t.type === 'call' ? finalPrice - t.ep : t.ep - finalPrice) * pnlMultFor(sym, t), 'close');
     }
   }
   // Persist after outcome update (added 2026-05-14). Outcomes are critical for audit —
@@ -14739,7 +14781,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.78-20260819-ea-fast-lane', // bump on each deploy — lets /state verify what's live
+    build: '5.80-20260821-grind05-zoneperm-call', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
