@@ -1816,6 +1816,12 @@ function cohortFor(reason) {
   if (/EXT-GUARD/.test(reason)) return 'EXT-GUARD';
   if (/DEFERRED/.test(reason)) return 'MACD-DEFER';
   if (/macro not (CALL|PUT)-aligned/.test(reason)) return 'MACRO-NOT-ALIGNED';
+  if (/REJECT-FLOW/.test(reason)) return 'REJECT-FLOW';
+  if (/CT-VETO/.test(reason)) return 'CT-VETO';
+  if (/FADE-ROC/.test(reason)) return 'FADE-ROC';
+  // held-only split (2026-08-21, gate-report: 'held' positive on 3 consecutive batches,
+  // present on all 3 winning fires, absent on the week's only loss — instrument it).
+  if (/CONF-SCORE/.test(reason)) return /held1/.test(reason) ? 'CONF-HELD1' : 'CONF-HELD0';
   return null; // everything else stays buffer-only
 }
 function bumpCohortTally(sym, reason, outcome) {
@@ -2863,6 +2869,9 @@ function logSignal(sym, sig) {
             if (_zAhead) log(sym, '🧭 ZONE-TP NOTE — ' + sig.type.toUpperCase() + ' TP2 path crosses opposing ' + (_zAhead.kind || 'OB') + ' ' + (_zAhead.tf || '') + ' $' + _zAhead.lo.toFixed(2) + '-$' + _zAhead.hi.toFixed(2) + ' (Layer 2 telemetry).');
           }
         } catch (eZD) {}
+        // Fired-ladder emission (2026-08-21, gate-report rec, 6 nights standing):
+        // sl/tp1-3 machine-readable on every fired history row.
+        try { histEntry.sl = +t.slPrice || null; histEntry.tp1 = +t.tp1Price || null; histEntry.tp2 = +t.tp2Price || null; histEntry.tp3 = +t.tp3Price || null; } catch (eTPs) {}
         st.cfdTracks = st.cfdTracks || [];
         st.cfdTracks.push({
           entry: histEntry, type: sig.type, ep: ep, ts: _fireTs,
@@ -4927,6 +4936,28 @@ function processPrice(sym, price, hi, lo) {
       if (regimeAlignedB81 && htfAlignedB81) phase381Bypass = true;
     }
 
+    // ===== COUNTER-TREND VETO — XAU ONLY (2026-08-21, nightly gate-report rec) =====
+    // Three fresh batches at +16.7 to +61.0 pp (final n=77): counter-regime CONTINUATION
+    // entries lose reliably when the multi-day regime is directional. Report: "ship the
+    // counter-trend veto, gated on the /state regime field, trustworthy on XAU only."
+    // Continuation detectors only — fades/reversals live on counter-trend by design and
+    // keep their own gates. Overrides (V-REC/REV) exempt. Stamped: CT-VETO cohort.
+    try {
+      if (isXAU && sig._regime && sig._regime.dir !== 'neutral' && !sig._vRec && !sig._revOverride) {
+        const _ctTag = String(sig.score || '');
+        const _ctCont = /RIDE|TREND|BREAKOUT|IB_|FAST|SUST|SQZ|6\/6/.test(_ctTag) &&
+                        !/LHF|LLF|VREV|EXT-FLIP|OBREJ|OBMIT|INVERSAL|CHoCH|ATH|ATL|DIV|SWEEP|HI|LO/.test(_ctTag);
+        const _ctCounter = (sig._regime.dir === 'bull' && sig.type === 'put') ||
+                           (sig._regime.dir === 'bear' && sig.type === 'call');
+        if (_ctCont && _ctCounter) {
+          const _ctMsg = '🧭 ' + _ctTag + ' ' + sig.type.toUpperCase() + ' BLOCKED — CT-VETO: counter-trend continuation vs ' + sig._regime.dir.toUpperCase() + ' regime (s' + sig._regime.strength + ', ' + sig._regime.netChgPct + '% ' + (sig._regime.window || '') + ') — gate-report promotion 2026-08-21, 3 batches +16.7..+61pp.';
+          log(sym, _ctMsg); trackBlockedOutcome(sym, _ctMsg, true);
+          Object.assign(s, _emitSnapshot);
+          return false;
+        }
+      }
+    } catch (eCT) {}
+
     // ===== SPY DEMOTED TO INDICATOR-ONLY (added 2026-05-22) =====
     // Yesterday's 5/21 audit: SPY went 0/4 across all signals (3 PUT SL'd, 1 CALL SL'd)
     // while QQQ went 2/3 on identical setups (both winners were QQQ PUTs at 11:00 and 13:22).
@@ -6584,8 +6615,7 @@ function processPrice(sym, price, hi, lo) {
                 const _rcS6 = findRecoveryStructure(s, sym, sig.type, price, atrVal, _rc6.ref);
                 if (_rcS6 && _rcS6.ok) {
                   const msg6 = '🌀 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' RECOV-6 DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — conv ' + _cR6 + ' (floor ' + _r6Floor + (_r6Floor === 5 ? ', overnight factor-ceiling' : '') + ') + recovery ' + _rc6.offPct.toFixed(2) + '% off 30-min extreme (held ' + Math.round(_rc6.ageMin) + 'min)' + (_rcS6.anchorName ? ' · anchored to ' + _rcS6.anchorName + ' $' + _rcS6.anchor.toFixed(2) : '') + ' · chop bypass would be granted without metals confluence (Phase 3.99 dormant).';
-                  log(sym, msg6);
-                  trackBlockedOutcome(sym, msg6, true);
+                  /* RECOV-6 stamps DROPPED 2026-08-21 — gate-report rec standing since 8/6, final 1W/3L/1S */
                 }
               }
             }
@@ -7091,8 +7121,7 @@ function processPrice(sym, price, hi, lo) {
               const _rcS6c = findRecoveryStructure(s, sym, sig.type, price, atrVal, _rc6c.ref);
               if (_rcS6c && _rcS6c.ok) {
                 const msg6c = '🌀 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' RECOV-6 DORMANT-WOULD-WAIVE contra-block @ $' + price.toFixed(2) + ' — conv 6 + recovery ' + _rc6c.offPct.toFixed(2) + '% off 30-min extreme (held ' + Math.round(_rc6c.ageMin) + 'min)' + (_rcS6c.anchorName ? ' · anchored to ' + _rcS6c.anchorName + ' $' + _rcS6c.anchor.toFixed(2) : '') + ' (Phase 3.99 dormant).';
-                log(sym, msg6c);
-                trackBlockedOutcome(sym, msg6c, true);
+                /* RECOV-6 contra-waive stamps DROPPED 2026-08-21 — same verdict */
               }
             }
           }
@@ -7503,7 +7532,7 @@ function processPrice(sym, price, hi, lo) {
           log(sym, '🚫 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — XAU fade momentum-confirmation (live 7/18): ROC ' + roc3.toFixed(3) + '% not ≥0.10% aligned. Fades fire on confirmation, not anticipation (W-29: flat-ROC fades lost).');
           return false;
         }
-        log(sym, '🎯 FADE-ROC PASSED — ' + tag + ' ' + sig.type.toUpperCase() + ' confirmed at ROC ' + roc3.toFixed(3) + '%.');
+        { const _frMsg = '🎯 FADE-ROC PASSED — ' + tag + ' ' + sig.type.toUpperCase() + ' confirmed at ROC ' + roc3.toFixed(3) + '%.'; log(sym, _frMsg); trackBlockedOutcome(sym, _frMsg, true); } // stamped since 2026-08-21 — was log-only, 30 days invisible to the nightly report
       }
       // NAS/BTC FADE-ROC MARKERS (DORMANT, 2026-07-18): same hypothesis, per-symbol
       // thresholds (BTC 0.15% / NAS 0.10% — ROC magnitudes differ per symbol). Log-only:
@@ -7513,7 +7542,7 @@ function processPrice(sym, price, hi, lo) {
       if ((sym === 'BTC' || sym === 'NAS100') && /ATH|ATL|HI|LO|LHF|LLF|VREV|OBREJ|OBMIT/.test(tag) && !/MFLIP|TREND|FAST|BREAK|RIDE|SWEEP/.test(tag)) {
         const _frThr = sym === 'BTC' ? 0.15 : 0.10;
         const _frAl2 = (sig.type === 'call' && roc3 >= _frThr) || (sig.type === 'put' && roc3 <= -_frThr);
-        log(sym, '🎯 FADE-ROC marker — ' + tag + ' ' + sig.type.toUpperCase() + ' firing at ROC ' + roc3.toFixed(3) + '% → bucket ' + (_frAl2 ? 'ROC-CONFIRMED' : 'FLAT-EARLY') + ' (dormant, thr ' + _frThr + '%).');
+        { const _frMk = '🎯 FADE-ROC marker — ' + tag + ' ' + sig.type.toUpperCase() + ' firing at ROC ' + roc3.toFixed(3) + '% → bucket ' + (_frAl2 ? 'ROC-CONFIRMED' : 'FLAT-EARLY') + ' (dormant, thr ' + _frThr + '%).'; log(sym, _frMk); trackBlockedOutcome(sym, _frMk, true); }
       }
     } catch (eFr) { /* gate must never crash enrichment */ }
     return true;
@@ -9147,6 +9176,45 @@ function processPrice(sym, price, hi, lo) {
             }
           }
         } catch (eEP) { /* early-protect must never crash the tick */ }
+        // ===== REJECT-FLOW (DORMANT, 2026-08-21 — Jean's design) =====
+        // 8/21 07:38-08:16: detectors kept emitting CALLs at the 4604 top and the gates
+        // correctly refused five in a row while price rolled over — then the PUT that
+        // agreed with the gates died at its own floors. Jean: "5 calls rightly blocked —
+        // maybe we should ease the put when we have the situation." The one-sided
+        // rejection stream IS a signal: lagging detectors vs leading gates disagreeing
+        // repeatedly in one direction marks the turn. Rule: blocked candidates of ONE
+        // direction span ≥4 distinct minutes in 15min, ≤1 opposite block, and price has
+        // moved ≥0.75×ATR against the rejected direction → stamp an opposite-direction
+        // would-fire (REJECT-FLOW cohort). Dormant: counting only; promotion by cohort.
+        try {
+          if (Array.isArray(s.blockedAttempts) && s.blockedAttempts.length && Array.isArray(s._m5) && s._m5.length >= 5 && atrVal > 0) {
+            s._rejFlowTs = s._rejFlowTs || {};
+            const _rfWin = s.blockedAttempts.filter(b => b && _zNow - b.ts < 900000);
+            const _rfMinC = new Set(_rfWin.filter(b => /\bCALL\b/.test(b.msg)).map(b => Math.floor(b.ts / 60000))).size;
+            const _rfMinP = new Set(_rfWin.filter(b => /\bPUT\b/.test(b.msg)).map(b => Math.floor(b.ts / 60000))).size;
+            const _rfRef = s._m5[s._m5.length - 4]; // ~15-20min back
+            for (const _rf of [{ dir: 'put', rej: _rfMinC, opp: _rfMinP, rejName: 'CALL' }, { dir: 'call', rej: _rfMinP, opp: _rfMinC, rejName: 'PUT' }]) {
+              const _rfMove = _rf.dir === 'put' ? (_rfRef.c - price) : (price - _rfRef.c);
+              if (_rf.rej >= 4 && _rf.opp <= 1 && _rfMove >= 0.75 * atrVal &&
+                  _zNow - (s._rejFlowTs[_rf.dir] || 0) >= 600000) {
+                s._rejFlowTs[_rf.dir] = _zNow;
+                const _rfT1 = sym === 'XAU' ? 5 : sym === 'BTC' ? 50 : sym === 'NAS100' ? 30 : 0.3;
+                s.blockedOutcomes = s.blockedOutcomes || [];
+                s.blockedOutcomes.push({
+                  ts: _zNow, time: ts(), symbol: sym, detector: 'REJECT-FLOW', type: _rf.dir,
+                  price: +price.toFixed(2),
+                  virtualTp1: +(_rf.dir === 'call' ? price + _rfT1 : price - _rfT1).toFixed(2),
+                  virtualSl: +(_rf.dir === 'call' ? price - _rfT1 : price + _rfT1).toFixed(2),
+                  blockReason: '🔃 REJECT-FLOW ' + _rf.dir.toUpperCase() + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — gates refused ' + _rf.rej + ' ' + _rf.rejName + ' candidates in 15min (opposite blocks: ' + _rf.opp + ') while price moved ' + _rfMove.toFixed(2) + ' (' + (_rfMove / atrVal).toFixed(1) + '×ATR) against them; the one-sided rejection stream marks the turn (Jean 2026-08-21, 4604-top case).',
+                  snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+                  tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null,
+                  closed: false, closedTs: null, outcome: null
+                });
+                log(sym, '🔃 REJECT-FLOW ' + _rf.dir.toUpperCase() + ' armed dormant @ $' + price.toFixed(2) + ' (' + _rf.rej + ' rejected ' + _rf.rejName + ' minutes, move ' + _rfMove.toFixed(2) + ').');
+              }
+            }
+          }
+        } catch (eRF) { /* reject-flow must never crash the tick */ }
         // --- touch detection (unchanged contract: one dormant stamp per zone) ---
         s._zoneTouched = s._zoneTouched || {};
         for (const z of (s._zoneObs || [])) {
@@ -14797,7 +14865,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.81-20260821-btc-wt-only', // bump on each deploy — lets /state verify what's live
+    build: '5.83-20260821-reject-flow', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
