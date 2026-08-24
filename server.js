@@ -1816,6 +1816,7 @@ function cohortFor(reason) {
   if (/EXT-GUARD/.test(reason)) return 'EXT-GUARD';
   if (/DEFERRED/.test(reason)) return 'MACD-DEFER';
   if (/macro not (CALL|PUT)-aligned/.test(reason)) return 'MACRO-NOT-ALIGNED';
+  if (/INV-HOLD/.test(reason)) return 'INV-HOLD';
   if (/REJECT-FLOW/.test(reason)) return 'REJECT-FLOW';
   if (/CT-VETO/.test(reason)) return 'CT-VETO';
   if (/FADE-ROC/.test(reason)) return 'FADE-ROC';
@@ -9215,6 +9216,62 @@ function processPrice(sym, price, hi, lo) {
             }
           }
         } catch (eRF) { /* reject-flow must never crash the tick */ }
+        // ===== INV-HOLD RESOLVER (2026-08-24, Jean) =====
+        try {
+          const _ih = s._invHold;
+          if (_ih) {
+            const _ihDist = _ih.dir === 'call' ? price - _ih.slPrice : _ih.slPrice - price;
+            const _ihCap = sym === 'XAU' ? 5 : sym === 'BTC' ? 100 : sym === 'NAS100' ? 50 : 0.5;
+            if (_ihDist <= 0) {
+              // price reached the SL level before entry — setup invalidated, no trade, no loss
+              s._invHold = null;
+              const _ihM = '⏸ INVERSAL-HOLD ' + _ih.dir.toUpperCase() + ' INVALIDATED — price hit the SL level $' + _ih.slPrice.toFixed(2) + ' before entry; the wide-SL fire would have been a FULL -$' + _ih.initialDist.toFixed(2) + ' loss. INV-HOLD saved it (Jean 2026-08-24).';
+              log(sym, _ihM); trackBlockedOutcome(sym, _ihM, true);
+            } else if (_ihDist <= _ih.targetDist && !(s.trade && s.trade.active)) {
+              // FIRE at the improved entry — same stop, normal geometry
+              s._invHold = null;
+              const _ihT1 = Math.min(_ihDist * 1.5, _ihCap);
+              const _ihT2d = Math.max(_ihDist * 2.5, _ihT1 * 1.6);
+              s.trade = buildCfdTrade(_ih.dir, price, atrVal, sym);
+              s.trade.slPrice = _ih.slPrice;
+              s.trade.tp1Price = +(_ih.dir === 'call' ? price + _ihT1 : price - _ihT1).toFixed(2);
+              s.trade.tp2Price = +(_ih.dir === 'call' ? price + _ihT2d : price - _ihT2d).toFixed(2);
+              s.trade.tp3Price = CAPITAL_MODE ? s.trade.tp2Price : +(_ih.dir === 'call' ? price + Math.max(_ihDist * 4, _ihT1 * 2.5) : price - Math.max(_ihDist * 4, _ihT1 * 2.5)).toFixed(2);
+              if (_ih.sigRef) { _ih.sigRef.sl = _ih.slPrice.toFixed(2); _ih.sigRef.tp1 = s.trade.tp1Price.toFixed(2); _ih.sigRef.tp2 = s.trade.tp2Price.toFixed(2); _ih.sigRef.tp3 = s.trade.tp3Price.toFixed(2); _ih.sigRef.entryActual = +price.toFixed(2); _ih.sigRef.pendingEntry = false; }
+              log(sym, '▶️ INVERSAL-HOLD ' + _ih.dir.toUpperCase() + ' FILLED @ $' + price.toFixed(2) + ' — signal was $' + _ih.sigPrice.toFixed(2) + ', risk cut $' + _ih.initialDist.toFixed(2) + ' → $' + _ihDist.toFixed(2) + ' (same stop $' + _ih.slPrice.toFixed(2) + ') [Jean 2026-08-24].');
+              sendPush('▶️ ' + sym + ' INVERSAL ' + _ih.dir.toUpperCase() + ' filled', '$' + price.toFixed(2) + ' · risk $' + _ihDist.toFixed(2) + ' (was $' + _ih.initialDist.toFixed(2) + ') · SL $' + _ih.slPrice.toFixed(2), 'signal');
+            } else if (_zNow >= _ih.expiry) {
+              s._invHold = null;
+              if (_ihDist < _ih.initialDist && !(s.trade && s.trade.active)) {
+                // in the band at expiry — authorized to fire even with wide-ish SL (Jean's rule)
+                const _ihT1 = Math.min(_ihDist * 1.5, _ihCap);
+                const _ihT2d = Math.max(_ihDist * 2.5, _ihT1 * 1.6);
+                s.trade = buildCfdTrade(_ih.dir, price, atrVal, sym);
+                s.trade.slPrice = _ih.slPrice;
+                s.trade.tp1Price = +(_ih.dir === 'call' ? price + _ihT1 : price - _ihT1).toFixed(2);
+                s.trade.tp2Price = +(_ih.dir === 'call' ? price + _ihT2d : price - _ihT2d).toFixed(2);
+                s.trade.tp3Price = CAPITAL_MODE ? s.trade.tp2Price : +(_ih.dir === 'call' ? price + Math.max(_ihDist * 4, _ihT1 * 2.5) : price - Math.max(_ihDist * 4, _ihT1 * 2.5)).toFixed(2);
+                if (_ih.sigRef) { _ih.sigRef.sl = _ih.slPrice.toFixed(2); _ih.sigRef.tp1 = s.trade.tp1Price.toFixed(2); _ih.sigRef.tp2 = s.trade.tp2Price.toFixed(2); _ih.sigRef.tp3 = s.trade.tp3Price.toFixed(2); _ih.sigRef.entryActual = +price.toFixed(2); _ih.sigRef.pendingEntry = false; }
+                log(sym, '▶️ INVERSAL-HOLD ' + _ih.dir.toUpperCase() + ' BAND-FILL at expiry @ $' + price.toFixed(2) + ' — dist $' + _ihDist.toFixed(2) + ' (band ' + _ih.targetDist.toFixed(2) + '-' + _ih.initialDist.toFixed(2) + '); authorized wide fire (Jean 2026-08-24).');
+                sendPush('▶️ ' + sym + ' INVERSAL ' + _ih.dir.toUpperCase() + ' band-fill', '$' + price.toFixed(2) + ' · risk $' + _ihDist.toFixed(2) + ' · SL $' + _ih.slPrice.toFixed(2), 'signal');
+              } else {
+                const _ihM = '⏸ INVERSAL-HOLD ' + _ih.dir.toUpperCase() + ' MISSED — price ran away (dist $' + _ihDist.toFixed(2) + ' ≥ initial $' + _ih.initialDist.toFixed(2) + ') within 3min; per design: too bad for us (Jean 2026-08-24). Virtual track from signal price $' + _ih.sigPrice.toFixed(2) + ' measures the cost.';
+                log(sym, _ihM);
+                s.blockedOutcomes = s.blockedOutcomes || [];
+                s.blockedOutcomes.push({
+                  ts: _zNow, time: ts(), symbol: sym, detector: 'INV-HOLD-MISS', type: _ih.dir,
+                  price: +_ih.sigPrice.toFixed(2),
+                  virtualTp1: +(_ih.dir === 'call' ? _ih.sigPrice + _ihCap : _ih.sigPrice - _ihCap).toFixed(2),
+                  virtualSl: _ih.slPrice,
+                  blockReason: _ihM,
+                  snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+                  tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null,
+                  closed: false, closedTs: null, outcome: null
+                });
+              }
+            }
+          }
+        } catch (eIH) { /* inv-hold must never crash the tick */ }
         // --- touch detection (unchanged contract: one dormant stamp per zone) ---
         s._zoneTouched = s._zoneTouched || {};
         for (const z of (s._zoneObs || [])) {
@@ -10170,6 +10227,20 @@ function processPrice(sym, price, hi, lo) {
         const slDist = ibSl - price;
         if (slDist > 0) {
           const tp1Cap = isXAU ? 5 : isBTC ? 100 : isNAS ? 50 : 0.50;
+          // ===== INV-HOLD — JEAN'S WIDE-SL ENTRY AUCTION (2026-08-24) =====
+          // 8/24 02:20 case: INVERSAL fired @4655.51 with a $16 structural SL and drew
+          // down to $1.50 from death. Jean: "13$ SL is way too wide — wait for price to
+          // come to $8-from-SL before firing, within 3 minutes; if it only reaches the
+          // 8-13 band, authorize the fire anyway; if price runs away, too bad."
+          // Wide = >2×TP1cap ($10 XAU). Target = 1.6×TP1cap ($8 XAU). Same stop, same
+          // trade — just refusing to pay top price for wide structural risk.
+          if (slDist > tp1Cap * 2) {
+            sig.pendingEntry = true;
+            s._invHold = { dir: 'put', slPrice: +ibSl.toFixed(2), targetDist: tp1Cap * 1.6,
+                           initialDist: slDist, sigPrice: price, expiry: now2 + 180000, sigRef: sig };
+            log(sym, '⏸ INVERSAL-HOLD PUT armed — SL $' + ibSl.toFixed(2) + ' is $' + slDist.toFixed(2) + ' wide (>' + (tp1Cap * 2) + '); waiting ≤3min for price to reach $' + (tp1Cap * 1.6).toFixed(2) + '-from-SL (Jean 2026-08-24).');
+            sendPush('⏸ ' + sym + ' INVERSAL PUT holding', 'SL $' + slDist.toFixed(2) + ' wide — entry auction 3min', 'signal');
+          } else {
           const tp1Dist = Math.min(slDist * 1.5, tp1Cap);
           const tp1P = price - tp1Dist;
           const tp2P = price - slDist * 2.5;
@@ -10183,6 +10254,7 @@ function processPrice(sym, price, hi, lo) {
           sig.tp1 = tp1P.toFixed(2);
           sig.tp2 = tp2P.toFixed(2);
           sig.tp3 = tp3P.toFixed(2);
+          }
         } else {
           s.trade = buildCfdTrade('put', price, atrVal, sym);
           attachTpSl(sig, 'put', price, atrVal, sym);
@@ -10213,6 +10285,14 @@ function processPrice(sym, price, hi, lo) {
         const slDist = price - ibSl;
         if (slDist > 0) {
           const tp1Cap = isXAU ? 5 : isBTC ? 100 : isNAS ? 50 : 0.50;
+          // INV-HOLD — see PUT site above (Jean 2026-08-24).
+          if (slDist > tp1Cap * 2) {
+            sig.pendingEntry = true;
+            s._invHold = { dir: 'call', slPrice: +ibSl.toFixed(2), targetDist: tp1Cap * 1.6,
+                           initialDist: slDist, sigPrice: price, expiry: now2 + 180000, sigRef: sig };
+            log(sym, '⏸ INVERSAL-HOLD CALL armed — SL $' + ibSl.toFixed(2) + ' is $' + slDist.toFixed(2) + ' wide (>' + (tp1Cap * 2) + '); waiting ≤3min for price to reach $' + (tp1Cap * 1.6).toFixed(2) + '-from-SL (Jean 2026-08-24).');
+            sendPush('⏸ ' + sym + ' INVERSAL CALL holding', 'SL $' + slDist.toFixed(2) + ' wide — entry auction 3min', 'signal');
+          } else {
           const tp1Dist = Math.min(slDist * 1.5, tp1Cap);
           const tp1P = price + tp1Dist;
           const tp2P = price + slDist * 2.5;
@@ -10226,6 +10306,7 @@ function processPrice(sym, price, hi, lo) {
           sig.tp1 = tp1P.toFixed(2);
           sig.tp2 = tp2P.toFixed(2);
           sig.tp3 = tp3P.toFixed(2);
+          }
         } else {
           s.trade = buildCfdTrade('call', price, atrVal, sym);
           attachTpSl(sig, 'call', price, atrVal, sym);
@@ -14865,7 +14946,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.83-20260821-reject-flow', // bump on each deploy — lets /state verify what's live
+    build: '5.84-20260824-inv-hold', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
