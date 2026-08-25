@@ -1796,6 +1796,7 @@ function cohortFor(reason) {
   if (/ZONE-DEFER/.test(reason)) return 'ZONE-DEFER';
   if (/ZONE-VETO/.test(reason)) return 'ZONE-VETO';
   if (/ZONE-PERM/.test(reason)) return 'ZONE-PERM';
+  if (/CHOP-MOM/.test(reason)) return 'CHOP-MOM';
   if (/CHOP-BREAK/.test(reason)) return 'CHOP-BREAK';
   if (/SE-RETEST/.test(reason)) return 'SE-RETEST'; // chase-gate bounce-entry arm, Jean's design (2026-08-19)
   if (/EG-RETEST-Z/.test(reason)) return 'EG-RETEST-Z'; // zone-anchored variant, paired test (2026-08-19)
@@ -6664,6 +6665,23 @@ function processPrice(sym, price, hi, lo) {
               }
             }
           } catch (eCB) {}
+          // ===== CHOP-MOM (DORMANT, 2026-08-25 — Jean's design) =====
+          // "Can we overpass chop blocks by MACD or ROC3 numbers? If MACD > 0.3 let it
+          // fire." Momentum-magnitude bypass audition. History demands dormant first:
+          // REV-OVERRIDE (1W/2L) and V-CONT (0W/6L) both died as live chop bypasses —
+          // but both used validator confidence, not raw momentum. Stamps tag WHICH
+          // trigger fired (MACD ±0.3 / ROC3 ±0.15%) so the cohort learns if either
+          // discriminates. Promotion would also require revisiting the 7/29 RIDE
+          // chop-bypass bar — Jean's explicit call.
+          try {
+            const _cmM = parseFloat(sig.macd), _cmR = parseFloat(sig.roc);
+            const _cmMacdOk = sig.type === 'call' ? _cmM >= 0.3 : _cmM <= -0.3;
+            const _cmRocOk = sig.type === 'call' ? _cmR >= 0.15 : _cmR <= -0.15;
+            if (_cmMacdOk || _cmRocOk) {
+              const _cmMsg = '⚡ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' CHOP-MOM DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — chop bypass by momentum magnitude: ' + (_cmMacdOk ? 'MACD ' + _cmM.toFixed(3) + (_cmRocOk ? ' + ' : '') : '') + (_cmRocOk ? 'ROC3 ' + _cmR.toFixed(3) + '%' : '') + ' (thresholds ±0.3 / ±0.15%, Jean 2026-08-25).';
+              log(sym, _cmMsg); trackBlockedOutcome(sym, _cmMsg, true);
+            }
+          } catch (eCM) {}
           Object.assign(s, _emitSnapshot);
           // Force-tracked since 5.63 (2026-08-18, Jean: "how many saves vs misses from the chop
           // gate?" — answer was unknowable: sample-only tracking, no cohort). The 3-min global
@@ -15003,7 +15021,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.89-20260825-leg-arm-fade-guard', // bump on each deploy — lets /state verify what's live
+    build: '5.90-20260825-chop-mom-dormant', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
