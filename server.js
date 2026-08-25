@@ -3235,12 +3235,26 @@ function processPrice(sym, price, hi, lo) {
           const _tdRange = s.sessionHigh - s.sessionLow;
           const _tdNearHi = (s.sessionHigh - price) <= 1.5 * _tdAtr;
           const _tdNearLo = (price - s.sessionLow) <= 1.5 * _tdAtr;
-          if (_tdRange >= 6 * _tdAtr && (_tdNearHi || _tdNearLo)) { // 6x (not 5x): a range of exactly 5xATR with price at the edge is still ambiguous; 6x is unambiguous trend-day territory
-            s._tdLatch = { dir: _tdNearHi ? 'call' : 'put', ts: Date.now() }; // edge pressed = with-trend direction
+          // LEG-ARMING (2026-08-25, Jean: "price went 4600->4660 in 2h and the bot found
+          // no entry"): on a V-day, price spends the whole recovery mid-range between the
+          // morning low and the old overnight high — never "at an edge" — so the latch
+          // (and every ease it powers) slept until 14:59 while 8 vetoed calls graded wins.
+          // New arm: a one-sided directional LEG ≥6×ATRopen off a session extreme counts
+          // as a trend day in that direction, even mid-range. Ambiguous (both legs ≥6×ATR
+          // from mid-price) arms nothing.
+          let _tdDir = null;
+          if (_tdRange >= 6 * _tdAtr && (_tdNearHi || _tdNearLo)) _tdDir = _tdNearHi ? 'call' : 'put'; // original edge arm
+          if (!_tdDir) {
+            const _legUp = (price - s.sessionLow) >= 6 * _tdAtr;
+            const _legDn = (s.sessionHigh - price) >= 6 * _tdAtr;
+            if (_legUp !== _legDn) _tdDir = _legUp ? 'call' : 'put';
+          }
+          if (_tdDir) {
+            s._tdLatch = { dir: _tdDir, ts: Date.now() }; // with-trend direction
             if (s.chopActive) { s.chopActive = false; s.trendCount = 0; }
             if (!s._tdLatchLogTs || Date.now() - s._tdLatchLogTs > 300000) {
               s._tdLatchLogTs = Date.now();
-              log(sym, '📈 TREND-DAY LATCH (' + s._tdLatch.dir.toUpperCase() + ' edge) — session range $' + _tdRange.toFixed(2) + ' ≥ 6×ATRopen ($' + (6 * _tdAtr).toFixed(2) + ') and price at the edge; chop suppressed + location gates eased for with-trend continuation (2026-08-05, ext. 2026-08-17).');
+              log(sym, '📈 TREND-DAY LATCH (' + s._tdLatch.dir.toUpperCase() + ') — range $' + _tdRange.toFixed(2) + ' / leg vs 6×ATRopen ($' + (6 * _tdAtr).toFixed(2) + '); chop suppressed + location gates eased for with-trend continuation (2026-08-05, ext. 2026-08-17, leg-arm 2026-08-25).');
             }
           }
         }
@@ -8585,7 +8599,10 @@ function processPrice(sym, price, hi, lo) {
       if (isXAU && s.sessionHigh > 0 && price <= s.sessionHigh) {
         const _fePct = ((s.sessionHigh - price) / s.sessionHigh) * 100;
         const _feStale = (s.sessionHighUpdateTs || 0) > 0 && (Date.now() - s.sessionHighUpdateTs) >= 180000;
-        const _feWin = _fePct <= 0.15 && _feStale;
+        // FADE-vs-LATCH guard (2026-08-25): 6 put-fade ease attempts INTO the 4600->4660
+        // rally graded 0W/4L while the latch read CALL — the 8/4 NAS lesson on XAU tape.
+        // No fading against an armed trend-day latch.
+        const _feWin = _fePct <= 0.15 && _feStale && !tdLatchEase(s, 'call');
         _lhfFadeAtHigh = _feWin && convictionFor('put').score >= 5;
         // ZONE-PERM (DORMANT, 2026-08-14): 8/13 4363 double-top — 278 LHF PUT macro-blocks
         // at the touch because put-conviction was 0-2 (conviction is trend-following; it
@@ -8605,7 +8622,7 @@ function processPrice(sym, price, hi, lo) {
           if (_zpz) {
             _lhfFadeAtHigh = true; // waive macro like FADE-EASE — zone replaces conv≥5
             s._zpFadeTs = Date.now(); s._zpFadeZoneHi = _zpz.hi; // trade builder: tight SL
-            const _zpMsg = '🔓 ⬇LHF PUT ZONE-PERM LIVE-FIRING @ $' + price.toFixed(2) + ' — fade window at stale session high, conv<5 waived by mapped supply ' + (_zpz.kind || 'OB') + ' ' + (_zpz.tf || '') + ' $' + _zpz.lo.toFixed(2) + '-$' + _zpz.hi.toFixed(2) + ' · tight SL armed (promoted 2026-08-18).';
+            const _zpMsg = '🔓 ⬇LHF PUT ZONE-PERM EASE-GRANTED @ $' + price.toFixed(2) + ' — fade window at stale session high, conv<5 waived by mapped supply ' + (_zpz.kind || 'OB') + ' ' + (_zpz.tf || '') + ' $' + _zpz.lo.toFixed(2) + '-$' + _zpz.hi.toFixed(2) + ' · tight SL armed (promoted 2026-08-18).';
             log(sym, _zpMsg); trackBlockedOutcome(sym, _zpMsg, true);
           }
         }
@@ -8798,7 +8815,7 @@ function processPrice(sym, price, hi, lo) {
       if (isXAU && s.sessionLow > 0 && s.sessionLow < Infinity && price >= s.sessionLow) {
         const _fePctL = ((price - s.sessionLow) / price) * 100;
         const _feStaleL = (s.sessionLowUpdateTs || 0) > 0 && (Date.now() - s.sessionLowUpdateTs) >= 180000;
-        const _feWinL = _fePctL <= 0.15 && _feStaleL;
+        const _feWinL = _fePctL <= 0.15 && _feStaleL && !tdLatchEase(s, 'put'); // fade-vs-latch guard 2026-08-25 (mirror)
         _llfFadeAtLow = _feWinL && convictionFor('call').score >= 5;
         // ===== ZONE-PERM CALL MIRROR PROMOTED — WITH HOLD-CONFIRMATION (2026-08-21, Jean) =====
         // 8/20-21 overnight taught the split inside this detector: 0-for-9 fading zones
@@ -8815,7 +8832,7 @@ function processPrice(sym, price, hi, lo) {
             if (_lowHeldMin >= 10) {
               _llfFadeAtLow = true; // waive macro — zone + held low replace conv≥5
               s._zpFadeTsL = Date.now();
-              const _zpMsgL = '🔓 ⬆LLF CALL ZONE-PERM LIVE-FIRING @ $' + price.toFixed(2) + ' — stale session low HELD ' + Math.round(_lowHeldMin) + 'min, conv<5 waived by mapped demand ' + (_zpzL.kind || 'OB') + ' ' + (_zpzL.tf || '') + ' $' + _zpzL.lo.toFixed(2) + '-$' + _zpzL.hi.toFixed(2) + ' · tight SL armed (promoted 2026-08-21).';
+              const _zpMsgL = '🔓 ⬆LLF CALL ZONE-PERM EASE-GRANTED @ $' + price.toFixed(2) + ' — stale session low HELD ' + Math.round(_lowHeldMin) + 'min, conv<5 waived by mapped demand ' + (_zpzL.kind || 'OB') + ' ' + (_zpzL.tf || '') + ' $' + _zpzL.lo.toFixed(2) + '-$' + _zpzL.hi.toFixed(2) + ' · tight SL armed (promoted 2026-08-21).';
               log(sym, _zpMsgL); trackBlockedOutcome(sym, _zpMsgL, true);
             } else {
               const _zpMsgL = '🔓 ⬆LLF CALL ZONE-PERM DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — fade window at stale session low, conv<5 waived by mapped demand ' + (_zpzL.kind || 'OB') + ' ' + (_zpzL.tf || '') + ' $' + _zpzL.lo.toFixed(2) + '-$' + _zpzL.hi.toFixed(2) + ' (low held only ' + Math.round(_lowHeldMin) + 'min < 10 — hold-confirmation not met, dormant).';
@@ -14986,7 +15003,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.88-20260825-pending-entry-leak', // bump on each deploy — lets /state verify what's live
+    build: '5.89-20260825-leg-arm-fade-guard', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
