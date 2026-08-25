@@ -9216,6 +9216,23 @@ function processPrice(sym, price, hi, lo) {
             }
           }
         } catch (eRF) { /* reject-flow must never crash the tick */ }
+        // ===== TP3==TP2 EQUALITY GUARD (2026-08-25, Jean's MT5 report) =====
+        // Capital mode set tp3 EXACTLY equal to tp2 at every ladder site. If the EA
+        // allocates a portion per level, two identical prices is an edge case: the TP2
+        // portion closes, the TP3 portion's same-price order can fail to trigger, and
+        // the rump rides the reversal to the STOP while the server books a full TP3 win.
+        // Guard: whenever an active trade carries tp3 === tp2, nudge tp3 a hair INSIDE
+        // (0.1 XAU / 2 NAS / 10 BTC) so the final portion always exits just BEFORE tp2.
+        // Central per-tick guard — catches all 12 ladder sites at once.
+        try {
+          const _eqT = s.trade;
+          if (CAPITAL_MODE && _eqT && _eqT.active && typeof _eqT.tp2Price === 'number' && _eqT.tp2Price > 0 &&
+              _eqT.tp3Price === _eqT.tp2Price) {
+            const _eqEps = sym === 'XAU' ? 0.1 : sym === 'NAS100' ? 2 : sym === 'BTC' ? 10 : 0.05;
+            _eqT.tp3Price = +(_eqT.type === 'call' ? _eqT.tp2Price - _eqEps : _eqT.tp2Price + _eqEps).toFixed(2);
+            log(sym, '🔧 TP3==TP2 equality guard — tp3 nudged to $' + _eqT.tp3Price.toFixed(2) + ' (inside tp2 $' + _eqT.tp2Price.toFixed(2) + ') so the final portion always closes before tp2 (2026-08-25, MT5 rump-position bug).');
+          }
+        } catch (eEQ) {}
         // ===== INV-HOLD RESOLVER (2026-08-24, Jean) =====
         try {
           const _ih = s._invHold;
@@ -9225,7 +9242,7 @@ function processPrice(sym, price, hi, lo) {
             if (_ihDist <= 0) {
               // price reached the SL level before entry — setup invalidated, no trade, no loss
               s._invHold = null;
-              const _ihM = '⏸ INVERSAL-HOLD ' + _ih.dir.toUpperCase() + ' INVALIDATED — price hit the SL level $' + _ih.slPrice.toFixed(2) + ' before entry; the wide-SL fire would have been a FULL -$' + _ih.initialDist.toFixed(2) + ' loss. INV-HOLD saved it (Jean 2026-08-24).';
+              const _ihM = '⏸ ' + (_ih.tag || 'INVERSAL') + '-HOLD ' + _ih.dir.toUpperCase() + ' INVALIDATED — price hit the SL level $' + _ih.slPrice.toFixed(2) + ' before entry; the wide-SL fire would have been a FULL -$' + _ih.initialDist.toFixed(2) + ' loss. INV-HOLD saved it (Jean 2026-08-24).';
               log(sym, _ihM); trackBlockedOutcome(sym, _ihM, true);
             } else if (_ihDist <= _ih.targetDist && !(s.trade && s.trade.active)) {
               // FIRE at the improved entry — same stop, normal geometry
@@ -9238,8 +9255,8 @@ function processPrice(sym, price, hi, lo) {
               s.trade.tp2Price = +(_ih.dir === 'call' ? price + _ihT2d : price - _ihT2d).toFixed(2);
               s.trade.tp3Price = CAPITAL_MODE ? s.trade.tp2Price : +(_ih.dir === 'call' ? price + Math.max(_ihDist * 4, _ihT1 * 2.5) : price - Math.max(_ihDist * 4, _ihT1 * 2.5)).toFixed(2);
               if (_ih.sigRef) { _ih.sigRef.sl = _ih.slPrice.toFixed(2); _ih.sigRef.tp1 = s.trade.tp1Price.toFixed(2); _ih.sigRef.tp2 = s.trade.tp2Price.toFixed(2); _ih.sigRef.tp3 = s.trade.tp3Price.toFixed(2); _ih.sigRef.entryActual = +price.toFixed(2); _ih.sigRef.pendingEntry = false; }
-              log(sym, '▶️ INVERSAL-HOLD ' + _ih.dir.toUpperCase() + ' FILLED @ $' + price.toFixed(2) + ' — signal was $' + _ih.sigPrice.toFixed(2) + ', risk cut $' + _ih.initialDist.toFixed(2) + ' → $' + _ihDist.toFixed(2) + ' (same stop $' + _ih.slPrice.toFixed(2) + ') [Jean 2026-08-24].');
-              sendPush('▶️ ' + sym + ' INVERSAL ' + _ih.dir.toUpperCase() + ' filled', '$' + price.toFixed(2) + ' · risk $' + _ihDist.toFixed(2) + ' (was $' + _ih.initialDist.toFixed(2) + ') · SL $' + _ih.slPrice.toFixed(2), 'signal');
+              log(sym, '▶️ ' + (_ih.tag || 'INVERSAL') + '-HOLD ' + _ih.dir.toUpperCase() + ' FILLED @ $' + price.toFixed(2) + ' — signal was $' + _ih.sigPrice.toFixed(2) + ', risk cut $' + _ih.initialDist.toFixed(2) + ' → $' + _ihDist.toFixed(2) + ' (same stop $' + _ih.slPrice.toFixed(2) + ') [Jean 2026-08-24].');
+              sendPush('▶️ ' + sym + ' ' + (_ih.tag || 'INVERSAL') + ' ' + _ih.dir.toUpperCase() + ' filled', '$' + price.toFixed(2) + ' · risk $' + _ihDist.toFixed(2) + ' (was $' + _ih.initialDist.toFixed(2) + ') · SL $' + _ih.slPrice.toFixed(2), 'signal');
             } else if (_zNow >= _ih.expiry) {
               s._invHold = null;
               if (_ihDist < _ih.initialDist && !(s.trade && s.trade.active)) {
@@ -9252,10 +9269,10 @@ function processPrice(sym, price, hi, lo) {
                 s.trade.tp2Price = +(_ih.dir === 'call' ? price + _ihT2d : price - _ihT2d).toFixed(2);
                 s.trade.tp3Price = CAPITAL_MODE ? s.trade.tp2Price : +(_ih.dir === 'call' ? price + Math.max(_ihDist * 4, _ihT1 * 2.5) : price - Math.max(_ihDist * 4, _ihT1 * 2.5)).toFixed(2);
                 if (_ih.sigRef) { _ih.sigRef.sl = _ih.slPrice.toFixed(2); _ih.sigRef.tp1 = s.trade.tp1Price.toFixed(2); _ih.sigRef.tp2 = s.trade.tp2Price.toFixed(2); _ih.sigRef.tp3 = s.trade.tp3Price.toFixed(2); _ih.sigRef.entryActual = +price.toFixed(2); _ih.sigRef.pendingEntry = false; }
-                log(sym, '▶️ INVERSAL-HOLD ' + _ih.dir.toUpperCase() + ' BAND-FILL at expiry @ $' + price.toFixed(2) + ' — dist $' + _ihDist.toFixed(2) + ' (band ' + _ih.targetDist.toFixed(2) + '-' + _ih.initialDist.toFixed(2) + '); authorized wide fire (Jean 2026-08-24).');
-                sendPush('▶️ ' + sym + ' INVERSAL ' + _ih.dir.toUpperCase() + ' band-fill', '$' + price.toFixed(2) + ' · risk $' + _ihDist.toFixed(2) + ' · SL $' + _ih.slPrice.toFixed(2), 'signal');
+                log(sym, '▶️ ' + (_ih.tag || 'INVERSAL') + '-HOLD ' + _ih.dir.toUpperCase() + ' BAND-FILL at expiry @ $' + price.toFixed(2) + ' — dist $' + _ihDist.toFixed(2) + ' (band ' + _ih.targetDist.toFixed(2) + '-' + _ih.initialDist.toFixed(2) + '); authorized wide fire (Jean 2026-08-24).');
+                sendPush('▶️ ' + sym + ' ' + (_ih.tag || 'INVERSAL') + ' ' + _ih.dir.toUpperCase() + ' band-fill', '$' + price.toFixed(2) + ' · risk $' + _ihDist.toFixed(2) + ' · SL $' + _ih.slPrice.toFixed(2), 'signal');
               } else {
-                const _ihM = '⏸ INVERSAL-HOLD ' + _ih.dir.toUpperCase() + ' MISSED — price ran away (dist $' + _ihDist.toFixed(2) + ' ≥ initial $' + _ih.initialDist.toFixed(2) + ') within 3min; per design: too bad for us (Jean 2026-08-24). Virtual track from signal price $' + _ih.sigPrice.toFixed(2) + ' measures the cost.';
+                const _ihM = '⏸ ' + (_ih.tag || 'INVERSAL') + '-HOLD ' + _ih.dir.toUpperCase() + ' MISSED — price ran away (dist $' + _ihDist.toFixed(2) + ' ≥ initial $' + _ih.initialDist.toFixed(2) + ') within 3min; per design: too bad for us (Jean 2026-08-24). Virtual track from signal price $' + _ih.sigPrice.toFixed(2) + ' measures the cost.';
                 log(sym, _ihM);
                 s.blockedOutcomes = s.blockedOutcomes || [];
                 s.blockedOutcomes.push({
@@ -9331,6 +9348,19 @@ function processPrice(sym, price, hi, lo) {
                   const sigZ = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇ZONE-OB', rsi: (typeof rsiV === 'number' ? rsiV.toFixed(1) : '0'), macd: (typeof macdL === 'number' ? macdL.toFixed(3) : '0'), roc: '0.000%', num: s.dailySignalCount };
                   try { const _zc = convictionFor('put'); sigZ.conv = { score: _zc.score, label: _zc.score >= 5 ? 'HIGH' : 'MOD', factors: _zc.factors }; } catch (eZC) {}
                   s.signals.push(sigZ); logSignal(sym, sigZ);
+                  // ===== ZONE-OB ENTRY AUCTION (2026-08-24, Jean) =====
+                  // 8/23 20:40 case: 46.6-pt zone-anchored stop bought at full market price
+                  // → straight SL −$932 at ×20, one loss erasing 80% of a win. Same rule
+                  // as INV-HOLD: when the stop is wider than the ×20 sizing line
+                  // (NAS_WIDE_SL $25), hold ≤3min for price to come deeper into the zone
+                  // until risk ≤$20; band-fill at expiry; runaway = miss, measured.
+                  if (_zSlDist > NAS_WIDE_SL) {
+                    sigZ.pendingEntry = true;
+                    s._invHold = { tag: 'ZONE-OB', dir: 'put', slPrice: +(price + _zSlDist).toFixed(2), targetDist: 20,
+                                   initialDist: _zSlDist, sigPrice: price, expiry: _zNow + 180000, sigRef: sigZ };
+                    log(sym, '⏸ ZONE-OB-HOLD PUT armed — zone-anchored SL $' + (price + _zSlDist).toFixed(2) + ' is $' + _zSlDist.toFixed(2) + ' wide (>' + NAS_WIDE_SL + '); entry auction ≤3min for $20-from-SL (Jean 2026-08-24).');
+                    sendPush('⏸ NAS100 ZONE-OB PUT holding', 'SL $' + _zSlDist.toFixed(2) + ' wide — entry auction 3min', 'signal');
+                  } else {
                   const _zT1 = Math.max(Math.min(_zSlDist * 1.5, 50), 30);
                   const _zT2 = Math.max(_zSlDist * 2.5, _zT1 * 1.6);
                   const _zT3 = CAPITAL_MODE ? _zT2 : Math.max(_zSlDist * 4.0, _zT1 * 2.5);
@@ -9344,6 +9374,7 @@ function processPrice(sym, price, hi, lo) {
                   const _zFm = '🗺️ ZONE-OB PUT LIVE-FIRING @ $' + price.toFixed(2) + ' — ' + z.kind + ' ' + z.tf + ' supply $' + z.lo.toFixed(2) + '-$' + z.hi.toFixed(2) + ' retest, with-trend (1h ' + s.htf1h_dir + ') · tight SL $' + s.trade.slPrice.toFixed(2) + ' · TP1 $' + s.trade.tp1Price.toFixed(2) + ' (promoted 2026-08-18) [#' + s.dailySignalCount + '].';
                   log(sym, _zFm); trackBlockedOutcome(sym, _zFm, true);
                   sendPush('🗺️ NAS100 ZONE-OB PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · supply retest with-trend · SL $' + s.trade.slPrice.toFixed(2) + ' · TP1 $' + s.trade.tp1Price.toFixed(2), 'signal');
+                  }
                 }
               }
             } catch (eZF) { /* zone promotion must never crash the tick */ }
@@ -10234,9 +10265,9 @@ function processPrice(sym, price, hi, lo) {
           // 8-13 band, authorize the fire anyway; if price runs away, too bad."
           // Wide = >2×TP1cap ($10 XAU). Target = 1.6×TP1cap ($8 XAU). Same stop, same
           // trade — just refusing to pay top price for wide structural risk.
-          if (slDist > tp1Cap * 2) {
+          if (slDist > tp1Cap * 2.5) { // 2.0->2.5 (2026-08-25): $10.37 stop went to auction and missed a TP1 winner by $0.37 of threshold; Jean's spec was '13 is too wide' — borderline stops now fire normally
             sig.pendingEntry = true;
-            s._invHold = { dir: 'put', slPrice: +ibSl.toFixed(2), targetDist: tp1Cap * 1.6,
+            s._invHold = { tag: 'INVERSAL', dir: 'put', slPrice: +ibSl.toFixed(2), targetDist: tp1Cap * 1.6,
                            initialDist: slDist, sigPrice: price, expiry: now2 + 180000, sigRef: sig };
             log(sym, '⏸ INVERSAL-HOLD PUT armed — SL $' + ibSl.toFixed(2) + ' is $' + slDist.toFixed(2) + ' wide (>' + (tp1Cap * 2) + '); waiting ≤3min for price to reach $' + (tp1Cap * 1.6).toFixed(2) + '-from-SL (Jean 2026-08-24).');
             sendPush('⏸ ' + sym + ' INVERSAL PUT holding', 'SL $' + slDist.toFixed(2) + ' wide — entry auction 3min', 'signal');
@@ -10286,9 +10317,9 @@ function processPrice(sym, price, hi, lo) {
         if (slDist > 0) {
           const tp1Cap = isXAU ? 5 : isBTC ? 100 : isNAS ? 50 : 0.50;
           // INV-HOLD — see PUT site above (Jean 2026-08-24).
-          if (slDist > tp1Cap * 2) {
+          if (slDist > tp1Cap * 2.5) { // 2.0->2.5 (2026-08-25): $10.37 stop went to auction and missed a TP1 winner by $0.37 of threshold; Jean's spec was '13 is too wide' — borderline stops now fire normally
             sig.pendingEntry = true;
-            s._invHold = { dir: 'call', slPrice: +ibSl.toFixed(2), targetDist: tp1Cap * 1.6,
+            s._invHold = { tag: 'INVERSAL', dir: 'call', slPrice: +ibSl.toFixed(2), targetDist: tp1Cap * 1.6,
                            initialDist: slDist, sigPrice: price, expiry: now2 + 180000, sigRef: sig };
             log(sym, '⏸ INVERSAL-HOLD CALL armed — SL $' + ibSl.toFixed(2) + ' is $' + slDist.toFixed(2) + ' wide (>' + (tp1Cap * 2) + '); waiting ≤3min for price to reach $' + (tp1Cap * 1.6).toFixed(2) + '-from-SL (Jean 2026-08-24).');
             sendPush('⏸ ' + sym + ' INVERSAL CALL holding', 'SL $' + slDist.toFixed(2) + ' wide — entry auction 3min', 'signal');
@@ -14651,7 +14682,16 @@ setInterval(() => {
       // and it vanished from /signals/today when the date rolled. An open position does
       // not care what day it is: preserve it, keep managing it, and let /signals/today
       // carry the signal over until the trade closes.
-      if (s.trade && s.trade.active) {
+      const _coTerminal = !!(s.lastHistEntry && s.lastHistEntry.outcomes &&
+        (s.lastHistEntry.outcomes.slHit || s.lastHistEntry.outcomes.tp3Hit));
+      const _coStale = s.trade && s.trade.ts && (Date.now() - s.trade.ts) > 86400000;
+      if (s.trade && s.trade.active && (_coTerminal || _coStale)) {
+        // GHOST GUARD (2026-08-25): a QQQ paper trade SL'd 8/24 09:36 kept active=true and
+        // was carried across midnight forever, blocking the one-trade-at-a-time lane and
+        // polluting /signals/today carryOver. Terminal-or-stale trades are cleared, not carried.
+        log(sym, '👻 Daily reset — clearing GHOST trade (' + String(s.trade.type || '').toUpperCase() + ' @ $' + (+s.trade.ep || 0).toFixed(2) + ', outcome already terminal or >24h old). Carry-over is for LIVE positions only (2026-08-25).');
+        s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
+      } else if (s.trade && s.trade.active) {
         log(sym, '🌙 Daily reset — active ' + String(s.trade.type || '').toUpperCase() + ' trade @ $' + (+s.trade.ep || 0).toFixed(2) + ' PRESERVED across midnight: management, TP/SL stamping and P&L booking continue (2026-08-18).');
       } else {
         s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
@@ -14946,7 +14986,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.84-20260824-inv-hold', // bump on each deploy — lets /state verify what's live
+    build: '5.88-20260825-pending-entry-leak', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
@@ -15212,7 +15252,7 @@ app.get('/prices', (req, res) => {
       // signals[] it would trade rejected setups. Filter to FIRED-ONLY here so a blocked
       // signal can never reach the executor, regardless of EA logic. The `trade` object below
       // is already fired-only (set by buildCfdTrade); analytics keep full history via /signals.
-      signals: s.signals.filter(sg => !(sg && sg.conv && (sg.conv.enrichBlocked === true || sg.conv.label === 'BLOCKED'))).slice(-20),
+      signals: s.signals.filter(sg => !(sg && ((sg.conv && (sg.conv.enrichBlocked === true || sg.conv.label === 'BLOCKED')) || sg.pendingEntry === true))).slice(-20), // pendingEntry filter 2026-08-25: held auction signals leaked to the EA feed with NO sl/tp — MT5 traded one on its own defaults (00:35 case)
       // Manual-close command (2026-07-24). Surfaced here because the EA + mobile monitor
       // both poll /prices. EA: on closeRequest.active, flatten this symbol at market, then
       // POST /trade/close/ack {sym,id}. Auto-expires 60s.
@@ -15384,7 +15424,7 @@ app.get('/status', (req, res) => {
       signals: s.dailySignalCount,
       chopActive: s.chopActive,
       trade: s.trade.active ? { type: s.trade.type, ep: s.trade.ep, t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl } : null,
-      recentSignals: s.signals.filter(sg => !(sg && sg.conv && (sg.conv.enrichBlocked === true || sg.conv.label === 'BLOCKED'))).slice(-5),
+      recentSignals: s.signals.filter(sg => !(sg && ((sg.conv && (sg.conv.enrichBlocked === true || sg.conv.label === 'BLOCKED')) || sg.pendingEntry === true))).slice(-5),
       // Blocked-attempt visibility (added 2026-05-22) — surfaces enrichSig gates that
       // suppressed signal emission. Useful for diagnosing over-gating, especially BTC.
       blocked: (s.blockedAttempts || []).length,
@@ -15525,7 +15565,8 @@ app.get('/signals/today', (req, res) => {
     try {
       const st = S[sym];
       if (st && st.trade && st.trade.active && st.lastHistEntry &&
-          st.lastHistEntry.symbol === sym && st.lastHistEntry.date !== today) {
+          st.lastHistEntry.symbol === sym && st.lastHistEntry.date !== today &&
+          !(st.lastHistEntry.outcomes && (st.lastHistEntry.outcomes.slHit || st.lastHistEntry.outcomes.tp3Hit))) { // ghost guard 2026-08-25
         carryOver.push(Object.assign({ carryOver: true }, st.lastHistEntry));
       }
     } catch (e) {}
