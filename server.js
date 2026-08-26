@@ -7583,13 +7583,19 @@ function processPrice(sym, price, hi, lo) {
     // Promoted straight to live (user decision — XAU WR too low to wait out a shadow
     // period). W-29 evidence: winners fired at |ROC|~0.19%, flat-ROC fades lost.
     // A fade must fire on CONFIRMATION (|ROC-3| ≥0.10% aligned with the signal), not
-    // at the flat extreme in anticipation. STRUCT_SWEEP deliberately EXCLUDED (2W/0L
-    // this week incl. the 7/17 conv-8 winner); EXT-FLIP has its own gate chain.
+    // at the flat extreme in anticipation. EXT-FLIP has its own gate chain.
+    // STRUCT_SWEEP EXEMPTION REVOKED (2026-08-26, Jean "yes ship"): the original
+    // exclusion rested on a 2W/0L week-29 sample. 8/26 03:08 STRUCT_SWEEP CALL
+    // @4635.89 fired the reclaim with MACD 0.001 / ROC3 -0.005% — a dead reclaim in a
+    // lower-high London grind — and bled -$9.47 to SL without ever going +$1. That is
+    // precisely the flat-ROC anticipation entry this gate exists to refuse. Sweeps now
+    // need the same ROC confirmation as every other XAU fade; blocked sweeps stamp
+    // FADE-ROC telemetry so tonight's report grades the change.
     // TRIPWIRE (nightly cohort #12, revert rule): if blocked fades would-have-won ≥60%
     // over ≥10 resolved, OR the gate passes <20% of attempts while XAU fade fires drop
     // to ~zero, revert this gate to the dormant marker.
     try {
-      if (sym === 'XAU' && /ATH|ATL|HI|LO|LHF|LLF|VREV|OBREJ|OBMIT/.test(tag) && !/MFLIP|TREND|FAST|BREAK|RIDE|SWEEP/.test(tag)) {
+      if (sym === 'XAU' && /ATH|ATL|HI|LO|LHF|LLF|VREV|OBREJ|OBMIT|STRUCT_SWEEP/.test(tag) && !/MFLIP|TREND|FAST|BREAK|RIDE/.test(tag)) {
         const _frAligned = (sig.type === 'call' && roc3 >= 0.10) || (sig.type === 'put' && roc3 <= -0.10);
         if (!_frAligned) {
           Object.assign(s, _emitSnapshot);
@@ -15152,7 +15158,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.93-20260826-ote-hold-live', // bump on each deploy — lets /state verify what's live
+    build: '5.94-20260826-sweep-faderoc', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
