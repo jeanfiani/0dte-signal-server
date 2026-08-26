@@ -542,6 +542,23 @@ function loadRollingLevels() {
       if (typeof data[sym].asianSweepInvalidated === 'boolean') S[sym].asianSweepInvalidated = data[sym].asianSweepInvalidated;
       if (data[sym].asianAboveSince) S[sym].asianAboveSince = data[sym].asianAboveSince;
       if (data[sym].asianBelowSince) S[sym].asianBelowSince = data[sym].asianBelowSince;
+      // ===== SESSION H/L RESTORATION (2026-08-26) — same-day only =====
+      // Restore the pre-restart session extremes with their ORIGINAL update timestamps:
+      // a 2-hour-old low must come back as a 2-hour-old (defended) low, not a fresh
+      // break. Yesterday's saved extremes are ignored (daily reset owns the new day).
+      if (data[sym].sessionDate && data[sym].sessionDate === todayDateET()) {
+        if (typeof data[sym].sessionHigh === 'number' && data[sym].sessionHigh > S[sym].sessionHigh) {
+          S[sym].sessionHigh = data[sym].sessionHigh;
+          S[sym].sessionHighUpdateTs = data[sym].sessionHighUpdateTs || (Date.now() - 3600000);
+        }
+        if (typeof data[sym].sessionLow === 'number' && data[sym].sessionLow < S[sym].sessionLow) {
+          S[sym].sessionLow = data[sym].sessionLow;
+          S[sym].sessionLowUpdateTs = data[sym].sessionLowUpdateTs || (Date.now() - 3600000);
+        }
+        if (isFinite(S[sym].sessionHigh) && isFinite(S[sym].sessionLow)) {
+          console.log('[' + ts() + '] Session H/L restored — ' + sym + ': H $' + S[sym].sessionHigh.toFixed(2) + ' / L $' + S[sym].sessionLow.toFixed(2) + ' (same-day, stale timestamps kept — chase gate sees defended extremes).');
+        }
+      }
     });
     console.log('[' + ts() + '] Rolling levels loaded — XAU: ' + S.XAU.dailyLevels.length + ' days, high:$' + (S.XAU.rollingHigh || 0).toFixed(2) + ' low:$' + (S.XAU.rollingLow === Infinity ? 0 : S.XAU.rollingLow).toFixed(2));
     SYMBOLS.forEach(sym => {
@@ -649,7 +666,20 @@ function saveRollingLevels() {
       asianLockedDate:       S[sym].asianLockedDate,
       asianSweepInvalidated: !!S[sym].asianSweepInvalidated,
       asianAboveSince:       S[sym].asianAboveSince || 0,
-      asianBelowSince:       S[sym].asianBelowSince || 0
+      asianBelowSince:       S[sym].asianBelowSince || 0,
+      // ===== SESSION H/L PERSISTENCE (2026-08-26, Jean's 07:37 autopsy) =====
+      // Without this every redeploy wiped the session extremes. The chase gate then
+      // saw only the post-boot low, and price grinding at the day-low zone kept
+      // refreshing sessionLowUpdateTs — a perpetual "fresh live break" that waived the
+      // gate. 8/26 07:37 LHF PUT fired $1.69 above the real day low $4616.42 (already
+      // bounced 3x, set BEFORE the ~06:00 deploy) and SL'd -$358. Persist the extremes
+      // WITH their update timestamps so a restored extreme stays STALE (defended) in
+      // the gate's eyes — restarts must not manufacture breakout exemptions.
+      sessionHigh:         isFinite(S[sym].sessionHigh) ? S[sym].sessionHigh : null,
+      sessionLow:          isFinite(S[sym].sessionLow) ? S[sym].sessionLow : null,
+      sessionHighUpdateTs: S[sym].sessionHighUpdateTs || 0,
+      sessionLowUpdateTs:  S[sym].sessionLowUpdateTs || 0,
+      sessionDate:         todayDateET()
     };
   });
   try { fs.writeFileSync(ROLLING_FILE, JSON.stringify(data, null, 2)); } catch (e) {}
@@ -15186,7 +15216,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.95-20260826-mom-floor', // bump on each deploy — lets /state verify what's live
+    build: '5.96-20260826-session-hl-persist', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
