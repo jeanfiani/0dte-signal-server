@@ -2736,6 +2736,9 @@ function logSignal(sym, sig) {
     confScore: (typeof sig._confScore === 'number') ? sig._confScore : null,
     confClass: sig._confClass || null,
     confBreakdown: sig._confBreakdown || null,
+    // CT-VETO TREND exemption marker (2026-08-26): lets the nightly report grade the
+    // exempted-fire cohort directly from /signals (revert if net-negative over ~6 fires).
+    ctTrendExempt: sig._ctTrendExempt === true || undefined,
     // Outcome tracking (added 2026-05-12) — updated by checkExit() when trade flags flip.
     // Boolean fields stay false until TP1/TP2/TP3/SL price is touched. Used by CSV export
     // to surface trade outcome per signal.
@@ -4965,7 +4968,16 @@ function processPrice(sym, price, hi, lo) {
                         !/LHF|LLF|VREV|EXT-FLIP|OBREJ|OBMIT|INVERSAL|CHoCH|ATH|ATL|DIV|SWEEP|HI|LO/.test(_ctTag);
         const _ctCounter = (sig._regime.dir === 'bull' && sig.type === 'put') ||
                            (sig._regime.dir === 'bear' && sig.type === 'call');
-        if (_ctCont && _ctCounter) {
+        // TREND detector EXEMPT (2026-08-26): CT-VETO cohort 8/21-8/25 showed TREND
+        // puts 4W/1L/1S under the veto (RIDE 3W/4L/10S stays vetoed). 77% of all vetoed
+        // signals hit TP1 first; the TREND subset was the driver. Jean: "YES EXEMPT FOR
+        // TREND". Revert if exempted TREND fires run net-negative over ~6 fires.
+        const _ctTrendExempt = /TREND/.test(_ctTag);
+        if (_ctCont && _ctCounter && _ctTrendExempt) {
+          sig._ctTrendExempt = true;
+          log(sym, '🧭 ' + _ctTag + ' ' + sig.type.toUpperCase() + ' CT-VETO WAIVED — TREND exemption (2026-08-26, cohort 4W/1L/1S) — firing live vs ' + sig._regime.dir.toUpperCase() + ' regime');
+        }
+        if (_ctCont && _ctCounter && !_ctTrendExempt) {
           const _ctMsg = '🧭 ' + _ctTag + ' ' + sig.type.toUpperCase() + ' BLOCKED — CT-VETO: counter-trend continuation vs ' + sig._regime.dir.toUpperCase() + ' regime (s' + sig._regime.strength + ', ' + sig._regime.netChgPct + '% ' + (sig._regime.window || '') + ') — gate-report promotion 2026-08-21, 3 batches +16.7..+61pp.';
           log(sym, _ctMsg); trackBlockedOutcome(sym, _ctMsg, true);
           Object.assign(s, _emitSnapshot);
@@ -15021,7 +15033,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.90-20260825-chop-mom-dormant', // bump on each deploy — lets /state verify what's live
+    build: '5.91-20260826-ctveto-trend-exempt', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
