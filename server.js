@@ -1819,6 +1819,7 @@ function cohortFor(reason) {
   if (/macro not (CALL|PUT)-aligned/.test(reason)) return 'MACRO-NOT-ALIGNED';
   if (/INV-HOLD/.test(reason)) return 'INV-HOLD';
   if (/OTE-HOLD/.test(reason)) return 'OTE-HOLD'; // entry-auction invalidation saves (2026-08-26); fills are graded on the fired rows' oteHold field
+  if (/MOM-FLOOR/.test(reason)) return 'MOM-FLOOR'; // continuation momentum minimums restored (2026-08-26, Jean)
   if (/REJECT-FLOW/.test(reason)) return 'REJECT-FLOW';
   if (/CT-VETO/.test(reason)) return 'CT-VETO';
   if (/FADE-ROC/.test(reason)) return 'FADE-ROC';
@@ -7615,6 +7616,33 @@ function processPrice(sym, price, hi, lo) {
         { const _frMk = '🎯 FADE-ROC marker — ' + tag + ' ' + sig.type.toUpperCase() + ' firing at ROC ' + roc3.toFixed(3) + '% → bucket ' + (_frAl2 ? 'ROC-CONFIRMED' : 'FLAT-EARLY') + ' (dormant, thr ' + _frThr + '%).'; log(sym, _frMk); trackBlockedOutcome(sym, _frMk, true); }
       }
     } catch (eFr) { /* gate must never crash enrichment */ }
+    // ===== MOM-FLOOR — MINIMUM MOMENTUM FOR CONTINUATION ENTRIES (LIVE, 2026-08-26) =====
+    // Jean: "when we started the bot we were blocking signals that had too little MACD
+    // or ROC — I think we should go back to it." Restored as a continuation-only floor.
+    // Evidence: with the regime flipped to NEUTRAL chop (5-day +0.44%), every SL this
+    // week shared one fingerprint — continuation fire with dead momentum (8/26: TREND
+    // put MACD -0.063, SWEEP call 0.001, TREND put -0.009; all adverseFrac >=1, 0 TP1).
+    // Rule: RIDE/TREND/FAST/SUST/SQZ/6-6 on XAU need MACD >=0.10 AND ROC3 >=0.05%
+    // aligned with the direction (mirrored for puts). Fades/reversals exempt — they own
+    // FADE-ROC and fire against momentum by design. Jean's MACD-DEFER and CHOP-MOM
+    // (MACD>0.3 chop overpass) rules are untouched — this is a separate minimum floor.
+    // Blocked entries stamp the MOM-FLOOR cohort (force). REVERT RULE: blocked
+    // would-wins >=60% over >=15 resolved, or last week's trend-day winners start
+    // getting refused (>=3 blocked winners on an s2 regime day) -> revert.
+    try {
+      if (sym === 'XAU' && /RIDE|TREND|FAST|SUST|SQZ|6\/6/.test(tag) &&
+          !/LHF|LLF|VREV|EXT-FLIP|OBREJ|OBMIT|INVERSAL|SWEEP|CHoCH|ATH|ATL|DIV/.test(tag)) {
+        const _mfMacd = parseFloat(sig.macd);
+        const _mfOkM = isFinite(_mfMacd) && (sig.type === 'call' ? _mfMacd >= 0.10 : _mfMacd <= -0.10);
+        const _mfOkR = sig.type === 'call' ? roc3 >= 0.05 : roc3 <= -0.05;
+        if (!(_mfOkM && _mfOkR)) {
+          const _mfMsg = '🪫 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — MOM-FLOOR: continuation needs MACD ' + (sig.type === 'call' ? '≥+0.10' : '≤-0.10') + ' AND ROC3 ' + (sig.type === 'call' ? '≥+0.05%' : '≤-0.05%') + ' aligned; got MACD ' + (isFinite(_mfMacd) ? _mfMacd.toFixed(3) : '?') + ' / ROC ' + roc3.toFixed(3) + '% — dead-momentum continuation (Jean 2026-08-26, original momentum minimums restored).';
+          log(sym, _mfMsg); trackBlockedOutcome(sym, _mfMsg, true);
+          Object.assign(s, _emitSnapshot);
+          return false;
+        }
+      }
+    } catch (eMf) { /* floor must never crash enrichment */ }
     return true;
   }
 
@@ -15158,7 +15186,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.94-20260826-sweep-faderoc', // bump on each deploy — lets /state verify what's live
+    build: '5.95-20260826-mom-floor', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
