@@ -1818,6 +1818,7 @@ function cohortFor(reason) {
   if (/DEFERRED/.test(reason)) return 'MACD-DEFER';
   if (/macro not (CALL|PUT)-aligned/.test(reason)) return 'MACRO-NOT-ALIGNED';
   if (/INV-HOLD/.test(reason)) return 'INV-HOLD';
+  if (/OTE-HOLD/.test(reason)) return 'OTE-HOLD'; // entry-auction invalidation saves (2026-08-26); fills are graded on the fired rows' oteHold field
   if (/REJECT-FLOW/.test(reason)) return 'REJECT-FLOW';
   if (/CT-VETO/.test(reason)) return 'CT-VETO';
   if (/FADE-ROC/.test(reason)) return 'FADE-ROC';
@@ -5456,7 +5457,17 @@ function processPrice(sym, price, hi, lo) {
           // through this exemption (8/5 FAST, 8/7 09:42, 8/17 03:40 ≈ −$1,400 real combined)
           // happened with intraday ATR COMPRESSED below session open — Asian drift reads as
           // 'advancing highs'. A real breakout EXPANDS ATR; drift doesn't get the exemption.
-          const _seLiveBreak = _seBrkTs > 0 && (Date.now() - _seBrkTs) < 90000 && !(s._atrSessOpen > 0 && atrVal < 0.9 * s._atrSessOpen);
+          // TICK-RATE FLOOR ON THE WAIVER (2026-08-26, Jean "ok ship it"): LIVE-BREAK
+          // cohort lifetime 1W/9L/6S — fresh breaks on thin tape snap back. 8/26 02:27
+          // TREND PUT fired through this waiver at tickRatio 0.39 → bottom-tick SL
+          // (−$252.50). The ATR-compression check above passed (drift-vs-breakout test);
+          // tick rate is the direct participation measure. Require tape ≥70% of session
+          // average for the breakout exemption. Refused breaks stamp the LIVE-BREAK
+          // cohort (force) so measurement continues; they still fall through to the
+          // normal chase block + EXT-FLIP / SE-RETEST arms below.
+          const _seTickThin = s._tickRateSess > 0 && s._tickRate > 0 && (s._tickRate / s._tickRateSess) < 0.7;
+          const _seLiveBreak = _seBrkTs > 0 && (Date.now() - _seBrkTs) < 90000 && !(s._atrSessOpen > 0 && atrVal < 0.9 * s._atrSessOpen) && !_seTickThin;
+          const _seLiveBreakThinRefused = _seBrkTs > 0 && (Date.now() - _seBrkTs) < 90000 && !(s._atrSessOpen > 0 && atrVal < 0.9 * s._atrSessOpen) && _seTickThin;
           // ===== TREND-CONT CHASE EASE REVOKED (2026-08-19, Jean) =====
           // Lived 2 days. 8/18 19:36 TREND PUT @4330.22: EXT-GUARD refused every
           // mid-impulse entry all evening, then the latch ease waived THIS gate at a
@@ -5548,7 +5559,15 @@ function processPrice(sym, price, hi, lo) {
                 log(sym, '⏫ SE-RETEST ' + sig.type.toUpperCase() + ' armed @ $' + _srEp.toFixed(2) + ' (' + _srSrc + ') — dormant, 15min window.');
               }
             } catch (eSR) {}
-            log(sym, '🛑 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — session-extreme chase: $' + price.toFixed(2) + ' is ' + _sePct.toFixed(3) + '% from session ' + (_seCall ? 'high $' + s.sessionHigh.toFixed(2) : 'low $' + s.sessionLow.toFixed(2)) + ' (range $' + _seRange.toFixed(2) + ', extreme stale ' + Math.round((Date.now() - _seBrkTs) / 60000) + 'min). ' + (_seCall ? 'Buying the top' : 'Selling the bottom') + ' without breaking it is not allowed — all-paths fix 2026-07-31.');
+            if (_seLiveBreakThinRefused) {
+              // Live break refused on thin tape (2026-08-26): would have fired through
+              // the waiver before today. Stamp to the LIVE-BREAK cohort with force so
+              // the nightly report grades what the tick-rate floor is saving/costing.
+              const _seThinMsg = '📶 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — LIVE-BREAK waiver refused: fresh ' + (_seCall ? 'high' : 'low') + ' break @ $' + price.toFixed(2) + ' but tape thin (' + Math.round(s._tickRate || 0) + ' ticks/min = ×' + (s._tickRate / s._tickRateSess).toFixed(2) + ' of session avg, floor ×0.70) — thin-tape breaks snap back (cohort 1W/9L/6S; 8/26 02:27 evidence).';
+              log(sym, _seThinMsg); trackBlockedOutcome(sym, _seThinMsg, true);
+            } else {
+              log(sym, '🛑 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — session-extreme chase: $' + price.toFixed(2) + ' is ' + _sePct.toFixed(3) + '% from session ' + (_seCall ? 'high $' + s.sessionHigh.toFixed(2) : 'low $' + s.sessionLow.toFixed(2)) + ' (range $' + _seRange.toFixed(2) + ', extreme stale ' + Math.round((Date.now() - _seBrkTs) / 60000) + 'min). ' + (_seCall ? 'Buying the top' : 'Selling the bottom') + ' without breaking it is not allowed — all-paths fix 2026-07-31.');
+            }
             return false;
           }
         }
@@ -9280,6 +9299,90 @@ function processPrice(sym, price, hi, lo) {
             log(sym, '🔧 TP3==TP2 equality guard — tp3 nudged to $' + _eqT.tp3Price.toFixed(2) + ' (inside tp2 $' + _eqT.tp2Price.toFixed(2) + ') so the final portion always closes before tp2 (2026-08-25, MT5 rump-position bug).');
           }
         } catch (eEQ) {}
+        // ===== OTE-HOLD — ENTRY AUCTION FOR ALL XAU SIGNALS (2026-08-26, Jean) =====
+        // "Bot detects a signal → it looks where the OTE is → takes 3 to 5 minutes to
+        // get as close as possible to it → fires." Never skips a signal (the July
+        // limit-offset backtest died on missed runners): fires on OTE touch, on ≥0.5×ATR
+        // runaway (retrace isn't coming — don't chase late), or at 4-min expiry at
+        // market. Price crossing the SL level while waiting = invalidation, zero-loss
+        // save. Fresh XAU trades are born _oteVetted:false (hidden from EA feeds) and
+        // vetted here on the next tick, custom SL/TP geometry intact. Exempt: INVERSAL
+        // band fires, INV-HOLD fills, V-REC/elite scalps, same-dir continuations.
+        try {
+          if (sym === 'XAU' && s.trade && s.trade.active && s.trade._oteVetted === false && !s._invHold && !s._oteHold) {
+            const _ohT = s.trade;
+            const _ohDir = _ohT.type;
+            const _ohOte = computeOTE(s, sym, _ohDir);
+            if (!_ohOte || (_ohDir === 'call' ? price <= _ohOte.limit : price >= _ohOte.limit)) {
+              _ohT._oteVetted = true; // no valid impulse, or already at/beyond OTE → release to market now
+              delete _ohT.oteLimit; delete _ohT.oteExpiry; delete _ohT.oteImpulseHi; delete _ohT.oteImpulseLo; // XAU: server-side hold supersedes the legacy EA-side limit — never send both
+              if (_ohOte) log(sym, '🎯 OTE-HOLD skipped — $' + price.toFixed(2) + ' already at/beyond OTE $' + _ohOte.limit.toFixed(2) + '; released at market.');
+            } else {
+              const _ohSig = s.signals.length ? s.signals[s.signals.length - 1] : null;
+              if (_ohSig && _ohSig.type === _ohDir) _ohSig.pendingEntry = true;
+              if (s.lastHistEntry && s.lastHistEntry.type === _ohDir) s.lastHistEntry.pendingEntry = true;
+              s._oteHold = { dir: _ohDir, trade: _ohT,
+                             sigRef: (_ohSig && _ohSig.type === _ohDir) ? _ohSig : null,
+                             histRef: (s.lastHistEntry && s.lastHistEntry.type === _ohDir) ? s.lastHistEntry : null,
+                             sigPrice: _ohT.ep, ote: _ohOte.limit,
+                             slPrice: (typeof _ohT.slPrice === 'number' && _ohT.slPrice > 0) ? _ohT.slPrice : null,
+                             runaway: 0.5 * (atrVal > 0 ? atrVal : (_ohT.atr || 0)),
+                             armTs: _zNow, expiry: _zNow + 240000 };
+              s.trade = null;
+              log(sym, '⏳ OTE-HOLD ' + _ohDir.toUpperCase() + ' armed @ $' + price.toFixed(2) + ' — auctioning toward OTE $' + _ohOte.limit.toFixed(2) + ' (70.5% of impulse $' + _ohOte.impulseLo.toFixed(2) + '-$' + _ohOte.impulseHi.toFixed(2) + ') ≤4min; early fire on touch or ≥0.5×ATR runaway; invalidates at SL' + (s._oteHold.slPrice ? ' $' + s._oteHold.slPrice.toFixed(2) : '') + ' (Jean 2026-08-26).');
+              sendPush('⏳ XAU OTE-HOLD ' + _ohDir.toUpperCase(), 'waiting for $' + _ohOte.limit.toFixed(2) + ' (now $' + price.toFixed(2) + ') · ≤4min', 'signal');
+            }
+          }
+        } catch (eOV) { if (s.trade && s.trade._oteVetted === false) s.trade._oteVetted = true; /* never strand a trade unvetted */ }
+        // ===== OTE-HOLD RESOLVER (2026-08-26, Jean) =====
+        try {
+          const _oh = s._oteHold;
+          if (_oh && sym === 'XAU') {
+            const _ohC = _oh.dir === 'call';
+            const _ohSlX = _oh.slPrice !== null && (_ohC ? price <= _oh.slPrice : price >= _oh.slPrice);
+            const _ohTouch = _ohC ? price <= _oh.ote : price >= _oh.ote;
+            const _ohRun = _oh.runaway > 0 && (_ohC ? (price - _oh.sigPrice) >= _oh.runaway : (_oh.sigPrice - price) >= _oh.runaway);
+            const _ohExp = _zNow >= _oh.expiry;
+            if (_ohSlX) {
+              s._oteHold = null;
+              const _ohM = '⏳ OTE-HOLD ' + _oh.dir.toUpperCase() + ' INVALIDATED — price crossed the SL level $' + _oh.slPrice.toFixed(2) + ' while auctioning; the market entry @ $' + _oh.sigPrice.toFixed(2) + ' would have been a full loss. Zero-loss save (Jean 2026-08-26).';
+              log(sym, _ohM); trackBlockedOutcome(sym, _ohM, true);
+              if (_oh.sigRef) { _oh.sigRef.oteHold = 'invalidated-save'; }
+              if (_oh.histRef) { _oh.histRef.oteHold = 'invalidated-save'; _oh.histRef.pendingEntry = false; }
+            } else if ((_ohTouch || _ohRun || _ohExp) && !(s.trade && s.trade.active)) {
+              s._oteHold = null;
+              const _t = _oh.trade;
+              const _ohImp = _ohC ? _oh.sigPrice - price : price - _oh.sigPrice; // + = better entry
+              if (_ohImp >= 0) {
+                // better/equal entry: keep absolute SL (risk shrinks) + TP2/TP3 (structure
+                // targets); TP1 keeps its original DISTANCE from the new entry ($5 cap /
+                // OB-anchored dist preserved) so the profit-secure leg behaves as designed.
+                const _t1d = Math.abs(_t.ep - _t.tp1Price);
+                _t.ep = price;
+                _t.tp1Price = +(_ohC ? price + _t1d : price - _t1d).toFixed(2);
+              } else {
+                // worse entry (runaway/expiry): shift every level by the slip — all
+                // original distances preserved, risk unchanged.
+                const _ohD = price - _t.ep;
+                _t.ep = price;
+                if (typeof _t.slPrice === 'number') _t.slPrice = +(_t.slPrice + _ohD).toFixed(2);
+                if (typeof _t.tp1Price === 'number') _t.tp1Price = +(_t.tp1Price + _ohD).toFixed(2);
+                if (typeof _t.tp2Price === 'number') _t.tp2Price = +(_t.tp2Price + _ohD).toFixed(2);
+                if (typeof _t.tp3Price === 'number') _t.tp3Price = +(_t.tp3Price + _ohD).toFixed(2);
+              }
+              _t.bestPrice = price; _t.worstPrice = price; _t.ts = _zNow;
+              delete _t.oteLimit; delete _t.oteExpiry; delete _t.oteImpulseHi; delete _t.oteImpulseLo; // server-side hold supersedes the legacy EA-side OTE limit on XAU
+              _t._oteVetted = true;
+              s.trade = _t;
+              const _ohWhy = _ohTouch ? 'OTE touch' : _ohRun ? 'runaway ≥0.5×ATR' : 'window expiry';
+              const _ohInfo = { fill: +price.toFixed(2), sigPrice: +_oh.sigPrice.toFixed(2), improve: +_ohImp.toFixed(2), waitedSec: Math.round((_zNow - _oh.armTs) / 1000), via: _ohWhy };
+              if (_oh.sigRef) { _oh.sigRef.pendingEntry = false; _oh.sigRef.entryActual = _ohInfo.fill; _oh.sigRef.oteHold = _ohInfo; if (typeof _t.slPrice === 'number') { _oh.sigRef.sl = _t.slPrice.toFixed(2); _oh.sigRef.tp1 = _t.tp1Price.toFixed(2); _oh.sigRef.tp2 = _t.tp2Price.toFixed(2); _oh.sigRef.tp3 = _t.tp3Price.toFixed(2); } }
+              if (_oh.histRef) { _oh.histRef.pendingEntry = false; _oh.histRef.oteHold = _ohInfo; if (typeof _t.slPrice === 'number') { _oh.histRef.sl = _t.slPrice; _oh.histRef.tp1 = _t.tp1Price; _oh.histRef.tp2 = _t.tp2Price; _oh.histRef.tp3 = _t.tp3Price; } }
+              log(sym, '▶️ OTE-HOLD ' + _oh.dir.toUpperCase() + ' FILLED @ $' + price.toFixed(2) + ' via ' + _ohWhy + ' — signal $' + _oh.sigPrice.toFixed(2) + ', entry ' + (_ohImp >= 0 ? 'improved $' + _ohImp.toFixed(2) : 'slipped $' + (-_ohImp).toFixed(2)) + ', waited ' + _ohInfo.waitedSec + 's (Jean 2026-08-26).');
+              sendPush('▶️ XAU OTE ' + _oh.dir.toUpperCase() + ' filled', '$' + price.toFixed(2) + ' (' + (_ohImp >= 0 ? '+' : '-') + '$' + Math.abs(_ohImp).toFixed(2) + ' vs signal) · ' + _ohWhy, 'signal');
+            }
+          }
+        } catch (eOR) { /* ote-hold must never crash the tick */ }
         // ===== INV-HOLD RESOLVER (2026-08-24, Jean) =====
         try {
           const _ih = s._invHold;
@@ -9297,6 +9400,7 @@ function processPrice(sym, price, hi, lo) {
               const _ihT1 = Math.min(_ihDist * 1.5, _ihCap);
               const _ihT2d = Math.max(_ihDist * 2.5, _ihT1 * 1.6);
               s.trade = buildCfdTrade(_ih.dir, price, atrVal, sym);
+              s.trade._oteVetted = true; // already auctioned via INV-HOLD — no OTE re-hold
               s.trade.slPrice = _ih.slPrice;
               s.trade.tp1Price = +(_ih.dir === 'call' ? price + _ihT1 : price - _ihT1).toFixed(2);
               s.trade.tp2Price = +(_ih.dir === 'call' ? price + _ihT2d : price - _ihT2d).toFixed(2);
@@ -9311,6 +9415,7 @@ function processPrice(sym, price, hi, lo) {
                 const _ihT1 = Math.min(_ihDist * 1.5, _ihCap);
                 const _ihT2d = Math.max(_ihDist * 2.5, _ihT1 * 1.6);
                 s.trade = buildCfdTrade(_ih.dir, price, atrVal, sym);
+                s.trade._oteVetted = true; // already auctioned via INV-HOLD — no OTE re-hold
                 s.trade.slPrice = _ih.slPrice;
                 s.trade.tp1Price = +(_ih.dir === 'call' ? price + _ihT1 : price - _ihT1).toFixed(2);
                 s.trade.tp2Price = +(_ih.dir === 'call' ? price + _ihT2d : price - _ihT2d).toFixed(2);
@@ -10324,6 +10429,7 @@ function processPrice(sym, price, hi, lo) {
           const tp2P = price - slDist * 2.5;
           const tp3P = CAPITAL_MODE ? tp2P : price - slDist * 4.0; // capital mode: TP3=TP2 (2026-08-18 — this site missed the 8/14 patch)
           s.trade = buildCfdTrade('put', price, atrVal, sym);
+          s.trade._oteVetted = true; // INVERSAL band rule (Jean): $8-12.50 stop = authorized to fire NOW — no OTE hold
           s.trade.slPrice = +ibSl.toFixed(2);
           s.trade.tp1Price = +tp1P.toFixed(2);
           s.trade.tp2Price = +tp2P.toFixed(2);
@@ -10376,6 +10482,7 @@ function processPrice(sym, price, hi, lo) {
           const tp2P = price + slDist * 2.5;
           const tp3P = CAPITAL_MODE ? tp2P : price + slDist * 4.0; // capital mode: TP3=TP2 (2026-08-18 — this site missed the 8/14 patch)
           s.trade = buildCfdTrade('call', price, atrVal, sym);
+          s.trade._oteVetted = true; // INVERSAL band rule (Jean): $8-12.50 stop = authorized to fire NOW — no OTE hold
           s.trade.slPrice = +ibSl.toFixed(2);
           s.trade.tp1Price = +tp1P.toFixed(2);
           s.trade.tp2Price = +tp2P.toFixed(2);
@@ -13405,7 +13512,8 @@ function buildCfdTrade(type, price, atr, sym) {
       bestPrice: oldTrade.bestPrice || price, worstPrice: oldTrade.worstPrice || price,  // keep best-price tracking
       trailSl: oldTrade.trailSl || 0,
       isCfd: true,
-      scalp: _scalp || oldTrade.scalp || false
+      scalp: _scalp || oldTrade.scalp || false,
+      _oteVetted: true // same-dir continuation: EA is already positioned — never OTE-hold
     };
   }
 
@@ -13417,7 +13525,16 @@ function buildCfdTrade(type, price, atr, sym) {
     slPrice: sl, tp1Price: tp1, tp2Price: tp2, tp3Price: tp3,
     atr: atr, bestPrice: price, worstPrice: price, trailSl: 0,
     isCfd: true,
-    scalp: _scalp
+    scalp: _scalp,
+    // OTE-HOLD vetting flag (2026-08-26, Jean's design): fresh XAU trades are born
+    // UNVETTED — hidden from the EA feeds for one tick while the per-tick OTE-HOLD
+    // vet decides whether to hold the entry for a retracement auction (3-5min toward
+    // the 70.5% OTE of the last impulse) or release it to fire at market. Non-XAU
+    // trades and same-dir continuations are born vetted (no hold). Sites that manage
+    // their own auction (INVERSAL wide-SL, INV-HOLD resolver fills) set this true
+    // right after assignment. V-REC knife-catch scalps and elite TP1-only scalps are
+    // timing-critical — born vetted, never held.
+    _oteVetted: sym !== 'XAU' || _vRecActive || _scalp
   };
 }
 
@@ -14873,7 +14990,9 @@ app.get('/ea/:sym', (req, res) => {
   const t = s.trade;
   const since = parseInt(req.query.since, 10) || 0;
   const cr = (s.closeRequest && s.closeRequest.active) ? s.closeRequest.id : null;
-  if (!t || !t.active || !t.ts || t.ts <= since) {
+  if (!t || !t.active || !t.ts || t.ts <= since || t._oteVetted === false) {
+    // _oteVetted false = fresh XAU trade awaiting the OTE-HOLD vet (one tick) — do not
+    // serve it to the EA yet (2026-08-26); it returns here vetted or after the auction fill.
     return res.json({ n: 0, ts: Date.now(), close: cr });
   }
   res.json({
@@ -15033,7 +15152,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.91-20260826-ctveto-trend-exempt', // bump on each deploy — lets /state verify what's live
+    build: '5.93-20260826-ote-hold-live', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
@@ -15053,13 +15172,14 @@ app.get('/state/:sym', (req, res) => {
     obZone: s.obZone || null,
     obMitigated: !!s.obMitigated,
     obDeparted: !!s.obDeparted,
-    trade: s.trade && s.trade.active ? {
+    trade: s.trade && s.trade.active && s.trade._oteVetted !== false ? {
       type: s.trade.type, ep: s.trade.ep,
       t1: s.trade.t1, t2: s.trade.t2,
       slPrice: s.trade.slPrice, tp1Price: s.trade.tp1Price,
       tp2Price: s.trade.tp2Price, tp3Price: s.trade.tp3Price,
       ageMin: s.trade.ts ? Math.round((Date.now() - s.trade.ts) / 60000) : null
     } : null,
+    oteHold: s._oteHold ? { dir: s._oteHold.dir, ote: s._oteHold.ote, sigPrice: s._oteHold.sigPrice, sl: s._oteHold.slPrice, secLeft: Math.max(0, Math.round((s._oteHold.expiry - Date.now()) / 1000)) } : null,
     // Manual-close command for the poller (Signal Trader). Auto-expires after 60s so a
     // missed EA ack can't trigger a stale close on a much-later poll. EA: on closeRequest
     // .active, flatten this symbol at market, then POST /trade/close/ack {sym,id}.
@@ -15310,7 +15430,7 @@ app.get('/prices', (req, res) => {
         }
         return null;
       })(),
-      trade: s.trade.active ? {
+      trade: s.trade.active && s.trade._oteVetted !== false ? {
         active: true, type: s.trade.type, ep: s.trade.ep,
         t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl, rev: s.trade.rev,
         isTrend: s.trade.isTrend || false,
@@ -15470,7 +15590,7 @@ app.get('/status', (req, res) => {
       lastTickAgeSec: s.lastTradeTs ? Math.round((Date.now() - s.lastTradeTs) / 1000) : null,
       signals: s.dailySignalCount,
       chopActive: s.chopActive,
-      trade: s.trade.active ? { type: s.trade.type, ep: s.trade.ep, t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl } : null,
+      trade: s.trade.active && s.trade._oteVetted !== false ? { type: s.trade.type, ep: s.trade.ep, t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl } : null,
       recentSignals: s.signals.filter(sg => !(sg && ((sg.conv && (sg.conv.enrichBlocked === true || sg.conv.label === 'BLOCKED')) || sg.pendingEntry === true))).slice(-5),
       // Blocked-attempt visibility (added 2026-05-22) — surfaces enrichSig gates that
       // suppressed signal emission. Useful for diagnosing over-gating, especially BTC.
