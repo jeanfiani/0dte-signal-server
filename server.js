@@ -1828,6 +1828,7 @@ function cohortFor(reason) {
   if (/ZONE-PERM/.test(reason)) return 'ZONE-PERM';
   if (/CHOP-MOM/.test(reason)) return 'CHOP-MOM';
   if (/CHOP-BREAK/.test(reason)) return 'CHOP-BREAK';
+  if (/MACD-HI/.test(reason) && /RETEST/.test(reason)) return 'RETEST-HM'; // retest arms with |MACD|≥0.3 aligned at arm time (2026-08-26, Jean: does high-MACD retest beat 36W/60L?)
   if (/SE-RETEST/.test(reason)) return 'SE-RETEST'; // chase-gate bounce-entry arm, Jean's design (2026-08-19)
   if (/EG-RETEST-Z/.test(reason)) return 'EG-RETEST-Z'; // zone-anchored variant, paired test (2026-08-19)
   if (/EG-RETEST/.test(reason)) return 'EG-RETEST';
@@ -1850,6 +1851,8 @@ function cohortFor(reason) {
   if (/INV-HOLD/.test(reason)) return 'INV-HOLD';
   if (/OTE-HOLD/.test(reason)) return 'OTE-HOLD'; // entry-auction invalidation saves (2026-08-26); fills are graded on the fired rows' oteHold field
   if (/MOM-FLOOR/.test(reason)) return 'MOM-FLOOR'; // continuation momentum minimums restored (2026-08-26, Jean)
+  if (/MOM-OVERRIDE/.test(reason)) return 'MOM-OVERRIDE'; // high-MACD blocked-signal audition across ALL gates (2026-08-26, Jean)
+  if (/RANGE-FADE/.test(reason)) return 'RANGE-FADE'; // range-edge mean-reversion lane, dormant (2026-08-26, Jean: sell 4634 / buy 4599)
   if (/REJECT-FLOW/.test(reason)) return 'REJECT-FLOW';
   if (/CT-VETO/.test(reason)) return 'CT-VETO';
   if (/FADE-ROC/.test(reason)) return 'FADE-ROC';
@@ -1974,6 +1977,12 @@ function _flushPersist() {
     fs.writeFileSync(ZONE_MAP_FILE, JSON.stringify(out));
     fs.writeFileSync(COHORT_TALLY_FILE, JSON.stringify(cohortTally));
     fs.writeFileSync(PNL_LEDGER_FILE, JSON.stringify(pnlLedger));
+    // Full-runtime flush on shutdown (2026-08-26): active trade, session H/L, auctions,
+    // pending snaps, cooldowns — Jean: "on restart every important data stays as it is".
+    try { if (typeof saveRuntimeState === 'function') saveRuntimeState(); } catch (e2) {}
+    try { if (typeof saveRollingLevels === 'function') saveRollingLevels(); } catch (e2) {}
+    try { if (typeof saveSignalHistory === 'function') saveSignalHistory(); } catch (e2) {}
+    try { if (typeof saveBlockedOutcomes === 'function') saveBlockedOutcomes(); } catch (e2) {}
   } catch (e) {}
 }
 process.on('SIGTERM', () => { _flushPersist(); process.exit(0); });
@@ -2503,6 +2512,155 @@ function saveBlockedOutcomes() {
   }
 }
 
+// ===== RUNTIME STATE CHECKPOINT (2026-08-26, Jean: "on restart every important data stays as it is") =====
+// The files above persist analytics; this one persists the LIVE runtime that still
+// died with every redeploy:
+//   - the ACTIVE TRADE (worst gap: a restart mid-trade orphaned the MT5 position —
+//     no TP/SL tracking, no BE-trail, no P&L booking),
+//   - the lastHistEntry link (TP/SL stamps after a restart never reached the history
+//     row — past source of "hit TP3 but showed as loss" confusion),
+//   - pending 5/15/30/60-min price snapshots (the null-snap holes in /signals),
+//   - a pending closeRequest (an EA flatten command must survive a restart),
+//   - signal-level cooldowns not covered by the detector-map restore (lastNTs,
+//     opposite-direction flip guard, reversal ts, call/put counters, ZONE-OB lane
+//     cooldown, SE-RETEST throttles, live-break waiver ts),
+//   - chop state + the session-open ATR reference (_atrSessOpen — resetting it to
+//     current ATR mid-day silently moved the chop-escape bars),
+//   - tick-rate EMA (liquidity meter stays warm), EXT-FLIP arm, INVERSAL swept-levels,
+//   - armed INV-HOLD / OTE-HOLD entry auctions (re-linked to history rows by ts).
+// Saved every 20s + on SIGTERM (see _flushPersist). Restored same-ET-day only — the
+// daily reset owns a new day. A restored trade keeps its original ts, so the EA's
+// ?since= dedupe sees the same trade id and will not double-enter.
+const RUNTIME_FILE = path.join(DATA_DIR, 'runtime_state.json');
+function saveRuntimeState() {
+  try {
+    const out = { date: todayDateET(), savedTs: Date.now(), symbols: {} };
+    SYMBOLS.forEach(sym => {
+      const s = S[sym]; if (!s) return;
+      out.symbols[sym] = {
+        trade: (s.trade && s.trade.active) ? s.trade : null,
+        lastHistTs: (s.lastHistEntry && s.lastHistEntry.ts) || null,
+        closeRequest: (s.closeRequest && s.closeRequest.active) ? s.closeRequest : null,
+        cool: {
+          lastNTs: s.lastNTs || 0, lastSignalTs: s.lastSignalTs || 0,
+          lastSignalDir: s.lastSignalDir || null, lastAT: s.lastAT || '',
+          lastReversalTs: s.lastReversalTs || 0, nC: s.nC || 0, nP: s.nP || 0,
+          lastHiRevTs: s.lastHiRevTs || 0, lastLoRevTs: s.lastLoRevTs || 0,
+          zobLastFireTs: s._zobLastFireTs || 0, seRetestTs: s._seRetestTs || {},
+          lbWaiverTs: s._lbWaiverTs || 0
+        },
+        chop: { active: !!s.chopActive, chopCount: s.chopCount || 0, trendCount: s.trendCount || 0, atrSessOpen: s._atrSessOpen || 0 },
+        tickRateSess: (typeof s._tickRateSess === 'number') ? s._tickRateSess : null,
+        extFlip: s.extFlip || null,
+        sweptLevels: s.sweptLevels || null,
+        invHold: s._invHold ? {
+          tag: s._invHold.tag, dir: s._invHold.dir, slPrice: s._invHold.slPrice,
+          targetDist: s._invHold.targetDist, initialDist: s._invHold.initialDist,
+          sigPrice: s._invHold.sigPrice, expiry: s._invHold.expiry,
+          sigTs: (s._invHold.sigRef && s._invHold.sigRef.ts) || null
+        } : null,
+        oteHold: s._oteHold ? {
+          dir: s._oteHold.dir, ote: s._oteHold.ote, slPrice: s._oteHold.slPrice,
+          runaway: s._oteHold.runaway, armTs: s._oteHold.armTs, expiry: s._oteHold.expiry,
+          sigPrice: s._oteHold.sigPrice, trade: s._oteHold.trade,
+          histTs: (s._oteHold.histRef && s._oteHold.histRef.ts) || null
+        } : null,
+        pendingSnaps: (s.pendingSnapshots || [])
+          .map(ps => ({ fireTs: ps.fireTs, entryTs: (ps.entry && ps.entry.ts) || null }))
+          .filter(p => p.entryTs)
+      };
+    });
+    const tmp = RUNTIME_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(out));
+    fs.renameSync(tmp, RUNTIME_FILE);
+  } catch (e) { /* checkpoint must never crash the server */ }
+}
+setInterval(saveRuntimeState, 20000).unref();
+
+function loadRuntimeState() {
+  let raw = null;
+  try { raw = JSON.parse(fs.readFileSync(RUNTIME_FILE, 'utf8')); } catch (e) { console.log('[' + ts() + '] Runtime state: no file — fresh runtime.'); return; }
+  if (!raw || raw.date !== todayDateET()) { console.log('[' + ts() + '] Runtime state: stale (not today) — fresh runtime.'); return; }
+  const now = Date.now();
+  SYMBOLS.forEach(sym => {
+    const s = S[sym]; const d = raw.symbols && raw.symbols[sym];
+    if (!s || !d) return;
+    const findHist = (t) => t ? signalHistory.find(h => h.ts === t && h.symbol === sym) : null;
+    try {
+      // 1) Active trade — the critical restore. Original ts kept (EA identity).
+      if (d.trade && d.trade.active && d.trade.ts && (now - d.trade.ts) < 12 * 3600000) {
+        d.trade._oteVetted = true; // never re-vet a restored trade
+        s.trade = d.trade;
+        console.log('[' + ts() + '] ' + sym + ' — ACTIVE TRADE restored: ' + String(d.trade.type).toUpperCase() + ' @ $' + (+d.trade.ep).toFixed(2) + ' (age ' + Math.round((now - d.trade.ts) / 60000) + 'min, SL $' + (+d.trade.slPrice || 0).toFixed(2) + ') — management resumes.');
+      }
+      const _lh = findHist(d.lastHistTs);
+      if (_lh) s.lastHistEntry = _lh;
+      // 2) Pending EA close command
+      if (d.closeRequest && d.closeRequest.active) {
+        s.closeRequest = d.closeRequest;
+        console.log('[' + ts() + '] ' + sym + ' — pending closeRequest restored (id ' + d.closeRequest.id + ', source ' + d.closeRequest.source + ').');
+      }
+      // 3) Signal-level cooldowns (Math.max so a fresher in-memory value always wins)
+      if (d.cool) {
+        s.lastNTs = Math.max(s.lastNTs || 0, d.cool.lastNTs || 0);
+        s.lastSignalTs = Math.max(s.lastSignalTs || 0, d.cool.lastSignalTs || 0);
+        if (d.cool.lastSignalDir) s.lastSignalDir = d.cool.lastSignalDir;
+        if (d.cool.lastAT) s.lastAT = d.cool.lastAT;
+        s.lastReversalTs = Math.max(s.lastReversalTs || 0, d.cool.lastReversalTs || 0);
+        if (d.cool.nC) s.nC = Math.max(s.nC || 0, d.cool.nC);
+        if (d.cool.nP) s.nP = Math.max(s.nP || 0, d.cool.nP);
+        s.lastHiRevTs = Math.max(s.lastHiRevTs || 0, d.cool.lastHiRevTs || 0);
+        s.lastLoRevTs = Math.max(s.lastLoRevTs || 0, d.cool.lastLoRevTs || 0);
+        s._zobLastFireTs = Math.max(s._zobLastFireTs || 0, d.cool.zobLastFireTs || 0);
+        if (d.cool.seRetestTs && typeof d.cool.seRetestTs === 'object') s._seRetestTs = d.cool.seRetestTs;
+        s._lbWaiverTs = Math.max(s._lbWaiverTs || 0, d.cool.lbWaiverTs || 0);
+      }
+      // 4) Chop state + session-open ATR anchor
+      if (d.chop) {
+        s.chopActive = !!d.chop.active;
+        s.chopCount = d.chop.chopCount || 0; s.trendCount = d.chop.trendCount || 0;
+        if (d.chop.atrSessOpen > 0) s._atrSessOpen = d.chop.atrSessOpen;
+      }
+      // 5) Liquidity meter EMA, EXT-FLIP arm, INVERSAL swept levels
+      if (typeof d.tickRateSess === 'number') s._tickRateSess = d.tickRateSess;
+      if (d.extFlip) s.extFlip = d.extFlip;
+      if (d.sweptLevels && typeof d.sweptLevels === 'object') s.sweptLevels = d.sweptLevels;
+      // 6) Armed entry auctions — restore only if still inside their window
+      if (d.invHold && d.invHold.expiry > now && !(s.trade && s.trade.active)) {
+        s._invHold = { tag: d.invHold.tag, dir: d.invHold.dir, slPrice: d.invHold.slPrice,
+                       targetDist: d.invHold.targetDist, initialDist: d.invHold.initialDist,
+                       sigPrice: d.invHold.sigPrice, expiry: d.invHold.expiry,
+                       sigRef: findHist(d.invHold.sigTs) || null };
+        console.log('[' + ts() + '] ' + sym + ' — INV-HOLD auction restored (' + d.invHold.dir.toUpperCase() + ', ' + Math.round((d.invHold.expiry - now) / 1000) + 's left).');
+      }
+      if (d.oteHold && d.oteHold.expiry > now && !(s.trade && s.trade.active) && d.oteHold.trade) {
+        s._oteHold = { dir: d.oteHold.dir, ote: d.oteHold.ote, slPrice: d.oteHold.slPrice,
+                       runaway: d.oteHold.runaway, armTs: d.oteHold.armTs, expiry: d.oteHold.expiry,
+                       sigPrice: d.oteHold.sigPrice, trade: d.oteHold.trade,
+                       sigRef: null, histRef: findHist(d.oteHold.histTs) || null };
+        console.log('[' + ts() + '] ' + sym + ' — OTE-HOLD auction restored (' + d.oteHold.dir.toUpperCase() + ', target $' + (+d.oteHold.ote).toFixed(2) + ', ' + Math.round((d.oteHold.expiry - now) / 1000) + 's left).');
+      }
+      // 7) Pending price snapshots — re-link to history rows by ts, keep <65min-old
+      if (Array.isArray(d.pendingSnaps) && d.pendingSnaps.length > 0) {
+        s.pendingSnapshots = d.pendingSnaps
+          .map(p => ({ fireTs: p.fireTs, entry: findHist(p.entryTs) }))
+          .filter(x => x.entry && (now - x.fireTs) < 65 * 60000);
+        if (s.pendingSnapshots.length > 0) console.log('[' + ts() + '] ' + sym + ' — ' + s.pendingSnapshots.length + ' pending snapshot(s) re-linked.');
+      }
+      // 8) Stale pendingEntry cleanup: any history row still flagged pendingEntry with
+      // no matching live auction was orphaned by an earlier restart — release the flag
+      // so feeds/reports stop treating it as held.
+      const _hasHold = !!(s._invHold || s._oteHold);
+      signalHistory.forEach(h => {
+        if (h.symbol === sym && h.pendingEntry === true && (!_hasHold || (now - h.ts) > 10 * 60000)) {
+          h.pendingEntry = false;
+          if (!h.oteHold) h.oteHold = 'lost-restart';
+        }
+      });
+    } catch (e) { console.error('[' + ts() + '] Runtime restore error (' + sym + '): ' + e.message); }
+  });
+}
+
 // ===== PHASE 3.32 + 3.33 — LOAD ALL PERSISTENCE FILES ON STARTUP (added 2026-06-22, tasks #232/#233) =====
 // CRITICAL BUG FIX: All these load functions were defined but never invoked. Every
 // server restart began with empty state, then the autosaves (60s later) wrote that
@@ -2543,6 +2701,11 @@ try {
   loadBlockedOutcomes(); // Shadow-fire analytics (30-day window)
 } catch (e) {
   console.error('[STARTUP] loadBlockedOutcomes threw — starting fresh:', e.message);
+}
+try {
+  loadRuntimeState();    // 6. LIVE runtime: active trade, closeRequest, auctions, snaps, cooldowns, chop (2026-08-26 — must run AFTER loadSignalHistory so history-row re-links resolve)
+} catch (e) {
+  console.error('[STARTUP] loadRuntimeState threw — starting fresh:', e.message);
 }
 
 // Periodic backup save — every 60 seconds, catches snapshot updates and outcome changes
@@ -4436,7 +4599,36 @@ function processPrice(sym, price, hi, lo) {
   //     because fighting the macro trend needs strong confirmation
   // The thresholds are deliberately moderate for the first deployment; tune after a week
   // of conv-logged data shows what wins / loses.
+  // ===== MOM-OVERRIDE WRAPPER (DORMANT, 2026-08-26 — Jean's running observation) =====
+  // "again high MACD with chop 1 = winner": 8/25 10:26 CALL (MACD 0.453) and 8/26 09:43
+  // CALL (MACD 0.540) were blocked winners — but NOT by the chop gate, so CHOP-MOM
+  // (which auditions only AT the chop gate, 0 samples in 2 days) never saw them. The
+  // high-momentum signals die at OTHER gates (macro-align, ZONE-VETO, EXT-GUARD, chase).
+  // This wrapper watches EVERY enrichSig block, whatever the gate: |MACD| ≥ 0.4 aligned
+  // + conv ≥ 5 on XAU stamps a MOM-OVERRIDE would-fire with the chop flag noted, giving
+  // Jean's "momentum overrides everything" hypothesis a live cohort across all gates.
+  // 7-day backtest at ±0.3 was 46% overall / ~56% on chop=1 — this tests the stricter
+  // 0.4 bar + conv floor. DORMANT: signal still blocks. 3-min per-direction throttle.
   function enrichSig(sig) {
+    const _esPassed = enrichSigCore(sig);
+    if (!_esPassed) {
+      try {
+        if (sym === 'XAU' && sig && sig.type) {
+          const _moM = parseFloat(sig.macd);
+          const _moConv = (sig.conv && sig.conv.score) || 0;
+          const _moOk = isFinite(_moM) && (sig.type === 'call' ? _moM >= 0.4 : _moM <= -0.4);
+          s._momOvrTs = s._momOvrTs || {};
+          if (_moOk && _moConv >= 5 && Date.now() - (s._momOvrTs[sig.type] || 0) >= 180000) {
+            s._momOvrTs[sig.type] = Date.now();
+            const _moMsg = '💪 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' MOM-OVERRIDE DORMANT-WOULD-FIRE @ $' + parseFloat(sig.price).toFixed(2) + ' — blocked by a gate but MACD ' + _moM.toFixed(3) + ' aligned + conv ' + _moConv + ' (chop=' + (s.chopActive ? 1 : 0) + ', ROC ' + (sig.roc || '?') + ') — high-momentum override audition (Jean 2026-08-26; 8/25 10:26 + 8/26 09:43 blocked winners).';
+            log(sym, _moMsg); trackBlockedOutcome(sym, _moMsg, true);
+          }
+        }
+      } catch (eMO) { /* audition must never affect blocking */ }
+    }
+    return _esPassed;
+  }
+  function enrichSigCore(sig) {
     // ===== TOP-OF-FUNCTION STAMPS (moved here 2026-07-17 audit) =====
     // Previously stamped after ~10 early gates (regime/RSI/weekend/R5), so elite blocks
     // by those gates were never force-tracked (3.94) and early-blocked attempts were
@@ -5402,7 +5594,13 @@ function processPrice(sym, price, hi, lo) {
                     virtualTp1: +(sig.type === 'call' ? _egRetest + _egT1 : _egRetest - _egT1).toFixed(2),
                     virtualSl: +(sig.type === 'call' ? _egRetest - _egSlD : _egRetest + _egSlD).toFixed(2),
                     pendingFill: +_egRetest.toFixed(2),
-                    blockReason: '🪃 EG-RETEST ' + sig.type.toUpperCase() + ' ARMED (dormant) @ $' + _egRetest.toFixed(2) + ' — EXT-GUARD refused the crest @ $' + price.toFixed(2) + ' (' + Math.round(_egPos * 100) + '% of $' + _egRange.toFixed(2) + ' impulse); pending entry at its own computed retest, SL $' + _egSlD.toFixed(2) + ' beyond (2026-08-18).',
+                    // MACD-AT-ARM (2026-08-26, Jean: "check if the retest with high MACD works
+                    // better than 36W/60L"): retro join showed high-MACD arms mostly NEVER FILL
+                    // (9/10 runaway — strong momentum doesn't pull back). Stamp the arm MACD +
+                    // a MACD-HI tag (|MACD| ≥ 0.3 aligned) so cohortFor splits RETEST-HM out
+                    // and the nightly report answers with fills, not guesses.
+                    armMacd: (function () { const m = parseFloat(sig.macd); return isFinite(m) ? m : null; })(),
+                    blockReason: '🪃 EG-RETEST ' + sig.type.toUpperCase() + ' ARMED (dormant) @ $' + _egRetest.toFixed(2) + ' — EXT-GUARD refused the crest @ $' + price.toFixed(2) + ' (' + Math.round(_egPos * 100) + '% of $' + _egRange.toFixed(2) + ' impulse); pending entry at its own computed retest, SL $' + _egSlD.toFixed(2) + ' beyond (2026-08-18).' + (function () { const m = parseFloat(sig.macd); return (isFinite(m) && (sig.type === 'call' ? m >= 0.3 : m <= -0.3)) ? ' · MACD ' + m.toFixed(3) + ' [MACD-HI]' : (isFinite(m) ? ' · MACD ' + m.toFixed(3) : ''); })(),
                     snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
                     tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null,
                     closed: false, closedTs: null, outcome: null
@@ -5431,7 +5629,8 @@ function processPrice(sym, price, hi, lo) {
                           virtualTp1: +(sig.type === 'call' ? _ezEp + _egT1 : _ezEp - _egT1).toFixed(2),
                           virtualSl: +_ezSl.toFixed(2),
                           pendingFill: +_ezEp.toFixed(2),
-                          blockReason: '🧲 EG-RETEST-Z ' + sig.type.toUpperCase() + ' ARMED (dormant, paired) @ $' + _ezEp.toFixed(2) + ' — zone-anchored variant: ' + (_ezZ.kind || 'OB') + ' ' + (_ezZ.tf || '') + ' $' + _ezZ.lo.toFixed(2) + '-$' + _ezZ.hi.toFixed(2) + ' between retest $' + _egRetest.toFixed(2) + ' and extreme; SL beyond zone $' + _ezSl.toFixed(2) + ' (2026-08-19).',
+                          armMacd: (function () { const m = parseFloat(sig.macd); return isFinite(m) ? m : null; })(),
+                          blockReason: '🧲 EG-RETEST-Z ' + sig.type.toUpperCase() + ' ARMED (dormant, paired) @ $' + _ezEp.toFixed(2) + ' — zone-anchored variant: ' + (_ezZ.kind || 'OB') + ' ' + (_ezZ.tf || '') + ' $' + _ezZ.lo.toFixed(2) + '-$' + _ezZ.hi.toFixed(2) + ' between retest $' + _egRetest.toFixed(2) + ' and extreme; SL beyond zone $' + _ezSl.toFixed(2) + ' (2026-08-19).' + (function () { const m = parseFloat(sig.macd); return (isFinite(m) && (sig.type === 'call' ? m >= 0.3 : m <= -0.3)) ? ' · MACD ' + m.toFixed(3) + ' [MACD-HI]' : (isFinite(m) ? ' · MACD ' + m.toFixed(3) : ''); })(),
                           snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
                           tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null,
                           closed: false, closedTs: null, outcome: null
@@ -9363,6 +9562,52 @@ function processPrice(sym, price, hi, lo) {
             log(sym, '🔧 TP3==TP2 equality guard — tp3 nudged to $' + _eqT.tp3Price.toFixed(2) + ' (inside tp2 $' + _eqT.tp2Price.toFixed(2) + ') so the final portion always closes before tp2 (2026-08-25, MT5 rump-position bug).');
           }
         } catch (eEQ) {}
+        // ===== RANGE-FADE (DORMANT, 2026-08-26 — Jean: "sell at 4634, buy at 4599") =====
+        // Range-day mean-reversion lane: on an ESTABLISHED range, stand at the edges and
+        // trade back toward the middle — the exact inverse of the week's losing pattern
+        // (continuation entries mid-range in a NEUTRAL drift). Conditions: session range
+        // ≥3×ATR, each side touched ≥2× (10-min-spaced touches), NO trend-day latch armed
+        // (fading edges on a trend day is the 8/18 bottom-tick disease), and the extreme
+        // STALE >90s at fill (a fresh break belongs to the live-break lane, not a fade).
+        // Virtual fill on touch within 0.1×ATR of the extreme; SL 0.5×ATR beyond it
+        // (range thesis dead = out cheap); TP1 $5. One stamp per side per 90min.
+        // DORMANT: RANGE-FADE cohort only. Promote at ≥60% over ≥15 fills (agreed bar).
+        try {
+          if (sym === 'XAU' && atrVal > 0 && s.sessionHigh > 0 && s.sessionLow < Infinity && isFinite(s.sessionHigh) && isFinite(s.sessionLow)) {
+            const _rfR = s.sessionHigh - s.sessionLow;
+            if (!s._rf || s._rf.day !== todayDateET()) s._rf = { day: todayDateET(), hiN: 0, loN: 0, hiTs: 0, loTs: 0, lastStamp: { put: 0, call: 0 } };
+            const _rfNear = 0.2 * atrVal;
+            if (s.sessionHigh - price <= _rfNear && _zNow - s._rf.hiTs > 600000) { s._rf.hiN++; s._rf.hiTs = _zNow; }
+            if (price - s.sessionLow <= _rfNear && _zNow - s._rf.loTs > 600000) { s._rf.loN++; s._rf.loTs = _zNow; }
+            const _rfLatch = tdLatchEase(s, 'call') || tdLatchEase(s, 'put');
+            if (_rfR >= 3 * atrVal && !_rfLatch) {
+              const _rfHiStale = (s.sessionHighUpdateTs || 0) > 0 && (_zNow - s.sessionHighUpdateTs) > 90000;
+              if (s.sessionHigh - price <= 0.1 * atrVal && _rfHiStale && s._rf.hiN >= 2 && _zNow - s._rf.lastStamp.put >= 5400000) {
+                s._rf.lastStamp.put = _zNow;
+                const _rfSl = +(s.sessionHigh + 0.5 * atrVal).toFixed(2);
+                s.blockedOutcomes = s.blockedOutcomes || [];
+                s.blockedOutcomes.push({ ts: _zNow, time: ts(), symbol: sym, detector: 'RANGE-FADE', type: 'put',
+                  price: +price.toFixed(2), virtualTp1: +(price - 5).toFixed(2), virtualSl: _rfSl,
+                  blockReason: '🏓 RANGE-FADE PUT DORMANT-WOULD-FILL @ $' + price.toFixed(2) + ' — selling the range high $' + s.sessionHigh.toFixed(2) + ' (touch #' + s._rf.hiN + ', range $' + _rfR.toFixed(2) + ' = ' + (_rfR / atrVal).toFixed(1) + '×ATR, high stale ' + Math.round((_zNow - s.sessionHighUpdateTs) / 60000) + 'min) · SL $' + _rfSl.toFixed(2) + ' (0.5×ATR beyond) — Jean 2026-08-26: sell the edge, buy the edge.',
+                  snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+                  tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+                log(sym, '🏓 RANGE-FADE PUT stamped @ $' + price.toFixed(2) + ' — range high $' + s.sessionHigh.toFixed(2) + ' (dormant).');
+              }
+              const _rfLoStale = (s.sessionLowUpdateTs || 0) > 0 && (_zNow - s.sessionLowUpdateTs) > 90000;
+              if (price - s.sessionLow <= 0.1 * atrVal && _rfLoStale && s._rf.loN >= 2 && _zNow - s._rf.lastStamp.call >= 5400000) {
+                s._rf.lastStamp.call = _zNow;
+                const _rfSl2 = +(s.sessionLow - 0.5 * atrVal).toFixed(2);
+                s.blockedOutcomes = s.blockedOutcomes || [];
+                s.blockedOutcomes.push({ ts: _zNow, time: ts(), symbol: sym, detector: 'RANGE-FADE', type: 'call',
+                  price: +price.toFixed(2), virtualTp1: +(price + 5).toFixed(2), virtualSl: _rfSl2,
+                  blockReason: '🏓 RANGE-FADE CALL DORMANT-WOULD-FILL @ $' + price.toFixed(2) + ' — buying the range low $' + s.sessionLow.toFixed(2) + ' (touch #' + s._rf.loN + ', range $' + _rfR.toFixed(2) + ' = ' + (_rfR / atrVal).toFixed(1) + '×ATR, low stale ' + Math.round((_zNow - s.sessionLowUpdateTs) / 60000) + 'min) · SL $' + _rfSl2.toFixed(2) + ' (0.5×ATR beyond) — Jean 2026-08-26: sell the edge, buy the edge.',
+                  snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+                  tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+                log(sym, '🏓 RANGE-FADE CALL stamped @ $' + price.toFixed(2) + ' — range low $' + s.sessionLow.toFixed(2) + ' (dormant).');
+              }
+            }
+          }
+        } catch (eRF) { /* dormant lane must never crash the tick */ }
         // ===== OTE-HOLD — ENTRY AUCTION FOR ALL XAU SIGNALS (2026-08-26, Jean) =====
         // "Bot detects a signal → it looks where the OTE is → takes 3 to 5 minutes to
         // get as close as possible to it → fires." Never skips a signal (the July
@@ -15216,7 +15461,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '5.96-20260826-session-hl-persist', // bump on each deploy — lets /state verify what's live
+    build: '6.00-20260826-retest-macd-split', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
