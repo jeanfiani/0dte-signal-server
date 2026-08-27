@@ -1853,6 +1853,7 @@ function cohortFor(reason) {
   if (/MOM-FLOOR/.test(reason)) return 'MOM-FLOOR'; // continuation momentum minimums restored (2026-08-26, Jean)
   if (/MOM-OVERRIDE/.test(reason)) return 'MOM-OVERRIDE'; // high-MACD blocked-signal audition across ALL gates (2026-08-26, Jean)
   if (/RANGE-FADE/.test(reason)) return 'RANGE-FADE'; // range-edge mean-reversion lane, dormant (2026-08-26, Jean: sell 4634 / buy 4599)
+  if (/P381-BYPASS/.test(reason)) return 'P381-BYPASS'; // RSI-exhaustion bypass fires, finally cohort-stamped (2026-08-27, 06:40 bottom-tick case)
   if (/REJECT-FLOW/.test(reason)) return 'REJECT-FLOW';
   if (/CT-VETO/.test(reason)) return 'CT-VETO';
   if (/FADE-ROC/.test(reason)) return 'FADE-ROC';
@@ -2934,6 +2935,10 @@ function logSignal(sym, sig) {
     // CT-VETO TREND exemption marker (2026-08-26): lets the nightly report grade the
     // exempted-fire cohort directly from /signals (revert if net-negative over ~6 fires).
     ctTrendExempt: sig._ctTrendExempt === true || undefined,
+    // Phase 3.81 RSI-exhaustion bypass marker (2026-08-27): fires that rode the bypass,
+    // gradable from /signals real outcomes (06:40 bottom-tick case — revert rule: bypass
+    // net-negative over ~8 fires → drop the bypass entirely).
+    p381Bypass: sig._p381 === true || undefined,
     // Outcome tracking (added 2026-05-12) — updated by checkExit() when trade flags flip.
     // Boolean fields stay false until TP1/TP2/TP3/SL price is touched. Used by CSV export
     // to surface trade outcome per signal.
@@ -5336,24 +5341,41 @@ function processPrice(sym, price, hi, lo) {
         ((sig.type === 'put' && s.htf1h_dir === 'down') || (sig.type === 'call' && s.htf1h_dir === 'up'));
       const ecTag = relaxedExemptCandidate ? ' [EXEMPT-CANDIDATE dormant: conv ' + sig.conv.score + ' + 1h ' + s.htf1h_dir + ', regime not aligned]' : '';
       if (!isFadeAtExtreme) {
+        // ===== P381 ROLLING-EXTREME REVOCATION (2026-08-27, Jean's 06:40 autopsy) =====
+        // The 3.81 bypass ("regime+1h+conv5 proves the trend is real, not exhausted")
+        // shorted the BOTTOM of the 5-day range: 06:40 RIDE+MACRO PUT @4577.10 at RSI
+        // 32.7, $3.25 above the 5-day rolling low 4573.85 — SL'd in 131s as price
+        // V-bounced +$12 (adverseFrac 1.01). At the multi-day extreme, oversold IS
+        // exhaustion — every player who chased the 5-day low is trapped. The bypass is
+        // revoked within 1×ATR (min $3) of the rolling extreme; mid-range trend
+        // continuations keep it. Bypassed fires now also stamp a P381-BYPASS cohort —
+        // the bypass ran 30+ days live with ZERO telemetry (same disease as FADE-ROC).
+        const _p381NearFloor = sig.type === 'put' && s.rollingLow < Infinity && s.rollingLow > 0 &&
+                               (price - s.rollingLow) <= Math.max(atrVal > 0 ? atrVal : 0, 3);
+        const _p381NearCeil = sig.type === 'call' && s.rollingHigh > 0 && isFinite(s.rollingHigh) &&
+                              (s.rollingHigh - price) <= Math.max(atrVal > 0 ? atrVal : 0, 3);
         if (sig.type === 'put' && typeof rsiV === 'number' && rsiV < 35) {
           // PHASE 3.81 bypass — regime+1h+conv5 alignment proves the trend is real, not exhausted.
           // CHoCH excluded (2026-07-02): 3.81 justifies bypassing exhaustion for trend-CONTINUATION
           // detectors; CHoCH is a REVERSAL detector — its 7/02 first fire rode the bypass to a
           // -$14 top-buy at RSI 74. Reversal signals never get the exhaustion bypass.
-          if (phase381Bypass && !/CHoCH/.test(tagX)) {
-            log(sym, '↪️ ' + tagX + ' PUT Phase 3.81 — RSI exhaustion gate bypassed (RSI ' + rsiV.toFixed(1) + ', regime ' + sig._regime.dir + ', 1h ' + s.htf1h_dir + ', conv ' + sig.conv.score + ').');
+          if (phase381Bypass && !/CHoCH/.test(tagX) && !_p381NearFloor) {
+            sig._p381 = true;
+            const _pbMsg = '↪️ P381-BYPASS ' + tagX + ' PUT — RSI exhaustion gate bypassed (RSI ' + rsiV.toFixed(1) + ', regime ' + sig._regime.dir + ', 1h ' + s.htf1h_dir + ', conv ' + sig.conv.score + ') — firing live; cohort-stamped since 2026-08-27.';
+            log(sym, _pbMsg); trackBlockedOutcome(sym, _pbMsg, true);
           } else {
-            log(sym, '🛑 ' + tagX + ' PUT BLOCKED — XAU RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' < 35 (oversold). No PUT at the bottom regardless of conviction — macro factors lag price exhaustion.' + ecTag);
+            log(sym, '🛑 ' + tagX + ' PUT BLOCKED — XAU RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' < 35 (oversold). No PUT at the bottom regardless of conviction — macro factors lag price exhaustion.' + (_p381NearFloor && phase381Bypass ? ' [3.81 bypass REVOKED: $' + (price - s.rollingLow).toFixed(2) + ' above 5-day rolling low $' + s.rollingLow.toFixed(2) + ' — 2026-08-27 06:40 case]' : '') + ecTag);
             return false;
           }
         }
         if (sig.type === 'call' && typeof rsiV === 'number' && rsiV > 65) {
           // CHoCH excluded from 3.81 bypass (2026-07-02) — see PUT branch comment above
-          if (phase381Bypass && !/CHoCH/.test(tagX)) {
-            log(sym, '↪️ ' + tagX + ' CALL Phase 3.81 — RSI exhaustion gate bypassed (RSI ' + rsiV.toFixed(1) + ', regime ' + sig._regime.dir + ', 1h ' + s.htf1h_dir + ', conv ' + sig.conv.score + ').');
+          if (phase381Bypass && !/CHoCH/.test(tagX) && !_p381NearCeil) {
+            sig._p381 = true;
+            const _pbMsg2 = '↪️ P381-BYPASS ' + tagX + ' CALL — RSI exhaustion gate bypassed (RSI ' + rsiV.toFixed(1) + ', regime ' + sig._regime.dir + ', 1h ' + s.htf1h_dir + ', conv ' + sig.conv.score + ') — firing live; cohort-stamped since 2026-08-27.';
+            log(sym, _pbMsg2); trackBlockedOutcome(sym, _pbMsg2, true);
           } else {
-            log(sym, '🛑 ' + tagX + ' CALL BLOCKED — XAU RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' > 65 (overbought). No CALL at the top regardless of conviction — macro factors lag price exhaustion.' + ecTag);
+            log(sym, '🛑 ' + tagX + ' CALL BLOCKED — XAU RSI exhaustion: RSI ' + rsiV.toFixed(1) + ' > 65 (overbought). No CALL at the top regardless of conviction — macro factors lag price exhaustion.' + (_p381NearCeil && phase381Bypass ? ' [3.81 bypass REVOKED: $' + (s.rollingHigh - price).toFixed(2) + ' below 5-day rolling high $' + s.rollingHigh.toFixed(2) + ' — 2026-08-27 06:40 case]' : '') + ecTag);
             return false;
           }
         }
@@ -5865,11 +5887,18 @@ function processPrice(sym, price, hi, lo) {
             (_zvC ? (z.lo >= price && z.lo <= price + 1.2 * atrVal) : (z.hi <= price && z.hi >= price - 1.2 * atrVal)));
           if (_zvE) log(sym, '📈 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' TREND-CONT EASE — ZONE-VETO waived: opposing ' + (_zvE.kind || 'OB') + ' ' + (_zvE.tf || '') + ' ahead ignored, trend-day latch with-trend (2026-08-19, 8/19 launch case).');
         } else {
+        // INSIDE-ZONE EXTENSION (2026-08-27, Jean's 20:03 autopsy): the veto only saw
+        // zones AHEAD of price (z.lo >= price for calls) — a signal firing INSIDE an
+        // opposing unmitigated zone slipped through untouched. 8/26 20:03 CHoCH CALL
+        // @4626.15 bought inside the 7h-old 4623.95-4631.93 supply OB and SL'd in 149s
+        // (-$321.50, adverseFrac 1.04). Buying inside supply is worse than under it.
         const _zv = s._zoneObs.find(z => z && z.dir !== sig.type &&
-          (_zvC ? (z.lo >= price && z.lo <= price + 1.2 * atrVal) : (z.hi <= price && z.hi >= price - 1.2 * atrVal)));
+          ((_zvC ? (z.lo >= price && z.lo <= price + 1.2 * atrVal) : (z.hi <= price && z.hi >= price - 1.2 * atrVal)) ||
+           (price >= z.lo && price <= z.hi)));
         if (_zv) {
           Object.assign(s, _emitSnapshot);
-          const _zvMsg = '🚧 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ZONE-VETO: opposing ' + (_zv.kind || 'OB') + ' ' + (_zv.tf || '') + ' $' + _zv.lo.toFixed(2) + '-$' + _zv.hi.toFixed(2) + ' sits ' + (_zvC ? (_zv.lo - price) : (price - _zv.hi)).toFixed(2) + ' ahead (<1.2×ATR) — path runs into mapped ' + (_zvC ? 'supply' : 'demand') + ' (Layer 3, 2026-08-13).';
+          const _zvInside = price >= _zv.lo && price <= _zv.hi;
+          const _zvMsg = '🚧 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ZONE-VETO: ' + (_zvInside ? 'price is INSIDE opposing ' : 'opposing ') + (_zv.kind || 'OB') + ' ' + (_zv.tf || '') + ' $' + _zv.lo.toFixed(2) + '-$' + _zv.hi.toFixed(2) + (_zvInside ? ' (2026-08-27 inside-zone rule, 8/26 20:03 case)' : ' sits ' + (_zvC ? (_zv.lo - price) : (price - _zv.hi)).toFixed(2) + ' ahead (<1.2×ATR)') + ' — path runs into mapped ' + (_zvC ? 'supply' : 'demand') + ' (Layer 3, 2026-08-13).';
           log(sym, _zvMsg); trackBlockedOutcome(sym, _zvMsg, true);
           return false;
         }
@@ -13771,8 +13800,8 @@ function buildCfdTrade(type, price, atr, sym) {
     }
   }
   let tp1 = iC ? price + tp1Dist : price - tp1Dist;
-  const tp2 = iC ? price + tp2Dist : price - tp2Dist;
-  const tp3 = iC ? price + tp3Dist : price - tp3Dist;
+  let tp2 = iC ? price + tp2Dist : price - tp2Dist;
+  let tp3 = iC ? price + tp3Dist : price - tp3Dist;
   // ===== OB-ANCHORED TP1 (added 2026-05-25) =====
   // If there's an unmitigated opposing OB in the trade direction CLOSER than the
   // ATR-based TP1, anchor TP1 to just before the OB edge. The OB is a structural
@@ -13789,6 +13818,34 @@ function buildCfdTrade(type, price, atr, sym) {
       }
     }
   }
+
+  // ===== ZONE-ANCHORED TP2 (2026-08-27, Jean's 21:43 autopsy) =====
+  // 8/26 21:43 CHoCH CALL @4625.28: TP2 was 2.5×ATR = $20.30 out (4645.58) with ATR
+  // still inflated from the crash day. The bounce died at ~4640-4642 — exactly the
+  // mapped overhead supply — and the runner half BE-trailed home for +$2 instead of
+  // +$14.70. Reactions terminate at STRUCTURE, not at ATR multiples (same law as the
+  // OB-anchored TP1 above and the EG-RETEST-Z lesson). Rule: if an opposing
+  // unmitigated zone edge sits BEYOND TP1 but BEFORE the ATR-based TP2, pull TP2 to
+  // just in front of the zone edge (0.15×ATR buffer). Only TIGHTENS — never widens;
+  // requires ≥1.2× the TP1 distance so the ladder stays monotonic. Capital mode
+  // re-pins TP3 to the new TP2 (equality guard nudges it inside per 2026-08-25).
+  try {
+    if (sStateForOb && Array.isArray(sStateForOb._zoneObs) && atr > 0) {
+      const _t2Opp = type === 'call' ? 'put' : 'call';
+      const _t2Min = iC ? price + Math.abs(tp1 - price) * 1.2 : price - Math.abs(tp1 - price) * 1.2;
+      const _t2Z = sStateForOb._zoneObs.filter(z => z && z.dir === _t2Opp &&
+          (iC ? (z.lo - 0.15 * atr > _t2Min && z.lo - 0.15 * atr < tp2)
+              : (z.hi + 0.15 * atr < _t2Min && z.hi + 0.15 * atr > tp2)))
+        .sort((a, b) => iC ? (a.lo - b.lo) : (b.hi - a.hi))[0];
+      if (_t2Z) {
+        const _t2New = +(iC ? _t2Z.lo - 0.15 * atr : _t2Z.hi + 0.15 * atr).toFixed(2);
+        console.log('[' + ts() + '] ' + sym + ': 🎯 Zone-anchored TP2 — $' + _t2New.toFixed(2) + ' (before opposing ' + (_t2Z.kind || 'OB') + ' ' + (_t2Z.tf || '') + ' $' + _t2Z.lo.toFixed(2) + '-$' + _t2Z.hi.toFixed(2) + ') vs ATR default $' + tp2.toFixed(2) + ' (2026-08-27, 8/26 21:43 case — runner exits at structure).');
+        tp2 = _t2New;
+        if (CAPITAL_MODE) tp3 = tp2; // capital mode: TP3 rides the anchored TP2 (equality guard nudges inside)
+        else if (iC ? tp3 < tp2 : tp3 > tp2) tp3 = tp2; // never let TP3 sit inside TP2
+      }
+    }
+  } catch (eT2) { /* anchor must never break trade construction */ }
 
   // ===== SAME-DIRECTION CONTINUATION — LOCK TP1 (added 2026-05-14) =====
   // When a new same-direction signal fires while the existing trade is still active and
@@ -15461,7 +15518,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.00-20260826-retest-macd-split', // bump on each deploy — lets /state verify what's live
+    build: '6.02-20260827-p381-rolling-guard', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
