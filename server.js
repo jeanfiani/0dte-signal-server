@@ -1854,6 +1854,7 @@ function cohortFor(reason) {
   if (/MOM-OVERRIDE/.test(reason)) return 'MOM-OVERRIDE'; // high-MACD blocked-signal audition across ALL gates (2026-08-26, Jean)
   if (/RANGE-FADE/.test(reason)) return 'RANGE-FADE'; // range-edge mean-reversion lane, dormant (2026-08-26, Jean: sell 4634 / buy 4599)
   if (/P381-BYPASS/.test(reason)) return 'P381-BYPASS'; // RSI-exhaustion bypass fires, finally cohort-stamped (2026-08-27, 06:40 bottom-tick case)
+  if (/FLOOR-PATH/.test(reason)) return 'FLOOR-PATH'; // TP1-into-defended-floor blocks (2026-08-28, 21:57/06:40 cases)
   if (/REJECT-FLOW/.test(reason)) return 'REJECT-FLOW';
   if (/CT-VETO/.test(reason)) return 'CT-VETO';
   if (/FADE-ROC/.test(reason)) return 'FADE-ROC';
@@ -5882,6 +5883,21 @@ function processPrice(sym, price, hi, lo) {
         // price mitigates them within minutes. Ease is WITH-TREND only while the latch
         // is fresh; range days (all 61 lifetime saves) are untouched, counter-trend
         // signals still fully vetoed. Eases are logged for the audit trail.
+        // ===== INSIDE-ZONE — NO LATCH EASE (2026-08-28, Jean's 23:46 autopsy) =====
+        // The 8/19 ease waives zones AHEAD on latched trend days ("footprints of the
+        // move"). That logic never applied to being INSIDE an opposing zone: 8/27 23:46
+        // TREND PUT fired from inside the 22h-old demand OB 4569.26-4581.25 (put-latch
+        // armed → whole veto skipped) — the zone had absorbed every test for 14h,
+        // bounced it to SL (-$254), then launched +$42 off that same block. Inside-zone
+        // blocks run FIRST, latch or no latch; the ahead-of-price ease is unchanged.
+        const _zvIn = s._zoneObs.find(z => z && z.dir !== sig.type && price >= z.lo && price <= z.hi);
+        if (_zvIn) {
+          Object.assign(s, _emitSnapshot);
+          const _zvInAge = _zvIn.ts ? Math.round((Date.now() - _zvIn.ts) / 60000) : null;
+          const _zvInMsg = '🚧 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ZONE-VETO: price is INSIDE opposing ' + (_zvIn.kind || 'OB') + ' ' + (_zvIn.tf || '') + ' $' + _zvIn.lo.toFixed(2) + '-$' + _zvIn.hi.toFixed(2) + (_zvInAge !== null ? ' · zone age ' + _zvInAge + 'min [' + (_zvInAge < 240 ? 'ZAGE-FRESH' : _zvInAge <= 720 ? 'ZAGE-MID' : 'ZAGE-OLD') + ']' : '') + ' — inside-zone rule holds even on latched trend days (2026-08-28, 8/27 23:46 case).';
+          log(sym, _zvInMsg); trackBlockedOutcome(sym, _zvInMsg, true);
+          return false;
+        }
         if (tdLatchEase(s, sig.type)) {
           const _zvE = s._zoneObs.find(z => z && z.dir !== sig.type &&
             (_zvC ? (z.lo >= price && z.lo <= price + 1.2 * atrVal) : (z.hi <= price && z.hi >= price - 1.2 * atrVal)));
@@ -5897,8 +5913,13 @@ function processPrice(sym, price, hi, lo) {
            (price >= z.lo && price <= z.hi)));
         if (_zv) {
           Object.assign(s, _emitSnapshot);
-          const _zvInside = price >= _zv.lo && price <= _zv.hi;
-          const _zvMsg = '🚧 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ZONE-VETO: ' + (_zvInside ? 'price is INSIDE opposing ' : 'opposing ') + (_zv.kind || 'OB') + ' ' + (_zv.tf || '') + ' $' + _zv.lo.toFixed(2) + '-$' + _zv.hi.toFixed(2) + (_zvInside ? ' (2026-08-27 inside-zone rule, 8/26 20:03 case)' : ' sits ' + (_zvC ? (_zv.lo - price) : (price - _zv.hi)).toFixed(2) + ' ahead (<1.2×ATR)') + ' — path runs into mapped ' + (_zvC ? 'supply' : 'demand') + ' (Layer 3, 2026-08-13).';
+          // Zone-age telemetry (2026-08-28, Jean: "does a 22h zone still make sense?") —
+          // every veto stamp carries the zone's age + bucket so the nightly report can
+          // split saves-vs-costs by ZAGE-FRESH (<4h) / ZAGE-MID (4-12h) / ZAGE-OLD (>12h).
+          // If ZAGE-OLD saves degrade, tighten the 1500-min zone cap with evidence.
+          const _zvAge = _zv.ts ? Math.round((Date.now() - _zv.ts) / 60000) : null;
+          const _zvAgeTag = _zvAge !== null ? ' · zone age ' + _zvAge + 'min [' + (_zvAge < 240 ? 'ZAGE-FRESH' : _zvAge <= 720 ? 'ZAGE-MID' : 'ZAGE-OLD') + ']' : '';
+          const _zvMsg = '🚧 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ZONE-VETO: opposing ' + (_zv.kind || 'OB') + ' ' + (_zv.tf || '') + ' $' + _zv.lo.toFixed(2) + '-$' + _zv.hi.toFixed(2) + ' sits ' + (_zvC ? (_zv.lo - price) : (price - _zv.hi)).toFixed(2) + ' ahead (<1.2×ATR)' + _zvAgeTag + ' — path runs into mapped ' + (_zvC ? 'supply' : 'demand') + ' (Layer 3, 2026-08-13).';
           log(sym, _zvMsg); trackBlockedOutcome(sym, _zvMsg, true);
           return false;
         }
@@ -7901,6 +7922,42 @@ function processPrice(sym, price, hi, lo) {
         }
       }
     } catch (eMf) { /* floor must never crash enrichment */ }
+    // ===== FLOOR-IN-THE-PATH (LIVE, 2026-08-28 — Jean's 21:57/06:40 autopsies) =====
+    // A continuation entry whose TP1 requires the DEFENDED multi-day floor to break is
+    // asking to be the bounce. 8/27 21:57 TREND PUT @4576.02: TP1 4571.02 vs day low
+    // 4570.70 — target $0.32 inside a 12h floor; bounced to SL -$265. 8/27 06:40 same
+    // shape at the 5-day rolling low (-$252). Overnight the same floor then launched
+    // +$42. Rule: XAU continuation PUT blocked when (price − floor) < tp1Cap($5) +
+    // 0.5×ATR with floor = min(session low, 5-day rolling low), UNLESS the floor is
+    // breaking live (<90s — Jean's breakout exemption) or price is already below it.
+    // Mirror for CALLs at the ceiling. Fades exempt (they fire AT extremes by design,
+    // in the opposite direction). Stamps FLOOR-PATH cohort — revert if blocked
+    // would-wins ≥60% over ≥15 resolved.
+    try {
+      if (sym === 'XAU' && atrVal > 0 && /RIDE|TREND|FAST|SUST|SQZ|6\/6/.test(tag) &&
+          !/LHF|LLF|VREV|EXT-FLIP|OBREJ|OBMIT|INVERSAL|SWEEP|CHoCH|ATH|ATL|DIV/.test(tag)) {
+        const _fpBuf = 5 + 0.5 * atrVal;
+        if (sig.type === 'put') {
+          const _fpFloor = Math.min(isFinite(s.sessionLow) ? s.sessionLow : Infinity, (s.rollingLow > 0 && isFinite(s.rollingLow)) ? s.rollingLow : Infinity);
+          const _fpFresh = (s.sessionLowUpdateTs || 0) > 0 && (Date.now() - s.sessionLowUpdateTs) < 90000;
+          if (isFinite(_fpFloor) && price > _fpFloor && (price - _fpFloor) < _fpBuf && !_fpFresh) {
+            const _fpMsg = '🧱 ' + tag + ' PUT BLOCKED — FLOOR-PATH: TP1 needs $' + (5).toFixed(2) + ' but the defended multi-day floor $' + _fpFloor.toFixed(2) + ' sits only $' + (price - _fpFloor).toFixed(2) + ' below (< $5 + 0.5×ATR = $' + _fpBuf.toFixed(2) + '); profit path requires breaking a held floor (2026-08-28, 21:57/06:40 cases). Fires normally on a live break.';
+            log(sym, _fpMsg); trackBlockedOutcome(sym, _fpMsg, true);
+            Object.assign(s, _emitSnapshot);
+            return false;
+          }
+        } else if (sig.type === 'call') {
+          const _fpCeil = Math.max(isFinite(s.sessionHigh) ? s.sessionHigh : -Infinity, (s.rollingHigh > 0 && isFinite(s.rollingHigh)) ? s.rollingHigh : -Infinity);
+          const _fpFreshC = (s.sessionHighUpdateTs || 0) > 0 && (Date.now() - s.sessionHighUpdateTs) < 90000;
+          if (isFinite(_fpCeil) && price < _fpCeil && (_fpCeil - price) < _fpBuf && !_fpFreshC) {
+            const _fpMsgC = '🧱 ' + tag + ' CALL BLOCKED — FLOOR-PATH: TP1 needs $' + (5).toFixed(2) + ' but the defended multi-day ceiling $' + _fpCeil.toFixed(2) + ' sits only $' + (_fpCeil - price).toFixed(2) + ' above (< $5 + 0.5×ATR = $' + _fpBuf.toFixed(2) + '); profit path requires breaking a held ceiling (2026-08-28). Fires normally on a live break.';
+            log(sym, _fpMsgC); trackBlockedOutcome(sym, _fpMsgC, true);
+            Object.assign(s, _emitSnapshot);
+            return false;
+          }
+        }
+      }
+    } catch (eFP) { /* floor-path must never crash enrichment */ }
     return true;
   }
 
@@ -15518,7 +15575,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.02-20260827-p381-rolling-guard', // bump on each deploy — lets /state verify what's live
+    build: '6.03-20260828-floorpath-insidezone-zage', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
