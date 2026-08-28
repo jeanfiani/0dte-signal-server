@@ -14148,11 +14148,29 @@ function checkExit(sym, price) {
         s.trade = { active: false };
         return;
       }
+      // ===== FAST BE-DELAY (2026-08-28, Jean) =====
+      // "FAST PUT was the best signal of the day — TP1, back to PE, closed, then
+      // flushed to TP3 without us. Take the risk on FAST: keep the SL unchanged for
+      // 5 minutes after TP1 before switching to PE." FAST fires on burst impulses —
+      // their pullbacks routinely tag entry before the second leg. Accepted risk:
+      // during the 5-min window the runner half can lose the FULL original stop
+      // (TP1 half already banked). After 5min the normal entry±0.3ATR lock arms.
+      // Cohort: fired rows carry beDelay:'fast-5min' — revert if the window turns
+      // ≥3 would-be scratches into full SLs before earning a TP2/TP3.
+      const _fastBe = /FAST/.test((s.lastHistEntry && s.lastHistEntry.symbol === sym && s.lastHistEntry.score) || '');
+      if (_fastBe) {
+        t.t1 = true; t._beDelayUntil = now + 300000; t.lastETs = now;
+        try { if (s.lastHistEntry) s.lastHistEntry.beDelay = 'fast-5min'; } catch (eBD) {}
+        log(sym, '🎯 TP1 HIT — $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2) + ' · FAST BE-DELAY: SL stays at ORIGINAL $' + t.slPrice.toFixed(2) + ' for 5min to let the burst breathe (Jean 2026-08-28); entry-lock arms at ' + new Date(t._beDelayUntil).toISOString().slice(11, 19) + 'Z.');
+        sendPush('🎯 ' + sym + ' TP1 HIT (FAST)', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · SL stays original 5min — do NOT move to BE yet', 'signal');
+        updateSignalOutcome(sym, price);
+      } else {
       const lockDist = (typeof t.atr === 'number' && isFinite(t.atr) && t.atr > 0) ? t.atr * 0.3 : 0;
       t.t1 = true; t.trailSl = iC ? t.ep + lockDist : t.ep - lockDist; t.lastETs = now;
       log(sym, '🎯 TP1 HIT — $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2) + ' · SL → entry' + (lockDist > 0 ? (iC ? '+' : '-') + '$' + lockDist.toFixed(2) + ' (profit-lock)' : ' (BE)') + ' $' + t.trailSl.toFixed(2));
       sendPush('🎯 ' + sym + ' TP1 HIT', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · SL → entry' + (lockDist > 0 ? '±0.3ATR lock' : ' (BE)'), 'signal');
       updateSignalOutcome(sym, price);
+      }
     }
     // TP2 hit → trail SL to TP1
     if (!t.t2 && ((iC && price >= t.tp2Price) || (!iC && price <= t.tp2Price))) {
@@ -14170,6 +14188,15 @@ function checkExit(sym, price) {
       s.trade = { active: false };
       return;
     }
+    // FAST BE-delay expiry (2026-08-28, Jean): 5min after TP1 with no exit — the
+    // burst had its breathing room; arm the normal entry±0.3ATR lock now.
+    if (t.t1 && !t.sl && t._beDelayUntil && !(t.trailSl > 0) && now >= t._beDelayUntil) {
+      const _bdLock = (typeof t.atr === 'number' && isFinite(t.atr) && t.atr > 0) ? t.atr * 0.3 : 0;
+      t.trailSl = iC ? t.ep + _bdLock : t.ep - _bdLock;
+      t._beDelayUntil = 0;
+      log(sym, '⏱ FAST BE-DELAY expired — SL → entry' + (_bdLock > 0 ? '±$' + _bdLock.toFixed(2) + ' lock' : ' (BE)') + ' $' + t.trailSl.toFixed(2) + ' (5min window closed, Jean 2026-08-28).');
+      sendPush('⏱ ' + sym + ' FAST BE-delay over', 'SL → $' + t.trailSl.toFixed(2) + ' (entry lock) — move it now', 'signal');
+    }
     // Trail SL hit (after TP1)
     if (t.trailSl > 0) {
       const tsHit = iC ? price <= t.trailSl : price >= t.trailSl;
@@ -14178,6 +14205,21 @@ function checkExit(sym, price) {
         t.sl = true; t.lastETs = now;
         log(sym, '🛑 TRAIL SL — $' + price.toFixed(2) + ' · SL was $' + t.trailSl.toFixed(2) + ' · P&L $' + tsPnl.toFixed(2));
         sendPush('🛑 ' + sym + ' TRAIL SL', '$' + price.toFixed(2) + ' · P&L $' + tsPnl.toFixed(2), 'exit');
+        updateSignalOutcome(sym, price);
+        s.trade = { active: false };
+        return;
+      }
+    }
+    // FAST BE-delay grace window (2026-08-28): TP1 banked but no trail armed yet —
+    // the ORIGINAL stop is still the protection. Full original-SL loss on the runner
+    // half is the accepted risk (Jean: "take a risk for FAST").
+    if (t.t1 && !t.sl && t._beDelayUntil && !(t.trailSl > 0)) {
+      const _bdSlHit = iC ? price <= t.slPrice : price >= t.slPrice;
+      if (_bdSlHit) {
+        const _bdPnl = iC ? t.slPrice - t.ep : t.ep - t.slPrice;
+        t.sl = true; t.lastETs = now;
+        log(sym, '🛑 FAST BE-DELAY SL — original stop $' + t.slPrice.toFixed(2) + ' hit during the 5min grace · runner P&L $' + _bdPnl.toFixed(2) + ' (TP1 half was banked; accepted risk, Jean 2026-08-28).');
+        sendPush('🛑 ' + sym + ' FAST grace SL', 'original stop hit · runner $' + _bdPnl.toFixed(2), 'exit');
         updateSignalOutcome(sym, price);
         s.trade = { active: false };
         return;
@@ -15438,7 +15480,15 @@ app.get('/ea/:sym', (req, res) => {
   res.json({
     n: 1, id: t.ts, type: t.type || '', ep: +t.ep || 0,
     sl: +t.slPrice || 0, tp1: +t.tp1Price || 0, tp2: +t.tp2Price || 0, tp3: +t.tp3Price || 0,
-    age: Math.round((Date.now() - t.ts) / 1000), ts: Date.now(), close: cr
+    age: Math.round((Date.now() - t.ts) / 1000), ts: Date.now(), close: cr,
+    // FAST BE-DELAY (2026-08-28, Jean: "it's the EA that banks TP"): the EA moves the
+    // broker SL to BE at TP1 autonomously, so it must be told when a trade carries the
+    // 5-min delay. beDelaySec > 0 → EA banks the TP1 half as usual but leaves the
+    // runner's SL at the ORIGINAL level for this many seconds after the TP1 fill,
+    // THEN moves it to entry±lock. 300 for FAST signals, 0 for everything else.
+    beDelaySec: (function () {
+      try { return /FAST/.test((s.lastHistEntry && s.lastHistEntry.symbol === sym && s.lastHistEntry.score) || '') ? 300 : 0; } catch (e) { return 0; }
+    })()
   });
 });
 
@@ -15592,7 +15642,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.04-20260828-momovr-rev-split', // bump on each deploy — lets /state verify what's live
+    build: '6.05-20260828-fast-be-delay', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
@@ -15889,6 +15939,8 @@ app.get('/prices', (req, res) => {
         // gives meaningfully better fills). Null on FAST/SQZ/SWEEP/VREV/TREND/MFLIP.
         oteLimit: s.trade.oteLimit || null,
         oteExpiry: s.trade.oteExpiry || null,
+        // FAST BE-delay flag (2026-08-28) — mirror of /ea beDelaySec; see that endpoint.
+        beDelaySec: (function () { try { return /FAST/.test((s.lastHistEntry && s.lastHistEntry.score) || '') ? 300 : 0; } catch (e) { return 0; } })(),
         oteImpulseHi: s.trade.oteImpulseHi || null,
         oteImpulseLo: s.trade.oteImpulseLo || null,
         pnl: s.trade.isCfd && s.lastPrice > 0 ? +(((s.trade.type === 'call' ? s.lastPrice - s.trade.ep : s.trade.ep - s.lastPrice) / s.trade.ep) * 100).toFixed(3) : null
