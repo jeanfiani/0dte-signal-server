@@ -1851,7 +1851,9 @@ function cohortFor(reason) {
   if (/INV-HOLD/.test(reason)) return 'INV-HOLD';
   if (/OTE-HOLD/.test(reason)) return 'OTE-HOLD'; // entry-auction invalidation saves (2026-08-26); fills are graded on the fired rows' oteHold field
   if (/MOM-FLOOR/.test(reason)) return 'MOM-FLOOR'; // continuation momentum minimums restored (2026-08-26, Jean)
-  if (/MOM-OVERRIDE/.test(reason)) return 'MOM-OVERRIDE'; // high-MACD blocked-signal audition across ALL gates (2026-08-26, Jean)
+  if (/MOM-OVR-REV/.test(reason)) return 'MOM-OVR-REV'; // high-MACD reversal thrust off a fresh session extreme (2026-08-28, Jean: "like INVERSAL — bottom, strike back up")
+  if (/MOM-OVR-CONT/.test(reason)) return 'MOM-OVR-CONT'; // high-MACD mid-range continuation — suspected loser class (2026-08-28 split)
+  if (/MOM-OVERRIDE/.test(reason)) return 'MOM-OVERRIDE'; // pre-split stamps (8/26-8/28) — high-MACD blocked-signal audition across ALL gates
   if (/RANGE-FADE/.test(reason)) return 'RANGE-FADE'; // range-edge mean-reversion lane, dormant (2026-08-26, Jean: sell 4634 / buy 4599)
   if (/P381-BYPASS/.test(reason)) return 'P381-BYPASS'; // RSI-exhaustion bypass fires, finally cohort-stamped (2026-08-27, 06:40 bottom-tick case)
   if (/FLOOR-PATH/.test(reason)) return 'FLOOR-PATH'; // TP1-into-defended-floor blocks (2026-08-28, 21:57/06:40 cases)
@@ -4626,7 +4628,22 @@ function processPrice(sym, price, hi, lo) {
           s._momOvrTs = s._momOvrTs || {};
           if (_moOk && _moConv >= 5 && Date.now() - (s._momOvrTs[sig.type] || 0) >= 180000) {
             s._momOvrTs[sig.type] = Date.now();
-            const _moMsg = '💪 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' MOM-OVERRIDE DORMANT-WOULD-FIRE @ $' + parseFloat(sig.price).toFixed(2) + ' — blocked by a gate but MACD ' + _moM.toFixed(3) + ' aligned + conv ' + _moConv + ' (chop=' + (s.chopActive ? 1 : 0) + ', ROC ' + (sig.roc || '?') + ') — high-momentum override audition (Jean 2026-08-26; 8/25 10:26 + 8/26 09:43 blocked winners).';
+            // ===== REV/CONT SPLIT (2026-08-28, Jean) =====
+            // "MOM-OVERRIDE on session lows and highs — it only works like INVERSAL,
+            // when price reaches the bottom and strikes back up, or vice versa."
+            // Day-1 tally agreed: 8W/21L pooled, but both live winner examples (8/26
+            // 09:43, 8/28 02:48) were reversal THRUSTS off a fresh session extreme.
+            // Split: MOM-OVR-REV = high-MACD CALL within 45min of a fresh session LOW
+            // (the strike back up) / PUT within 45min of a fresh session HIGH.
+            // Everything else = MOM-OVR-CONT (mid-range continuation chase — the
+            // suspected loser class). Promotion candidate is REV only.
+            const _moLowAgo = (s.sessionLowUpdateTs || 0) > 0 ? (Date.now() - s.sessionLowUpdateTs) / 60000 : 9999;
+            const _moHighAgo = (s.sessionHighUpdateTs || 0) > 0 ? (Date.now() - s.sessionHighUpdateTs) / 60000 : 9999;
+            const _moRev = sig.type === 'call' ? _moLowAgo <= 45 : _moHighAgo <= 45;
+            const _moLoc = _moRev
+              ? '[MOM-OVR-REV: ' + (sig.type === 'call' ? 'session low ' + Math.round(_moLowAgo) + 'min ago, +$' + (parseFloat(sig.price) - s.sessionLow).toFixed(2) + ' off it' : 'session high ' + Math.round(_moHighAgo) + 'min ago, -$' + (s.sessionHigh - parseFloat(sig.price)).toFixed(2) + ' off it') + ']'
+              : '[MOM-OVR-CONT: mid-range]';
+            const _moMsg = '💪 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' MOM-OVERRIDE DORMANT-WOULD-FIRE @ $' + parseFloat(sig.price).toFixed(2) + ' — blocked by a gate but MACD ' + _moM.toFixed(3) + ' aligned + conv ' + _moConv + ' (chop=' + (s.chopActive ? 1 : 0) + ', ROC ' + (sig.roc || '?') + ') ' + _moLoc + ' — high-momentum override audition (Jean 2026-08-26; REV/CONT split 2026-08-28).';
             log(sym, _moMsg); trackBlockedOutcome(sym, _moMsg, true);
           }
         }
@@ -15575,7 +15592,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.03-20260828-floorpath-insidezone-zage', // bump on each deploy — lets /state verify what's live
+    build: '6.04-20260828-momovr-rev-split', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
