@@ -1857,6 +1857,7 @@ function cohortFor(reason) {
   if (/RANGE-FADE/.test(reason)) return 'RANGE-FADE'; // range-edge mean-reversion lane, dormant (2026-08-26, Jean: sell 4634 / buy 4599)
   if (/P381-BYPASS/.test(reason)) return 'P381-BYPASS'; // RSI-exhaustion bypass fires, finally cohort-stamped (2026-08-27, 06:40 bottom-tick case)
   if (/FLOOR-PATH/.test(reason)) return 'FLOOR-PATH'; // TP1-into-defended-floor blocks (2026-08-28, 21:57/06:40 cases)
+  if (/BTC-INV/.test(reason)) return 'BTC-INV'; // inverted BTC RIDE/LHF puts → calls, dormant audition (2026-08-28, Jean's LOL that graded 78%/62%)
   if (/REJECT-FLOW/.test(reason)) return 'REJECT-FLOW';
   if (/CT-VETO/.test(reason)) return 'CT-VETO';
   if (/FADE-ROC/.test(reason)) return 'FADE-ROC';
@@ -4648,6 +4649,36 @@ function processPrice(sym, price, hi, lo) {
           }
         }
       } catch (eMO) { /* audition must never affect blocking */ }
+      // ===== BTC-INV — INVERSION AUDITION (DORMANT, 2026-08-28, Jean) =====
+      // 7-day BTC tally: RIDE-put 7W/73L/14S, LHF-put 7W/65L/32S — the detectors are
+      // a working CONTRARIAN indicator on BTC put setups (shorting the liquidity grab
+      // before the pop). Symmetric brackets flip exactly: inverted CALLS grade 78% and
+      // 62% retroactively (scratches flip to losses — counted). Jean: "IT'S FREE" —
+      // so every blocked BTC RIDE/LHF PUT also stamps the INVERTED CALL with the same
+      // ATR bracket, own cohort. Bar to even discuss going live: ≥60% over a few
+      // hundred samples spanning BOTH an up-week and a down-week. 3-min throttle.
+      try {
+        if (sym === 'BTC' && sig && sig.type === 'put' && /RIDE|LHF/.test(sig.score || '')) {
+          if (Date.now() - (s._btcInvTs || 0) >= 180000) {
+            s._btcInvTs = Date.now();
+            const _biP = parseFloat(sig.price);
+            const _biB = Math.max(50, 1.2 * (s._atr || 0));
+            if (isFinite(_biP) && _biP > 0) {
+              s.blockedOutcomes = s.blockedOutcomes || [];
+              s.blockedOutcomes.push({
+                ts: Date.now(), time: ts(), symbol: sym, detector: 'BTC-INV', type: 'call',
+                price: +_biP.toFixed(2),
+                virtualTp1: +(_biP + _biB).toFixed(2), virtualSl: +(_biP - _biB).toFixed(2),
+                blockReason: '🔁 BTC-INV CALL DORMANT-WOULD-FIRE @ $' + _biP.toFixed(2) + ' — INVERSION of blocked ' + (sig.score || '') + ' PUT (MACD ' + (sig.macd || '?') + ', conv ' + ((sig.conv && sig.conv.score) || 0) + '): BTC put setups are the liquidity grab before the pop (7d inverse grade: RIDE→78%, LHF→62%; Jean 2026-08-28). Bracket ±$' + _biB.toFixed(0) + '.',
+                snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+                tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null,
+                closed: false, closedTs: null, outcome: null
+              });
+              log(sym, '🔁 BTC-INV CALL stamped @ $' + _biP.toFixed(2) + ' (inverse of ' + (sig.score || '') + ' PUT, dormant).');
+            }
+          }
+        }
+      } catch (eBI) { /* inversion audit must never affect blocking */ }
     }
     return _esPassed;
   }
@@ -15642,7 +15673,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.05-20260828-fast-be-delay', // bump on each deploy — lets /state verify what's live
+    build: '6.06-20260828-btc-inv-audition', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
