@@ -1859,6 +1859,7 @@ function cohortFor(reason) {
   if (/FLOOR-PATH/.test(reason)) return 'FLOOR-PATH'; // TP1-into-defended-floor blocks (2026-08-28, 21:57/06:40 cases)
   if (/BTC-INV/.test(reason)) return 'BTC-INV'; // inverted BTC RIDE/LHF puts → calls, dormant audition (2026-08-28, Jean's LOL that graded 78%/62%)
   if (/PROTECT-STREAK|PROTECT-DAYCAP/.test(reason)) return 'PROTECT'; // circuit-breaker suppressed fires (2026-08-28, Freqtrade port) — measures what each pause saved/cost
+  if (/ML-DIR/.test(reason)) return 'ML-DIR'; // learned scorer's p≥0.65 blocked signals (dormant FreqAI-style audition, 2026-08-29)
   if (/REJECT-FLOW/.test(reason)) return 'REJECT-FLOW';
   if (/CT-VETO/.test(reason)) return 'CT-VETO';
   if (/FADE-ROC/.test(reason)) return 'FADE-ROC';
@@ -1953,6 +1954,105 @@ function pnlMultFor(sym, t) {
   } catch (e) {}
   return PNL_MULT[sym] || 1;
 }
+// ===== ML-DIR — LEARNED DIRECTION/QUALITY SCORER (DORMANT, 2026-08-29, Jean) =====
+// FreqAI port: a small logistic classifier trained IN-PROCESS on our own graded
+// signals (fired rows with real outcomes + blocked rows joined to their virtual
+// bracket outcomes by ts). Retrained every 12h on a rolling 14-day window with a
+// 25% chronological holdout — the printed holdout W/L is the only number that
+// matters. DORMANT: every XAU signal gets sig._mlP stamped (persisted as mlP on
+// fired rows); blocked signals with p ≥ 0.65 stamp the ML-DIR cohort. Promotion:
+// holdout p≥0.6 bucket wins ≥60% across 2+ retrains AND the live ML-DIR cohort
+// confirms — then it becomes a FreqAI-style confirmation gate (never overriding
+// Jean's MACD rules or protective gates). Features deliberately boring: aligned
+// MACD/ROC/RSI, conv, chop, confScore, held-bit. No lookahead: features are what
+// the bot knew at stamp time.
+const ML_FILE = path.join(DATA_DIR, 'ml_model.json');
+let mlModel = null;
+try { mlModel = JSON.parse(fs.readFileSync(ML_FILE, 'utf8')); if (mlModel && mlModel.w) console.log('[STARTUP] ML-DIR model loaded (trained ' + new Date(mlModel.trainedTs).toISOString() + ', n=' + mlModel.n + ')'); } catch (e) { mlModel = null; }
+const mlSigmoid = (z) => 1 / (1 + Math.exp(-z));
+function mlFeatures(type, macd, roc, rsi, conv, chop, confScore, heldBit) {
+  const sgn = type === 'call' ? 1 : -1;
+  return [
+    Math.max(-3, Math.min(3, sgn * macd)),
+    Math.max(-1, Math.min(1, sgn * roc * 5)),
+    sgn * (rsi - 50) / 50,
+    Math.min(1, (conv || 0) / 10),
+    chop ? 1 : 0,
+    Math.min(1, (confScore || 0) / 6),
+    heldBit ? 1 : 0
+  ];
+}
+function mlPredict(f) {
+  if (!mlModel || !Array.isArray(mlModel.w) || mlModel.w.length !== f.length) return null;
+  let z = mlModel.b || 0;
+  for (let i = 0; i < f.length; i++) z += mlModel.w[i] * (f[i] || 0);
+  return mlSigmoid(z);
+}
+function mlBuildDataset(days) {
+  const cutoff = Date.now() - days * 86400000;
+  const rows = [];
+  const s = S.XAU;
+  if (!s) return rows;
+  const bo = (s.blockedOutcomes || []).filter(o => o && o.ts > cutoff && (o.outcome === 'win' || o.outcome === 'loss') && !o.pendingFill);
+  for (const h of signalHistory) {
+    if (h.symbol !== 'XAU' || h.ts <= cutoff) continue;
+    const m = parseFloat(h.macd), r = parseFloat(String(h.roc).replace(/[%+]/g, '')), rs = parseFloat(h.rsi);
+    if (!isFinite(m) || !isFinite(r) || !isFinite(rs)) continue;
+    let y = null;
+    const fired = !(h.conv && (h.conv.enrichBlocked === true || h.conv.label === 'BLOCKED'));
+    if (fired && h.outcomes && (h.outcomes.tp1Hit || h.outcomes.slHit)) {
+      y = (h.outcomes.tp1Hit && !h.outcomes.slHit) ? 1 : ((h.outcomes.slHit && !h.outcomes.tp1Hit) ? 0 : null); // scratches dropped
+    } else {
+      const j = bo.find(o => o.type === h.type && Math.abs(o.ts - h.ts) < 10000);
+      if (j) y = j.outcome === 'win' ? 1 : 0;
+    }
+    if (y === null) continue;
+    const heldBit = /held1/.test(h.confBreakdown || '') ? 1 : 0;
+    rows.push({ ts: h.ts, y: y, x: mlFeatures(h.type, m, r, rs, h.conv && h.conv.score, h.chop, h.confScore, heldBit) });
+  }
+  rows.sort((a, b) => a.ts - b.ts);
+  return rows;
+}
+function mlTrain() {
+  try {
+    const rows = mlBuildDataset(14);
+    if (rows.length < 80) { console.log('[' + ts() + '] ML-DIR: only ' + rows.length + ' graded samples — training skipped (need 80).'); return; }
+    const nHold = Math.max(20, Math.floor(rows.length * 0.25));
+    const train = rows.slice(0, rows.length - nHold), hold = rows.slice(rows.length - nHold);
+    const dim = train[0].x.length;
+    let w = new Array(dim).fill(0), b = 0;
+    const lr = 0.05, l2 = 0.001;
+    for (let e = 0; e < 400; e++) {
+      let gb = 0; const gw = new Array(dim).fill(0);
+      for (const r0 of train) {
+        let z = b; for (let i = 0; i < dim; i++) z += w[i] * r0.x[i];
+        const d = mlSigmoid(z) - r0.y;
+        gb += d; for (let i = 0; i < dim; i++) gw[i] += d * r0.x[i];
+      }
+      b -= lr * gb / train.length;
+      for (let i = 0; i < dim; i++) w[i] -= lr * (gw[i] / train.length + l2 * w[i]);
+    }
+    const hi = { win: 0, loss: 0 }, lo = { win: 0, loss: 0 }, mid = { win: 0, loss: 0 };
+    for (const r0 of hold) {
+      let z = b; for (let i = 0; i < dim; i++) z += w[i] * r0.x[i];
+      const p = mlSigmoid(z);
+      const bucket = p >= 0.6 ? hi : (p < 0.4 ? lo : mid);
+      r0.y ? bucket.win++ : bucket.loss++;
+    }
+    mlModel = { w: w.map(v => +v.toFixed(5)), b: +b.toFixed(5), trainedTs: Date.now(), n: train.length, holdN: hold.length,
+                holdHi: hi, holdMid: mid, holdLo: lo,
+                feats: ['alignedMACD', 'alignedROC', 'alignedRSI', 'conv', 'chop', 'confScore', 'held'] };
+    try { fs.writeFileSync(ML_FILE, JSON.stringify(mlModel)); } catch (eW) {}
+    console.log('[' + ts() + '] 🧠 ML-DIR trained — n=' + train.length + ', holdout ' + hold.length + ': p≥0.6 → ' + hi.win + 'W/' + hi.loss + 'L · mid → ' + mid.win + 'W/' + mid.loss + 'L · p<0.4 → ' + lo.win + 'W/' + lo.loss + 'L. Weights [' + mlModel.feats.map((f, i) => f + ':' + mlModel.w[i]).join(', ') + '].');
+  } catch (e) { console.log('[' + ts() + '] ML-DIR train error: ' + e.message); }
+}
+setTimeout(() => { try { mlTrain(); } catch (e) {} }, 90000);
+setInterval(() => { try { mlTrain(); } catch (e) {} }, 12 * 3600000).unref();
+app.get('/ml', (req, res) => {
+  if (req.query.train === '1') mlTrain();
+  res.json(mlModel || { trained: false, note: 'needs 80+ graded samples in the last 14 days' });
+});
+
 // ===== PROTECTIONS — FREQTRADE-STYLE CIRCUIT BREAKERS (2026-08-28, Jean) =====
 // Ported concepts from Freqtrade's protections module (StoplossGuard + MaxDrawdown):
 // PROTECT_MAX_STREAK straight pre-TP1 stops → pause firing PROTECT_PAUSE_MIN minutes;
@@ -2553,6 +2653,11 @@ function saveRuntimeState() {
     SYMBOLS.forEach(sym => {
       const s = S[sym]; if (!s) return;
       out.symbols[sym] = {
+        // lastPrice persistence (2026-08-30, btc.html blank-after-deploy case): a
+        // restart cleared all in-memory prices; with the bridge quiet (weekend) the
+        // monitors showed $0 until the next real tick. Restore is display-safe — the
+        // quarantine gap-confirm logic still vets Monday's first real tick.
+        lastPrice: s.lastPrice || 0,
         trade: (s.trade && s.trade.active) ? s.trade : null,
         lastHistTs: (s.lastHistEntry && s.lastHistEntry.ts) || null,
         closeRequest: (s.closeRequest && s.closeRequest.active) ? s.closeRequest : null,
@@ -2596,13 +2701,33 @@ setInterval(saveRuntimeState, 20000).unref();
 function loadRuntimeState() {
   let raw = null;
   try { raw = JSON.parse(fs.readFileSync(RUNTIME_FILE, 'utf8')); } catch (e) { console.log('[' + ts() + '] Runtime state: no file — fresh runtime.'); return; }
-  if (!raw || raw.date !== todayDateET()) { console.log('[' + ts() + '] Runtime state: stale (not today) — fresh runtime.'); return; }
+  if (!raw || raw.date !== todayDateET()) {
+    // Stale checkpoint: trades/cooldowns belong to their day and stay dead — but the
+    // last known PRICE is still the best display value over a weekend/restart gap
+    // (2026-08-30 btc.html case). Restore prices only, from checkpoints ≤3 days old.
+    try {
+      if (raw && raw.savedTs && (Date.now() - raw.savedTs) < 3 * 86400000 && raw.symbols) {
+        SYMBOLS.forEach(sym => {
+          const d0 = raw.symbols[sym];
+          if (S[sym] && d0 && d0.lastPrice > 0 && !(S[sym].lastPrice > 0)) {
+            S[sym].lastPrice = d0.lastPrice;
+            console.log('[' + ts() + '] ' + sym + ' — lastPrice restored from stale checkpoint: $' + d0.lastPrice + ' (display continuity).');
+          }
+        });
+      }
+    } catch (eLP) {}
+    console.log('[' + ts() + '] Runtime state: stale (not today) — fresh runtime (prices carried).');
+    return;
+  }
   const now = Date.now();
   SYMBOLS.forEach(sym => {
     const s = S[sym]; const d = raw.symbols && raw.symbols[sym];
     if (!s || !d) return;
     const findHist = (t) => t ? signalHistory.find(h => h.ts === t && h.symbol === sym) : null;
     try {
+      // 0) Last known price (2026-08-30): restore for display/quarantine continuity
+      // only if no fresh tick has arrived since boot.
+      if (!(s.lastPrice > 0) && d.lastPrice > 0) s.lastPrice = d.lastPrice;
       // 1) Active trade — the critical restore. Original ts kept (EA identity).
       if (d.trade && d.trade.active && d.trade.ts && (now - d.trade.ts) < 12 * 3600000) {
         d.trade._oteVetted = true; // never re-vet a restored trade
@@ -2957,6 +3082,9 @@ function logSignal(sym, sig) {
     // gradable from /signals real outcomes (06:40 bottom-tick case — revert rule: bypass
     // net-negative over ~8 fires → drop the bypass entirely).
     p381Bypass: sig._p381 === true || undefined,
+    // ML-DIR learned-scorer probability (dormant, 2026-08-29) — grade fired rows by
+    // p-bucket in the nightly report; promotion requires holdout AND live agreement.
+    mlP: (typeof sig._mlP === 'number') ? +sig._mlP.toFixed(3) : undefined,
     // Outcome tracking (added 2026-05-12) — updated by checkExit() when trade flags flip.
     // Boolean fields stay false until TP1/TP2/TP3/SL price is touched. Used by CSV export
     // to surface trade outcome per signal.
@@ -4634,6 +4762,28 @@ function processPrice(sym, price, hi, lo) {
   // 0.4 bar + conv floor. DORMANT: signal still blocks. 3-min per-direction throttle.
   function enrichSig(sig) {
     const _esPassed = enrichSigCore(sig);
+    // ===== ML-DIR SCORING (DORMANT, 2026-08-29) — every XAU signal, fired or blocked =====
+    try {
+      if (sym === 'XAU' && sig && sig.type && mlModel && mlModel.w) {
+        const _mlM = parseFloat(sig.macd), _mlR = parseFloat(String(sig.roc).replace(/[%+]/g, '')), _mlRs = parseFloat(sig.rsi);
+        if (isFinite(_mlM) && isFinite(_mlR) && isFinite(_mlRs)) {
+          const _mlHeld = sig._cHeld === 1 ? 1 : 0;
+          const _mlP = mlPredict(mlFeatures(sig.type, _mlM, _mlR, _mlRs, sig.conv && sig.conv.score, s.chopActive ? 1 : 0, sig._confScore, _mlHeld));
+          if (_mlP !== null) {
+            sig._mlP = _mlP;
+            // Blocked signal the model LIKES (p ≥ 0.65) → ML-DIR cohort (3-min throttle/direction)
+            if (!_esPassed && _mlP >= 0.65) {
+              s._mlDirTs = s._mlDirTs || {};
+              if (Date.now() - (s._mlDirTs[sig.type] || 0) >= 180000) {
+                s._mlDirTs[sig.type] = Date.now();
+                const _mlMsg = '🧠 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' ML-DIR DORMANT-WOULD-FIRE @ $' + parseFloat(sig.price).toFixed(2) + ' — learned scorer p=' + _mlP.toFixed(2) + ' (model n=' + mlModel.n + ', trained ' + Math.round((Date.now() - mlModel.trainedTs) / 3600000) + 'h ago) but a gate blocked it (FreqAI-style confirmation audition, 2026-08-29).';
+                log(sym, _mlMsg); trackBlockedOutcome(sym, _mlMsg, true);
+              }
+            }
+          }
+        }
+      }
+    } catch (eML) { /* scorer must never affect firing */ }
     if (!_esPassed) {
       try {
         if (sym === 'XAU' && sig && sig.type) {
@@ -15755,7 +15905,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.08-20260828-trailsim-sweep', // bump on each deploy — lets /state verify what's live
+    build: '6.10-20260830-lastprice-persist', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
