@@ -1860,6 +1860,9 @@ function cohortFor(reason) {
   if (/BTC-INV/.test(reason)) return 'BTC-INV'; // inverted BTC RIDE/LHF puts → calls, dormant audition (2026-08-28, Jean's LOL that graded 78%/62%)
   if (/PROTECT-STREAK|PROTECT-DAYCAP/.test(reason)) return 'PROTECT'; // circuit-breaker suppressed fires (2026-08-28, Freqtrade port) — measures what each pause saved/cost
   if (/ML-DIR/.test(reason)) return 'ML-DIR'; // learned scorer's p≥0.65 blocked signals (dormant FreqAI-style audition, 2026-08-29)
+  if (/NAS-ORB/.test(reason)) return 'NAS-ORB'; // opening-range breakout lane, dormant (2026-08-30, Zarattini port)
+  if (/NAS-GAP/.test(reason)) return 'NAS-GAP'; // overnight gap-fill lane, dormant (2026-08-30)
+  if (/NAS-VWAP/.test(reason)) return 'NAS-VWAP'; // session-VWAP stretch fade lane, dormant (2026-08-30)
   if (/REJECT-FLOW/.test(reason)) return 'REJECT-FLOW';
   if (/CT-VETO/.test(reason)) return 'CT-VETO';
   if (/FADE-ROC/.test(reason)) return 'FADE-ROC';
@@ -2668,7 +2671,8 @@ function saveRuntimeState() {
           lastHiRevTs: s.lastHiRevTs || 0, lastLoRevTs: s.lastLoRevTs || 0,
           zobLastFireTs: s._zobLastFireTs || 0, seRetestTs: s._seRetestTs || {},
           lbWaiverTs: s._lbWaiverTs || 0,
-          protSlStreak: s._protSlStreak || 0, protPauseUntil: s._protPauseUntil || 0
+          protSlStreak: s._protSlStreak || 0, protPauseUntil: s._protPauseUntil || 0,
+          rthClose: s._rthClose || 0, rthCloseDate: s._rthCloseDate || null
         },
         chop: { active: !!s.chopActive, chopCount: s.chopCount || 0, trendCount: s.trendCount || 0, atrSessOpen: s._atrSessOpen || 0 },
         tickRateSess: (typeof s._tickRateSess === 'number') ? s._tickRateSess : null,
@@ -2712,6 +2716,10 @@ function loadRuntimeState() {
           if (S[sym] && d0 && d0.lastPrice > 0 && !(S[sym].lastPrice > 0)) {
             S[sym].lastPrice = d0.lastPrice;
             console.log('[' + ts() + '] ' + sym + ' — lastPrice restored from stale checkpoint: $' + d0.lastPrice + ' (display continuity).');
+          }
+          // NAS-GAP prior close also crosses day boundaries by nature (2026-08-30)
+          if (S[sym] && d0 && d0.cool && d0.cool.rthClose > 0 && !(S[sym]._rthClose > 0)) {
+            S[sym]._rthClose = d0.cool.rthClose; S[sym]._rthCloseDate = d0.cool.rthCloseDate || null;
           }
         });
       }
@@ -2758,6 +2766,8 @@ function loadRuntimeState() {
         // PROTECT breaker state (2026-08-28): a tripped breaker must survive a redeploy
         s._protSlStreak = Math.max(s._protSlStreak || 0, d.cool.protSlStreak || 0);
         s._protPauseUntil = Math.max(s._protPauseUntil || 0, d.cool.protPauseUntil || 0);
+        // NAS-GAP prior-RTH-close (2026-08-30): must survive the overnight/weekend restart
+        if (d.cool.rthClose > 0 && !(s._rthClose > 0)) { s._rthClose = d.cool.rthClose; s._rthCloseDate = d.cool.rthCloseDate || null; }
       }
       // 4) Chop state + session-open ATR anchor
       if (d.chop) {
@@ -9929,6 +9939,88 @@ function processPrice(sym, price, hi, lo) {
             }
           }
         } catch (eRF) { /* dormant lane must never crash the tick */ }
+        // ===== NAS DORMANT LANES — ORB / VWAP-FADE / GAP-FILL (2026-08-30, Jean: "ship the 3 as dormant") =====
+        // GitHub/paper ports, all measurement-only:
+        //  · NAS-ORB — Zarattini-style opening range: 09:30-09:45 ET range, first breakout
+        //    after 09:45 (until 11:30), stop = far side of range, target = 1R. One/day.
+        //    Replication warns edge is marginal after costs — that's what the cohort tests.
+        //  · NAS-GAP — overnight gap vs prior RTH close (captured 15:55-16:00 ET), stamped
+        //    at 09:30-09:36 toward the fill (NQ gaps fill ~60% per public stats), stop 0.5×gap.
+        //  · NAS-VWAP — session-VWAP stretch fade: |price − vwap| ≥ max(2×ATR, 0.20%) in RTH
+        //    → fade toward VWAP (target = VWAP, stop 1×ATR beyond). 30-min/side throttle.
+        // Promotion bar for each: ≥60% over ≥15 resolved, else they stay stamps forever.
+        try {
+          if (sym === 'NAS100' && price > 0) {
+            const _nlEt = new Date().toLocaleTimeString('en-GB', { timeZone: 'America/New_York' });
+            const _nlHM = (+_nlEt.slice(0, 2)) * 60 + (+_nlEt.slice(3, 5));
+            const _nlDay = todayDateET();
+            if (!s._nl || s._nl.date !== _nlDay) s._nl = { date: _nlDay, orbHi: -Infinity, orbLo: Infinity, orbFired: false, gapDone: false, vwapTs: { call: 0, put: 0 } };
+            // prior-RTH-close capture for tomorrow's gap (15:55-16:00 ET, last tick wins)
+            if (_nlHM >= 955 && _nlHM < 960) { s._rthClose = price; s._rthCloseDate = _nlDay; }
+            // --- NAS-ORB: build the 09:30-09:45 range, stamp the first breakout 09:45-11:30 ---
+            if (_nlHM >= 570 && _nlHM < 585) {
+              if (price > s._nl.orbHi) s._nl.orbHi = price;
+              if (price < s._nl.orbLo) s._nl.orbLo = price;
+            } else if (!s._nl.orbFired && _nlHM >= 585 && _nlHM < 690 && isFinite(s._nl.orbHi) && isFinite(s._nl.orbLo) && s._nl.orbHi > s._nl.orbLo) {
+              const _orbR = s._nl.orbHi - s._nl.orbLo;
+              const _orbDir = price > s._nl.orbHi ? 'call' : (price < s._nl.orbLo ? 'put' : null);
+              if (_orbDir && _orbR >= 5) {
+                s._nl.orbFired = true;
+                s.blockedOutcomes = s.blockedOutcomes || [];
+                s.blockedOutcomes.push({
+                  ts: _zNow, time: ts(), symbol: sym, detector: 'NAS-ORB', type: _orbDir,
+                  price: +price.toFixed(2),
+                  virtualTp1: +(_orbDir === 'call' ? price + _orbR : price - _orbR).toFixed(2),
+                  virtualSl: +(_orbDir === 'call' ? s._nl.orbLo : s._nl.orbHi).toFixed(2),
+                  blockReason: '🕘 NAS-ORB ' + _orbDir.toUpperCase() + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — first breakout of the 09:30-09:45 opening range $' + s._nl.orbLo.toFixed(2) + '-$' + s._nl.orbHi.toFixed(2) + ' ($' + _orbR.toFixed(2) + '); stop = far side, target = 1R (Zarattini ORB port, dormant 2026-08-30).',
+                  snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+                  tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null
+                });
+                log(sym, '🕘 NAS-ORB ' + _orbDir.toUpperCase() + ' stamped @ $' + price.toFixed(2) + ' (range $' + _orbR.toFixed(2) + ', dormant).');
+              }
+            }
+            // --- NAS-GAP: overnight gap toward the fill, once, 09:30-09:36 ---
+            if (!s._nl.gapDone && _nlHM >= 570 && _nlHM < 576 && s._rthClose > 0 && s._rthCloseDate && s._rthCloseDate !== _nlDay) {
+              s._nl.gapDone = true;
+              const _gap = price - s._rthClose;
+              if (Math.abs(_gap) >= Math.max(20, price * 0.0007)) {
+                const _gDir = _gap > 0 ? 'put' : 'call';
+                s.blockedOutcomes = s.blockedOutcomes || [];
+                s.blockedOutcomes.push({
+                  ts: _zNow, time: ts(), symbol: sym, detector: 'NAS-GAP', type: _gDir,
+                  price: +price.toFixed(2),
+                  virtualTp1: +s._rthClose.toFixed(2),
+                  virtualSl: +(_gap > 0 ? price + Math.abs(_gap) * 0.5 : price - Math.abs(_gap) * 0.5).toFixed(2),
+                  blockReason: '🕳 NAS-GAP ' + _gDir.toUpperCase() + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — overnight gap ' + (_gap > 0 ? '+' : '') + '$' + _gap.toFixed(2) + ' vs prior RTH close $' + s._rthClose.toFixed(2) + ' (' + s._rthCloseDate + '); trade toward the fill, stop 0.5×gap (NQ gaps fill ~60%, dormant 2026-08-30).',
+                  snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+                  tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null
+                });
+                log(sym, '🕳 NAS-GAP ' + _gDir.toUpperCase() + ' stamped @ $' + price.toFixed(2) + ' (gap $' + _gap.toFixed(2) + ', dormant).');
+              }
+            }
+            // --- NAS-VWAP: session-VWAP stretch fade, RTH 09:45-15:55 ---
+            if (_nlHM >= 585 && _nlHM < 955 && s.vwapCount > 30 && atrVal > 0) {
+              const _vw = s.vwapSum / s.vwapCount;
+              const _vwD = price - _vw;
+              const _vwStretch = Math.max(2 * atrVal, price * 0.002);
+              const _vwDir = _vwD >= _vwStretch ? 'put' : (_vwD <= -_vwStretch ? 'call' : null);
+              if (_vwDir && _zNow - (s._nl.vwapTs[_vwDir] || 0) >= 1800000) {
+                s._nl.vwapTs[_vwDir] = _zNow;
+                s.blockedOutcomes = s.blockedOutcomes || [];
+                s.blockedOutcomes.push({
+                  ts: _zNow, time: ts(), symbol: sym, detector: 'NAS-VWAP', type: _vwDir,
+                  price: +price.toFixed(2),
+                  virtualTp1: +_vw.toFixed(2),
+                  virtualSl: +(_vwDir === 'put' ? price + atrVal : price - atrVal).toFixed(2),
+                  blockReason: '📏 NAS-VWAP ' + _vwDir.toUpperCase() + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — stretched $' + Math.abs(_vwD).toFixed(2) + ' ' + (_vwD > 0 ? 'above' : 'below') + ' session VWAP $' + _vw.toFixed(2) + ' (≥max(2×ATR $' + (2 * atrVal).toFixed(2) + ', 0.20%)); fade toward VWAP, stop 1×ATR beyond (NQ VWAP-reversion port, dormant 2026-08-30).',
+                  snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+                  tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null
+                });
+                log(sym, '📏 NAS-VWAP ' + _vwDir.toUpperCase() + ' stamped @ $' + price.toFixed(2) + ' (vwap $' + _vw.toFixed(2) + ', dormant).');
+              }
+            }
+          }
+        } catch (eNL) { /* dormant lanes must never crash the tick */ }
         // ===== OTE-HOLD — ENTRY AUCTION FOR ALL XAU SIGNALS (2026-08-26, Jean) =====
         // "Bot detects a signal → it looks where the OTE is → takes 3 to 5 minutes to
         // get as close as possible to it → fires." Never skips a signal (the July
@@ -15905,7 +15997,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.10-20260830-lastprice-persist', // bump on each deploy — lets /state verify what's live
+    build: '6.11-20260830-nas-orb-vwap-gap', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
