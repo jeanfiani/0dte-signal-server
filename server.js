@@ -1858,6 +1858,7 @@ function cohortFor(reason) {
   if (/P381-BYPASS/.test(reason)) return 'P381-BYPASS'; // RSI-exhaustion bypass fires, finally cohort-stamped (2026-08-27, 06:40 bottom-tick case)
   if (/FLOOR-PATH/.test(reason)) return 'FLOOR-PATH'; // TP1-into-defended-floor blocks (2026-08-28, 21:57/06:40 cases)
   if (/BTC-INV/.test(reason)) return 'BTC-INV'; // inverted BTC RIDE/LHF puts → calls, dormant audition (2026-08-28, Jean's LOL that graded 78%/62%)
+  if (/PROTECT-STREAK|PROTECT-DAYCAP/.test(reason)) return 'PROTECT'; // circuit-breaker suppressed fires (2026-08-28, Freqtrade port) — measures what each pause saved/cost
   if (/REJECT-FLOW/.test(reason)) return 'REJECT-FLOW';
   if (/CT-VETO/.test(reason)) return 'CT-VETO';
   if (/FADE-ROC/.test(reason)) return 'FADE-ROC';
@@ -1952,6 +1953,15 @@ function pnlMultFor(sym, t) {
   } catch (e) {}
   return PNL_MULT[sym] || 1;
 }
+// ===== PROTECTIONS — FREQTRADE-STYLE CIRCUIT BREAKERS (2026-08-28, Jean) =====
+// Ported concepts from Freqtrade's protections module (StoplossGuard + MaxDrawdown):
+// PROTECT_MAX_STREAK straight pre-TP1 stops → pause firing PROTECT_PAUSE_MIN minutes;
+// booked day P&L ≤ -PROTECT_DAY_LOSS → flat until the next ET session. Signals during
+// a breaker keep stamping + virtual-tracking (PROTECT cohort) so every pause
+// self-measures — revert with evidence like any gate.
+const PROTECT_MAX_STREAK = parseInt(process.env.PROTECT_MAX_STREAK || '3', 10);
+const PROTECT_PAUSE_MIN = parseInt(process.env.PROTECT_PAUSE_MIN || '90', 10);
+const PROTECT_DAY_LOSS = parseFloat(process.env.PROTECT_DAY_LOSS || '1200');
 const PNL_LEDGER_FILE = path.join(DATA_DIR, 'pnl_ledger.json');
 let pnlLedger = {};
 try { pnlLedger = JSON.parse(fs.readFileSync(PNL_LEDGER_FILE, 'utf8')) || {}; } catch (e) { pnlLedger = {}; }
@@ -2552,7 +2562,8 @@ function saveRuntimeState() {
           lastReversalTs: s.lastReversalTs || 0, nC: s.nC || 0, nP: s.nP || 0,
           lastHiRevTs: s.lastHiRevTs || 0, lastLoRevTs: s.lastLoRevTs || 0,
           zobLastFireTs: s._zobLastFireTs || 0, seRetestTs: s._seRetestTs || {},
-          lbWaiverTs: s._lbWaiverTs || 0
+          lbWaiverTs: s._lbWaiverTs || 0,
+          protSlStreak: s._protSlStreak || 0, protPauseUntil: s._protPauseUntil || 0
         },
         chop: { active: !!s.chopActive, chopCount: s.chopCount || 0, trendCount: s.trendCount || 0, atrSessOpen: s._atrSessOpen || 0 },
         tickRateSess: (typeof s._tickRateSess === 'number') ? s._tickRateSess : null,
@@ -2619,6 +2630,9 @@ function loadRuntimeState() {
         s._zobLastFireTs = Math.max(s._zobLastFireTs || 0, d.cool.zobLastFireTs || 0);
         if (d.cool.seRetestTs && typeof d.cool.seRetestTs === 'object') s._seRetestTs = d.cool.seRetestTs;
         s._lbWaiverTs = Math.max(s._lbWaiverTs || 0, d.cool.lbWaiverTs || 0);
+        // PROTECT breaker state (2026-08-28): a tripped breaker must survive a redeploy
+        s._protSlStreak = Math.max(s._protSlStreak || 0, d.cool.protSlStreak || 0);
+        s._protPauseUntil = Math.max(s._protPauseUntil || 0, d.cool.protPauseUntil || 0);
       }
       // 4) Chop state + session-open ATR anchor
       if (d.chop) {
@@ -8006,6 +8020,29 @@ function processPrice(sym, price, hi, lo) {
         }
       }
     } catch (eFP) { /* floor-path must never crash enrichment */ }
+    // ===== PROTECTIONS GATE (LIVE, 2026-08-28 — Freqtrade port, Jean: "we can ship
+    // the protections module") ===== Placed LAST deliberately: only signals that
+    // passed every other gate reach here, so PROTECT stamps measure exactly the
+    // fires each breaker suppressed.
+    try {
+      if (isMT5) {
+        const _prNow = Date.now();
+        if (s._protPauseUntil && _prNow < s._protPauseUntil) {
+          const _prMsg = '🛡️ ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — PROTECT-STREAK: ' + PROTECT_MAX_STREAK + ' straight SLs tripped the breaker, paused ' + Math.ceil((s._protPauseUntil - _prNow) / 60000) + 'min more (Freqtrade StoplossGuard port 2026-08-28). Virtual tracking continues.';
+          log(sym, _prMsg); trackBlockedOutcome(sym, _prMsg, true);
+          Object.assign(s, _emitSnapshot);
+          return false;
+        }
+        const _prDay = pnlLedger[todayDateET()];
+        const _prPnl = (_prDay && _prDay[sym] && typeof _prDay[sym].pnl === 'number') ? _prDay[sym].pnl : 0;
+        if (_prPnl <= -PROTECT_DAY_LOSS) {
+          const _prMsg2 = '🛡️ ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — PROTECT-DAYCAP: booked day P&L $' + _prPnl.toFixed(2) + ' ≤ -$' + PROTECT_DAY_LOSS.toFixed(0) + ' — flat until next ET session (Freqtrade MaxDrawdown port 2026-08-28). Virtual tracking continues.';
+          log(sym, _prMsg2); trackBlockedOutcome(sym, _prMsg2, true);
+          Object.assign(s, _emitSnapshot);
+          return false;
+        }
+      }
+    } catch (ePR) { /* protections must never crash enrichment */ }
     return true;
   }
 
@@ -14163,11 +14200,28 @@ function checkExit(sym, price) {
     if (iC && price < t.worstPrice) t.worstPrice = price;
     if (!iC && price > t.worstPrice) t.worstPrice = price;
 
+    // ===== TRAIL-SIM — PASSIVBOT-STYLE TRAILING CLOSE, SHADOW (2026-08-28, Jean) =====
+    // Passivbot closes runners on a RETRACE FROM PEAK, not at fixed levels: after the
+    // move goes favorable, exit when price gives back a set fraction of the peak gain.
+    // Shadow only: per tick we track what that rule (40% retrace of peak favorable,
+    // armed after TP1) would have done; at the real exit the comparison is logged +
+    // written to the fired row (trailSim field) so the nightly report can grade
+    // "trailing close vs BE-trail" on real trades before any live change.
+    if (t.t1 && !t.scalp && !t.sl) {
+      const _tcFav = iC ? price - t.ep : t.ep - price;
+      if (_tcFav > (t._tcPeak || 0)) t._tcPeak = _tcFav;
+      if (!t._tcExitP && (t._tcPeak || 0) > 0 && _tcFav <= t._tcPeak * 0.6) {
+        t._tcExitP = price; // virtual trailing exit locked at 40% give-back of peak
+        log(sym, '📐 TRAIL-SIM virtual exit @ $' + price.toFixed(2) + ' (peak fav $' + t._tcPeak.toFixed(2) + ', 40% retrace) — shadow only, real trade unaffected.');
+      }
+    }
+
     // TP1 hit → lock small profit (changed 2026-07-02: was pure breakeven).
     // ~1/3 of fired trades were ending as BE scratches — e.g. 7/02 XAU peaked +$5.04 and
     // exited at $0.00; BTC 09:31 TP1'd then scratched while price ran +$266 more. Trailing
     // at entry ± 0.3×ATR keeps a small win on every scratch instead of zero.
     if (!t.t1 && ((iC && price >= t.tp1Price) || (!iC && price <= t.tp1Price))) {
+      s._protSlStreak = 0; // PROTECT-STREAK (2026-08-28): any TP1 hit resets the stop streak
       // Phase 3.94 (2026-07-06): TP1-only scalp trades (elite-continuation bypass) take
       // the FULL exit at TP1 — no runners. Low-in-range continuation entries V-bounce
       // right after TP1 (7/06 10:41 case: 4136→4128→4137 in minutes).
@@ -14213,6 +14267,14 @@ function checkExit(sym, price) {
     // TP3 hit → full exit
     if (!t.sl && ((iC && price >= t.tp3Price) || (!iC && price <= t.tp3Price))) {
       t.sl = true; t.lastETs = now;
+      // TRAIL-SIM comparison at TP3 (2026-08-28): did the trailing close cut a full winner short?
+      try {
+        if (t._tcPeak) {
+          const _tcExitPnl3 = t._tcExitP ? (iC ? t._tcExitP - t.ep : t.ep - t._tcExitP) : pnl;
+          log(sym, '📐 TRAIL-SIM verdict — trailing close: $' + _tcExitPnl3.toFixed(2) + '/unit vs actual TP3: $' + pnl.toFixed(2) + '/unit (delta ' + (_tcExitPnl3 - pnl >= 0 ? '+' : '') + '$' + (_tcExitPnl3 - pnl).toFixed(2) + ').');
+          if (s.lastHistEntry && s.lastHistEntry.symbol === sym) s.lastHistEntry.trailSim = { exitPnl: +_tcExitPnl3.toFixed(2), actualPnl: +pnl.toFixed(2), peak: +t._tcPeak.toFixed(2) };
+        }
+      } catch (eTC3) {}
       log(sym, '🏆 TP3 FULL TARGET — $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2));
       sendPush('🏆 ' + sym + ' TP3 — FULL TARGET', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · close trade', 'signal');
       updateSignalOutcome(sym, price); // capture TP3 outcome BEFORE clearing trade
@@ -14234,6 +14296,14 @@ function checkExit(sym, price) {
       if (tsHit) {
         const tsPnl = iC ? t.trailSl - t.ep : t.ep - t.trailSl;
         t.sl = true; t.lastETs = now;
+        // TRAIL-SIM comparison (2026-08-28): what would Passivbot-style trailing close have earned?
+        try {
+          if (t._tcPeak) {
+            const _tcExitPnl = t._tcExitP ? (iC ? t._tcExitP - t.ep : t.ep - t._tcExitP) : tsPnl;
+            log(sym, '📐 TRAIL-SIM verdict — trailing close: $' + _tcExitPnl.toFixed(2) + '/unit vs actual BE-trail: $' + tsPnl.toFixed(2) + '/unit (delta ' + (_tcExitPnl - tsPnl >= 0 ? '+' : '') + '$' + (_tcExitPnl - tsPnl).toFixed(2) + ', peak $' + t._tcPeak.toFixed(2) + ').');
+            if (s.lastHistEntry && s.lastHistEntry.symbol === sym) s.lastHistEntry.trailSim = { exitPnl: +_tcExitPnl.toFixed(2), actualPnl: +tsPnl.toFixed(2), peak: +t._tcPeak.toFixed(2) };
+          }
+        } catch (eTC) {}
         log(sym, '🛑 TRAIL SL — $' + price.toFixed(2) + ' · SL was $' + t.trailSl.toFixed(2) + ' · P&L $' + tsPnl.toFixed(2));
         sendPush('🛑 ' + sym + ' TRAIL SL', '$' + price.toFixed(2) + ' · P&L $' + tsPnl.toFixed(2), 'exit');
         updateSignalOutcome(sym, price);
@@ -14265,6 +14335,18 @@ function checkExit(sym, price) {
         const slPnl = iC ? t.slPrice - t.ep : t.ep - t.slPrice;
         log(sym, '🛑 SL HIT — ' + t.type.toUpperCase() + ' $' + price.toFixed(2) + ' · SL $' + t.slPrice.toFixed(2) + ' · P&L $' + slPnl.toFixed(2));
         sendPush('🛑 ' + sym + ' SL HIT', t.type.toUpperCase() + ' · loss $' + slPnl.toFixed(2) + ' — exit now', 'exit');
+        // ===== PROTECT-STREAK (2026-08-28, Freqtrade StoplossGuard port, Jean) =====
+        // Full pre-TP1 stops count toward the streak; any TP1 hit resets it. At
+        // PROTECT_MAX_STREAK straight stops, firing pauses PROTECT_PAUSE_MIN minutes
+        // (signals keep stamping + virtual-tracking so the pause self-measures).
+        try {
+          s._protSlStreak = (s._protSlStreak || 0) + 1;
+          if (s._protSlStreak >= PROTECT_MAX_STREAK && !(s._protPauseUntil > now)) {
+            s._protPauseUntil = now + PROTECT_PAUSE_MIN * 60000;
+            log(sym, '🛡️ PROTECT-STREAK TRIPPED — ' + s._protSlStreak + ' straight SLs; firing paused ' + PROTECT_PAUSE_MIN + 'min (until ' + new Date(s._protPauseUntil).toISOString().slice(11, 16) + 'Z). Virtual tracking continues.');
+            sendPush('🛡️ ' + sym + ' trading PAUSED', s._protSlStreak + ' straight SLs — ' + PROTECT_PAUSE_MIN + 'min breaker (Freqtrade-style protections)', 'exit');
+          }
+        } catch (ePS) {}
         updateSignalOutcome(sym, price);
         // R5 (2026-06-11): record the loss for the repeat-loss zone lockout (gate in enrichSig)
         try {
@@ -15673,7 +15755,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.06-20260828-btc-inv-audition', // bump on each deploy — lets /state verify what's live
+    build: '6.08-20260828-trailsim-sweep', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
@@ -16335,6 +16417,54 @@ app.get('/signals/csv/:date', (req, res) => {
 });
 
 // Signal history — full JSON API (7-day persistent store)
+// ===== /sweep — HYPEROPT-STYLE THRESHOLD SWEEP (2026-08-28, Freqtrade port #3, Jean) =====
+// Freqtrade never hand-picks thresholds; it sweeps them against history. This does the
+// same in-process over the 7-day fired-signal store (real outcomes, no snapshots):
+// per-bin W/L for aligned |MACD| and |ROC3|, plus a what-if table for candidate bars
+// (MOM-FLOOR, FADE-ROC, MOM-OVERRIDE calibration). Usage: /sweep?symbol=XAU&days=7
+app.get('/sweep', (req, res) => {
+  try {
+    const sym = (req.query.symbol || 'XAU').toUpperCase();
+    const days = Math.min(parseInt(req.query.days, 10) || 7, 30);
+    const cutoff = Date.now() - days * 86400000;
+    const fired = signalHistory.filter(h => h.symbol === sym && h.ts > cutoff &&
+      !(h.conv && (h.conv.enrichBlocked === true || h.conv.label === 'BLOCKED')) &&
+      h.outcomes && (h.outcomes.tp1Hit || h.outcomes.slHit));
+    const grade = (h) => (h.outcomes.tp1Hit && !h.outcomes.slHit) ? 'win' : (h.outcomes.tp1Hit ? 'scratch' : 'loss');
+    const mk = () => ({ win: 0, loss: 0, scratch: 0 });
+    const macdEdges = [0, 0.1, 0.2, 0.3, 0.5, 1.0, 99];
+    const rocEdges = [0, 0.03, 0.05, 0.1, 0.15, 0.3, 99];
+    const macdBins = { against: mk() }, rocBins = { against: mk() };
+    const rows = [];
+    for (const h of fired) {
+      const m = parseFloat(h.macd), r = parseFloat(String(h.roc).replace(/[%+]/g, ''));
+      if (!isFinite(m) || !isFinite(r)) continue;
+      const aM = h.type === 'call' ? m : -m; // aligned magnitude (<0 = momentum AGAINST the trade)
+      const aR = h.type === 'call' ? r : -r;
+      const g = grade(h);
+      rows.push({ aM, aR, g });
+      if (aM < 0) macdBins.against[g]++;
+      else for (let i = 0; i < macdEdges.length - 1; i++) if (aM >= macdEdges[i] && aM < macdEdges[i + 1]) { const k = macdEdges[i] + '-' + macdEdges[i + 1]; (macdBins[k] = macdBins[k] || mk())[g]++; break; }
+      if (aR < 0) rocBins.against[g]++;
+      else for (let i = 0; i < rocEdges.length - 1; i++) if (aR >= rocEdges[i] && aR < rocEdges[i + 1]) { const k = rocEdges[i] + '-' + rocEdges[i + 1]; (rocBins[k] = rocBins[k] || mk())[g]++; break; }
+    }
+    const wr = (t) => (t.win + t.loss) > 0 ? +(100 * t.win / (t.win + t.loss)).toFixed(1) : null;
+    const whatIf = (key, bars) => bars.map(b => {
+      const above = mk(), below = mk();
+      rows.forEach(x => { const v = key === 'macd' ? x.aM : x.aR; (v >= b ? above : below)[x.g]++; });
+      return { bar: b, aboveN: above.win + above.loss + above.scratch, aboveWR: wr(above), belowN: below.win + below.loss + below.scratch, belowWR: wr(below) };
+    });
+    const withWr = (bins) => { const out = {}; Object.keys(bins).forEach(k => { out[k] = Object.assign({ wr: wr(bins[k]) }, bins[k]); }); return out; };
+    res.json({
+      symbol: sym, days: days, firedGraded: rows.length,
+      note: 'aligned = momentum in the trade direction; against = fired with momentum opposing it. WR = win/(win+loss), scratches excluded.',
+      macdBins: withWr(macdBins), rocBins: withWr(rocBins),
+      macdBarWhatIf: whatIf('macd', [0.05, 0.1, 0.15, 0.2, 0.3, 0.4]),
+      rocBarWhatIf: whatIf('roc', [0.02, 0.05, 0.08, 0.1, 0.15])
+    });
+  } catch (e) { res.status(500).json({ error: String(e && e.message) }); }
+});
+
 app.get('/signals', (req, res) => {
   let filtered = signalHistory;
   if (req.query.symbol) {
