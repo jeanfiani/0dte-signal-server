@@ -14442,6 +14442,23 @@ function checkExit(sym, price) {
     if (iC && price < t.worstPrice) t.worstPrice = price;
     if (!iC && price > t.worstPrice) t.worstPrice = price;
 
+    // ===== SL5-SIM — "SL = TP1" SHADOW (2026-08-30, Jean: "should we do SL = TP1?") =====
+    // Evidence for: winners' MAE ≤ $3.42 (July backtest) and ≤ $4.40 all this week,
+    // while losers run adverseFrac ≈ 1.0 — a $5 stop halves loser cost and kept every
+    // winner this week (~+$2,000). Evidence against: EA slippage ($3-4 on fast fires)
+    // effectively tightens any stop, and crash-day ATR makes $5 sub-noise. So: shadow
+    // first. Every XAU fired trade records whether a $5 adverse excursion occurred
+    // BEFORE TP1 (sl5WouldStop on the fired row). Nightly compares actual P&L vs the
+    // $5-stop world. Promote to live SL policy if the shadow shows it net-positive
+    // over ≥15 fires including at least one high-ATR day.
+    if (sym === 'XAU' && !t.t1 && !t.sl && !t._sl5Hit) {
+      const _sl5Adv = iC ? t.ep - price : price - t.ep;
+      if (_sl5Adv >= 5) {
+        t._sl5Hit = true;
+        try { if (s.lastHistEntry && s.lastHistEntry.symbol === sym) s.lastHistEntry.sl5WouldStop = true; } catch (e5) {}
+        log(sym, '📉 SL5-SIM — a $5 stop (SL=TP1) would have exited HERE @ $' + price.toFixed(2) + ' (actual SL $' + (+t.slPrice || 0).toFixed(2) + ' still live). Shadow only.');
+      }
+    }
     // ===== TRAIL-SIM — PASSIVBOT-STYLE TRAILING CLOSE, SHADOW (2026-08-28, Jean) =====
     // Passivbot closes runners on a RETRACE FROM PEAK, not at fixed levels: after the
     // move goes favorable, exit when price gives back a set fraction of the peak gain.
@@ -15997,7 +16014,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.11-20260830-nas-orb-vwap-gap', // bump on each deploy — lets /state verify what's live
+    build: '6.12-20260830-sl5-shadow', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
@@ -16425,6 +16442,11 @@ app.get('/prices', (req, res) => {
 });
 
 // Status endpoint
+// ===== INSTANCE FINGERPRINT (2026-08-30, O-36 replica fix verification) =====
+// A random id minted once per process boot. After setting Railway replicas to 1 and
+// removing stale deployments, refresh /status several times: the SAME bootId + build
+// every time = single instance confirmed; different ids = replicas still split.
+const BOOT_ID = Math.random().toString(36).slice(2, 8) + '-' + Date.now().toString(36);
 app.get('/status', (req, res) => {
   const status = {};
   SYMBOLS.forEach(sym => {
@@ -16448,7 +16470,7 @@ app.get('/status', (req, res) => {
   const wsState = ws ? ['CONNECTING','OPEN','CLOSING','CLOSED'][ws.readyState] : 'NULL';
   const sinceLastPong = wsLastPong > 0 ? ((Date.now() - wsLastPong) / 1000).toFixed(0) + 's' : 'never';
   const wsInfo = { state: wsState, reconnects: wsReconnects, backoff: wsBackoff, uptime: wsUptime(), lastPong: sinceLastPong, sessionAge: wsOpenedAt > 0 ? ((Date.now() - wsOpenedAt) / 1000).toFixed(0) + 's' : 'disconnected', lastClose: { code: wsLastCloseCode, reason: wsLastCloseReason, sessionSec: wsLastSessionDuration } };
-  res.json({ running: ws && ws.readyState === 1, vix: vixV, subscribers: subscriptions.length, ws: wsInfo, symbols: status });
+  res.json({ running: ws && ws.readyState === 1, bootId: BOOT_ID, vix: vixV, subscribers: subscriptions.length, ws: wsInfo, symbols: status });
 });
 
 // ===== PHASE 3.43 — WS DEBUG + ADMIN RE-SUBSCRIBE (added 2026-06-24, task #245) =====
