@@ -10194,8 +10194,18 @@ function processPrice(sym, price, hi, lo) {
             // no news blackout, no active trade, 20min lane cooldown, 30s global dedupe,
             // tight SL = min(zone anchor, 0.8×ATR floor $15). CALL side + XAU/BTC stay
             // DORMANT. Bench rule: 0W/3L live and it reverts to a stamp.
+            // ===== REVERTED TO DORMANT (2026-08-30, Jean: "ok go") =====
+            // W-35 live record: 3W/4L (Mon-Fri 2W/4L = 33.3%), every NAS fire of the
+            // week came from this lane, at ×30/×20 sizing, while NAS's supporting
+            // instruments are degraded (QQQ store frozen 44d, GEX feed dead, validator
+            // components unpopulated — digest O-3/O-38/O-37). The 8/18 promotion rode a
+            // hot 2-day sample; the weekly review's 33.33% NAS WR is this lane alone.
+            // ZONE_OB_NAS_LIVE=true re-enables without a code change. Stamps continue —
+            // re-promotion at ≥60% over ≥15 fresh dormant samples, per the standard bar.
+            const ZONE_OB_NAS_LIVE = process.env.ZONE_OB_NAS_LIVE === 'true';
             let _zFired = false;
             try {
+              if (ZONE_OB_NAS_LIVE) {
               // Session-extreme chase rule applies here too (2026-08-19, Jean: "every
               // signal, no exception"): no put fire within 0.05% of an unbroken session
               // low; a break within the last 90s (live breakdown) is the only way through.
@@ -10251,6 +10261,7 @@ function processPrice(sym, price, hi, lo) {
                   }
                 }
               }
+              } // end ZONE_OB_NAS_LIVE (reverted to dormant 2026-08-30)
             } catch (eZF) { /* zone promotion must never crash the tick */ }
             if (!_zFired) {
               const _zMsg = '🗺️ ZONE-OB' + (_isReTouch ? '-RT' : '') + ' ' + (z.dir === 'call' ? 'CALL' : 'PUT') + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — ' + z.kind + ' ' + z.tf + ' ' + (z.dir === 'call' ? 'demand' : 'supply') + ' $' + z.lo.toFixed(2) + '-$' + z.hi.toFixed(2) + ' (formed ' + Math.round((_zNow - z.ts) / 60000) + 'min ago) · SL would anchor $' + _zSl.toFixed(2) + '.';
@@ -16014,7 +16025,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.12-20260830-sl5-shadow', // bump on each deploy — lets /state verify what's live
+    build: '6.13-20260830-zoneob-nas-benched', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
