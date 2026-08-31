@@ -10519,7 +10519,20 @@ function processPrice(sym, price, hi, lo) {
     //         STRUCT_SWEEP locks for the rest of the session (set via s.asianSweepInvalidated)
     const STRUCT_SWEEP_MODE = process.env.STRUCT_SWEEP_MODE || 'aggressive';
     const isConservativeMode = STRUCT_SWEEP_MODE === 'conservative';
-    if (s.asianH_locked && s.asianL_locked && cool3 && !s.asianSweepInvalidated) {
+    // ===== DEGENERATE ASIAN-RANGE GUARD (2026-08-31, Jean: "at least $16") =====
+    // 8/30 18:23 case: Sunday reopen seeded asianH == asianL == Friday's close (zero
+    // range); the sweep floors (15% of range) collapsed to ~$0.89 and a $1 wiggle
+    // qualified as a Judas swing → STRUCT_SWEEP CALL fired into the crash, −$529.50,
+    // mlP 0.207. A liquidity grab needs real liquidity: Asian range must be ≥ $16 on
+    // XAU (≈0.36% elsewhere), and H must differ from L (single-price seeds invalid).
+    const _ssMinRange = sym === 'XAU' ? 16 : price * 0.0036;
+    const _ssRangeOk = s.asianH_locked && s.asianL_locked && s.asianH_locked > s.asianL_locked &&
+                       (s.asianH_locked - s.asianL_locked) >= _ssMinRange;
+    if (s.asianH_locked && s.asianL_locked && !_ssRangeOk && !s._ssRangeWarned) {
+      s._ssRangeWarned = true;
+      log(sym, '🥷 STRUCT_SWEEP standing down this session — Asian range $' + (s.asianH_locked - s.asianL_locked).toFixed(2) + ' < $' + _ssMinRange.toFixed(2) + ' minimum (degenerate/seeded levels; Jean 2026-08-31, 8/30 18:23 case).');
+    }
+    if (_ssRangeOk && s.asianH_locked && s.asianL_locked && cool3 && !s.asianSweepInvalidated) {
       const sweepCool = now2 - s.structSweepLastTs > 60 * 60 * 1000; // 60min between sweeps
       const sweepWindowMs = 4 * 60 * 60 * 1000; // sweep must have happened in last 4h
 
@@ -16025,7 +16038,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.13-20260830-zoneob-nas-benched', // bump on each deploy — lets /state verify what's live
+    build: '6.14-20260831-sweep-range-guard', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
