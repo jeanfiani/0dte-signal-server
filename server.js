@@ -1863,6 +1863,7 @@ function cohortFor(reason) {
   if (/NAS-ORB/.test(reason)) return 'NAS-ORB'; // opening-range breakout lane, dormant (2026-08-30, Zarattini port)
   if (/NAS-GAP/.test(reason)) return 'NAS-GAP'; // overnight gap-fill lane, dormant (2026-08-30)
   if (/NAS-VWAP/.test(reason)) return 'NAS-VWAP'; // session-VWAP stretch fade lane, dormant (2026-08-30)
+  if (/REGIME-BIAS/.test(reason)) return 'REGIME-BIAS'; // with-STRONG-regime continuations refused by chop/MOM-FLOOR (2026-08-31, Jean's 09:38 case)
   if (/REJECT-FLOW/.test(reason)) return 'REJECT-FLOW';
   if (/CT-VETO/.test(reason)) return 'CT-VETO';
   if (/FADE-ROC/.test(reason)) return 'FADE-ROC';
@@ -4853,6 +4854,27 @@ function processPrice(sym, price, hi, lo) {
           }
         }
       } catch (eBI) { /* inversion audit must never affect blocking */ }
+      // ===== REGIME-BIAS AUDITION (DORMANT, 2026-08-31, Jean's 09:38 blocked winner) =====
+      // 8/31 09:38 RIDE+MACRO PUT @4439.13: micro-weak (MACD +0.09 against, chop=1,
+      // conv 4) — chop gate + MOM-FLOOR both refuse it by design — yet +$17 in 15min,
+      // because the 5-DAY regime is STRONG BEAR and strong-regime chop resolves with
+      // the regime. Hypothesis (trend-day latch, one timeframe up): with-STRONG-regime
+      // continuation signals refused by CHOP or MOM-FLOOR deserve an ease. Stamp them;
+      // promote the ease at ≥60% over ≥15 resolved — never before.
+      try {
+        if (sym === 'XAU' && sig && (sig._blockedBy === 'CHOP' || sig._blockedBy === 'MOM-FLOOR') && sig._regime) {
+          const _rbChg = parseFloat(sig._regime.netChgPct);
+          const _rbStrong = sig._regime.dir !== 'neutral' && isFinite(_rbChg) && Math.abs(_rbChg) >= 2;
+          const _rbWith = (sig._regime.dir === 'bear' && sig.type === 'put') || (sig._regime.dir === 'bull' && sig.type === 'call');
+          const _rbCont = /RIDE|TREND|FAST|SUST|SQZ|6\/6/.test(sig.score || '');
+          s._rbTs = s._rbTs || {};
+          if (_rbStrong && _rbWith && _rbCont && Date.now() - (s._rbTs[sig.type] || 0) >= 180000) {
+            s._rbTs[sig.type] = Date.now();
+            const _rbMsg = '🌍 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' REGIME-BIAS DORMANT-WOULD-FIRE @ $' + parseFloat(sig.price).toFixed(2) + ' — refused by ' + sig._blockedBy + ' (micro-weak: MACD ' + (sig.macd || '?') + ', chop=' + (s.chopActive ? 1 : 0) + ') but WITH the STRONG ' + sig._regime.dir.toUpperCase() + ' regime (' + _rbChg.toFixed(2) + '% 5-day) — strong-regime chop resolves with the regime (Jean 2026-08-31, 09:38 case).';
+            log(sym, _rbMsg); trackBlockedOutcome(sym, _rbMsg, true);
+          }
+        }
+      } catch (eRB) { /* audition must never affect blocking */ }
     }
     return _esPassed;
   }
@@ -7222,6 +7244,7 @@ function processPrice(sym, price, hi, lo) {
           const _chopMsg = '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' chop mode active (only V-REV / LHF / LLF / OBREJ / OBMIT allowed in chop; other detectors consistently lose in flat range).';
           trackBlockedOutcome(sym, _chopMsg, true);
           log(sym, _chopMsg);
+          sig._blockedBy = 'CHOP'; // REGIME-BIAS audition marker (2026-08-31)
           return false;
         }
       }
@@ -8140,6 +8163,7 @@ function processPrice(sym, price, hi, lo) {
           const _mfMsg = '🪫 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — MOM-FLOOR: continuation needs MACD ' + (sig.type === 'call' ? '≥+0.10' : '≤-0.10') + ' AND ROC3 ' + (sig.type === 'call' ? '≥+0.05%' : '≤-0.05%') + ' aligned; got MACD ' + (isFinite(_mfMacd) ? _mfMacd.toFixed(3) : '?') + ' / ROC ' + roc3.toFixed(3) + '% — dead-momentum continuation (Jean 2026-08-26, original momentum minimums restored).';
           log(sym, _mfMsg); trackBlockedOutcome(sym, _mfMsg, true);
           Object.assign(s, _emitSnapshot);
+          sig._blockedBy = 'MOM-FLOOR'; // REGIME-BIAS audition marker (2026-08-31)
           return false;
         }
       }
@@ -16038,7 +16062,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.14-20260831-sweep-range-guard', // bump on each deploy — lets /state verify what's live
+    build: '6.16-20260831-pairs-backtest', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
@@ -16749,6 +16773,52 @@ app.get('/sweep', (req, res) => {
       macdBins: withWr(macdBins), rocBins: withWr(rocBins),
       macdBarWhatIf: whatIf('macd', [0.05, 0.1, 0.15, 0.2, 0.3, 0.4]),
       rocBarWhatIf: whatIf('roc', [0.02, 0.05, 0.08, 0.1, 0.15])
+    });
+  } catch (e) { res.status(500).json({ error: String(e && e.message) }); }
+});
+
+// ===== /pairs — RE-ATTEMPT BACKTEST (2026-08-31, Jean's question) =====
+// "A call fired and got blocked; within 5 minutes the same call fires within $2 of
+// the previous one — how many winners would the SECOND attempt give, calls and puts?"
+// Scans the full 30-day blocked-outcomes store in-process: pairs (A,B) of same-type
+// tracked stamps where 30s ≤ tsB−tsA ≤ withinSec and |priceB−priceA| ≤ tol; grades
+// B's real bracket outcome. Usage: /pairs?symbol=XAU&withinSec=300&tol=2&days=30
+app.get('/pairs', (req, res) => {
+  try {
+    const sym = (req.query.symbol || 'XAU').toUpperCase();
+    const s = S[sym];
+    if (!s) return res.status(404).json({ error: 'unknown symbol' });
+    const withinMs = (parseInt(req.query.withinSec, 10) || 300) * 1000;
+    const minGapMs = (parseInt(req.query.minGapSec, 10) || 30) * 1000;
+    const tol = parseFloat(req.query.tol) || (sym === 'XAU' ? 2 : sym === 'NAS100' ? 10 : 80);
+    const days = Math.min(parseInt(req.query.days, 10) || 30, 30);
+    const cutoff = Date.now() - days * 86400000;
+    const rows = (s.blockedOutcomes || []).filter(o => o && o.ts > cutoff && typeof o.price === 'number' && !o.pendingFill)
+      .sort((a, b) => a.ts - b.ts);
+    const mk = () => ({ pairs: 0, win: 0, loss: 0, scratch: 0, no_resolve: 0 });
+    const tally = { call: mk(), put: mk() };
+    const used = new Set();
+    const samples = [];
+    for (let i = 0; i < rows.length; i++) {
+      const a = rows[i];
+      for (let j = i + 1; j < rows.length; j++) {
+        const b = rows[j];
+        if (b.ts - a.ts > withinMs) break;
+        if (b.type !== a.type || b.ts - a.ts < minGapMs || Math.abs(b.price - a.price) > tol || used.has(j)) continue;
+        used.add(j);
+        const t = tally[b.type];
+        if (t) { t.pairs++; t[b.outcome || 'no_resolve'] = (t[b.outcome || 'no_resolve'] || 0) + 1; }
+        if (samples.length < 12) samples.push({ first: a.time + ' ' + (a.detector || '') + ' @' + a.price, second: b.time + ' ' + (b.detector || '') + ' @' + b.price, gapSec: Math.round((b.ts - a.ts) / 1000), outcome: b.outcome });
+        break; // pair A with its first qualifying B only
+      }
+    }
+    const wr = (t) => (t.win + t.loss) > 0 ? +(100 * t.win / (t.win + t.loss)).toFixed(1) : null;
+    res.json({
+      symbol: sym, days: days, withinSec: withinMs / 1000, priceTolerance: tol, scanned: rows.length,
+      note: 'B = the re-attempt; outcome graded on B\'s real virtual bracket. WR = win/(win+loss), scratches (TP1-then-SL) listed separately. 3-min dedupe already thins same-detector repeats, so pairs are mostly cross-detector insistence.',
+      call: Object.assign({ wr: wr(tally.call) }, tally.call),
+      put: Object.assign({ wr: wr(tally.put) }, tally.put),
+      samples: samples
     });
   } catch (e) { res.status(500).json({ error: String(e && e.message) }); }
 });
