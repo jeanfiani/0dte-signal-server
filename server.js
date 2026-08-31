@@ -1857,7 +1857,9 @@ function cohortFor(reason) {
   if (/RANGE-FADE/.test(reason)) return 'RANGE-FADE'; // range-edge mean-reversion lane, dormant (2026-08-26, Jean: sell 4634 / buy 4599)
   if (/P381-BYPASS/.test(reason)) return 'P381-BYPASS'; // RSI-exhaustion bypass fires, finally cohort-stamped (2026-08-27, 06:40 bottom-tick case)
   if (/FLOOR-PATH/.test(reason)) return 'FLOOR-PATH'; // TP1-into-defended-floor blocks (2026-08-28, 21:57/06:40 cases)
-  if (/BTC-INV/.test(reason)) return 'BTC-INV'; // inverted BTC RIDE/LHF puts → calls, dormant audition (2026-08-28, Jean's LOL that graded 78%/62%)
+  if (/INV-LO/.test(reason)) return 'BTC-INV-LO'; // inverted put fired AT/near the session low — the minima-bounce thesis cell (2026-09-01)
+  if (/INV-MID/.test(reason)) return 'BTC-INV-MID'; // inverted put mid-range — expected pure direction beta (2026-09-01)
+  if (/BTC-INV/.test(reason)) return 'BTC-INV'; // pre-split stamps (8/28-8/31); pooled cohort shown to be direction beta by the 8/31 report cross-tab
   if (/PROTECT-STREAK|PROTECT-DAYCAP/.test(reason)) return 'PROTECT'; // circuit-breaker suppressed fires (2026-08-28, Freqtrade port) — measures what each pause saved/cost
   if (/ML-DIR/.test(reason)) return 'ML-DIR'; // learned scorer's p≥0.65 blocked signals (dormant FreqAI-style audition, 2026-08-29)
   if (/NAS-ORB/.test(reason)) return 'NAS-ORB'; // opening-range breakout lane, dormant (2026-08-30, Zarattini port)
@@ -4839,17 +4841,30 @@ function processPrice(sym, price, hi, lo) {
             const _biP = parseFloat(sig.price);
             const _biB = Math.max(50, 1.2 * (s._atr || 0));
             if (isFinite(_biP) && _biP > 0) {
+              // ===== LO/MID SPLIT (2026-09-01, Jean + 8/31 gate report) =====
+              // The report's cross-tab showed the pooled cohort is pure direction beta
+              // (rising 20W/0L, falling 0W/8L — day-of-week explains nothing). The
+              // published edge (QuantPedia; Jean's REV instinct) is mean-reversion AT
+              // LOCAL MINIMA. Pre-registered split: INV-LO = the blocked put fired
+              // within 1.5 brackets of the session low OR the low printed <45min ago
+              // (the liquidity-grab-at-the-bottom case); INV-MID = everything else
+              // (expected to track direction and nothing more). If LO holds on down
+              // days while MID collapses, the minima thesis is real.
+              const _biLoDist = (isFinite(s.sessionLow) && s.sessionLow > 0) ? (_biP - s.sessionLow) : Infinity;
+              const _biLoAge = (s.sessionLowUpdateTs || 0) > 0 ? (Date.now() - s.sessionLowUpdateTs) / 60000 : 9999;
+              const _biLo = _biLoDist <= 1.5 * _biB || _biLoAge <= 45;
+              const _biTag = _biLo ? 'INV-LO' : 'INV-MID';
               s.blockedOutcomes = s.blockedOutcomes || [];
               s.blockedOutcomes.push({
                 ts: Date.now(), time: ts(), symbol: sym, detector: 'BTC-INV', type: 'call',
                 price: +_biP.toFixed(2),
                 virtualTp1: +(_biP + _biB).toFixed(2), virtualSl: +(_biP - _biB).toFixed(2),
-                blockReason: '🔁 BTC-INV CALL DORMANT-WOULD-FIRE @ $' + _biP.toFixed(2) + ' — INVERSION of blocked ' + (sig.score || '') + ' PUT (MACD ' + (sig.macd || '?') + ', conv ' + ((sig.conv && sig.conv.score) || 0) + '): BTC put setups are the liquidity grab before the pop (7d inverse grade: RIDE→78%, LHF→62%; Jean 2026-08-28). Bracket ±$' + _biB.toFixed(0) + '.',
+                blockReason: '🔁 BTC-INV CALL DORMANT-WOULD-FIRE @ $' + _biP.toFixed(2) + ' [' + _biTag + ': ' + (isFinite(_biLoDist) ? '$' + _biLoDist.toFixed(0) + ' above session low' : 'low unknown') + ', low ' + (_biLoAge < 9999 ? Math.round(_biLoAge) + 'min old' : '?') + '] — INVERSION of blocked ' + (sig.score || '') + ' PUT (MACD ' + (sig.macd || '?') + ', conv ' + ((sig.conv && sig.conv.score) || 0) + '): the minima-bounce thesis (QuantPedia + Jean; LO/MID split 2026-09-01). Bracket ±$' + _biB.toFixed(0) + '.',
                 snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
                 tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null,
                 closed: false, closedTs: null, outcome: null
               });
-              log(sym, '🔁 BTC-INV CALL stamped @ $' + _biP.toFixed(2) + ' (inverse of ' + (sig.score || '') + ' PUT, dormant).');
+              log(sym, '🔁 BTC-INV CALL stamped @ $' + _biP.toFixed(2) + ' [' + _biTag + '] (inverse of ' + (sig.score || '') + ' PUT, dormant).');
             }
           }
         }
@@ -16062,7 +16077,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.16-20260831-pairs-backtest', // bump on each deploy — lets /state verify what's live
+    build: '6.17-20260901-btcinv-lo-mid', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
