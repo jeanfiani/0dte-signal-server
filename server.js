@@ -6150,7 +6150,22 @@ function processPrice(sym, price, hi, lo) {
         // bounced it to SL (-$254), then launched +$42 off that same block. Inside-zone
         // blocks run FIRST, latch or no latch; the ahead-of-price ease is unchanged.
         const _zvIn = s._zoneObs.find(z => z && z.dir !== sig.type && price >= z.lo && price <= z.hi);
-        if (_zvIn) {
+        // ===== FAILING-ZONE EASE (2026-09-01, the 4444→4363 waterfall) =====
+        // The unconditional inside-zone rule (8/28) blocked SIX consecutive with-trend
+        // puts 03:21-04:00 — ALL graded wins — because a breakdown traverses stale
+        // opposing zones continuously; "inside demand" is the permanent state of a
+        // waterfall. Discriminator vs the 8/27 23:46 case it exists for: is the
+        // session extreme ADVANCING? 23:46 fired at a 5-hour-old defended low (block
+        // right); today new lows printed every few minutes (zones failing in real
+        // time). Ease: with-trend latch armed AND the session extreme updated within
+        // 15min → the inside-zone veto defers (8/19 footprints logic, made precise).
+        const _zvInEase = _zvIn && tdLatchEase(s, sig.type) && (sig.type === 'put'
+          ? ((s.sessionLowUpdateTs || 0) > 0 && (Date.now() - s.sessionLowUpdateTs) < 900000)
+          : ((s.sessionHighUpdateTs || 0) > 0 && (Date.now() - s.sessionHighUpdateTs) < 900000));
+        if (_zvInEase) {
+          log(sym, '📈 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' INSIDE-ZONE veto DEFERRED — with-trend latch + session extreme advancing <15min: the opposing ' + (_zvIn.kind || 'OB') + ' ' + (_zvIn.tf || '') + ' $' + _zvIn.lo.toFixed(2) + '-$' + _zvIn.hi.toFixed(2) + ' is failing in real time (2026-09-01 waterfall fix; defended-zone blocks unchanged).');
+        }
+        if (_zvIn && !_zvInEase) {
           Object.assign(s, _emitSnapshot);
           const _zvInAge = _zvIn.ts ? Math.round((Date.now() - _zvIn.ts) / 60000) : null;
           const _zvInMsg = '🚧 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ZONE-VETO: price is INSIDE opposing ' + (_zvIn.kind || 'OB') + ' ' + (_zvIn.tf || '') + ' $' + _zvIn.lo.toFixed(2) + '-$' + _zvIn.hi.toFixed(2) + (_zvInAge !== null ? ' · zone age ' + _zvInAge + 'min [' + (_zvInAge < 240 ? 'ZAGE-FRESH' : _zvInAge <= 720 ? 'ZAGE-MID' : 'ZAGE-OLD') + ']' : '') + ' — inside-zone rule holds even on latched trend days (2026-08-28, 8/27 23:46 case).';
@@ -16077,7 +16092,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.17-20260901-btcinv-lo-mid', // bump on each deploy — lets /state verify what's live
+    build: '6.18-20260901-failingzone-ease', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
