@@ -1866,6 +1866,7 @@ function cohortFor(reason) {
   if (/NAS-GAP/.test(reason)) return 'NAS-GAP'; // overnight gap-fill lane, dormant (2026-08-30)
   if (/NAS-VWAP/.test(reason)) return 'NAS-VWAP'; // session-VWAP stretch fade lane, dormant (2026-08-30)
   if (/REGIME-BIAS/.test(reason)) return 'REGIME-BIAS'; // with-STRONG-regime continuations refused by chop/MOM-FLOOR (2026-08-31, Jean's 09:38 case)
+  if (/LATCH-ADV-EASE/.test(reason)) return 'LATCH-ADV-EASE'; // crest gates deferred on latch+advancing-extreme — the 9/1 clever-loosening ease; revert if eased fires net-negative over ~10
   if (/REJECT-FLOW/.test(reason)) return 'REJECT-FLOW';
   if (/CT-VETO/.test(reason)) return 'CT-VETO';
   if (/FADE-ROC/.test(reason)) return 'FADE-ROC';
@@ -5923,9 +5924,24 @@ function processPrice(sym, price, hi, lo) {
                   } catch (eEZ) {}
                 }
               } catch (eER) {}
+              // ===== LATCH-ADV EASE (2026-09-01, Jean: "loosen the bot cleverly") =====
+              // Same discriminator as the failing-zone ease: with-trend latch armed AND
+              // the session extreme advanced <15min → the impulse isn't a crest to fade,
+              // it's a trend actively extending (today: EXT-GUARD's blocked puts in the
+              // advancing legs graded winners; its blocks at the stale 4326 base graded
+              // losers — the discriminator separates them). Eased fires stamp
+              // LATCH-ADV-EASE for the report. Revert: eased fires net-negative over ~10.
+              const _egEase = tdLatchEase(s, sig.type) && (sig.type === 'put'
+                ? ((s.sessionLowUpdateTs || 0) > 0 && (Date.now() - s.sessionLowUpdateTs) < 900000)
+                : ((s.sessionHighUpdateTs || 0) > 0 && (Date.now() - s.sessionHighUpdateTs) < 900000));
+              if (_egEase) {
+                const _egEaseMsg = '📈 LATCH-ADV-EASE — ' + tagEarly + ' ' + sig.type.toUpperCase() + ' EXT-GUARD deferred @ $' + price.toFixed(2) + ' (' + Math.round(_egPos * 100) + '% of $' + _egRange.toFixed(2) + ' impulse): with-trend latch + session extreme advancing <15min — trend extending, not cresting (2026-09-01).';
+                log(sym, _egEaseMsg); trackBlockedOutcome(sym, _egEaseMsg, true);
+              } else {
               Object.assign(s, _emitSnapshot);
               log(sym, '⏳ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — EXT-GUARD (Phase 3.91): entering at ' + Math.round(_egPos * 100) + '% of a $' + _egRange.toFixed(2) + ' 15-min impulse (' + (_egRange / atrVal).toFixed(1) + '×ATR). Chasing the crest of an oversized move; retest ~$' + _egRetest.toFixed(2) + ' would be the entry. EXT-FLIP candidate armed ' + (sig.type === 'call' ? 'PUT' : 'CALL') + '.');
               return false;
+              }
             }
           }
         }
@@ -6281,7 +6297,12 @@ function processPrice(sym, price, hi, lo) {
             // profile is preserved exactly when it matters.
             if ((isNAS || isXAU) && _gStr && !_gStr.ok) {
               const _gBkTs = sig.type === 'call' ? (s.sessionHighUpdateTs || 0) : (s.sessionLowUpdateTs || 0);
-              _gLiveBreak = _gBkTs > 0 && (Date.now() - _gBkTs) < 90000 && !(s._atrSessOpen > 0 && atrVal < 0.9 * s._atrSessOpen); // thin-tape suspension 2026-08-17
+              // LATCH-ADV widening (2026-09-01, Jean: "loosen cleverly"): with the
+              // trend-day latch armed with-trend, the 90s window widens to 15min — the
+              // same discriminator as the failing-zone and EXT-GUARD eases. Without the
+              // latch the original 90s stands, so range days keep tight anchors.
+              const _gWin = tdLatchEase(s, sig.type) ? 900000 : 90000;
+              _gLiveBreak = _gBkTs > 0 && (Date.now() - _gBkTs) < _gWin && !(s._atrSessOpen > 0 && atrVal < 0.9 * s._atrSessOpen); // thin-tape suspension 2026-08-17
               if (_gLiveBreak) {
                 const _gLbMsg = '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' LIVE-BREAK grind entry-quality waived @ $' + price.toFixed(2) + ' — session extreme advanced <90s ago; stale-anchor objection (' + _gStr.reason + ') is moot on a breakout leg (2026-08-05, NAS+XAU).';
                 log(sym, _gLbMsg);
@@ -16092,7 +16113,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.18-20260901-failingzone-ease', // bump on each deploy — lets /state verify what's live
+    build: '6.19-20260901-latch-adv-loosening', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
