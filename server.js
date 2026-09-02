@@ -1886,6 +1886,7 @@ function cohortFor(reason) {
   if (/NAS-VWAP/.test(reason)) return 'NAS-VWAP'; // session-VWAP stretch fade lane, dormant (2026-08-30)
   if (/REGIME-BIAS/.test(reason)) return 'REGIME-BIAS'; // with-STRONG-regime continuations refused by chop/MOM-FLOOR (2026-08-31, Jean's 09:38 case)
   if (/LATCH-ADV-EASE/.test(reason)) return 'LATCH-ADV-EASE'; // crest gates deferred on latch+advancing-extreme — the 9/1 clever-loosening ease; revert if eased fires net-negative over ~10
+  if (/HOLD-REV/.test(reason)) return 'HOLD-REV'; // counter-regime bounce off a HELD extreme (2026-09-02) — promote ≥60% over ≥15
   if (/REJECT-FLOW/.test(reason)) return 'REJECT-FLOW';
   if (/CT-VETO/.test(reason)) return 'CT-VETO';
   if (/FADE-ROC/.test(reason)) return 'FADE-ROC';
@@ -4912,6 +4913,39 @@ function processPrice(sym, price, hi, lo) {
           }
         }
       } catch (eRB) { /* audition must never affect blocking */ }
+      // ===== HOLD-REV AUDITION (DORMANT, 2026-09-02, Jean: "unlock only the winners") =====
+      // The recurring winner shape across 8/28, 9/1 and 9/2: counter-regime REVERSAL
+      // entries after the opposite session extreme came from a capitulation leg and
+      // then HELD. Mirror of LATCH-ADV: extreme advancing → ride with; extreme held
+      // 10-90min → allow the bounce. Conditions: STRONG regime, counter-regime
+      // reversal-class signal, opposite extreme held 10-90min, price within 2×ATR of
+      // it. Monday-night winners fit; Monday-day chasers (10W/57L class) do not.
+      // DORMANT: HOLD-REV cohort; promote ≥60% over ≥15 resolved, with V-REC-style
+      // tight stops if promoted. 3-min throttle per direction.
+      try {
+        if (sym === 'XAU' && !_esPassed && sig && sig._regime) {
+          const _hrChg = parseFloat(sig._regime.netChgPct);
+          const _hrStrong = sig._regime.dir !== 'neutral' && isFinite(_hrChg) && Math.abs(_hrChg) >= 2;
+          const _hrCounter = (sig._regime.dir === 'bear' && sig.type === 'call') || (sig._regime.dir === 'bull' && sig.type === 'put');
+          const _hrRevClass = sig.type === 'call'
+            ? /INVERSAL|LLF|CHoCH|VREV|SWEEP|LO\b/.test(sig.score || '')
+            : /INVERSAL|LHF|CHoCH|VREV|SWEEP|HI\b/.test(sig.score || '');
+          if (_hrStrong && _hrCounter && _hrRevClass) {
+            const _hrP = parseFloat(sig.price);
+            const _hrExt = sig.type === 'call' ? s.sessionLow : s.sessionHigh;
+            const _hrExtTs = sig.type === 'call' ? (s.sessionLowUpdateTs || 0) : (s.sessionHighUpdateTs || 0);
+            const _hrAge = _hrExtTs > 0 ? (Date.now() - _hrExtTs) / 60000 : 9999;
+            const _hrDist = isFinite(_hrExt) ? Math.abs(_hrP - _hrExt) : Infinity;
+            const _hrAtr = (typeof s._atr === 'number' && s._atr > 0) ? s._atr : 5;
+            s._hrTs = s._hrTs || {};
+            if (_hrAge >= 10 && _hrAge <= 90 && _hrDist <= 2 * _hrAtr && isFinite(_hrP) && Date.now() - (s._hrTs[sig.type] || 0) >= 180000) {
+              s._hrTs[sig.type] = Date.now();
+              const _hrMsg = '🔄 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' HOLD-REV DORMANT-WOULD-FIRE @ $' + _hrP.toFixed(2) + ' — counter-' + sig._regime.dir.toUpperCase() + '-regime bounce: opposite extreme $' + _hrExt.toFixed(2) + ' HELD ' + Math.round(_hrAge) + 'min, $' + _hrDist.toFixed(2) + ' off it (≤2×ATR $' + (2 * _hrAtr).toFixed(2) + ') — the recurring post-capitulation winner shape (Jean 2026-09-02).';
+              log(sym, _hrMsg); trackBlockedOutcome(sym, _hrMsg, true);
+            }
+          }
+        }
+      } catch (eHR) { /* audition must never affect blocking */ }
     }
     return _esPassed;
   }
@@ -16134,7 +16168,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.20-20260902-regime-latch', // bump on each deploy — lets /state verify what's live
+    build: '6.21-20260902-hold-rev', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
