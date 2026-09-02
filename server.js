@@ -1816,6 +1816,25 @@ function tdLatchEase(s, sigType) {
   try { return !!(s && s._tdLatch && s._tdLatch.dir === sigType && (Date.now() - s._tdLatch.ts) < 600000); }
   catch (e) { return false; }
 }
+// ===== LATCH-OR-REGIME SOURCE (2026-09-02, the 4331→4305 midnight-gap case) =====
+// The intraday latch is session-scoped and dies at the daily reset — on multi-day
+// crash continuations the 00:00-06:00 window has no latch even with the 5-day regime
+// at -5%+ (9/2: EXT-GUARD refused the 05:14 put un-eased for exactly this reason).
+// This wider source treats a STRONG regime (|5-day| ≥ 2%) as arming the with-regime
+// direction. ⚠️ USE ONLY at sites that PAIR it with the advancing-extreme condition
+// (inside-zone ease, EXT-GUARD ease, grind window) — wired into the broad latch eases
+// it would re-fire Monday's 8W/60L consolidation puts. s._lastRegime is cached by the
+// enrichSig wrapper on every scored signal (fresh to the minute on active tape).
+function latchAdvSource(s, sigType) {
+  if (tdLatchEase(s, sigType)) return true;
+  try {
+    const r = s && s._lastRegime;
+    if (!r || (Date.now() - (r.ts || 0)) > 1800000) return false;
+    const chg = parseFloat(r.netChgPct);
+    if (!isFinite(chg) || Math.abs(chg) < 2) return false;
+    return (r.dir === 'bear' && sigType === 'put') || (r.dir === 'bull' && sigType === 'call');
+  } catch (e) { return false; }
+}
 function cohortFor(reason) {
   if (/CLIMAX-FLIP/.test(reason)) return 'CLIMAX-FLIP';
   if (/RETEST-HI|RETEST-LO/.test(reason)) return 'RETEST';
@@ -4776,6 +4795,8 @@ function processPrice(sym, price, hi, lo) {
   // 0.4 bar + conv floor. DORMANT: signal still blocks. 3-min per-direction throttle.
   function enrichSig(sig) {
     const _esPassed = enrichSigCore(sig);
+    // Regime cache for latchAdvSource (2026-09-02) — fresh on every scored signal
+    try { if (sig && sig._regime) s._lastRegime = { dir: sig._regime.dir, netChgPct: sig._regime.netChgPct, ts: Date.now() }; } catch (eRC) {}
     // ===== ML-DIR SCORING (DORMANT, 2026-08-29) — every XAU signal, fired or blocked =====
     try {
       if (sym === 'XAU' && sig && sig.type && mlModel && mlModel.w) {
@@ -5931,7 +5952,7 @@ function processPrice(sym, price, hi, lo) {
               // advancing legs graded winners; its blocks at the stale 4326 base graded
               // losers — the discriminator separates them). Eased fires stamp
               // LATCH-ADV-EASE for the report. Revert: eased fires net-negative over ~10.
-              const _egEase = tdLatchEase(s, sig.type) && (sig.type === 'put'
+              const _egEase = latchAdvSource(s, sig.type) && (sig.type === 'put'
                 ? ((s.sessionLowUpdateTs || 0) > 0 && (Date.now() - s.sessionLowUpdateTs) < 900000)
                 : ((s.sessionHighUpdateTs || 0) > 0 && (Date.now() - s.sessionHighUpdateTs) < 900000));
               if (_egEase) {
@@ -6175,7 +6196,7 @@ function processPrice(sym, price, hi, lo) {
         // right); today new lows printed every few minutes (zones failing in real
         // time). Ease: with-trend latch armed AND the session extreme updated within
         // 15min → the inside-zone veto defers (8/19 footprints logic, made precise).
-        const _zvInEase = _zvIn && tdLatchEase(s, sig.type) && (sig.type === 'put'
+        const _zvInEase = _zvIn && latchAdvSource(s, sig.type) && (sig.type === 'put'
           ? ((s.sessionLowUpdateTs || 0) > 0 && (Date.now() - s.sessionLowUpdateTs) < 900000)
           : ((s.sessionHighUpdateTs || 0) > 0 && (Date.now() - s.sessionHighUpdateTs) < 900000));
         if (_zvInEase) {
@@ -6301,7 +6322,7 @@ function processPrice(sym, price, hi, lo) {
               // trend-day latch armed with-trend, the 90s window widens to 15min — the
               // same discriminator as the failing-zone and EXT-GUARD eases. Without the
               // latch the original 90s stands, so range days keep tight anchors.
-              const _gWin = tdLatchEase(s, sig.type) ? 900000 : 90000;
+              const _gWin = latchAdvSource(s, sig.type) ? 900000 : 90000;
               _gLiveBreak = _gBkTs > 0 && (Date.now() - _gBkTs) < _gWin && !(s._atrSessOpen > 0 && atrVal < 0.9 * s._atrSessOpen); // thin-tape suspension 2026-08-17
               if (_gLiveBreak) {
                 const _gLbMsg = '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' LIVE-BREAK grind entry-quality waived @ $' + price.toFixed(2) + ' — session extreme advanced <90s ago; stale-anchor objection (' + _gStr.reason + ') is moot on a breakout leg (2026-08-05, NAS+XAU).';
@@ -16113,7 +16134,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.19-20260901-latch-adv-loosening', // bump on each deploy — lets /state verify what's live
+    build: '6.20-20260902-regime-latch', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
