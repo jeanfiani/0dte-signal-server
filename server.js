@@ -1865,6 +1865,7 @@ function grindReclaimTag(s, sigType, price, zone) {
 function cohortFor(reason) {
   if (/GRIND-RECLAIM/.test(reason)) return 'GRIND-RECLAIM'; // must precede ZONE-VETO/EXT-GUARD — the tag rides on their block messages (2026-09-02)
   if (/SLPAD-SIM/.test(reason)) return 'SLPAD-SIM'; // wick-pad shadow on real stops: SAVE rows' bracket outcome = pad-world verdict; DEEP rows = pad pure cost (2026-09-03)
+  if (/HELD45\+/.test(reason)) return 'ZP-HELD45'; // ZONE-PERM ease at an extreme held ≥45min — 9/3 overnight: held fades won both sides, fresh fades lost (must precede ZONE-PERM match)
   if (/CLIMAX-FLIP/.test(reason)) return 'CLIMAX-FLIP';
   if (/RETEST-HI|RETEST-LO/.test(reason)) return 'RETEST';
   if (/ZONE-OB-RT/.test(reason)) return 'ZONE-OB-RT'; // re-touch sub-cohort (2026-08-19)
@@ -9424,7 +9425,11 @@ function processPrice(sym, price, hi, lo) {
           if (_zpz) {
             _lhfFadeAtHigh = true; // waive macro like FADE-EASE — zone replaces conv≥5
             s._zpFadeTs = Date.now(); s._zpFadeZoneHi = _zpz.hi; // trade builder: tight SL
-            const _zpMsg = '🔓 ⬇LHF PUT ZONE-PERM EASE-GRANTED @ $' + price.toFixed(2) + ' — fade window at stale session high, conv<5 waived by mapped supply ' + (_zpz.kind || 'OB') + ' ' + (_zpz.tf || '') + ' $' + _zpz.lo.toFixed(2) + '-$' + _zpz.hi.toFixed(2) + ' · tight SL armed (promoted 2026-08-18).';
+            // HELD45+ hold-time tag (2026-09-03): 9/3 overnight — held-extreme fades won
+            // both directions (12 put + 10 call stamps, 0 losses ≥45min hold) while every
+            // fresh-extreme fade lost. Sub-cohort ZP-HELD45; ≥60%/15 bar as usual.
+            const _hiHeldMin = (s.sessionHighUpdateTs || 0) > 0 ? (Date.now() - s.sessionHighUpdateTs) / 60000 : 0;
+            const _zpMsg = '🔓 ⬇LHF PUT ZONE-PERM EASE-GRANTED @ $' + price.toFixed(2) + ' — fade window at stale session high (held ' + Math.round(_hiHeldMin) + 'min)' + (_hiHeldMin >= 45 ? ' [HELD45+]' : '') + ', conv<5 waived by mapped supply ' + (_zpz.kind || 'OB') + ' ' + (_zpz.tf || '') + ' $' + _zpz.lo.toFixed(2) + '-$' + _zpz.hi.toFixed(2) + ' · tight SL armed (promoted 2026-08-18).';
             log(sym, _zpMsg); trackBlockedOutcome(sym, _zpMsg, true);
           }
         }
@@ -9634,7 +9639,7 @@ function processPrice(sym, price, hi, lo) {
             if (_lowHeldMin >= 10) {
               _llfFadeAtLow = true; // waive macro — zone + held low replace conv≥5
               s._zpFadeTsL = Date.now();
-              const _zpMsgL = '🔓 ⬆LLF CALL ZONE-PERM EASE-GRANTED @ $' + price.toFixed(2) + ' — stale session low HELD ' + Math.round(_lowHeldMin) + 'min, conv<5 waived by mapped demand ' + (_zpzL.kind || 'OB') + ' ' + (_zpzL.tf || '') + ' $' + _zpzL.lo.toFixed(2) + '-$' + _zpzL.hi.toFixed(2) + ' · tight SL armed (promoted 2026-08-21).';
+              const _zpMsgL = '🔓 ⬆LLF CALL ZONE-PERM EASE-GRANTED @ $' + price.toFixed(2) + ' — stale session low HELD ' + Math.round(_lowHeldMin) + 'min' + (_lowHeldMin >= 45 ? ' [HELD45+]' : '') + ', conv<5 waived by mapped demand ' + (_zpzL.kind || 'OB') + ' ' + (_zpzL.tf || '') + ' $' + _zpzL.lo.toFixed(2) + '-$' + _zpzL.hi.toFixed(2) + ' · tight SL armed (promoted 2026-08-21).';
               log(sym, _zpMsgL); trackBlockedOutcome(sym, _zpMsgL, true);
             } else {
               const _zpMsgL = '🔓 ⬆LLF CALL ZONE-PERM DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — fade window at stale session low, conv<5 waived by mapped demand ' + (_zpzL.kind || 'OB') + ' ' + (_zpzL.tf || '') + ' $' + _zpzL.lo.toFixed(2) + '-$' + _zpzL.hi.toFixed(2) + ' (low held only ' + Math.round(_lowHeldMin) + 'min < 10 — hold-confirmation not met, dormant).';
@@ -16222,7 +16227,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.24-20260903-slpad-sim', // bump on each deploy — lets /state verify what's live
+    build: '6.25-20260903-zp-held45', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
