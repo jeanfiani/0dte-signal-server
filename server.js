@@ -1864,6 +1864,7 @@ function grindReclaimTag(s, sigType, price, zone) {
 }
 function cohortFor(reason) {
   if (/GRIND-RECLAIM/.test(reason)) return 'GRIND-RECLAIM'; // must precede ZONE-VETO/EXT-GUARD — the tag rides on their block messages (2026-09-02)
+  if (/SLPAD-SIM/.test(reason)) return 'SLPAD-SIM'; // wick-pad shadow on real stops: SAVE rows' bracket outcome = pad-world verdict; DEEP rows = pad pure cost (2026-09-03)
   if (/CLIMAX-FLIP/.test(reason)) return 'CLIMAX-FLIP';
   if (/RETEST-HI|RETEST-LO/.test(reason)) return 'RETEST';
   if (/ZONE-OB-RT/.test(reason)) return 'ZONE-OB-RT'; // re-touch sub-cohort (2026-08-19)
@@ -14781,6 +14782,26 @@ function checkExit(sym, price) {
         const slPnl = iC ? t.slPrice - t.ep : t.ep - t.slPrice;
         log(sym, '🛑 SL HIT — ' + t.type.toUpperCase() + ' $' + price.toFixed(2) + ' · SL $' + t.slPrice.toFixed(2) + ' · P&L $' + slPnl.toFixed(2));
         sendPush('🛑 ' + sym + ' SL HIT', t.type.toUpperCase() + ' · loss $' + slPnl.toFixed(2) + ' — exit now', 'exit');
+        // ===== SLPAD-SIM — WICK-PAD SHADOW (2026-09-03, Jean: "mainly timing issues") =====
+        // 9/3 specimen day: both fires stopped $0.11/$0.13 THROUGH the level at the exact
+        // retrace low (adverseFrac ≥1.0), then the move went (08:06 → +$20 in 30min).
+        // Shadow: would a stop padded 0.25×ATR (min $1) beyond the computed level have
+        // survived this exact touch? SAVE → a forced virtual ±$5 bracket from here grades
+        // the pad-world (win = post-stop direction was favorable). DEEP → price breached
+        // the pad too; the pad only adds pad×multiplier loss on this stop. Nightly weighs
+        // saves vs deep-costs (SLPAD-SIM cohort); ≥15 fires before touching SL placement.
+        if (sym === 'XAU') {
+          try {
+            const _padAmt = Math.max(1, 0.25 * (t.atr || 0));
+            const _padLvl = iC ? t.slPrice - _padAmt : t.slPrice + _padAmt;
+            const _padDeep = iC ? price <= _padLvl : price >= _padLvl;
+            const _padMsg = _padDeep
+              ? ('📐 SLPAD-SIM ' + t.type.toUpperCase() + ' DEEP — $' + price.toFixed(2) + ' breached the padded stop $' + _padLvl.toFixed(2) + ' too (pad $' + _padAmt.toFixed(2) + '); pad would only add loss on this stop.')
+              : ('📐 SLPAD-SIM ' + t.type.toUpperCase() + ' SAVE — real SL $' + t.slPrice.toFixed(2) + ' hit @ $' + price.toFixed(2) + ' but padded stop $' + _padLvl.toFixed(2) + ' (pad $' + _padAmt.toFixed(2) + ', 0.25×ATR) survives the wick — virtual bracket tracks the pad-world.');
+            log(sym, _padMsg);
+            trackBlockedOutcome(sym, _padMsg, true);
+          } catch (ePad) {}
+        }
         // ===== PROTECT-STREAK (2026-08-28, Freqtrade StoplossGuard port, Jean) =====
         // Full pre-TP1 stops count toward the streak; any TP1 hit resets it. At
         // PROTECT_MAX_STREAK straight stops, firing pauses PROTECT_PAUSE_MIN minutes
@@ -16201,7 +16222,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.23-20260903-inversal-ote', // bump on each deploy — lets /state verify what's live
+    build: '6.24-20260903-slpad-sim', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
