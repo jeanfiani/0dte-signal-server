@@ -560,6 +560,23 @@ function loadRollingLevels() {
         }
       }
     });
+    // ===== ONE-TIME SCRUB (2026-09-04): phantom $4418.87 XAU low ===================
+    // A garbage first tick after the 20:00 ET daily reset (lastPrice was zeroed →
+    // quarantine bypassed; loophole closed same day) poisoned 9/4's dailyLevels low.
+    // Jean's broker chart shows the night held 4465-4487. Scrub the exact bad value;
+    // the 30s upsert rebuilds today's low from the clean live sessionLow.
+    try {
+      (S.XAU.dailyLevels || []).forEach(d => {
+        if (d.date === '2026-09-04' && Math.abs(d.low - 4418.87) < 0.01) {
+          d.low = (isFinite(S.XAU.sessionLow) && S.XAU.sessionLow > 0) ? S.XAU.sessionLow : d.high;
+          console.log('[' + ts() + '] 🧹 XAU dailyLevels 2026-09-04: phantom low $4418.87 scrubbed → $' + d.low.toFixed(2));
+        }
+      });
+      if (S.XAU.dailyLevels && S.XAU.dailyLevels.length > 0) {
+        S.XAU.rollingHigh = Math.max(...S.XAU.dailyLevels.map(d => d.high));
+        S.XAU.rollingLow = Math.min(...S.XAU.dailyLevels.map(d => d.low));
+      }
+    } catch (eScrub) {}
     console.log('[' + ts() + '] Rolling levels loaded — XAU: ' + S.XAU.dailyLevels.length + ' days, high:$' + (S.XAU.rollingHigh || 0).toFixed(2) + ' low:$' + (S.XAU.rollingLow === Infinity ? 0 : S.XAU.rollingLow).toFixed(2));
     SYMBOLS.forEach(sym => {
       if (S[sym].asianH_locked) {
@@ -1862,10 +1879,21 @@ function grindReclaimTag(s, sigType, price, zone) {
     return ' [GRIND-RECLAIM]';
   } catch (e) { return ''; }
 }
+// ===== NIGHT tag (2026-09-04, dormant) ==========================================
+// After the US close the conviction inputs (DXY/TLT/SLV/GDX/NAS/SPY) freeze, so the
+// conviction detectors go structurally silent and only the zone lanes see the night
+// (9/3→9/4: every night stamp was zone-lane, 7/7 graded wins in the 4465-4487 range).
+// Thesis: at night, zone confluence legitimately substitutes for conviction because
+// conviction is UNMEASURABLE, not absent. Tag zone-lane stamps 18:00-06:00 ET →
+// NIGHT-ZONE cohort; promote a night lane (tight SL) at ≥60% over ≥15 resolved.
+function nightTag() {
+  try { const m = gET(); return (m >= 1080 || m < 360) ? ' [NIGHT]' : ''; } catch (e) { return ''; }
+}
 function cohortFor(reason) {
   if (/GRIND-RECLAIM/.test(reason)) return 'GRIND-RECLAIM'; // must precede ZONE-VETO/EXT-GUARD — the tag rides on their block messages (2026-09-02)
   if (/SLPAD-SIM/.test(reason)) return 'SLPAD-SIM'; // wick-pad shadow on real stops: SAVE rows' bracket outcome = pad-world verdict; DEEP rows = pad pure cost (2026-09-03)
   if (/HELD45\+/.test(reason)) return 'ZP-HELD45'; // ZONE-PERM ease at an extreme held ≥45min — 9/3 overnight: held fades won both sides, fresh fades lost (must precede ZONE-PERM match)
+  if (/\[NIGHT\]/.test(reason)) return 'NIGHT-ZONE'; // zone-lane stamps 18:00-06:00 ET (2026-09-04) — after ZP-HELD45 (a held night fade counts there; text carries both tags for cross-tab), before ZONE-PERM/LIQ-POOL
   if (/CLIMAX-FLIP/.test(reason)) return 'CLIMAX-FLIP';
   if (/RETEST-HI|RETEST-LO/.test(reason)) return 'RETEST';
   if (/ZONE-OB-RT/.test(reason)) return 'ZONE-OB-RT'; // re-touch sub-cohort (2026-08-19)
@@ -9040,7 +9068,7 @@ function processPrice(sym, price, hi, lo) {
           try {
             const _zpf = Array.isArray(s._zoneObs) && s._zoneObs.find(z => z && z.dir === EF.dir && price >= z.lo && price <= z.hi);
             if (_zpf) {
-              const _zpfMsg = '🔓 EXT-FLIP ' + EF.dir.toUpperCase() + ' ZONE-PERM DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — conv ' + _efConv + ' < 3 waived by mapped ' + (EF.dir === 'put' ? 'supply' : 'demand') + ' ' + (_zpf.kind || 'OB') + ' ' + (_zpf.tf || '') + ' $' + _zpf.lo.toFixed(2) + '-$' + _zpf.hi.toFixed(2) + ' (dormant 2026-08-14, 8/13 4363 case).';
+              const _zpfMsg = '🔓 EXT-FLIP ' + EF.dir.toUpperCase() + ' ZONE-PERM DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — conv ' + _efConv + ' < 3 waived by mapped ' + (EF.dir === 'put' ? 'supply' : 'demand') + ' ' + (_zpf.kind || 'OB') + ' ' + (_zpf.tf || '') + ' $' + _zpf.lo.toFixed(2) + '-$' + _zpf.hi.toFixed(2) + ' (dormant 2026-08-14, 8/13 4363 case).' + nightTag();
               log(sym, _zpfMsg); trackBlockedOutcome(sym, _zpfMsg, true);
             }
           } catch (eZP) {}
@@ -9429,7 +9457,7 @@ function processPrice(sym, price, hi, lo) {
             // both directions (12 put + 10 call stamps, 0 losses ≥45min hold) while every
             // fresh-extreme fade lost. Sub-cohort ZP-HELD45; ≥60%/15 bar as usual.
             const _hiHeldMin = (s.sessionHighUpdateTs || 0) > 0 ? (Date.now() - s.sessionHighUpdateTs) / 60000 : 0;
-            const _zpMsg = '🔓 ⬇LHF PUT ZONE-PERM EASE-GRANTED @ $' + price.toFixed(2) + ' — fade window at stale session high (held ' + Math.round(_hiHeldMin) + 'min)' + (_hiHeldMin >= 45 ? ' [HELD45+]' : '') + ', conv<5 waived by mapped supply ' + (_zpz.kind || 'OB') + ' ' + (_zpz.tf || '') + ' $' + _zpz.lo.toFixed(2) + '-$' + _zpz.hi.toFixed(2) + ' · tight SL armed (promoted 2026-08-18).';
+            const _zpMsg = '🔓 ⬇LHF PUT ZONE-PERM EASE-GRANTED @ $' + price.toFixed(2) + ' — fade window at stale session high (held ' + Math.round(_hiHeldMin) + 'min)' + (_hiHeldMin >= 45 ? ' [HELD45+]' : '') + ', conv<5 waived by mapped supply ' + (_zpz.kind || 'OB') + ' ' + (_zpz.tf || '') + ' $' + _zpz.lo.toFixed(2) + '-$' + _zpz.hi.toFixed(2) + ' · tight SL armed (promoted 2026-08-18).' + nightTag();
             log(sym, _zpMsg); trackBlockedOutcome(sym, _zpMsg, true);
           }
         }
@@ -9639,10 +9667,10 @@ function processPrice(sym, price, hi, lo) {
             if (_lowHeldMin >= 10) {
               _llfFadeAtLow = true; // waive macro — zone + held low replace conv≥5
               s._zpFadeTsL = Date.now();
-              const _zpMsgL = '🔓 ⬆LLF CALL ZONE-PERM EASE-GRANTED @ $' + price.toFixed(2) + ' — stale session low HELD ' + Math.round(_lowHeldMin) + 'min' + (_lowHeldMin >= 45 ? ' [HELD45+]' : '') + ', conv<5 waived by mapped demand ' + (_zpzL.kind || 'OB') + ' ' + (_zpzL.tf || '') + ' $' + _zpzL.lo.toFixed(2) + '-$' + _zpzL.hi.toFixed(2) + ' · tight SL armed (promoted 2026-08-21).';
+              const _zpMsgL = '🔓 ⬆LLF CALL ZONE-PERM EASE-GRANTED @ $' + price.toFixed(2) + ' — stale session low HELD ' + Math.round(_lowHeldMin) + 'min' + (_lowHeldMin >= 45 ? ' [HELD45+]' : '') + ', conv<5 waived by mapped demand ' + (_zpzL.kind || 'OB') + ' ' + (_zpzL.tf || '') + ' $' + _zpzL.lo.toFixed(2) + '-$' + _zpzL.hi.toFixed(2) + ' · tight SL armed (promoted 2026-08-21).' + nightTag();
               log(sym, _zpMsgL); trackBlockedOutcome(sym, _zpMsgL, true);
             } else {
-              const _zpMsgL = '🔓 ⬆LLF CALL ZONE-PERM DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — fade window at stale session low, conv<5 waived by mapped demand ' + (_zpzL.kind || 'OB') + ' ' + (_zpzL.tf || '') + ' $' + _zpzL.lo.toFixed(2) + '-$' + _zpzL.hi.toFixed(2) + ' (low held only ' + Math.round(_lowHeldMin) + 'min < 10 — hold-confirmation not met, dormant).';
+              const _zpMsgL = '🔓 ⬆LLF CALL ZONE-PERM DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — fade window at stale session low, conv<5 waived by mapped demand ' + (_zpzL.kind || 'OB') + ' ' + (_zpzL.tf || '') + ' $' + _zpzL.lo.toFixed(2) + '-$' + _zpzL.hi.toFixed(2) + ' (low held only ' + Math.round(_lowHeldMin) + 'min < 10 — hold-confirmation not met, dormant).' + nightTag();
               log(sym, _zpMsgL); trackBlockedOutcome(sym, _zpMsgL, true);
             }
           }
@@ -10457,7 +10485,7 @@ function processPrice(sym, price, hi, lo) {
                   const swept = side === 'hi' ? (_last.h > lv + 0.1 * atrVal && _last.c < lv) : (_last.l < lv - 0.1 * atrVal && _last.c > lv);
                   if (swept && !s._liqTouched[key]) {
                     s._liqTouched[key] = true;
-                    const _lm = '💧 LIQ-POOL ' + (side === 'hi' ? 'PUT' : 'CALL') + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — equal-' + (side === 'hi' ? 'highs' : 'lows') + ' pool $' + lv.toFixed(2) + ' (' + eq.length + ' swings) swept and reclaimed.';
+                    const _lm = '💧 LIQ-POOL ' + (side === 'hi' ? 'PUT' : 'CALL') + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — equal-' + (side === 'hi' ? 'highs' : 'lows') + ' pool $' + lv.toFixed(2) + ' (' + eq.length + ' swings) swept and reclaimed.' + nightTag();
                     log(sym, _lm); trackBlockedOutcome(sym, _lm, true);
                   }
                 }
@@ -15856,7 +15884,13 @@ setInterval(() => {
       s.breakRange = []; s.breakHi = 0; s.breakLo = Infinity; s.breakCoilStart = 0; s.breakCoilActive = false; s.breakFrozenHi = 0; s.breakFrozenLo = Infinity; s.breakLastTs = 0; s.breakLastDir = null; s.breakLastPrice = 0; s._pendingBreakout = null;
       s.macroPrevDir = null; s.macroFlipTs = 0; s.superFlipTs = 0;
       s.lastAT = ''; s.lastNTs = 0; s.lastReversalTs = 0;
-      s.lastPrice = 0; // Reset so first price after daily gap is always accepted by /feed sanity check
+      // s.lastPrice NO LONGER zeroed at daily reset (2026-09-04): zeroing it made the
+      // FIRST tick after every 20:00 ET reset bypass quarantineCheck entirely — a garbage
+      // first tick printed a phantom $4418.87 XAU low into 9/4's dailyLevels (Jean's
+      // broker chart: the night never left 4465-4487). Genuine overnight/weekend gaps are
+      // already handled by quarantine's 2-tick confirm path (two consistent ticks within
+      // 0.3% inside 15s → accepted with a one-tick delay), so keeping lastPrice loses
+      // nothing and closes the poison window.
       s.dailySignalCount = 0; s.lastSignalDir = null; s.lastSignalTs = 0;
       s.nC = 0; s.nP = 0; s.nBl = 0;
       s.chopShort = []; s.chopLong = []; s.chopCount = 0; s.trendCount = 0; s.chopActive = false;
@@ -16227,7 +16261,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.25-20260903-zp-held45', // bump on each deploy — lets /state verify what's live
+    build: '6.27-20260904-night-zone', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
