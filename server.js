@@ -2045,8 +2045,8 @@ function pnlMultFor(sym, t) {
 // bracket outcomes by ts). Retrained every 12h on a rolling 14-day window with a
 // 25% chronological holdout — the printed holdout W/L is the only number that
 // matters. DORMANT: every XAU signal gets sig._mlP stamped (persisted as mlP on
-// fired rows); blocked signals with p ≥ 0.65 stamp the ML-DIR cohort. Promotion:
-// holdout p≥0.6 bucket wins ≥60% across 2+ retrains AND the live ML-DIR cohort
+// fired rows); blocked signals with p ≥ pHi (model 70th-pctile, recalibrated 2026-09-04) stamp ML-DIR. Promotion:
+// holdout holdHi (p≥pHi) bucket wins ≥60% across 2+ consecutive retrains AND the live ML-DIR cohort
 // confirms — then it becomes a FreqAI-style confirmation gate (never overriding
 // Jean's MACD rules or protective gates). Features deliberately boring: aligned
 // MACD/ROC/RSI, conv, chop, confScore, held-bit. No lookahead: features are what
@@ -2117,18 +2117,30 @@ function mlTrain() {
       b -= lr * gb / train.length;
       for (let i = 0; i < dim; i++) w[i] -= lr * (gw[i] / train.length + l2 * w[i]);
     }
+    // ===== PERCENTILE CALIBRATION (2026-09-04, gate-report 9/3 finding) =====
+    // With conv weighted negative and b ≈ −0.66 the model's live output range tops out
+    // around 0.29 — the fixed p≥0.6 / p<0.4 buckets were structurally EMPTY and the
+    // "holdout p≥0.6 wins ≥60%" promote bar was unsatisfiable by construction (holdHi
+    // 0W/0L three straight nights). Thresholds now come from the model's OWN train-set
+    // distribution: pHi = 70th percentile, pLo = 30th. Same intent — "the model's
+    // most-liked tail" — but achievable at every retrain. Promote bar restated:
+    // holdHi ≥60% across 2 consecutive retrains AND live ML-DIR cohort agreement.
+    const trainPs = train.map(r0 => { let z = b; for (let i = 0; i < dim; i++) z += w[i] * r0.x[i]; return mlSigmoid(z); }).sort((a2, b2) => a2 - b2);
+    const pHi = trainPs.length ? trainPs[Math.min(trainPs.length - 1, Math.floor(trainPs.length * 0.7))] : 0.6;
+    const pLo = trainPs.length ? trainPs[Math.floor(trainPs.length * 0.3)] : 0.4;
     const hi = { win: 0, loss: 0 }, lo = { win: 0, loss: 0 }, mid = { win: 0, loss: 0 };
     for (const r0 of hold) {
       let z = b; for (let i = 0; i < dim; i++) z += w[i] * r0.x[i];
       const p = mlSigmoid(z);
-      const bucket = p >= 0.6 ? hi : (p < 0.4 ? lo : mid);
+      const bucket = p >= pHi ? hi : (p < pLo ? lo : mid);
       r0.y ? bucket.win++ : bucket.loss++;
     }
     mlModel = { w: w.map(v => +v.toFixed(5)), b: +b.toFixed(5), trainedTs: Date.now(), n: train.length, holdN: hold.length,
                 holdHi: hi, holdMid: mid, holdLo: lo,
+                pHi: +pHi.toFixed(4), pLo: +pLo.toFixed(4),
                 feats: ['alignedMACD', 'alignedROC', 'alignedRSI', 'conv', 'chop', 'confScore', 'held'] };
     try { fs.writeFileSync(ML_FILE, JSON.stringify(mlModel)); } catch (eW) {}
-    console.log('[' + ts() + '] 🧠 ML-DIR trained — n=' + train.length + ', holdout ' + hold.length + ': p≥0.6 → ' + hi.win + 'W/' + hi.loss + 'L · mid → ' + mid.win + 'W/' + mid.loss + 'L · p<0.4 → ' + lo.win + 'W/' + lo.loss + 'L. Weights [' + mlModel.feats.map((f, i) => f + ':' + mlModel.w[i]).join(', ') + '].');
+    console.log('[' + ts() + '] 🧠 ML-DIR trained — n=' + train.length + ', holdout ' + hold.length + ': p≥' + pHi.toFixed(3) + ' (70pct) → ' + hi.win + 'W/' + hi.loss + 'L · mid → ' + mid.win + 'W/' + mid.loss + 'L · p<' + pLo.toFixed(3) + ' (30pct) → ' + lo.win + 'W/' + lo.loss + 'L. Weights [' + mlModel.feats.map((f, i) => f + ':' + mlModel.w[i]).join(', ') + '].');
   } catch (e) { console.log('[' + ts() + '] ML-DIR train error: ' + e.message); }
 }
 setTimeout(() => { try { mlTrain(); } catch (e) {} }, 90000);
@@ -4865,8 +4877,11 @@ function processPrice(sym, price, hi, lo) {
           const _mlP = mlPredict(mlFeatures(sig.type, _mlM, _mlR, _mlRs, sig.conv && sig.conv.score, s.chopActive ? 1 : 0, sig._confScore, _mlHeld));
           if (_mlP !== null) {
             sig._mlP = _mlP;
-            // Blocked signal the model LIKES (p ≥ 0.65) → ML-DIR cohort (3-min throttle/direction)
-            if (!_esPassed && _mlP >= 0.65) {
+            // Blocked signal the model LIKES → ML-DIR cohort (3-min throttle/direction).
+            // Threshold recalibrated 2026-09-04: pHi = model's own 70th-percentile output
+            // (the fixed 0.65 was unreachable — live mlP tops out ~0.29, so the cohort
+            // could never stamp). Falls back to 0.65 only for a pre-recalibration model file.
+            if (!_esPassed && _mlP >= (typeof mlModel.pHi === 'number' ? mlModel.pHi : 0.65)) {
               s._mlDirTs = s._mlDirTs || {};
               if (Date.now() - (s._mlDirTs[sig.type] || 0) >= 180000) {
                 s._mlDirTs[sig.type] = Date.now();
@@ -16177,10 +16192,20 @@ app.get('/blocked-outcomes/:sym', (req, res) => {
     // breakdown produced 43 blocked winners whose block reasons had scrolled out of
     // the fixed 50-entry tail before they could be audited — the exact data needed
     // to decide gate loosening. ?outcome=win|loss|scratch filters server-side.
+    // ?order=desc (2026-09-04, gate-report ask): newest rows FIRST. The nightly probe's
+    // fetcher truncates payloads at ~70KB, and ascending order meant the truncation
+    // always deleted the NEWEST rows (49% of BTC / 28% of NAS readable on 9/3). With
+    // desc, a truncated payload still contains today's rows. ?since=<ms-epoch> also
+    // supported for precise incremental pulls.
     entries: (function () {
       let e = outcomes;
       if (req.query.outcome) e = e.filter(o => o.outcome === String(req.query.outcome));
+      if (req.query.since && isFinite(parseFloat(req.query.since))) {
+        const sinceTs = parseFloat(req.query.since);
+        e = e.filter(o => o.ts >= sinceTs);
+      }
       const lim = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 1500);
+      if (String(req.query.order).toLowerCase() === 'desc') return e.slice(-lim).reverse();
       return e.slice(-lim);
     })()
   });
@@ -16261,7 +16286,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.27-20260904-night-zone', // bump on each deploy — lets /state verify what's live
+    build: '6.28-20260904-desc-mlcal', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
