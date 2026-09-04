@@ -1933,6 +1933,7 @@ function cohortFor(reason) {
   if (/MOM-OVERRIDE/.test(reason)) return 'MOM-OVERRIDE'; // pre-split stamps (8/26-8/28) — high-MACD blocked-signal audition across ALL gates
   if (/RANGE-FADE/.test(reason)) return 'RANGE-FADE'; // range-edge mean-reversion lane, dormant (2026-08-26, Jean: sell 4634 / buy 4599)
   if (/P381-BYPASS/.test(reason)) return 'P381-BYPASS'; // RSI-exhaustion bypass fires, finally cohort-stamped (2026-08-27, 06:40 bottom-tick case)
+  if (/FLOOR-PDL/.test(reason)) return 'FLOOR-PDL'; // TP1-into-prior-day-extreme stamps, dormant (2026-09-04, 02:57 case) — must precede FLOOR-PATH
   if (/FLOOR-PATH/.test(reason)) return 'FLOOR-PATH'; // TP1-into-defended-floor blocks (2026-08-28, 21:57/06:40 cases)
   if (/INV-LO/.test(reason)) return 'BTC-INV-LO'; // inverted put fired AT/near the session low — the minima-bounce thesis cell (2026-09-01)
   if (/INV-MID/.test(reason)) return 'BTC-INV-MID'; // inverted put mid-range — expected pure direction beta (2026-09-01)
@@ -8383,6 +8384,34 @@ function processPrice(sym, price, hi, lo) {
         }
       }
     } catch (eFP) { /* floor-path must never crash enrichment */ }
+    // ===== FLOOR-PDL (DORMANT STAMP, 2026-09-04 — Jean's 02:57 put) =====
+    // 9/4 02:57 TREND PUT @4460.73 fired with the PRIOR-DAY LOW at 4460.96 — nearPdl
+    // was already stamped on the row but nothing consumes it: FLOOR-PATH's floor set
+    // is min(sessionLow, rollingLow), the PDL isn't in it, and the session-low breach
+    // read as a "live break" (breakout exemption). The PDL bounce stopped it in 6min.
+    // Measure the class: continuation candidate whose TP1 path requires the prior-day
+    // extreme to break while price sits at/just through it. Stamp-only — never blocks;
+    // joins FLOOR-PATH's floor set only at ≥60% blocked-would-LOSE... i.e. promote the
+    // block if stamped candidates lose ≥60% over ≥15 resolved.
+    try {
+      if (sym === 'XAU' && atrVal > 0 && sig._pdhPdl && /RIDE|TREND|FAST|SUST|SQZ|6\/6/.test(tag) &&
+          !/LHF|LLF|VREV|EXT-FLIP|OBREJ|OBMIT|INVERSAL|SWEEP|CHoCH|ATH|ATL|DIV/.test(tag)) {
+        const _pd = sig._pdhPdl;
+        let _fpdlHit = '';
+        if (sig.type === 'put' && _pd.pdl > 0 && (price - _pd.pdl) < 5 && (price - _pd.pdl) > -0.3 * atrVal)
+          _fpdlHit = 'TP1 path requires the prior-day LOW $' + _pd.pdl.toFixed(2) + ' to break (price $' + (price - _pd.pdl).toFixed(2) + ' from it)';
+        else if (sig.type === 'call' && _pd.pdh > 0 && (_pd.pdh - price) < 5 && (_pd.pdh - price) > -0.3 * atrVal)
+          _fpdlHit = 'TP1 path requires the prior-day HIGH $' + _pd.pdh.toFixed(2) + ' to break (price $' + (_pd.pdh - price).toFixed(2) + ' from it)';
+        if (_fpdlHit) {
+          s._fpdlTs = s._fpdlTs || {};
+          if (Date.now() - (s._fpdlTs[sig.type] || 0) >= 180000) {
+            s._fpdlTs[sig.type] = Date.now();
+            const _fpdlMsg = '🧱 ' + tag + ' ' + sig.type.toUpperCase() + ' FLOOR-PDL DORMANT-WOULD-BLOCK @ $' + price.toFixed(2) + ' — ' + _fpdlHit + ' (2026-09-04, 02:57 case; stamp-only, signal proceeds through remaining gates).';
+            log(sym, _fpdlMsg); trackBlockedOutcome(sym, _fpdlMsg, true);
+          }
+        }
+      }
+    } catch (eFPD) { /* stamp must never crash enrichment */ }
     // ===== PROTECTIONS GATE (LIVE, 2026-08-28 — Freqtrade port, Jean: "we can ship
     // the protections module") ===== Placed LAST deliberately: only signals that
     // passed every other gate reach here, so PROTECT stamps measure exactly the
@@ -14678,6 +14707,20 @@ function checkExit(sym, price) {
     if (iC && price < t.worstPrice) t.worstPrice = price;
     if (!iC && price > t.worstPrice) t.worstPrice = price;
 
+    // ===== TP LADDER MONOTONICITY CLAMP (2026-09-04, Jean's 02:57 put) =====
+    // The zone-anchored TP2 can anchor to a zone NEARER than TP1 (02:57 put: TP1
+    // 4455.73 / TP2 4457.24 ABOVE it / TP3 4455.15) — a degenerate ladder where TP1
+    // instantly cascades TP2/TP3 (carried R-1). Enforce order every tick pre-TP1
+    // (idempotent, also re-fixes OTE-fill level shifts): call tp1≤tp2≤tp3, put mirrored.
+    if (!t.t1 && !t.sl && typeof t.tp1Price === 'number' && typeof t.tp2Price === 'number') {
+      if (iC) {
+        if (t.tp2Price < t.tp1Price) t.tp2Price = t.tp1Price;
+        if (typeof t.tp3Price === 'number' && t.tp3Price < t.tp2Price) t.tp3Price = t.tp2Price;
+      } else {
+        if (t.tp2Price > t.tp1Price) t.tp2Price = t.tp1Price;
+        if (typeof t.tp3Price === 'number' && t.tp3Price > t.tp2Price) t.tp3Price = t.tp2Price;
+      }
+    }
     // ===== SL5-SIM — "SL = TP1" SHADOW (2026-08-30, Jean: "should we do SL = TP1?") =====
     // Evidence for: winners' MAE ≤ $3.42 (July backtest) and ≤ $4.40 all this week,
     // while losers run adverseFrac ≈ 1.0 — a $5 stop halves loser cost and kept every
@@ -16286,7 +16329,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.28-20260904-desc-mlcal', // bump on each deploy — lets /state verify what's live
+    build: '6.30-20260904-floor-pdl', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
@@ -16554,6 +16597,19 @@ app.get('/prices', (req, res) => {
       // signal can never reach the executor, regardless of EA logic. The `trade` object below
       // is already fired-only (set by buildCfdTrade); analytics keep full history via /signals.
       signals: s.signals.filter(sg => !(sg && ((sg.conv && (sg.conv.enrichBlocked === true || sg.conv.label === 'BLOCKED')) || sg.pendingEntry === true))).slice(-20), // pendingEntry filter 2026-08-25: held auction signals leaked to the EA feed with NO sl/tp — MT5 traded one on its own defaults (00:35 case)
+      // OTE auction visibility (2026-09-04, Jean: "the signal disappeared from the app").
+      // While OTE-HOLD auctions the entry, the signal is hidden above (by design — no
+      // levels yet) and s.trade is parked, so the mobile monitor showed a black hole.
+      // Surface the auction state so the UI can show "⏳ auctioning toward $X" instead.
+      // EA MUST IGNORE this field (informational only; the trade arrives after the fill).
+      oteHold: (function () {
+        try {
+          if (s._oteHold && s._oteHold.expiry > Date.now()) {
+            return { dir: s._oteHold.dir, target: +(+s._oteHold.ote).toFixed(2), sigPrice: +(+s._oteHold.sigPrice).toFixed(2), expiresInSec: Math.max(0, Math.round((s._oteHold.expiry - Date.now()) / 1000)) };
+          }
+        } catch (eOH) {}
+        return null;
+      })(),
       // Manual-close command (2026-07-24). Surfaced here because the EA + mobile monitor
       // both poll /prices. EA: on closeRequest.active, flatten this symbol at market, then
       // POST /trade/close/ack {sym,id}. Auto-expires 60s.
