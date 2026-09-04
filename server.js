@@ -9178,7 +9178,12 @@ function processPrice(sym, price, hi, lo) {
           // in 5min with TP1 $11.4 away (-$7.6 loss); BTC 20:44 bounced +$284 with TP1
           // $336 away (-$224 loss). Both become TP1 WINS under the cap. Post-TP1 trail
           // lock still lets real reversals run toward the R-based TP2/TP3.
-          const efTp1Dist = Math.min(efSlDist * 1.5, efAtr * 1.25);
+          // $-cap added 2026-09-04 (Jean: "it didn't apply the TP1 at $5 rule") — the 7/13
+          // 1.25×ATR cap predates the absolute tp1Cap and ballooned to $14.60 on the 9/4
+          // post-crash ATR (10:18 EXT-FLIP put). EXT-FLIP now honors the same cap as
+          // every other path: min(1.5R, 1.25×ATR, $5 XAU / $100 BTC / $50 NAS).
+          const efTp1Cap = sym === 'XAU' ? 5 : sym === 'BTC' ? 100 : sym === 'NAS100' ? 50 : 0.50;
+          const efTp1Dist = Math.min(efSlDist * 1.5, efAtr * 1.25, efTp1Cap);
           const efTp1 = efCall ? price + efTp1Dist : price - efTp1Dist;
           const efTp2 = efCall ? price + efSlDist * 3.0 : price - efSlDist * 3.0;
           const efTp3 = efCall ? price + efSlDist * 5.0 : price - efSlDist * 5.0;
@@ -14721,6 +14726,29 @@ function checkExit(sym, price) {
         if (typeof t.tp3Price === 'number' && t.tp3Price > t.tp2Price) t.tp3Price = t.tp2Price;
       }
     }
+    // ===== UNIVERSAL TP1/SL CAP — SAFETY NET (2026-09-04, Jean's 9/4 fires) =====
+    // Two live escapes on 9/4: the 10:18 EXT-FLIP put served TP1 $14.60 from entry
+    // (path-local ATR cap, fixed at source same day) and the 08:39 INVERSAL put went
+    // LIVE with an $85 structural SL (a path bypassed the $8-12.50 INV-HOLD band —
+    // $4,250 of book risk at ×50). Whatever fire door built the trade, at activation:
+    // TP1 is clamped to tp1Cap ($5/$100/$50) and SL to 2.5×tp1Cap (the band ceiling
+    // Jean set 8/24: ">$12.50 must never fire at top price"). Runs pre-TP1, once.
+    if (!t.t1 && !t.sl && !t._capChecked && t.ep > 0) {
+      t._capChecked = true;
+      const _capT = sym === 'XAU' ? 5 : sym === 'BTC' ? 100 : sym === 'NAS100' ? 50 : 0;
+      if (_capT > 0) {
+        if (typeof t.tp1Price === 'number' && Math.abs(t.ep - t.tp1Price) > _capT + 0.01) {
+          const _oldT1 = t.tp1Price;
+          t.tp1Price = +(iC ? t.ep + _capT : t.ep - _capT).toFixed(2);
+          log(sym, '📏 TP1-CAPPED — ' + t.type.toUpperCase() + ' TP1 $' + _oldT1.toFixed(2) + ' was $' + Math.abs(t.ep - _oldT1).toFixed(2) + ' from entry (cap $' + _capT + '); clamped to $' + t.tp1Price.toFixed(2) + ' (universal net, 2026-09-04).');
+        }
+        if (typeof t.slPrice === 'number' && t.slPrice > 0 && Math.abs(t.ep - t.slPrice) > 2.5 * _capT + 0.01) {
+          const _oldSl = t.slPrice;
+          t.slPrice = +(iC ? t.ep - 2.5 * _capT : t.ep + 2.5 * _capT).toFixed(2);
+          log(sym, '📏 SL-CAPPED — ' + t.type.toUpperCase() + ' SL $' + _oldSl.toFixed(2) + ' was $' + Math.abs(t.ep - _oldSl).toFixed(2) + ' from entry (band ceiling $' + (2.5 * _capT).toFixed(2) + ', Jean 8/24); clamped to $' + t.slPrice.toFixed(2) + '. A path bypassed INV-HOLD — check logs.');
+        }
+      }
+    }
     // ===== SL5-SIM — "SL = TP1" SHADOW (2026-08-30, Jean: "should we do SL = TP1?") =====
     // Evidence for: winners' MAE ≤ $3.42 (July backtest) and ≤ $4.40 all this week,
     // while losers run adverseFrac ≈ 1.0 — a $5 stop halves loser cost and kept every
@@ -16329,7 +16357,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.30-20260904-floor-pdl', // bump on each deploy — lets /state verify what's live
+    build: '6.31-20260904-tp1-sl-caps', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
