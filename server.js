@@ -1935,6 +1935,7 @@ function cohortFor(reason) {
   if (/P381-BYPASS/.test(reason)) return 'P381-BYPASS'; // RSI-exhaustion bypass fires, finally cohort-stamped (2026-08-27, 06:40 bottom-tick case)
   if (/FLOOR-PDL/.test(reason)) return 'FLOOR-PDL'; // TP1-into-prior-day-extreme stamps, dormant (2026-09-04, 02:57 case) — must precede FLOOR-PATH
   if (/FLOOR-PATH/.test(reason)) return 'FLOOR-PATH'; // TP1-into-defended-floor blocks (2026-08-28, 21:57/06:40 cases)
+  if (/BTC-RANGE5/.test(reason)) return 'BTC-RANGE5'; // 5-day-extreme fade shadow, self-graded wide brackets (2026-09-06, Jean's thesis)
   if (/INV-LO/.test(reason)) return 'BTC-INV-LO'; // inverted put fired AT/near the session low — the minima-bounce thesis cell (2026-09-01)
   if (/INV-MID/.test(reason)) return 'BTC-INV-MID'; // inverted put mid-range — expected pure direction beta (2026-09-01)
   if (/BTC-INV/.test(reason)) return 'BTC-INV'; // pre-split stamps (8/28-8/31); pooled cohort shown to be direction beta by the 8/31 report cross-tab
@@ -2773,6 +2774,7 @@ function saveRuntimeState() {
         tickRateSess: (typeof s._tickRateSess === 'number') ? s._tickRateSess : null,
         extFlip: s.extFlip || null,
         sweptLevels: s.sweptLevels || null,
+        r5: s._r5 || null, // BTC-RANGE5 virtuals survive restarts (2026-09-06) — a 5-day-horizon shadow can't afford to die on every deploy
         invHold: s._invHold ? {
           tag: s._invHold.tag, dir: s._invHold.dir, slPrice: s._invHold.slPrice,
           targetDist: s._invHold.targetDist, initialDist: s._invHold.initialDist,
@@ -2875,6 +2877,7 @@ function loadRuntimeState() {
       if (d.extFlip) s.extFlip = d.extFlip;
       if (d.sweptLevels && typeof d.sweptLevels === 'object') s.sweptLevels = d.sweptLevels;
       // 6) Armed entry auctions — restore only if still inside their window
+      if (d.r5 && typeof d.r5 === 'object') { s._r5 = d.r5; if (s._r5.long || s._r5.short) console.log('[' + ts() + '] ' + sym + ' — BTC-RANGE5 virtual(s) restored (' + (s._r5.long ? 'LONG ' : '') + (s._r5.short ? 'SHORT' : '') + ').'); }
       if (d.invHold && d.invHold.expiry > now && !(s.trade && s.trade.active)) {
         s._invHold = { tag: d.invHold.tag, dir: d.invHold.dir, slPrice: d.invHold.slPrice,
                        targetDist: d.invHold.targetDist, initialDist: d.invHold.initialDist,
@@ -3452,6 +3455,50 @@ function processPrice(sym, price, hi, lo) {
 
   if (price > s.sessionHigh) { s.sessionHigh = price; s.sessionHighUpdateTs = Date.now(); }
   if (price < s.sessionLow) { s.sessionLow = price; s.sessionLowUpdateTs = Date.now(); }
+
+  // ===== BTC-RANGE5 — 5-DAY EXTREME FADE, DORMANT SHADOW (2026-09-06, Jean) =====
+  // Jean's thesis after the BTC-INV post-mortems: "the only way to make BTC work is
+  // buy the 5-day low and sell the 5-day high with a high SL and a very wide TP."
+  // Literature agrees on the shape (x-day-MIN bounce effect; grid/DCA practice) and
+  // warns it dies in strong trends — so measure first. Virtual only, SELF-GRADED
+  // (the ±ATR tracker brackets are far too tight to grade a wide-TP thesis):
+  //   LONG arm: price ≤ 5-day low + 0.1×ADR · SL = arm-time low − 0.75×ADR (high SL)
+  //   TP = 5-day range MID (very wide); the FAR side is recorded as a bonus flag.
+  //   SHORT arm mirrored at the 5-day high. One virtual per side; 6h re-arm cooldown
+  //   after resolution; 5-day expiry grades scratch. Resolutions bump the BTC-RANGE5
+  //   cohort directly. Promotion: ≥60% over ≥15 resolved, split by weekly direction
+  //   exactly like BTC-INV (the direction-beta trap must be re-checked here too).
+  if (sym === 'BTC') {
+    try {
+      const _r5dl = s.dailyLevels || [];
+      if (_r5dl.length >= 3 && s.rollingLow > 0 && isFinite(s.rollingLow) && s.rollingHigh > s.rollingLow) {
+        const _adr = _r5dl.reduce((a, d) => a + (d.high - d.low), 0) / _r5dl.length;
+        const _mid = (s.rollingHigh + s.rollingLow) / 2;
+        s._r5 = s._r5 || { long: null, short: null, cdL: 0, cdS: 0 };
+        ['long', 'short'].forEach(sd => {
+          const v = s._r5[sd]; if (!v) return;
+          if (!v.farHit && (sd === 'long' ? price >= v.tpFar : price <= v.tpFar)) v.farHit = true;
+          const win = sd === 'long' ? price >= v.tp : price <= v.tp;
+          const loss = sd === 'long' ? price <= v.sl : price >= v.sl;
+          const expired = Date.now() - v.ts > 5 * 86400000;
+          if (win || loss || expired) {
+            const oc = win ? 'win' : loss ? 'loss' : 'scratch';
+            log(sym, '🎢 BTC-RANGE5 ' + sd.toUpperCase() + ' RESOLVED ' + oc.toUpperCase() + ' — armed $' + v.ep.toFixed(0) + ' → ' + (win ? 'TP(mid) $' + v.tp.toFixed(0) : loss ? 'SL $' + v.sl.toFixed(0) : 'expired 5d @ $' + price.toFixed(0)) + (v.farHit ? ' · FAR side was reached' : '') + ' · held ' + Math.round((Date.now() - v.ts) / 3600000) + 'h (dormant 5-day-extreme fade, Jean 2026-09-06).');
+            try { bumpCohortTally(sym, 'BTC-RANGE5', oc); } catch (eB) {}
+            s._r5[sd] = null; s._r5[sd === 'long' ? 'cdL' : 'cdS'] = Date.now();
+          }
+        });
+        if (!s._r5.long && Date.now() - s._r5.cdL > 21600000 && price <= s.rollingLow + 0.1 * _adr) {
+          s._r5.long = { ep: price, sl: +(s.rollingLow - 0.75 * _adr).toFixed(2), tp: +_mid.toFixed(2), tpFar: s.rollingHigh, ts: Date.now(), farHit: false };
+          log(sym, '🎢 BTC-RANGE5 LONG armed @ $' + price.toFixed(0) + ' — at the 5-day low $' + s.rollingLow.toFixed(0) + ' · SL $' + s._r5.long.sl.toFixed(0) + ' (low − 0.75×ADR $' + _adr.toFixed(0) + ') · TP mid $' + _mid.toFixed(0) + ' · far $' + s.rollingHigh.toFixed(0) + ' (dormant shadow).');
+        }
+        if (!s._r5.short && Date.now() - s._r5.cdS > 21600000 && price >= s.rollingHigh - 0.1 * _adr) {
+          s._r5.short = { ep: price, sl: +(s.rollingHigh + 0.75 * _adr).toFixed(2), tp: +_mid.toFixed(2), tpFar: s.rollingLow, ts: Date.now(), farHit: false };
+          log(sym, '🎢 BTC-RANGE5 SHORT armed @ $' + price.toFixed(0) + ' — at the 5-day high $' + s.rollingHigh.toFixed(0) + ' · SL $' + s._r5.short.sl.toFixed(0) + ' (high + 0.75×ADR $' + _adr.toFixed(0) + ') · TP mid $' + _mid.toFixed(0) + ' · far $' + s.rollingLow.toFixed(0) + ' (dormant shadow).');
+        }
+      }
+    } catch (eR5) { /* shadow must never crash the tick path */ }
+  }
 
   // Update rolling 5-day high/low for ATH/ATL detector
   // Simple approach: rollingHigh = max(past 5 daily highs, today's sessionHigh)
@@ -16357,7 +16404,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.31-20260904-tp1-sl-caps', // bump on each deploy — lets /state verify what's live
+    build: '6.32-20260906-btc-range5', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
