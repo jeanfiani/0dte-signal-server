@@ -1865,18 +1865,32 @@ function latchAdvSource(s, sigType) {
 // a zone older than the extreme is a defended level (block stays right). NOTE: this
 // deliberately misses the 12:55 cluster (price wasn't above the 60-min high yet) —
 // precision over recall, pre-registered. Promotion bar: ≥60% over ≥15 resolved.
-function grindReclaimTag(s, sigType, price, zone) {
+function grindReclaimTag(s, sigType, price, zone, atrVal) {
   try {
-    if (!latchAdvSource(s, sigType)) return '';
     const fresh60 = sigType === 'call'
       ? (s.localHi60min > 0 && price >= s.localHi60min)
       : (s.localLo60min > 0 && price <= s.localLo60min);
     if (!fresh60) return '';
-    if (zone) {
-      const extTs = sigType === 'call' ? (s.sessionHighUpdateTs || 0) : (s.sessionLowUpdateTs || 0);
-      if (!(zone.ts && extTs && zone.ts > extTs)) return '';
+    if (latchAdvSource(s, sigType)) {
+      if (zone) {
+        const extTs = sigType === 'call' ? (s.sessionHighUpdateTs || 0) : (s.sessionLowUpdateTs || 0);
+        if (!(zone.ts && extTs && zone.ts > extTs)) return '';
+      }
+      return ' [GRIND-RECLAIM]';
     }
-    return ' [GRIND-RECLAIM]';
+    // ===== V-RECOVERY ARM (2026-09-07, third specimen: 9/2 pm, 9/4, 9/7) ==========
+    // After a capitulation low the V-recovery has NO with-trend latch by definition
+    // (the latch points the other way) and the regime is usually NEUTRAL — so the
+    // original arm can never tag it, and 9/7's refused RIDE calls went 8W/2L unseen.
+    // Second arm: no latch, but price is at a fresh 60-min extreme AND has reclaimed
+    // ≥50% of a meaningful day range (≥2×ATR) from the opposite extreme. Separate
+    // cohort GRIND-RECLAIM-V — the two arms must prove themselves independently.
+    const _rng = (isFinite(s.sessionHigh) && isFinite(s.sessionLow) && s.sessionHigh > s.sessionLow) ? s.sessionHigh - s.sessionLow : 0;
+    if (_rng > 0 && (!atrVal || _rng >= 2 * atrVal)) {
+      const _reclaim = sigType === 'call' ? (price - s.sessionLow) / _rng : (s.sessionHigh - price) / _rng;
+      if (_reclaim >= 0.5) return ' [GRIND-RECLAIM-V]';
+    }
+    return '';
   } catch (e) { return ''; }
 }
 // ===== NIGHT tag (2026-09-04, dormant) ==========================================
@@ -1890,6 +1904,7 @@ function nightTag() {
   try { const m = gET(); return (m >= 1080 || m < 360) ? ' [NIGHT]' : ''; } catch (e) { return ''; }
 }
 function cohortFor(reason) {
+  if (/GRIND-RECLAIM-V/.test(reason)) return 'GRIND-RECLAIM-V'; // V-recovery arm, no latch (2026-09-07, 9/7 RIDE-call 8W/2L specimen) — must precede the plain match
   if (/GRIND-RECLAIM/.test(reason)) return 'GRIND-RECLAIM'; // must precede ZONE-VETO/EXT-GUARD — the tag rides on their block messages (2026-09-02)
   if (/SLPAD-SIM/.test(reason)) return 'SLPAD-SIM'; // wick-pad shadow on real stops: SAVE rows' bracket outcome = pad-world verdict; DEEP rows = pad pure cost (2026-09-03)
   if (/HELD45\+/.test(reason)) return 'ZP-HELD45'; // ZONE-PERM ease at an extreme held ≥45min — 9/3 overnight: held fades won both sides, fresh fades lost (must precede ZONE-PERM match)
@@ -1935,6 +1950,7 @@ function cohortFor(reason) {
   if (/P381-BYPASS/.test(reason)) return 'P381-BYPASS'; // RSI-exhaustion bypass fires, finally cohort-stamped (2026-08-27, 06:40 bottom-tick case)
   if (/FLOOR-PDL/.test(reason)) return 'FLOOR-PDL'; // TP1-into-prior-day-extreme stamps, dormant (2026-09-04, 02:57 case) — must precede FLOOR-PATH
   if (/FLOOR-PATH/.test(reason)) return 'FLOOR-PATH'; // TP1-into-defended-floor blocks (2026-08-28, 21:57/06:40 cases)
+  if (/BTC-RANGE5-RT/.test(reason)) return 'BTC-RANGE5-RT'; // retest arm: nearest unbroken prior-day extreme (2026-09-07) — must precede the plain match
   if (/BTC-RANGE5/.test(reason)) return 'BTC-RANGE5'; // 5-day-extreme fade shadow, self-graded wide brackets (2026-09-06, Jean's thesis)
   if (/INV-LO/.test(reason)) return 'BTC-INV-LO'; // inverted put fired AT/near the session low — the minima-bounce thesis cell (2026-09-01)
   if (/INV-MID/.test(reason)) return 'BTC-INV-MID'; // inverted put mid-range — expected pure direction beta (2026-09-01)
@@ -3496,6 +3512,49 @@ function processPrice(sym, price, hi, lo) {
           s._r5.short = { ep: price, sl: +(s.rollingHigh + 0.75 * _adr).toFixed(2), tp: +_mid.toFixed(2), tpFar: s.rollingLow, ts: Date.now(), farHit: false };
           log(sym, '🎢 BTC-RANGE5 SHORT armed @ $' + price.toFixed(0) + ' — at the 5-day high $' + s.rollingHigh.toFixed(0) + ' · SL $' + s._r5.short.sl.toFixed(0) + ' (high + 0.75×ADR $' + _adr.toFixed(0) + ') · TP mid $' + _mid.toFixed(0) + ' · far $' + s.rollingLow.toFixed(0) + ' (dormant shadow).');
         }
+        // ===== R5-RETEST ARM (2026-09-07, Jean: "today the strategy won") ==========
+        // The DEEP arm keys off the ABSOLUTE 5-day extreme, so a single capitulation
+        // wick (9/3's 76,299) poisons the trigger for five days — while the level that
+        // actually held today was the NEAREST UNBROKEN prior daily low (9/5's 78,632;
+        // today's dip to 78,676 held it and bounced $1,250). Second arm: retest of the
+        // nearest prior-day low still unbroken today (mirrored at prior-day highs).
+        // Same wide brackets; own cohort BTC-RANGE5-RT so the two arms grade apart.
+        try {
+          const _todayIso = new Date().toISOString().slice(0, 10);
+          const _prior = _r5dl.filter(d0 => d0.date !== _todayIso);
+          s._r5.longR = s._r5.longR !== undefined ? s._r5.longR : null;
+          s._r5.shortR = s._r5.shortR !== undefined ? s._r5.shortR : null;
+          s._r5.cdLR = s._r5.cdLR || 0; s._r5.cdSR = s._r5.cdSR || 0;
+          // grade active retest virtuals
+          [['longR', 'long'], ['shortR', 'short']].forEach(pair => {
+            const key = pair[0], sd = pair[1], v = s._r5[key]; if (!v) return;
+            if (!v.farHit && (sd === 'long' ? price >= v.tpFar : price <= v.tpFar)) v.farHit = true;
+            const win = sd === 'long' ? price >= v.tp : price <= v.tp;
+            const loss = sd === 'long' ? price <= v.sl : price >= v.sl;
+            const expired = Date.now() - v.ts > 5 * 86400000;
+            if (win || loss || expired) {
+              const oc = win ? 'win' : loss ? 'loss' : 'scratch';
+              log(sym, '🎢 BTC-RANGE5-RT ' + sd.toUpperCase() + ' RESOLVED ' + oc.toUpperCase() + ' — level $' + v.lvl.toFixed(0) + ', armed $' + v.ep.toFixed(0) + ' → ' + (win ? 'TP(mid) $' + v.tp.toFixed(0) : loss ? 'SL $' + v.sl.toFixed(0) : 'expired 5d @ $' + price.toFixed(0)) + (v.farHit ? ' · FAR side reached' : '') + ' (retest arm, Jean 2026-09-07).');
+              try { bumpCohortTally(sym, 'BTC-RANGE5-RT', oc); } catch (eB2) {}
+              s._r5[key] = null; s._r5[sd === 'long' ? 'cdLR' : 'cdSR'] = Date.now();
+            }
+          });
+          // arm: nearest prior daily LOW below price, unbroken today, not the deep extreme
+          if (!s._r5.longR && Date.now() - s._r5.cdLR > 21600000) {
+            const _lvlL = _prior.map(d0 => d0.low).filter(l0 => l0 > 0 && l0 < price && l0 > s.rollingLow + 0.1 * _adr && (!isFinite(s.sessionLow) || s.sessionLow > l0 - 0.1 * _adr)).sort((a0, b0) => b0 - a0)[0];
+            if (_lvlL && price - _lvlL <= 0.1 * _adr) {
+              s._r5.longR = { lvl: _lvlL, ep: price, sl: +(_lvlL - 0.75 * _adr).toFixed(2), tp: +((_lvlL + s.rollingHigh) / 2).toFixed(2), tpFar: s.rollingHigh, ts: Date.now(), farHit: false };
+              log(sym, '🎢 BTC-RANGE5-RT LONG armed @ $' + price.toFixed(0) + ' — retest of unbroken prior-day low $' + _lvlL.toFixed(0) + ' · SL $' + s._r5.longR.sl.toFixed(0) + ' · TP mid $' + s._r5.longR.tp.toFixed(0) + ' · far $' + s.rollingHigh.toFixed(0) + ' (dormant shadow).');
+            }
+          }
+          if (!s._r5.shortR && Date.now() - s._r5.cdSR > 21600000) {
+            const _lvlH = _prior.map(d0 => d0.high).filter(h0 => h0 > 0 && h0 > price && h0 < s.rollingHigh - 0.1 * _adr && (!isFinite(s.sessionHigh) || s.sessionHigh < h0 + 0.1 * _adr)).sort((a0, b0) => a0 - b0)[0];
+            if (_lvlH && _lvlH - price <= 0.1 * _adr) {
+              s._r5.shortR = { lvl: _lvlH, ep: price, sl: +(_lvlH + 0.75 * _adr).toFixed(2), tp: +((_lvlH + s.rollingLow) / 2).toFixed(2), tpFar: s.rollingLow, ts: Date.now(), farHit: false };
+              log(sym, '🎢 BTC-RANGE5-RT SHORT armed @ $' + price.toFixed(0) + ' — retest of unbroken prior-day high $' + _lvlH.toFixed(0) + ' · SL $' + s._r5.shortR.sl.toFixed(0) + ' · TP mid $' + s._r5.shortR.tp.toFixed(0) + ' · far $' + s.rollingLow.toFixed(0) + ' (dormant shadow).');
+            }
+          }
+        } catch (eR5R) {}
       }
     } catch (eR5) { /* shadow must never crash the tick path */ }
   }
@@ -6115,7 +6174,7 @@ function processPrice(sym, price, hi, lo) {
                 log(sym, _egEaseMsg); trackBlockedOutcome(sym, _egEaseMsg, true);
               } else {
               Object.assign(s, _emitSnapshot);
-              log(sym, '⏳ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — EXT-GUARD (Phase 3.91): entering at ' + Math.round(_egPos * 100) + '% of a $' + _egRange.toFixed(2) + ' 15-min impulse (' + (_egRange / atrVal).toFixed(1) + '×ATR). Chasing the crest of an oversized move; retest ~$' + _egRetest.toFixed(2) + ' would be the entry. EXT-FLIP candidate armed ' + (sig.type === 'call' ? 'PUT' : 'CALL') + '.' + grindReclaimTag(s, sig.type, price, null));
+              log(sym, '⏳ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — EXT-GUARD (Phase 3.91): entering at ' + Math.round(_egPos * 100) + '% of a $' + _egRange.toFixed(2) + ' 15-min impulse (' + (_egRange / atrVal).toFixed(1) + '×ATR). Chasing the crest of an oversized move; retest ~$' + _egRetest.toFixed(2) + ' would be the entry. EXT-FLIP candidate armed ' + (sig.type === 'call' ? 'PUT' : 'CALL') + '.' + grindReclaimTag(s, sig.type, price, null, atrVal));
               return false;
               }
             }
@@ -6360,7 +6419,7 @@ function processPrice(sym, price, hi, lo) {
         if (_zvIn && !_zvInEase) {
           Object.assign(s, _emitSnapshot);
           const _zvInAge = _zvIn.ts ? Math.round((Date.now() - _zvIn.ts) / 60000) : null;
-          const _zvInMsg = '🚧 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ZONE-VETO: price is INSIDE opposing ' + (_zvIn.kind || 'OB') + ' ' + (_zvIn.tf || '') + ' $' + _zvIn.lo.toFixed(2) + '-$' + _zvIn.hi.toFixed(2) + (_zvInAge !== null ? ' · zone age ' + _zvInAge + 'min [' + (_zvInAge < 240 ? 'ZAGE-FRESH' : _zvInAge <= 720 ? 'ZAGE-MID' : 'ZAGE-OLD') + ']' : '') + ' — inside-zone rule holds even on latched trend days (2026-08-28, 8/27 23:46 case).' + grindReclaimTag(s, sig.type, price, _zvIn);
+          const _zvInMsg = '🚧 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ZONE-VETO: price is INSIDE opposing ' + (_zvIn.kind || 'OB') + ' ' + (_zvIn.tf || '') + ' $' + _zvIn.lo.toFixed(2) + '-$' + _zvIn.hi.toFixed(2) + (_zvInAge !== null ? ' · zone age ' + _zvInAge + 'min [' + (_zvInAge < 240 ? 'ZAGE-FRESH' : _zvInAge <= 720 ? 'ZAGE-MID' : 'ZAGE-OLD') + ']' : '') + ' — inside-zone rule holds even on latched trend days (2026-08-28, 8/27 23:46 case).' + grindReclaimTag(s, sig.type, price, _zvIn, atrVal);
           log(sym, _zvInMsg); trackBlockedOutcome(sym, _zvInMsg, true);
           return false;
         }
@@ -6385,7 +6444,7 @@ function processPrice(sym, price, hi, lo) {
           // If ZAGE-OLD saves degrade, tighten the 1500-min zone cap with evidence.
           const _zvAge = _zv.ts ? Math.round((Date.now() - _zv.ts) / 60000) : null;
           const _zvAgeTag = _zvAge !== null ? ' · zone age ' + _zvAge + 'min [' + (_zvAge < 240 ? 'ZAGE-FRESH' : _zvAge <= 720 ? 'ZAGE-MID' : 'ZAGE-OLD') + ']' : '';
-          const _zvMsg = '🚧 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ZONE-VETO: opposing ' + (_zv.kind || 'OB') + ' ' + (_zv.tf || '') + ' $' + _zv.lo.toFixed(2) + '-$' + _zv.hi.toFixed(2) + ' sits ' + (_zvC ? (_zv.lo - price) : (price - _zv.hi)).toFixed(2) + ' ahead (<1.2×ATR)' + _zvAgeTag + ' — path runs into mapped ' + (_zvC ? 'supply' : 'demand') + ' (Layer 3, 2026-08-13).' + grindReclaimTag(s, sig.type, price, _zv);
+          const _zvMsg = '🚧 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ZONE-VETO: opposing ' + (_zv.kind || 'OB') + ' ' + (_zv.tf || '') + ' $' + _zv.lo.toFixed(2) + '-$' + _zv.hi.toFixed(2) + ' sits ' + (_zvC ? (_zv.lo - price) : (price - _zv.hi)).toFixed(2) + ' ahead (<1.2×ATR)' + _zvAgeTag + ' — path runs into mapped ' + (_zvC ? 'supply' : 'demand') + ' (Layer 3, 2026-08-13).' + grindReclaimTag(s, sig.type, price, _zv, atrVal);
           log(sym, _zvMsg); trackBlockedOutcome(sym, _zvMsg, true);
           return false;
         }
@@ -16425,7 +16484,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.33-20260907-ote-direction', // bump on each deploy — lets /state verify what's live
+    build: '6.35-20260907-r5-retest', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
