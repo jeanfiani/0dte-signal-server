@@ -3475,6 +3475,34 @@ function processPrice(sym, price, hi, lo) {
   if (price > s.sessionHigh) { s.sessionHigh = price; s.sessionHighUpdateTs = Date.now(); }
   if (price < s.sessionLow) { s.sessionLow = price; s.sessionLowUpdateTs = Date.now(); }
 
+  // ===== OTE-HOLD WATCHDOG (2026-09-07, the 18:48 MFLIP zombie) =====
+  // The OTE vet/resolver lives inside the zone-map section, gated by atrVal > 0 —
+  // after a mid-session reboot the ATR candles rebuild for up to ~70min, atrVal reads
+  // 0, and a restored auction sits FROZEN past its expiry (18:48 hold expired 18:52,
+  // still armed at 19:15). This watchdog is UNGATED: (a) price crossing the trade SL
+  // while any hold is armed → invalidation SAVE regardless of ATR state; (b) a hold
+  // >2min past expiry → dropped as stale (a 20-min-late market fill is a different
+  // trade than the one the detector priced — no trade beats a blind one).
+  try {
+    if (s._oteHold && isMT5) {
+      const _ow = s._oteHold, _owC = _ow.dir === 'call';
+      const _owSlX = _ow.slPrice != null && (_owC ? price <= _ow.slPrice : price >= _ow.slPrice);
+      if (_owSlX) {
+        s._oteHold = null;
+        const _owM = '⏳ OTE-HOLD ' + _ow.dir.toUpperCase() + ' INVALIDATED (watchdog) — price crossed the SL level $' + (+_ow.slPrice).toFixed(2) + ' while auctioning; the market entry @ $' + (+_ow.sigPrice).toFixed(2) + ' would have been a full loss. Zero-loss save.';
+        log(sym, _owM);
+        try { trackBlockedOutcome(sym, _owM, true); } catch (eT) {}
+        if (_ow.sigRef) _ow.sigRef.oteHold = 'invalidated-save';
+        if (_ow.histRef) { _ow.histRef.oteHold = 'invalidated-save'; _ow.histRef.pendingEntry = false; }
+      } else if (Date.now() > _ow.expiry + 120000) {
+        s._oteHold = null;
+        log(sym, '🧹 OTE-HOLD ' + _ow.dir.toUpperCase() + ' DROPPED stale (watchdog) — expired ' + Math.round((Date.now() - _ow.expiry) / 60000) + 'min ago unresolved (resolver starved by post-reboot ATR warm-up); signal context is gone, no trade taken.');
+        if (_ow.sigRef) { _ow.sigRef.oteHold = 'stale-expired'; _ow.sigRef.pendingEntry = false; }
+        if (_ow.histRef) { _ow.histRef.oteHold = 'stale-expired'; _ow.histRef.pendingEntry = false; }
+      }
+    }
+  } catch (eOW) { /* watchdog must never crash the tick */ }
+
   // ===== BTC-RANGE5 — 5-DAY EXTREME FADE, DORMANT SHADOW (2026-09-06, Jean) =====
   // Jean's thesis after the BTC-INV post-mortems: "the only way to make BTC work is
   // buy the 5-day low and sell the 5-day high with a high SL and a very wide TP."
@@ -9147,7 +9175,7 @@ function processPrice(sym, price, hi, lo) {
   // could fire PUTs against a profitable CALL, wrecking a winning trade.
   // Same-direction signals are still allowed (e.g., trend continuation CALL when CALL trade is running).
   let winProtectDir = null; // set to 'call'|'put' = direction being protected (block opposite)
-  if (isMT5 && s.trade.active && s.trade.ep > 0) {
+  if (isMT5 && s.trade && s.trade.active && s.trade.ep > 0) {
     const wpDir = s.trade.type;
     const wpPnl = wpDir === 'call' ? price - s.trade.ep : s.trade.ep - price;
     const wpMin = isBTC ? 50 : isNAS ? 10 : isXAU ? 1 : 0.20; // XAU lowered from $2 to $1 — $1.76 profit PUT wasn't protected, allowed false TREND CALL
@@ -10403,7 +10431,7 @@ function processPrice(sym, price, hi, lo) {
                              slPrice: (typeof _ohT.slPrice === 'number' && _ohT.slPrice > 0) ? _ohT.slPrice : null,
                              runaway: 0.5 * (atrVal > 0 ? atrVal : (_ohT.atr || 0)),
                              armTs: _zNow, expiry: _zNow + 240000 };
-              s.trade = null;
+              s.trade = { active: false }; // NEVER null (2026-09-07 crash: /prices//status/checkExit read .active unguarded — the 18:48 MFLIP auction nulled this and crash-looped the server)
               log(sym, '⏳ OTE-HOLD ' + _ohDir.toUpperCase() + ' armed @ $' + price.toFixed(2) + ' — auctioning toward OTE $' + _ohOte.limit.toFixed(2) + ' (70.5% of impulse $' + _ohOte.impulseLo.toFixed(2) + '-$' + _ohOte.impulseHi.toFixed(2) + ') ≤4min; early fire on touch or ≥0.5×ATR runaway; invalidates at SL' + (s._oteHold.slPrice ? ' $' + s._oteHold.slPrice.toFixed(2) : '') + ' (Jean 2026-08-26).');
               sendPush('⏳ XAU OTE-HOLD ' + _ohDir.toUpperCase(), 'waiting for $' + _ohOte.limit.toFixed(2) + ' (now $' + price.toFixed(2) + ') · ≤4min', 'signal');
             }
@@ -14144,7 +14172,7 @@ function processPrice(sym, price, hi, lo) {
   // === WINNING TRADE PROTECTION (regular signals — backup for global guard above) ===
   // Global winProtectDir guard blocks all specialized detectors already.
   // This is a safety net for regular 5/6, 6/6 signals + provides a log message.
-  if (isMT5 && s.trade.active) {
+  if (isMT5 && s.trade && s.trade.active) {
     const tDir = s.trade.type; // current trade direction
     const tPnl = tDir === 'call' ? price - s.trade.ep : s.trade.ep - price; // current P&L in $
     const minProfit = isBTC ? 50 : isNAS ? 10 : isXAU ? 2 : 0.20; // minimum profit to protect ($2 for XAU, $50 for BTC, $10 for NAS100)
@@ -14819,7 +14847,7 @@ function checkCfdTracks(sym, price) {
 
 function checkExit(sym, price) {
   const s = S[sym], t = s.trade;
-  if (!t.active || !t.ep || price <= 0) return;
+  if (!t || !t.active || !t.ep || price <= 0) return; // null-guard 2026-09-07
   const iC = t.type === 'call';
   const pnl = iC ? price - t.ep : t.ep - price;
 
@@ -15650,7 +15678,7 @@ function processTicks(symbols) {
     // the 0-losers strategy. CFD trades use the TP1/TP2/TP3 trailSl mechanism in
     // checkExit() which correctly waits for TP1 hit before moving SL to BE.
     // Legacy percentage-based trades (non-CFD) still use this trailing logic as before.
-    if ((isXAUt || isBTCt || isNASt) && s.trade.active && s.trade.isTrend && !s.trade.isCfd) {
+    if ((isXAUt || isBTCt || isNASt) && s.trade && s.trade.active && s.trade.isTrend && !s.trade.isCfd) {
       const t = s.trade;
       const tPnl = t.type === 'call' ? price - t.ep : t.ep - price;
       const atr = t.atr || (isBTCt ? 50 : sym === 'NAS100' ? 15 : 3);
@@ -16499,7 +16527,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.36-20260907-gex-coil-fix', // bump on each deploy — lets /state verify what's live
+    build: '6.37-20260907-null-trade-fix', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
@@ -16790,7 +16818,7 @@ app.get('/prices', (req, res) => {
         }
         return null;
       })(),
-      trade: s.trade.active && s.trade._oteVetted !== false ? {
+      trade: s.trade && s.trade.active && s.trade._oteVetted !== false ? {
         active: true, type: s.trade.type, ep: s.trade.ep,
         t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl, rev: s.trade.rev,
         isTrend: s.trade.isTrend || false,
@@ -16957,7 +16985,7 @@ app.get('/status', (req, res) => {
       lastTickAgeSec: s.lastTradeTs ? Math.round((Date.now() - s.lastTradeTs) / 1000) : null,
       signals: s.dailySignalCount,
       chopActive: s.chopActive,
-      trade: s.trade.active && s.trade._oteVetted !== false ? { type: s.trade.type, ep: s.trade.ep, t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl } : null,
+      trade: s.trade && s.trade.active && s.trade._oteVetted !== false ? { type: s.trade.type, ep: s.trade.ep, t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl } : null,
       recentSignals: s.signals.filter(sg => !(sg && ((sg.conv && (sg.conv.enrichBlocked === true || sg.conv.label === 'BLOCKED')) || sg.pendingEntry === true))).slice(-5),
       // Blocked-attempt visibility (added 2026-05-22) — surfaces enrichSig gates that
       // suppressed signal emission. Useful for diagnosing over-gating, especially BTC.
