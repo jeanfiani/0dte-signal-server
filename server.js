@@ -10319,6 +10319,9 @@ function processPrice(sym, price, hi, lo) {
         // vetted here on the next tick, custom SL/TP geometry intact. Exempt: INVERSAL
         // band fires, INV-HOLD fills, V-REC/elite scalps, same-dir continuations.
         try {
+          // OTE kill switch (2026-09-07, Jean's WR concern): set OTE_DISABLED=1 in
+          // Railway env to release every fire at market instantly — no code push needed.
+          if (process.env.OTE_DISABLED === '1' && s.trade && s.trade._oteVetted === false) s.trade._oteVetted = true;
           if (sym === 'XAU' && s.trade && s.trade.active && s.trade._oteVetted === false && !s._invHold && !s._oteHold) {
             const _ohT = s.trade;
             const _ohDir = _ohT.type;
@@ -14252,15 +14255,24 @@ function computeOTE(s, sym, dir) {
   const minRange = sym === 'XAU' ? 3 : sym === 'BTC' ? 150 : sym === 'NAS100' ? 15 : 3;
   if (range < minRange) return null;
   // 70.5% retracement (golden mean of OTE zone)
+  // ===== DIRECTION FIX (2026-09-07, Jean's 07:33 autopsy) =====
+  // The old branches required the OPPOSITE impulse (put needed an UP-leg, call a
+  // DOWN-leg) — but the dominant fire class is CONTINUATION (TREND/RIDE put on a
+  // breakdown, breakout call), whose latest impulse is WITH the signal. Result:
+  // computeOTE returned null on virtually every fire and the auction silently
+  // released at market — exactly ONE trade ever carried oteHold in its 12-day life.
+  // Unified per the standard OTE definition and Jean's 8/26 spec: measure the 15-min
+  // hi/lo leg; PUT entry = the bounce back UP to 70.5% of it (lo + 0.705r), CALL =
+  // the dip back DOWN to 70.5% (hi − 0.705r), regardless of impulse order. Fires
+  // already at/beyond the limit release at market (existing vet skip); momentum
+  // runaways still fire early (≥0.5×ATR release); price crossing the trade SL while
+  // waiting = invalidation SAVE. Last night both TREND-put losers (02:02, 07:33)
+  // would have been SAVES — the bounce crossed their SLs during the auction window.
   let oteLimit;
   if (dir === 'put') {
-    // Need UP-impulse to fade — high must be more recent than low
-    if (hiTs <= loTs) return null;
-    oteLimit = hiP - range * 0.705;
-  } else {
-    // CALL — need DOWN-impulse to ride from — low must be more recent than high
-    if (loTs <= hiTs) return null;
     oteLimit = loP + range * 0.705;
+  } else {
+    oteLimit = hiP - range * 0.705;
   }
   return {
     limit: +oteLimit.toFixed(2),
@@ -14919,7 +14931,16 @@ function checkExit(sym, price) {
         } catch (eTC) {}
         log(sym, '🛑 TRAIL SL — $' + price.toFixed(2) + ' · SL was $' + t.trailSl.toFixed(2) + ' · P&L $' + tsPnl.toFixed(2));
         sendPush('🛑 ' + sym + ' TRAIL SL', '$' + price.toFixed(2) + ' · P&L $' + tsPnl.toFixed(2), 'exit');
-        updateSignalOutcome(sym, price);
+        // closePrice = the TRAIL LEVEL, not the detection tick (2026-09-07): the 9/6
+        // 23:02 EXT-FLIP runner graded at the BE-lock 4408.87 but the row recorded the
+        // gapped tick 4415.39, which read as "runner lost to original SL". Grade and
+        // display must agree.
+        updateSignalOutcome(sym, t.trailSl);
+        // Explicit trailExit flag (2026-09-07, 9/4 report's "spurious slHit" fault):
+        // post-TP1 trail closes set the same sl flag as a REAL stop-out, so tp1+sl
+        // rows read as losses at a glance and corrupt WIN(trail) classifiers. Stamp
+        // the truth on the row.
+        try { if (s.lastHistEntry && s.lastHistEntry.symbol === sym && s.lastHistEntry.outcomes) s.lastHistEntry.outcomes.trailExit = true; } catch (eTX) {}
         s.trade = { active: false };
         return;
       }
@@ -16404,7 +16425,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.32-20260906-btc-range5', // bump on each deploy — lets /state verify what's live
+    build: '6.33-20260907-ote-direction', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
