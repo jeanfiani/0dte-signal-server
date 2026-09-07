@@ -1997,7 +1997,10 @@ let _gexLevels = { ts: 0, flip: null, magnets: [], health: 'never-run' };
 function _fetchGex() {
   try {
     const https = require('https');
-    https.get('https://cdn.cboe.com/api/global/delayed_quotes/options/_QQQ.json', { headers: { 'User-Agent': 'Mozilla/5.0' } }, r => {
+    // URL fix (2026-09-07, H-6: 5 nights of "parse-err: <?xml vers..."): the underscore
+    // prefix is CBOE's INDEX convention (_SPX); ETFs use the bare ticker. _QQQ.json
+    // returned an S3 NoSuchKey XML error page every fetch.
+    https.get('https://cdn.cboe.com/api/global/delayed_quotes/options/QQQ.json', { headers: { 'User-Agent': 'Mozilla/5.0' } }, r => {
       let body = '';
       r.on('data', c => body += c);
       r.on('end', () => {
@@ -15738,8 +15741,14 @@ function processTicks(symbols) {
         s.breakHi = bHi;
         s.breakLo = bLo;
 
-        // Coil detection: range < threshold = instrument is consolidating
-        if (bRange < coilMaxRange && !s.breakCoilActive) {
+        // Coil detection: range < threshold = instrument is consolidating.
+        // MINIMUM range guard (2026-09-07, Labor Day case: 5-min window printed ONE
+        // price → bRange 0 → "coil" with frozen hi == lo == 29570.8, where any wiggle
+        // reads as a breakout and the OB zone built from it is a line, not a zone.
+        // Same family as the Sunday Judas-sweep bug (6.14). A real coil needs real
+        // two-sided trade: require bRange ≥ 0.1×ATR (and strictly > 0).
+        const coilMinRange = (typeof s._atr === 'number' && s._atr > 0) ? 0.1 * s._atr : 0.0001;
+        if (bRange >= coilMinRange && bRange < coilMaxRange && !s.breakCoilActive) {
           // NEW COIL — freeze the boundaries at this moment
           s.breakCoilStart = bNow;
           s.breakCoilActive = true;
@@ -15749,6 +15758,12 @@ function processTicks(symbols) {
         } else if (s.breakCoilActive && bRange < coilMaxRange) {
           // STILL COILING — boundaries stay FROZEN. Do not update.
           // If we widen them, the breakout detection drifts with price (the original bug).
+        }
+        // Dissolve a DEGENERATE coil already armed before the min-range guard shipped
+        // (today's NAS coil has frozen hi == lo == 29570.8): a line is not a coil.
+        if (s.breakCoilActive && (s.breakFrozenHi - s.breakFrozenLo) < coilMinRange) {
+          s.breakCoilActive = false; s.breakCoilStart = 0; s.breakFrozenHi = 0; s.breakFrozenLo = Infinity;
+          log(sym, '🧹 Degenerate coil dissolved — frozen bounds spanned less than 0.1×ATR (dead-tape artifact, 2026-09-07 guard).');
         }
 
         // COIL ARMED ALERT (NAS only, added 2026-05-16): fire a one-time push notification
@@ -16484,7 +16499,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.35-20260907-r5-retest', // bump on each deploy — lets /state verify what's live
+    build: '6.36-20260907-gex-coil-fix', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
