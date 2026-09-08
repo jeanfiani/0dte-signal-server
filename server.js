@@ -3095,6 +3095,10 @@ setInterval(() => {
 }, 60000); // check once a minute
 
 function logSignal(sym, sig) {
+  // ts stamp (2026-09-08): in-memory s.signals rows carried only the "HH:MM:SS" time
+  // string — the /prices 5s youth filter (OTE race fix) needs a numeric ts. Single
+  // source: every signal passes through logSignal at fire time.
+  try { if (sig && !sig.ts) sig.ts = Date.now(); } catch (eTS2) {}
   // Chop circuit breaker bookkeeping (added 2026-05-13): if this signal is the opposite
   // direction of the previous one for this symbol, record the timestamp in flipHistory.
   // The breaker logic (in the detector preamble) checks if flipHistory has >=3 entries in
@@ -3493,12 +3497,16 @@ function processPrice(sym, price, hi, lo) {
         const _owM = '⏳ OTE-HOLD ' + _ow.dir.toUpperCase() + ' INVALIDATED (watchdog) — price crossed the SL level $' + (+_ow.slPrice).toFixed(2) + ' while auctioning; the market entry @ $' + (+_ow.sigPrice).toFixed(2) + ' would have been a full loss. Zero-loss save.';
         log(sym, _owM);
         try { trackBlockedOutcome(sym, _owM, true); } catch (eT) {}
+        // NOTE (2026-09-08 fix): sigRef.pendingEntry stays TRUE on saves/drops — clearing
+        // it un-hid the row from /prices and the EA entered a CANCELLED trade as if it
+        // were a fresh signal. Only the fill path may un-hide. histRef (analytics /signals)
+        // may clear freely — the EA never reads it.
         if (_ow.sigRef) _ow.sigRef.oteHold = 'invalidated-save';
         if (_ow.histRef) { _ow.histRef.oteHold = 'invalidated-save'; _ow.histRef.pendingEntry = false; }
       } else if (Date.now() > _ow.expiry + 120000) {
         s._oteHold = null;
         log(sym, '🧹 OTE-HOLD ' + _ow.dir.toUpperCase() + ' DROPPED stale (watchdog) — expired ' + Math.round((Date.now() - _ow.expiry) / 60000) + 'min ago unresolved (resolver starved by post-reboot ATR warm-up); signal context is gone, no trade taken.');
-        if (_ow.sigRef) { _ow.sigRef.oteHold = 'stale-expired'; _ow.sigRef.pendingEntry = false; }
+        if (_ow.sigRef) { _ow.sigRef.oteHold = 'stale-expired'; } // pendingEntry stays true — never re-show a dropped signal to the EA
         if (_ow.histRef) { _ow.histRef.oteHold = 'stale-expired'; _ow.histRef.pendingEntry = false; }
       }
     }
@@ -16583,7 +16591,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.40-20260908-ote-min-risk', // bump on each deploy — lets /state verify what's live
+    build: '6.41-20260908-ote-race-fix', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
@@ -16850,7 +16858,7 @@ app.get('/prices', (req, res) => {
       // signals[] it would trade rejected setups. Filter to FIRED-ONLY here so a blocked
       // signal can never reach the executor, regardless of EA logic. The `trade` object below
       // is already fired-only (set by buildCfdTrade); analytics keep full history via /signals.
-      signals: s.signals.filter(sg => !(sg && ((sg.conv && (sg.conv.enrichBlocked === true || sg.conv.label === 'BLOCKED')) || sg.pendingEntry === true))).slice(-20), // pendingEntry filter 2026-08-25: held auction signals leaked to the EA feed with NO sl/tp — MT5 traded one on its own defaults (00:35 case)
+      signals: s.signals.filter(sg => !(sg && ((sg.conv && (sg.conv.enrichBlocked === true || sg.conv.label === 'BLOCKED')) || sg.pendingEntry === true || (sym === 'XAU' && sg.ts && Date.now() - sg.ts < 5000)))).slice(-20), // pendingEntry filter 2026-08-25 + 5s XAU youth filter 2026-09-08: the OTE vet marks pendingEntry on the NEXT TICK after fire — an EA poll landing in that ≤1s gap saw the naked row and market-entered DURING the auction (Jean's 02:03 case, EA in @4414 while the server auctioned to 4411.83). Rows younger than 5s stay hidden until the vet has claimed or released them; the EA's own entry delay (15-25s) makes this free.
       // OTE auction visibility (2026-09-04, Jean: "the signal disappeared from the app").
       // While OTE-HOLD auctions the entry, the signal is hidden above (by design — no
       // levels yet) and s.trade is parked, so the mobile monitor showed a black hole.
