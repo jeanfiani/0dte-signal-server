@@ -10481,6 +10481,17 @@ function processPrice(sym, price, hi, lo) {
                 const _t1d = Math.abs(_t.ep - _t.tp1Price);
                 _t.ep = price;
                 _t.tp1Price = +(_ohC ? price + _t1d : price - _t1d).toFixed(2);
+                // MIN-RISK FLOOR (2026-09-08, the 23:22 case): a deeply improved fill kept
+                // the absolute SL FIVE CENTS from the fill (4431.94 vs 4431.89) — the trade
+                // died in seconds for −$2.50 on a winning entry. Keep the absolute SL, but
+                // never closer than 0.5×TP1cap from the fill.
+                try {
+                  const _mr = (sym === 'XAU' ? 5 : sym === 'BTC' ? 100 : sym === 'NAS100' ? 50 : 5) * 0.5;
+                  if (typeof _t.slPrice === 'number' && _t.slPrice > 0) {
+                    if (_ohC) { if (price - _t.slPrice < _mr) _t.slPrice = +(price - _mr).toFixed(2); }
+                    else { if (_t.slPrice - price < _mr) _t.slPrice = +(price + _mr).toFixed(2); }
+                  }
+                } catch (eMR) {}
               } else {
                 // worse entry (runaway/expiry): shift every level by the slip — all
                 // original distances preserved, risk unchanged.
@@ -16572,7 +16583,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.39-20260907-crest-inv', // bump on each deploy — lets /state verify what's live
+    build: '6.40-20260908-ote-min-risk', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
