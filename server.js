@@ -9246,14 +9246,30 @@ function processPrice(sym, price, hi, lo) {
         // (trail), conv 1 and conv 0 flips both went straight to SL. Matches the BTC autopsy
         // (conv≤2 = 1W/12SL/−$985; conv≥3 = 3W/1L/+$300).
         else if (_efConv < 3) {
+          // ===== NIGHT-ZONE PROMOTION (2026-09-07, Jean: "wire it") =====
+          // The NIGHT-ZONE cohort cleared its pre-agreed bar on XAU: 13W/6L = 68.4%
+          // over 19 resolved (≥60%/≥15). At night the conviction inputs are frozen and
+          // zone confluence legitimately substitutes — so 18:00-06:00 ET on XAU, the
+          // EXT-FLIP zone waiver FIRES instead of stamping (existing EXT-FLIP fire
+          // path: structural SL beyond the extreme, TP1 $5 cap via the 6.31 universal
+          // net, OTE auction applies). NAS (8W/8L) and BTC (1W/2L) stay dormant —
+          // below bar. BENCH RULE: night-waived fires open 0W/3L or net-negative
+          // over the first 6 → re-dormant this waiver.
+          let _nzLive = false;
           try {
             const _zpf = Array.isArray(s._zoneObs) && s._zoneObs.find(z => z && z.dir === EF.dir && price >= z.lo && price <= z.hi);
             if (_zpf) {
-              const _zpfMsg = '🔓 EXT-FLIP ' + EF.dir.toUpperCase() + ' ZONE-PERM DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — conv ' + _efConv + ' < 3 waived by mapped ' + (EF.dir === 'put' ? 'supply' : 'demand') + ' ' + (_zpf.kind || 'OB') + ' ' + (_zpf.tf || '') + ' $' + _zpf.lo.toFixed(2) + '-$' + _zpf.hi.toFixed(2) + ' (dormant 2026-08-14, 8/13 4363 case).' + nightTag();
-              log(sym, _zpfMsg); trackBlockedOutcome(sym, _zpfMsg, true);
+              if (sym === 'XAU' && nightTag() !== '') {
+                _nzLive = true;
+                s._nzLiveTs = Date.now(); // fired row stamps nightZone:true (report tracking)
+                log(sym, '🌙 EXT-FLIP ' + EF.dir.toUpperCase() + ' NIGHT-ZONE LIVE WAIVER @ $' + price.toFixed(2) + ' — conv ' + _efConv + ' < 3 waived by mapped ' + (EF.dir === 'put' ? 'supply' : 'demand') + ' ' + (_zpf.kind || 'OB') + ' ' + (_zpf.tf || '') + ' $' + _zpf.lo.toFixed(2) + '-$' + _zpf.hi.toFixed(2) + ' [NIGHT-LIVE] (promoted 2026-09-07, cohort 13W/6L; bench at 0W/3L).');
+              } else {
+                const _zpfMsg = '🔓 EXT-FLIP ' + EF.dir.toUpperCase() + ' ZONE-PERM DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — conv ' + _efConv + ' < 3 waived by mapped ' + (EF.dir === 'put' ? 'supply' : 'demand') + ' ' + (_zpf.kind || 'OB') + ' ' + (_zpf.tf || '') + ' $' + _zpf.lo.toFixed(2) + '-$' + _zpf.hi.toFixed(2) + ' (dormant 2026-08-14, 8/13 4363 case).' + nightTag();
+                log(sym, _zpfMsg); trackBlockedOutcome(sym, _zpfMsg, true);
+              }
             }
           } catch (eZP) {}
-          efReason = 'EXT-FLIP conv floor — conv ' + _efConv + ' < 3 (BTC autopsy 7/24: conv≤2 = 1W/12SL/−$985; conv≥3 = 3W/1L/+$300; XAU 8/2-3: conv≤1 = 0W/2SL)';
+          if (!_nzLive) efReason = 'EXT-FLIP conv floor — conv ' + _efConv + ' < 3 (BTC autopsy 7/24: conv≤2 = 1W/12SL/−$985; conv≥3 = 3W/1L/+$300; XAU 8/2-3: conv≤1 = 0W/2SL)';
         }
         else if (_efConv === 3 && !(Array.isArray(s._zoneObs) && s._zoneObs.some(z => z && z.dir === EF.dir && price >= z.lo && price <= z.hi))) efReason = 'EXT-FLIP conv 3 (floor minimum) without mapped zone confluence — flips at the threshold need the map to agree (8/16 23:13 PUT fought the trend from empty space, −$323 real; 2026-08-17)';
         else if (!(EF.burst >= 1.5)) efReason = 'no climax volume (burst ×' + (EF.burst || 0).toFixed(1) + ' < 1.5)';
@@ -9302,6 +9318,7 @@ function processPrice(sym, price, hi, lo) {
           s.lastSignalDir = EF.dir; s.lastSignalTs = now2; s.lastNTs = now2;
           s.lastSameDir = EF.dir; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
           const sigEf = { type: EF.dir, time: ts(), price: price.toFixed(2), score: (efCall ? '⬆' : '⬇') + 'EXT-FLIP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
+          if (Date.now() - (s._nzLiveTs || 0) < 5000) sigEf.nightZone = true; // NIGHT-ZONE promoted fire (2026-09-07) — grade these against the 0W/3L bench rule
           try {
             const cEf = convictionFor(EF.dir);
             sigEf.conv = { score: cEf.score, label: cEf.score >= 5 ? 'HIGH' : cEf.score >= 3 ? 'MOD' : 'LOW', factors: cEf.factors };
@@ -16527,7 +16544,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.37-20260907-null-trade-fix', // bump on each deploy — lets /state verify what's live
+    build: '6.38-20260907-night-zone-live', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
