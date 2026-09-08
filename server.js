@@ -1907,6 +1907,7 @@ function cohortFor(reason) {
   if (/GRIND-RECLAIM-V/.test(reason)) return 'GRIND-RECLAIM-V'; // V-recovery arm, no latch (2026-09-07, 9/7 RIDE-call 8W/2L specimen) — must precede the plain match
   if (/GRIND-RECLAIM/.test(reason)) return 'GRIND-RECLAIM'; // must precede ZONE-VETO/EXT-GUARD — the tag rides on their block messages (2026-09-02)
   if (/SLPAD-SIM/.test(reason)) return 'SLPAD-SIM'; // wick-pad shadow on real stops: SAVE rows' bracket outcome = pad-world verdict; DEEP rows = pad pure cost (2026-09-03)
+  if (/CREST-INV/.test(reason)) return 'CREST-INV'; // inverted twin of continuation fires at their own session extreme (2026-09-07, Jean's 19:45 specimen) — split by regime before promoting
   if (/HELD45\+/.test(reason)) return 'ZP-HELD45'; // ZONE-PERM ease at an extreme held ≥45min — 9/3 overnight: held fades won both sides, fresh fades lost (must precede ZONE-PERM match)
   if (/\[NIGHT\]/.test(reason)) return 'NIGHT-ZONE'; // zone-lane stamps 18:00-06:00 ET (2026-09-04) — after ZP-HELD45 (a held night fade counts there; text carries both tags for cross-tab), before ZONE-PERM/LIQ-POOL
   if (/CLIMAX-FLIP/.test(reason)) return 'CLIMAX-FLIP';
@@ -14914,6 +14915,33 @@ function checkExit(sym, price) {
           log(sym, '📏 SL-CAPPED — ' + t.type.toUpperCase() + ' SL $' + _oldSl.toFixed(2) + ' was $' + Math.abs(t.ep - _oldSl).toFixed(2) + ' from entry (band ceiling $' + (2.5 * _capT).toFixed(2) + ', Jean 8/24); clamped to $' + t.slPrice.toFixed(2) + '. A path bypassed INV-HOLD — check logs.');
         }
       }
+      // ===== CREST-INV SHADOW (2026-09-07, Jean: "this call was the best put possible —
+      // maybe invert at extreme highs and vice versa") =====
+      // Evidence for: the last 7 fired losers ALL entered within a whisker of their own
+      // session extreme with adverseFrac ≥ 1.0 — the retrace covered an inverted $5 TP1
+      // every time (19:45 call @4426.83 at the session high is specimen #7). Evidence
+      // against: BTC-INV was this idea and decayed to direction beta (22W/24L pooled);
+      // MOM-OVR-REV settled 4W/22L. The new discriminator is AT-OWN-EXTREME, applied to
+      // continuation fires only. Every live XAU RIDE/TREND/FAST/SUST fire entering
+      // within 0.3×ATR of its own-direction session extreme stamps a virtual INVERTED
+      // trade (±$5 tracker bracket = the TP1 cap). Winners' inversions grade too — no
+      // loser-only survivorship. Promote at ≥60% over ≥15 resolved, split by regime.
+      if (sym === 'XAU') {
+        try {
+          const _ciScore = (s.lastHistEntry && s.lastHistEntry.symbol === sym && s.lastHistEntry.score) || '';
+          const _ciAtr = (typeof t.atr === 'number' && t.atr > 0) ? t.atr : 0;
+          if (_ciAtr > 0 && /RIDE|TREND|FAST|SUST/.test(_ciScore)) {
+            const _ciNear = t.type === 'call'
+              ? (isFinite(s.sessionHigh) && (s.sessionHigh - t.ep) <= 0.3 * _ciAtr)
+              : (isFinite(s.sessionLow) && (t.ep - s.sessionLow) <= 0.3 * _ciAtr);
+            if (_ciNear) {
+              const _ciDir = t.type === 'call' ? 'PUT' : 'CALL';
+              const _ciMsg = '🔁 CREST-INV ' + _ciDir + ' DORMANT-WOULD-FIRE @ $' + t.ep.toFixed(2) + ' — inversion of the live ' + t.type.toUpperCase() + ' (' + _ciScore.replace(/[⬆⬇]/g, '') + ') that fired within 0.3×ATR of its own session extreme (Jean 2026-09-07, 19:45 specimen).';
+              log(sym, _ciMsg); trackBlockedOutcome(sym, _ciMsg, true);
+            }
+          }
+        } catch (eCI) {}
+      }
     }
     // ===== SL5-SIM — "SL = TP1" SHADOW (2026-08-30, Jean: "should we do SL = TP1?") =====
     // Evidence for: winners' MAE ≤ $3.42 (July backtest) and ≤ $4.40 all this week,
@@ -16544,7 +16572,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.38-20260907-night-zone-live', // bump on each deploy — lets /state verify what's live
+    build: '6.39-20260907-crest-inv', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
