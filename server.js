@@ -1917,6 +1917,7 @@ function cohortFor(reason) {
   if (/GRIND-RECLAIM-V/.test(reason)) return 'GRIND-RECLAIM-V'; // V-recovery arm, no latch (2026-09-07, 9/7 RIDE-call 8W/2L specimen) — must precede the plain match
   if (/GRIND-RECLAIM/.test(reason)) return 'GRIND-RECLAIM'; // must precede ZONE-VETO/EXT-GUARD — the tag rides on their block messages (2026-09-02)
   if (/NAS-RTH/.test(reason)) return 'NAS-RTH'; // RTH-only gate blocks (2026-09-09) — early so detector tags in the message don't steal the row
+  if (/NIGHT-MOMVETO/.test(reason)) return 'NIGHT-MOMVETO'; // night momentum-minimum vetoes (2026-09-09) — must precede the [NIGHT] match; if vetoed fires WIN ≥60%/15 the thresholds are too tight
   if (/V-REC BENCHED/.test(reason)) return 'BTC-VREC-BENCH'; // benched V-REC would-fires (2026-09-09) — must precede any V-REC/detector matches
   if (/SLPAD-SIM/.test(reason)) return 'SLPAD-SIM'; // wick-pad shadow on real stops: SAVE rows' bracket outcome = pad-world verdict; DEEP rows = pad pure cost (2026-09-03)
   if (/CREST-INV/.test(reason)) return 'CREST-INV'; // inverted twin of continuation fires at their own session extreme (2026-09-07, Jean's 19:45 specimen) — split by regime before promoting
@@ -9325,9 +9326,26 @@ function processPrice(sym, price, hi, lo) {
             const _zpf = Array.isArray(s._zoneObs) && s._zoneObs.find(z => z && z.dir === EF.dir && price >= z.lo && price <= z.hi);
             if (_zpf) {
               if (sym === 'XAU' && nightTag() !== '') {
+                // ===== NIGHT MOMENTUM MINIMUM (2026-09-09, Jean: "can't we just add the
+                // MACD and ROC minimum rule?") ===== 9/8→9/9 night: all 5 losing night
+                // fires faded a live up-grind (worst: 03:46 put at RSI 91.6, MACD +1.87,
+                // ROC +0.136% — SL'd in 5 seconds); the 19:44 TP3 winner (+$8.30/oz)
+                // fired on a STALLED tape (MACD +0.007, ROC +0.030%). The fade only
+                // fires once momentum has stalled: put needs macd ≤ +0.10 AND roc ≤
+                // +0.05%; call mirrored. Vetoed would-fires stamp NIGHT-MOMVETO so the
+                // cut is graded. Chosen over re-benching the lane after the rolling-6
+                // net-negative trigger (2 trail-W / 4 L, ≈−$590/lot).
+                const _nmOk = EF.dir === 'put'
+                  ? (macdL <= 0.10 && roc3 <= 0.05)
+                  : (macdL >= -0.10 && roc3 >= -0.05);
+                if (!_nmOk) {
+                  const _nmMsg = '🌙 EXT-FLIP ' + EF.dir.toUpperCase() + ' NIGHT-MOMVETO @ $' + price.toFixed(2) + ' — momentum still running against the fade (MACD ' + macdL.toFixed(3) + ', ROC ' + (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%); the night waiver needs a stalled tape: put macd≤0.10 & roc≤0.05, call mirrored (Jean 2026-09-09).' + nightTag();
+                  log(sym, _nmMsg); trackBlockedOutcome(sym, _nmMsg, true);
+                } else {
                 _nzLive = true;
                 s._nzLiveTs = Date.now(); // fired row stamps nightZone:true (report tracking)
-                log(sym, '🌙 EXT-FLIP ' + EF.dir.toUpperCase() + ' NIGHT-ZONE LIVE WAIVER @ $' + price.toFixed(2) + ' — conv ' + _efConv + ' < 3 waived by mapped ' + (EF.dir === 'put' ? 'supply' : 'demand') + ' ' + (_zpf.kind || 'OB') + ' ' + (_zpf.tf || '') + ' $' + _zpf.lo.toFixed(2) + '-$' + _zpf.hi.toFixed(2) + ' [NIGHT-LIVE] (promoted 2026-09-07, cohort 13W/6L; bench at 0W/3L).');
+                log(sym, '🌙 EXT-FLIP ' + EF.dir.toUpperCase() + ' NIGHT-ZONE LIVE WAIVER @ $' + price.toFixed(2) + ' — conv ' + _efConv + ' < 3 waived by mapped ' + (EF.dir === 'put' ? 'supply' : 'demand') + ' ' + (_zpf.kind || 'OB') + ' ' + (_zpf.tf || '') + ' $' + _zpf.lo.toFixed(2) + '-$' + _zpf.hi.toFixed(2) + ' [NIGHT-LIVE] (promoted 2026-09-07; momentum minimum added 2026-09-09; bench at 0W/3L or net-negative rolling 6).');
+                }
               } else {
                 const _zpfMsg = '🔓 EXT-FLIP ' + EF.dir.toUpperCase() + ' ZONE-PERM DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — conv ' + _efConv + ' < 3 waived by mapped ' + (EF.dir === 'put' ? 'supply' : 'demand') + ' ' + (_zpf.kind || 'OB') + ' ' + (_zpf.tf || '') + ' $' + _zpf.lo.toFixed(2) + '-$' + _zpf.hi.toFixed(2) + ' (dormant 2026-08-14, 8/13 4363 case).' + nightTag();
                 log(sym, _zpfMsg); trackBlockedOutcome(sym, _zpfMsg, true);
@@ -14852,7 +14870,26 @@ function updateSignalOutcome(sym, finalPrice) {
       entry.outcomes.adverseFrac = _slDist ? +(_mae / _slDist).toFixed(2) : null;
       entry.outcomes.cleanEntry = _slDist ? (_mae <= _slDist * 0.10) : (_mae === 0); // ≤10% of stop used
     }
-  } catch (eMae) { /* MAE recording must never affect outcome stamping */ }
+    // ===== MFE — MAX FAVORABLE EXCURSION (2026-09-09, Jean: "should we increase TP1
+    // above $5?") ===== The missing half of MAE: how far price ran FOR the entry.
+    // Jean's 9/9 hand trade (FVG buy 4394.61 → +$15.57/oz on a latch day) asked whether
+    // the $5 XAU TP1 cap leaves money on trend days. mfe answers every cap question
+    // ($5 vs $8 vs $10, flat vs regime-scaled) as a query instead of a debate.
+    // latchOn stamps whether the trend-day latch agreed with the fire at entry, so the
+    // nightly can split latch-day with-trend fires from range/night fires. Decision
+    // rule (pre-registered): raise TP1 to $10 on latch-day with-trend fires only if,
+    // over ≥15 such fires, MFE ≥ $10 occurs at ≥60% of the rate MFE ≥ $5 does.
+    if (typeof t.bestPrice === 'number' && t.ep > 0) {
+      const _fav = t.type === 'call' ? (t.bestPrice - t.ep) : (t.ep - t.bestPrice);
+      const _mfe = Math.max(0, _fav);
+      const _atrF = t.atr > 0 ? t.atr : null;
+      entry.outcomes.mfe = +_mfe.toFixed(2);
+      entry.outcomes.mfeAtr = _atrF ? +(_mfe / _atrF).toFixed(2) : null;
+      if (entry.outcomes.latchOn === undefined) {
+        try { entry.outcomes.latchOn = !!(s._tdLatch && s._tdLatch.dir === t.type && (Date.now() - s._tdLatch.ts) < 600000); } catch (eLo) { entry.outcomes.latchOn = null; } // same freshness test as the 1833 helper; stamped once at first outcome transition
+      }
+    }
+  } catch (eMae) { /* MAE/MFE recording must never affect outcome stamping */ }
   if (t.t1 && !entry.outcomes.tp1Hit) {
     entry.outcomes.tp1Hit = true; entry.outcomes.tp1HitTs = now;
     // book the realized TP1 half (2026-08-17)
@@ -16647,7 +16684,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.45-20260909-nas-rth-vrec-bench', // bump on each deploy — lets /state verify what's live
+    build: '6.45-20260909-nas-rth-vrec-nightmom', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
