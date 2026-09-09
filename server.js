@@ -1903,9 +1903,21 @@ function grindReclaimTag(s, sigType, price, zone, atrVal) {
 function nightTag() {
   try { const m = gET(); return (m >= 1080 || m < 360) ? ' [NIGHT]' : ''; } catch (e) { return ''; }
 }
+function nasRthBlocked(sym) {
+  // ===== NAS RTH-ONLY GATE (2026-09-09, Jean: "yes for nas only during opening hours") =====
+  // NAS100 fires only 09:30–16:00 ET (cash session). All 3 live NAS winners this week fired
+  // inside RTH; the overnight tape is thin-book futures drift NAS's reversal edge doesn't own.
+  // Blocked signals stamp the NAS-RTH cohort so we can measure what off-hours would have paid.
+  // NAS_RTH_ONLY=0 in Railway env disables the gate without a code push.
+  if (sym !== 'NAS100') return false;
+  if (process.env.NAS_RTH_ONLY === '0') return false;
+  try { const m = gET(); return (m < 570 || m >= 960); } catch (e) { return false; }
+}
 function cohortFor(reason) {
   if (/GRIND-RECLAIM-V/.test(reason)) return 'GRIND-RECLAIM-V'; // V-recovery arm, no latch (2026-09-07, 9/7 RIDE-call 8W/2L specimen) — must precede the plain match
   if (/GRIND-RECLAIM/.test(reason)) return 'GRIND-RECLAIM'; // must precede ZONE-VETO/EXT-GUARD — the tag rides on their block messages (2026-09-02)
+  if (/NAS-RTH/.test(reason)) return 'NAS-RTH'; // RTH-only gate blocks (2026-09-09) — early so detector tags in the message don't steal the row
+  if (/V-REC BENCHED/.test(reason)) return 'BTC-VREC-BENCH'; // benched V-REC would-fires (2026-09-09) — must precede any V-REC/detector matches
   if (/SLPAD-SIM/.test(reason)) return 'SLPAD-SIM'; // wick-pad shadow on real stops: SAVE rows' bracket outcome = pad-world verdict; DEEP rows = pad pure cost (2026-09-03)
   if (/CREST-INV/.test(reason)) return 'CREST-INV'; // inverted twin of continuation fires at their own session extreme (2026-09-07, Jean's 19:45 specimen) — split by regime before promoting
   if (/HELD45\+/.test(reason)) return 'ZP-HELD45'; // ZONE-PERM ease at an extreme held ≥45min — 9/3 overnight: held fades won both sides, fresh fades lost (must precede ZONE-PERM match)
@@ -1951,6 +1963,8 @@ function cohortFor(reason) {
   if (/P381-BYPASS/.test(reason)) return 'P381-BYPASS'; // RSI-exhaustion bypass fires, finally cohort-stamped (2026-08-27, 06:40 bottom-tick case)
   if (/FLOOR-PDL/.test(reason)) return 'FLOOR-PDL'; // TP1-into-prior-day-extreme stamps, dormant (2026-09-04, 02:57 case) — must precede FLOOR-PATH
   if (/FLOOR-PATH/.test(reason)) return 'FLOOR-PATH'; // TP1-into-defended-floor blocks (2026-08-28, 21:57/06:40 cases)
+  if (/NAS-RANGE5-RT/.test(reason)) return 'NAS-RANGE5-RT'; // NAS clone (2026-09-08, Jean: "same model applies to NAS")
+  if (/NAS-RANGE5/.test(reason)) return 'NAS-RANGE5';
   if (/BTC-RANGE5-RT/.test(reason)) return 'BTC-RANGE5-RT'; // retest arm: nearest unbroken prior-day extreme (2026-09-07) — must precede the plain match
   if (/BTC-RANGE5/.test(reason)) return 'BTC-RANGE5'; // 5-day-extreme fade shadow, self-graded wide brackets (2026-09-06, Jean's thesis)
   if (/INV-LO/.test(reason)) return 'BTC-INV-LO'; // inverted put fired AT/near the session low — the minima-bounce thesis cell (2026-09-01)
@@ -3524,8 +3538,9 @@ function processPrice(sym, price, hi, lo) {
   //   after resolution; 5-day expiry grades scratch. Resolutions bump the BTC-RANGE5
   //   cohort directly. Promotion: ≥60% over ≥15 resolved, split by weekly direction
   //   exactly like BTC-INV (the direction-beta trap must be re-checked here too).
-  if (sym === 'BTC') {
+  if (sym === 'BTC' || sym === 'NAS100') { // NAS added 2026-09-08 (Jean: "same model is applicable to NAS") — premium/discount fade suits index mean-reversion; cohorts NAS-RANGE5(-RT) grade separately
     try {
+      const _r5Tag = sym === 'BTC' ? 'BTC-RANGE5' : 'NAS-RANGE5';
       const _r5dl = s.dailyLevels || [];
       if (_r5dl.length >= 3 && s.rollingLow > 0 && isFinite(s.rollingLow) && s.rollingHigh > s.rollingLow) {
         const _adr = _r5dl.reduce((a, d) => a + (d.high - d.low), 0) / _r5dl.length;
@@ -3539,18 +3554,18 @@ function processPrice(sym, price, hi, lo) {
           const expired = Date.now() - v.ts > 5 * 86400000;
           if (win || loss || expired) {
             const oc = win ? 'win' : loss ? 'loss' : 'scratch';
-            log(sym, '🎢 BTC-RANGE5 ' + sd.toUpperCase() + ' RESOLVED ' + oc.toUpperCase() + ' — armed $' + v.ep.toFixed(0) + ' → ' + (win ? 'TP(mid) $' + v.tp.toFixed(0) : loss ? 'SL $' + v.sl.toFixed(0) : 'expired 5d @ $' + price.toFixed(0)) + (v.farHit ? ' · FAR side was reached' : '') + ' · held ' + Math.round((Date.now() - v.ts) / 3600000) + 'h (dormant 5-day-extreme fade, Jean 2026-09-06).');
-            try { bumpCohortTally(sym, 'BTC-RANGE5', oc); } catch (eB) {}
+            log(sym, '🎢 ' + _r5Tag + ' ' + sd.toUpperCase() + ' RESOLVED ' + oc.toUpperCase() + ' — armed $' + v.ep.toFixed(0) + ' → ' + (win ? 'TP(mid) $' + v.tp.toFixed(0) : loss ? 'SL $' + v.sl.toFixed(0) : 'expired 5d @ $' + price.toFixed(0)) + (v.farHit ? ' · FAR side was reached' : '') + ' · held ' + Math.round((Date.now() - v.ts) / 3600000) + 'h (dormant 5-day-extreme fade, Jean 2026-09-06).');
+            try { bumpCohortTally(sym, _r5Tag, oc); } catch (eB) {}
             s._r5[sd] = null; s._r5[sd === 'long' ? 'cdL' : 'cdS'] = Date.now();
           }
         });
         if (!s._r5.long && Date.now() - s._r5.cdL > 21600000 && price <= s.rollingLow + 0.1 * _adr) {
           s._r5.long = { ep: price, sl: +(s.rollingLow - 0.75 * _adr).toFixed(2), tp: +_mid.toFixed(2), tpFar: s.rollingHigh, ts: Date.now(), farHit: false };
-          log(sym, '🎢 BTC-RANGE5 LONG armed @ $' + price.toFixed(0) + ' — at the 5-day low $' + s.rollingLow.toFixed(0) + ' · SL $' + s._r5.long.sl.toFixed(0) + ' (low − 0.75×ADR $' + _adr.toFixed(0) + ') · TP mid $' + _mid.toFixed(0) + ' · far $' + s.rollingHigh.toFixed(0) + ' (dormant shadow).');
+          log(sym, '🎢 ' + _r5Tag + ' LONG armed'.replace(' armed','') + ' armed @ $' + price.toFixed(0) + ' — at the 5-day low $' + s.rollingLow.toFixed(0) + ' · SL $' + s._r5.long.sl.toFixed(0) + ' (low − 0.75×ADR $' + _adr.toFixed(0) + ') · TP mid $' + _mid.toFixed(0) + ' · far $' + s.rollingHigh.toFixed(0) + ' (dormant shadow).');
         }
         if (!s._r5.short && Date.now() - s._r5.cdS > 21600000 && price >= s.rollingHigh - 0.1 * _adr) {
           s._r5.short = { ep: price, sl: +(s.rollingHigh + 0.75 * _adr).toFixed(2), tp: +_mid.toFixed(2), tpFar: s.rollingLow, ts: Date.now(), farHit: false };
-          log(sym, '🎢 BTC-RANGE5 SHORT armed @ $' + price.toFixed(0) + ' — at the 5-day high $' + s.rollingHigh.toFixed(0) + ' · SL $' + s._r5.short.sl.toFixed(0) + ' (high + 0.75×ADR $' + _adr.toFixed(0) + ') · TP mid $' + _mid.toFixed(0) + ' · far $' + s.rollingLow.toFixed(0) + ' (dormant shadow).');
+          log(sym, '🎢 ' + _r5Tag + ' SHORT armed'.replace(' armed','') + ' armed @ $' + price.toFixed(0) + ' — at the 5-day high $' + s.rollingHigh.toFixed(0) + ' · SL $' + s._r5.short.sl.toFixed(0) + ' (high + 0.75×ADR $' + _adr.toFixed(0) + ') · TP mid $' + _mid.toFixed(0) + ' · far $' + s.rollingLow.toFixed(0) + ' (dormant shadow).');
         }
         // ===== R5-RETEST ARM (2026-09-07, Jean: "today the strategy won") ==========
         // The DEEP arm keys off the ABSOLUTE 5-day extreme, so a single capitulation
@@ -3574,8 +3589,8 @@ function processPrice(sym, price, hi, lo) {
             const expired = Date.now() - v.ts > 5 * 86400000;
             if (win || loss || expired) {
               const oc = win ? 'win' : loss ? 'loss' : 'scratch';
-              log(sym, '🎢 BTC-RANGE5-RT ' + sd.toUpperCase() + ' RESOLVED ' + oc.toUpperCase() + ' — level $' + v.lvl.toFixed(0) + ', armed $' + v.ep.toFixed(0) + ' → ' + (win ? 'TP(mid) $' + v.tp.toFixed(0) : loss ? 'SL $' + v.sl.toFixed(0) : 'expired 5d @ $' + price.toFixed(0)) + (v.farHit ? ' · FAR side reached' : '') + ' (retest arm, Jean 2026-09-07).');
-              try { bumpCohortTally(sym, 'BTC-RANGE5-RT', oc); } catch (eB2) {}
+              log(sym, '🎢 ' + _r5Tag + '-RT ' + sd.toUpperCase() + ' RESOLVED ' + oc.toUpperCase() + ' — level $' + v.lvl.toFixed(0) + ', armed $' + v.ep.toFixed(0) + ' → ' + (win ? 'TP(mid) $' + v.tp.toFixed(0) : loss ? 'SL $' + v.sl.toFixed(0) : 'expired 5d @ $' + price.toFixed(0)) + (v.farHit ? ' · FAR side reached' : '') + ' (retest arm, Jean 2026-09-07).');
+              try { bumpCohortTally(sym, _r5Tag + '-RT', oc); } catch (eB2) {}
               s._r5[key] = null; s._r5[sd === 'long' ? 'cdLR' : 'cdSR'] = Date.now();
             }
           });
@@ -3584,14 +3599,14 @@ function processPrice(sym, price, hi, lo) {
             const _lvlL = _prior.map(d0 => d0.low).filter(l0 => l0 > 0 && l0 < price && l0 > s.rollingLow + 0.1 * _adr && (!isFinite(s.sessionLow) || s.sessionLow > l0 - 0.1 * _adr)).sort((a0, b0) => b0 - a0)[0];
             if (_lvlL && price - _lvlL <= 0.1 * _adr) {
               s._r5.longR = { lvl: _lvlL, ep: price, sl: +(_lvlL - 0.75 * _adr).toFixed(2), tp: +((_lvlL + s.rollingHigh) / 2).toFixed(2), tpFar: s.rollingHigh, ts: Date.now(), farHit: false };
-              log(sym, '🎢 BTC-RANGE5-RT LONG armed @ $' + price.toFixed(0) + ' — retest of unbroken prior-day low $' + _lvlL.toFixed(0) + ' · SL $' + s._r5.longR.sl.toFixed(0) + ' · TP mid $' + s._r5.longR.tp.toFixed(0) + ' · far $' + s.rollingHigh.toFixed(0) + ' (dormant shadow).');
+              log(sym, '🎢 ' + _r5Tag + '-RT LONG armed'.replace(' armed','') + ' armed @ $' + price.toFixed(0) + ' — retest of unbroken prior-day low $' + _lvlL.toFixed(0) + ' · SL $' + s._r5.longR.sl.toFixed(0) + ' · TP mid $' + s._r5.longR.tp.toFixed(0) + ' · far $' + s.rollingHigh.toFixed(0) + ' (dormant shadow).');
             }
           }
           if (!s._r5.shortR && Date.now() - s._r5.cdSR > 21600000) {
             const _lvlH = _prior.map(d0 => d0.high).filter(h0 => h0 > 0 && h0 > price && h0 < s.rollingHigh - 0.1 * _adr && (!isFinite(s.sessionHigh) || s.sessionHigh < h0 + 0.1 * _adr)).sort((a0, b0) => a0 - b0)[0];
             if (_lvlH && _lvlH - price <= 0.1 * _adr) {
               s._r5.shortR = { lvl: _lvlH, ep: price, sl: +(_lvlH + 0.75 * _adr).toFixed(2), tp: +((_lvlH + s.rollingLow) / 2).toFixed(2), tpFar: s.rollingLow, ts: Date.now(), farHit: false };
-              log(sym, '🎢 BTC-RANGE5-RT SHORT armed @ $' + price.toFixed(0) + ' — retest of unbroken prior-day high $' + _lvlH.toFixed(0) + ' · SL $' + s._r5.shortR.sl.toFixed(0) + ' · TP mid $' + s._r5.shortR.tp.toFixed(0) + ' · far $' + s.rollingLow.toFixed(0) + ' (dormant shadow).');
+              log(sym, '🎢 ' + _r5Tag + '-RT SHORT armed'.replace(' armed','') + ' armed @ $' + price.toFixed(0) + ' — retest of unbroken prior-day high $' + _lvlH.toFixed(0) + ' · SL $' + s._r5.shortR.sl.toFixed(0) + ' · TP mid $' + s._r5.shortR.tp.toFixed(0) + ' · far $' + s.rollingLow.toFixed(0) + ' (dormant shadow).');
             }
           }
         } catch (eR5R) {}
@@ -5337,6 +5352,16 @@ function processPrice(sym, price, hi, lo) {
     // the post-crash bounce scalp produced the two largest wins in the dataset (+$470 TP3 on
     // 7/24, +$212 TP3 on 7/24) on a tight 0.8×ATR stop. Everything else on BTC goes dormant;
     // V-REC stays live and now carries BTC alone, so its record will be unambiguous.
+    // ===== BTC V-REC BENCHED (2026-09-09, Jean: "bench btc v-rec ok") =====
+    // Closes the dormant-gate exemption below — without this, a V-REC candidate on a
+    // no-chop tick sails through (the chop-section bench never runs when chop is off).
+    // Lifetime 2W/6L; BTC is now 100% shadow. BTC_VREC_ENABLED=1 re-arms, no deploy.
+    if (isBTC && !BTC_TRADING_ENABLED && sig._vRec && process.env.BTC_VREC_ENABLED !== '1') {
+      Object.assign(s, _emitSnapshot);
+      const _vbM = '🩹 ' + _tagX + ' ' + sig.type.toUpperCase() + ' V-REC BENCHED (BTC shadow-only, 2026-09-09) @ $' + price.toFixed(2) + ' — would have fired the bounce scalp; lifetime 2W/6L. BTC_VREC_ENABLED=1 re-arms.';
+      log(sym, _vbM); trackBlockedOutcome(sym, _vbM, true);
+      return false;
+    }
     if (isBTC && !BTC_TRADING_ENABLED && !sig._vRec) {
       Object.assign(s, _emitSnapshot);
       const _m = '⛔ ' + _tagX + ' ' + sig.type.toUpperCase() + ' BLOCKED — BTC dormant except V-REC (2026-07-29): 4 straight losing weeks + −$503 on 7/28-29 (CHoCH/LHF shorts into a rally). Shadow-tracking continues; set BTC_TRADING_ENABLED=true to re-enable all.';
@@ -7483,12 +7508,22 @@ function processPrice(sym, price, hi, lo) {
           sig._revOverride = false; // fall through to the chop block
         }
         if (sig._vRec && !sig._revOverride && !_chopVolBypass && !_btcMildChopBypass && !_xauMetalsBypass && !_crossAssetBypass) {
-          // V-REC post-crash bounce scalp: waive chop gate, arm the tight-stop ladder.
-          sig._vRecFired = true;
-          s._vRecUntil = Date.now() + 5000; // buildCfdTrade → 0.8×ATR SL + 3/5/8×ATR TPs
-          const _vrMsg = '🩹 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' V-REC bounce scalp @ $' + price.toFixed(2) + ' — [' + (sig._confBreakdown || '') + '] recovery+structure after ≥2×ATR move; TIGHT 0.8×ATR stop, TPs 3/5/8×ATR (live). Chop gate waived.';
-          log(sym, _vrMsg);
-          trackBlockedOutcome(sym, _vrMsg, true);
+          // ===== BTC V-REC BENCHED (2026-09-09, Jean) =====
+          // The last live BTC lane: 2W/6L lifetime, bled again 9/7 (−$160.66). BTC is
+          // now 100% shadow until a cohort clears its bar (BTC-RANGE5/RT measuring).
+          // BTC_VREC_ENABLED=1 in Railway env re-arms without a code push.
+          if (sym === 'BTC' && process.env.BTC_VREC_ENABLED !== '1') {
+            const _vbMsg = '🩹 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' V-REC BENCHED (BTC shadow-only, 2026-09-09) @ $' + price.toFixed(2) + ' — would have fired the bounce scalp; lifetime 2W/6L. BTC_VREC_ENABLED=1 re-arms.';
+            log(sym, _vbMsg); trackBlockedOutcome(sym, _vbMsg, true);
+            sig._vRec = false; // fall through to the normal chop block — no fire
+          } else {
+            // V-REC post-crash bounce scalp: waive chop gate, arm the tight-stop ladder.
+            sig._vRecFired = true;
+            s._vRecUntil = Date.now() + 5000; // buildCfdTrade → 0.8×ATR SL + 3/5/8×ATR TPs
+            const _vrMsg = '🩹 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' V-REC bounce scalp @ $' + price.toFixed(2) + ' — [' + (sig._confBreakdown || '') + '] recovery+structure after ≥2×ATR move; TIGHT 0.8×ATR stop, TPs 3/5/8×ATR (live). Chop gate waived.';
+            log(sym, _vrMsg);
+            trackBlockedOutcome(sym, _vrMsg, true);
+          }
         }
         if (!sig._vRec && !sig._revOverride && !_chopVolBypass && !_btcMildChopBypass && !_xauMetalsBypass && !_crossAssetBypass) {
           // ===== PHASE 3.99 — STANDALONE RECOVERY BYPASS (DORMANT, 2026-07-10) =====
@@ -8540,13 +8575,14 @@ function processPrice(sym, price, hi, lo) {
     // joins FLOOR-PATH's floor set only at ≥60% blocked-would-LOSE... i.e. promote the
     // block if stamped candidates lose ≥60% over ≥15 resolved.
     try {
-      if (sym === 'XAU' && atrVal > 0 && sig._pdhPdl && /RIDE|TREND|FAST|SUST|SQZ|6\/6/.test(tag) &&
+      if ((sym === 'XAU' || sym === 'NAS100') && atrVal > 0 && sig._pdhPdl && /RIDE|TREND|FAST|SUST|SQZ|6\/6/.test(tag) && // NAS 2026-09-09
           !/LHF|LLF|VREV|EXT-FLIP|OBREJ|OBMIT|INVERSAL|SWEEP|CHoCH|ATH|ATL|DIV/.test(tag)) {
         const _pd = sig._pdhPdl;
         let _fpdlHit = '';
-        if (sig.type === 'put' && _pd.pdl > 0 && (price - _pd.pdl) < 5 && (price - _pd.pdl) > -0.3 * atrVal)
+        const _fpdlCap = sym === 'XAU' ? 5 : 50; // TP1-cap-scaled (NAS 2026-09-09)
+        if (sig.type === 'put' && _pd.pdl > 0 && (price - _pd.pdl) < _fpdlCap && (price - _pd.pdl) > -0.3 * atrVal)
           _fpdlHit = 'TP1 path requires the prior-day LOW $' + _pd.pdl.toFixed(2) + ' to break (price $' + (price - _pd.pdl).toFixed(2) + ' from it)';
-        else if (sig.type === 'call' && _pd.pdh > 0 && (_pd.pdh - price) < 5 && (_pd.pdh - price) > -0.3 * atrVal)
+        else if (sig.type === 'call' && _pd.pdh > 0 && (_pd.pdh - price) < _fpdlCap && (_pd.pdh - price) > -0.3 * atrVal)
           _fpdlHit = 'TP1 path requires the prior-day HIGH $' + _pd.pdh.toFixed(2) + ' to break (price $' + (_pd.pdh - price).toFixed(2) + ' from it)';
         if (_fpdlHit) {
           s._fpdlTs = s._fpdlTs || {};
@@ -8558,6 +8594,25 @@ function processPrice(sym, price, hi, lo) {
         }
       }
     } catch (eFPD) { /* stamp must never crash enrichment */ }
+    // ===== NAS RTH-ONLY GATE (LIVE, 2026-09-09 — Jean: "yes for nas only during
+    // opening hours") ===== NAS100 fires only 09:30–16:00 ET. Placed before PROTECT
+    // so blocked off-hours candidates stamp the NAS-RTH cohort cleanly — every stamp
+    // measures what firing outside the cash session would have paid. NAS_RTH_ONLY=0
+    // in Railway env disables without a deploy. Dedupe mirrors the BTC dormant gate:
+    // one tracked shadow per detector+direction per 3 min (logging untouched).
+    if (nasRthBlocked(sym)) {
+      Object.assign(s, _emitSnapshot);
+      const _nrMsg = '🕥 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — NAS-RTH gate: outside 09:30-16:00 ET (2026-09-09). NAS pays on RTH extreme reversals; overnight futures drift is not its edge. NAS_RTH_ONLY=0 re-enables 24h.';
+      let _nrOk = true;
+      try {
+        s._nasRthTrackTs = s._nasRthTrackTs || {};
+        const _nrK = (tag || 'x') + ':' + sig.type;
+        if (Date.now() - (s._nasRthTrackTs[_nrK] || 0) < 180000) _nrOk = false;
+        else s._nasRthTrackTs[_nrK] = Date.now();
+      } catch (eNR) {}
+      log(sym, _nrMsg); if (_nrOk) trackBlockedOutcome(sym, _nrMsg, true);
+      return false;
+    }
     // ===== PROTECTIONS GATE (LIVE, 2026-08-28 — Freqtrade port, Jean: "we can ship
     // the protections module") ===== Placed LAST deliberately: only signals that
     // passed every other gate reach here, so PROTECT stamps measure exactly the
@@ -9245,6 +9300,7 @@ function processPrice(sym, price, hi, lo) {
         let efReason = null;
         if (sym === 'BTC' && !BTC_TRADING_ENABLED) efReason = 'BTC TRADING DISABLED (2026-07-29) — set BTC_TRADING_ENABLED=true to re-enable';
         else if (sym === 'BTC' && btcWeekendClosed()) efReason = 'BTC weekend no-trade window (Phase 4.0): Sat 00:00 → Sun 12:00 ET';
+        else if (nasRthBlocked(sym)) efReason = 'NAS-RTH gate — outside 09:30-16:00 ET cash session (Jean 2026-09-09); NAS_RTH_ONLY=0 re-enables 24h';
         // BTC EXT-FLIP conviction floor (2026-07-24, loser autopsy): BTC EXT-FLIP at conv ≤2
         // went 1W/12SL/−$985 (knife-catches into BTC's ~$200 ATR), while conv ≥3 went 3W/1L
         // /+~$300. Conviction is a clean discriminator here — require ≥3 on BTC. XAU/NAS EXT-
@@ -10438,7 +10494,7 @@ function processPrice(sym, price, hi, lo) {
           // OTE kill switch (2026-09-07, Jean's WR concern): set OTE_DISABLED=1 in
           // Railway env to release every fire at market instantly — no code push needed.
           if (process.env.OTE_DISABLED === '1' && s.trade && s.trade._oteVetted === false) s.trade._oteVetted = true;
-          if (sym === 'XAU' && s.trade && s.trade.active && s.trade._oteVetted === false && !s._invHold && !s._oteHold) {
+          if ((sym === 'XAU' || sym === 'NAS100') && s.trade && s.trade.active && s.trade._oteVetted === false && !s._invHold && !s._oteHold) { // NAS added 2026-09-09 (Jean: "we need to work on NAS")
             const _ohT = s.trade;
             const _ohDir = _ohT.type;
             const _ohOte = computeOTE(s, sym, _ohDir);
@@ -10466,7 +10522,7 @@ function processPrice(sym, price, hi, lo) {
         // ===== OTE-HOLD RESOLVER (2026-08-26, Jean) =====
         try {
           const _oh = s._oteHold;
-          if (_oh && sym === 'XAU') {
+          if (_oh && (sym === 'XAU' || sym === 'NAS100')) {
             const _ohC = _oh.dir === 'call';
             const _ohSlX = _oh.slPrice !== null && (_ohC ? price <= _oh.slPrice : price >= _oh.slPrice);
             const _ohTouch = _ohC ? price <= _oh.ote : price >= _oh.ote;
@@ -10516,7 +10572,7 @@ function processPrice(sym, price, hi, lo) {
               s.trade = _t;
               const _ohWhy = _ohTouch ? 'OTE touch' : _ohRun ? 'runaway ≥0.5×ATR' : 'window expiry';
               const _ohInfo = { fill: +price.toFixed(2), sigPrice: +_oh.sigPrice.toFixed(2), improve: +_ohImp.toFixed(2), waitedSec: Math.round((_zNow - _oh.armTs) / 1000), via: _ohWhy };
-              if (_oh.sigRef) { _oh.sigRef.pendingEntry = false; _oh.sigRef.entryActual = _ohInfo.fill; _oh.sigRef.oteHold = _ohInfo; if (typeof _t.slPrice === 'number') { _oh.sigRef.sl = _t.slPrice.toFixed(2); _oh.sigRef.tp1 = _t.tp1Price.toFixed(2); _oh.sigRef.tp2 = _t.tp2Price.toFixed(2); _oh.sigRef.tp3 = _t.tp3Price.toFixed(2); } }
+              if (_oh.sigRef) { _oh.sigRef.pendingEntry = false; _oh.sigRef.entryActual = _ohInfo.fill; _oh.sigRef.oteHold = _ohInfo; _oh.sigRef.price = price.toFixed(2); /* 2026-09-08: the EA anchors its chase-guard (and its dedupe key) on sig.price — a fill un-hiding a minutes-old row must present the FILL, not the stale signal price */ if (typeof _t.slPrice === 'number') { _oh.sigRef.sl = _t.slPrice.toFixed(2); _oh.sigRef.tp1 = _t.tp1Price.toFixed(2); _oh.sigRef.tp2 = _t.tp2Price.toFixed(2); _oh.sigRef.tp3 = _t.tp3Price.toFixed(2); } }
               if (_oh.histRef) { _oh.histRef.pendingEntry = false; _oh.histRef.oteHold = _ohInfo; if (typeof _t.slPrice === 'number') { _oh.histRef.sl = _t.slPrice; _oh.histRef.tp1 = _t.tp1Price; _oh.histRef.tp2 = _t.tp2Price; _oh.histRef.tp3 = _t.tp3Price; } }
               log(sym, '▶️ OTE-HOLD ' + _oh.dir.toUpperCase() + ' FILLED @ $' + price.toFixed(2) + ' via ' + _ohWhy + ' — signal $' + _oh.sigPrice.toFixed(2) + ', entry ' + (_ohImp >= 0 ? 'improved $' + _ohImp.toFixed(2) : 'slipped $' + (-_ohImp).toFixed(2)) + ', waited ' + _ohInfo.waitedSec + 's (Jean 2026-08-26).');
               sendPush('▶️ XAU OTE ' + _oh.dir.toUpperCase() + ' filled', '$' + price.toFixed(2) + ' (' + (_ohImp >= 0 ? '+' : '-') + '$' + Math.abs(_ohImp).toFixed(2) + ' vs signal) · ' + _ohWhy, 'signal');
@@ -14945,7 +15001,7 @@ function checkExit(sym, price) {
       // within 0.3×ATR of its own-direction session extreme stamps a virtual INVERTED
       // trade (±$5 tracker bracket = the TP1 cap). Winners' inversions grade too — no
       // loser-only survivorship. Promote at ≥60% over ≥15 resolved, split by regime.
-      if (sym === 'XAU') {
+      if (sym === 'XAU' || sym === 'NAS100') { // NAS 2026-09-09
         try {
           const _ciScore = (s.lastHistEntry && s.lastHistEntry.symbol === sym && s.lastHistEntry.score) || '';
           const _ciAtr = (typeof t.atr === 'number' && t.atr > 0) ? t.atr : 0;
@@ -15131,9 +15187,9 @@ function checkExit(sym, price) {
         // the pad-world (win = post-stop direction was favorable). DEEP → price breached
         // the pad too; the pad only adds pad×multiplier loss on this stop. Nightly weighs
         // saves vs deep-costs (SLPAD-SIM cohort); ≥15 fires before touching SL placement.
-        if (sym === 'XAU') {
+        if (sym === 'XAU' || sym === 'NAS100') { // NAS 2026-09-09
           try {
-            const _padAmt = Math.max(1, 0.25 * (t.atr || 0));
+            const _padAmt = Math.max(sym === 'XAU' ? 1 : 10, 0.25 * (t.atr || 0));
             const _padLvl = iC ? t.slPrice - _padAmt : t.slPrice + _padAmt;
             const _padDeep = iC ? price <= _padLvl : price >= _padLvl;
             const _padMsg = _padDeep
@@ -16591,7 +16647,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.41-20260908-ote-race-fix', // bump on each deploy — lets /state verify what's live
+    build: '6.45-20260909-nas-rth-vrec-bench', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
@@ -16858,7 +16914,7 @@ app.get('/prices', (req, res) => {
       // signals[] it would trade rejected setups. Filter to FIRED-ONLY here so a blocked
       // signal can never reach the executor, regardless of EA logic. The `trade` object below
       // is already fired-only (set by buildCfdTrade); analytics keep full history via /signals.
-      signals: s.signals.filter(sg => !(sg && ((sg.conv && (sg.conv.enrichBlocked === true || sg.conv.label === 'BLOCKED')) || sg.pendingEntry === true || (sym === 'XAU' && sg.ts && Date.now() - sg.ts < 5000)))).slice(-20), // pendingEntry filter 2026-08-25 + 5s XAU youth filter 2026-09-08: the OTE vet marks pendingEntry on the NEXT TICK after fire — an EA poll landing in that ≤1s gap saw the naked row and market-entered DURING the auction (Jean's 02:03 case, EA in @4414 while the server auctioned to 4411.83). Rows younger than 5s stay hidden until the vet has claimed or released them; the EA's own entry delay (15-25s) makes this free.
+      signals: s.signals.filter(sg => !(sg && ((sg.conv && (sg.conv.enrichBlocked === true || sg.conv.label === 'BLOCKED')) || sg.pendingEntry === true || ((sym === 'XAU' || sym === 'NAS100') && sg.ts && !sg.entryActual && Date.now() - sg.ts < 12000)))).slice(-20), // pendingEntry filter 2026-08-25 + 5s XAU youth filter 2026-09-08: the OTE vet marks pendingEntry on the NEXT TICK after fire — an EA poll landing in that ≤1s gap saw the naked row and market-entered DURING the auction (Jean's 02:03 case, EA in @4414 while the server auctioned to 4411.83). Rows younger than 5s stay hidden until the vet has claimed or released them; the EA's own entry delay (15-25s) makes this free.
       // OTE auction visibility (2026-09-04, Jean: "the signal disappeared from the app").
       // While OTE-HOLD auctions the entry, the signal is hidden above (by design — no
       // levels yet) and s.trade is parked, so the mobile monitor showed a black hole.
