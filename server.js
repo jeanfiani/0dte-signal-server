@@ -3528,6 +3528,22 @@ function processPrice(sym, price, hi, lo) {
     }
   } catch (eOW) { /* watchdog must never crash the tick */ }
 
+  // ===== UNVETTED-TRADE WATCHDOG (2026-09-10, the 02:29 post-deploy leak) =====
+  // The OTE vet is atrVal-gated: after the 01:57 deploy the ATR was still warming up
+  // when the 02:29:43 EXT-FLIP fired — the fresh trade sat _oteVetted:false for ~3min,
+  // the signal row aged past the 12s youth filter unclaimed, and the EA market-entered
+  // @ $4416.80 while the vet later auctioned to a $4413.35 fill (the phantom entry then
+  // closed at a loss on reconciliation). Bound the stall: an unvetted trade older than
+  // 30s force-releases at market — without ATR the auction can't be priced anyway, and
+  // pre-OTE behavior beats a naked limbo. The /prices filter also hides unclaimed rows
+  // STATE-based now, so even the ≤30s window is invisible to the EA.
+  try {
+    if (isMT5 && s.trade && s.trade.active && s.trade._oteVetted === false && s.trade.ts && Date.now() - s.trade.ts > 30000) {
+      s.trade._oteVetted = true;
+      log(sym, '⚠️ OTE VET STALLED >30s (watchdog) — ' + String(s.trade.type || '').toUpperCase() + ' @ $' + (+s.trade.ep || 0).toFixed(2) + ' force-released at market; the vet never ran (ATR warm-up / gate starvation).');
+    }
+  } catch (eUV) { /* watchdog must never crash the tick */ }
+
   // ===== BTC-RANGE5 — 5-DAY EXTREME FADE, DORMANT SHADOW (2026-09-06, Jean) =====
   // Jean's thesis after the BTC-INV post-mortems: "the only way to make BTC work is
   // buy the 5-day low and sell the 5-day high with a high SL and a very wide TP."
@@ -16719,7 +16735,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.46-20260910-earlyprot-tightstop', // bump on each deploy — lets /state verify what's live
+    build: '6.47-20260910-vetstall-fix', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
@@ -16986,7 +17002,7 @@ app.get('/prices', (req, res) => {
       // signals[] it would trade rejected setups. Filter to FIRED-ONLY here so a blocked
       // signal can never reach the executor, regardless of EA logic. The `trade` object below
       // is already fired-only (set by buildCfdTrade); analytics keep full history via /signals.
-      signals: s.signals.filter(sg => !(sg && ((sg.conv && (sg.conv.enrichBlocked === true || sg.conv.label === 'BLOCKED')) || sg.pendingEntry === true || ((sym === 'XAU' || sym === 'NAS100') && sg.ts && !sg.entryActual && Date.now() - sg.ts < 12000)))).slice(-20), // pendingEntry filter 2026-08-25 + 5s XAU youth filter 2026-09-08: the OTE vet marks pendingEntry on the NEXT TICK after fire — an EA poll landing in that ≤1s gap saw the naked row and market-entered DURING the auction (Jean's 02:03 case, EA in @4414 while the server auctioned to 4411.83). Rows younger than 5s stay hidden until the vet has claimed or released them; the EA's own entry delay (15-25s) makes this free.
+      signals: s.signals.filter(sg => !(sg && ((sg.conv && (sg.conv.enrichBlocked === true || sg.conv.label === 'BLOCKED')) || sg.pendingEntry === true || ((sym === 'XAU' || sym === 'NAS100') && sg.ts && !sg.entryActual && !sg.oteHold && (Date.now() - sg.ts < 12000 || (s.trade && s.trade.active && s.trade._oteVetted === false && s.trade.type === sg.type)))))).slice(-20), // STATE-based hide added 2026-09-10 (the 02:29 vet-stall leak, −$738): a row stays hidden for as long as its trade sits unvetted — the 12s clock assumed the vet runs next tick, but ATR warm-up after a deploy starved it for 3min and the EA took the naked row @4418.82. Rows un-hide the moment the vet resolves (oteHold stamped on fills AND instant releases since 6.46). // pendingEntry filter 2026-08-25 + 5s XAU youth filter 2026-09-08: the OTE vet marks pendingEntry on the NEXT TICK after fire — an EA poll landing in that ≤1s gap saw the naked row and market-entered DURING the auction (Jean's 02:03 case, EA in @4414 while the server auctioned to 4411.83). Rows younger than 5s stay hidden until the vet has claimed or released them; the EA's own entry delay (15-25s) makes this free.
       // OTE auction visibility (2026-09-04, Jean: "the signal disappeared from the app").
       // While OTE-HOLD auctions the entry, the signal is hidden above (by design — no
       // levels yet) and s.trade is parked, so the mobile monitor showed a black hole.
