@@ -1918,6 +1918,7 @@ function cohortFor(reason) {
   if (/GRIND-RECLAIM/.test(reason)) return 'GRIND-RECLAIM'; // must precede ZONE-VETO/EXT-GUARD — the tag rides on their block messages (2026-09-02)
   if (/NAS-RTH/.test(reason)) return 'NAS-RTH'; // RTH-only gate blocks (2026-09-09) — early so detector tags in the message don't steal the row
   if (/NIGHT-MOMVETO/.test(reason)) return 'NIGHT-MOMVETO'; // night momentum-minimum vetoes (2026-09-09) — must precede the [NIGHT] match; if vetoed fires WIN ≥60%/15 the thresholds are too tight
+  if (/EARLY-PROT/.test(reason)) return 'EARLY-PROT'; // early-protect closes + tight-stop skips (2026-09-10, the 00:45 TP3-that-got-flattened case) — SKIPPED rows grade the exemption, CLOSED rows grade the rule itself
   if (/V-REC BENCHED/.test(reason)) return 'BTC-VREC-BENCH'; // benched V-REC would-fires (2026-09-09) — must precede any V-REC/detector matches
   if (/SLPAD-SIM/.test(reason)) return 'SLPAD-SIM'; // wick-pad shadow on real stops: SAVE rows' bracket outcome = pad-world verdict; DEEP rows = pad pure cost (2026-09-03)
   if (/CREST-INV/.test(reason)) return 'CREST-INV'; // inverted twin of continuation fires at their own session extreme (2026-09-07, Jean's 19:45 specimen) — split by regime before promoting
@@ -10304,14 +10305,34 @@ function processPrice(sym, price, hi, lo) {
             const _epFav = _ept.type === 'call' ? price - _ept.ep : _ept.ep - price;
             if (_epFav > (_ept._pkFav || 0)) _ept._pkFav = _epFav;
             const _epT1d = (typeof _ept.tp1Price === 'number' && _ept.tp1Price > 0) ? Math.abs(_ept.tp1Price - _ept.ep) : 0;
+            // ===== TIGHT-STOP EXEMPTION (2026-09-10, Jean: "loosen a bit the early
+            // protect") ===== 9/10 00:45 EXT-FLIP CALL: OTE-improved fill 4408.85 with
+            // a $2.21 stop (0.67× the $3.31 TP1). Protect fired on the decay, EA
+            // flattened near BE — then price bottomed $0.08 ABOVE the SL and ran +$11.14
+            // to TP3. When SL risk ≤ 0.7×TP1 the stop is already tighter than the
+            // target: protect can save at most ~the stop but costs the whole runner —
+            // the round-trip asymmetry this rule fixes (8/19: peak +$4 → full −$5.12)
+            // doesn't exist. Skip protect there; the tight stop IS the protection.
+            // Every skip AND every protect close stamps EARLY-PROT so both sides grade.
+            const _epRisk = (typeof _ept.slPrice === 'number' && _ept.slPrice > 0) ? Math.abs(_ept.ep - _ept.slPrice) : 0;
+            const _epTight = _epT1d > 0 && _epRisk > 0 && _epRisk <= 0.7 * _epT1d;
             if (!_ept.t1 && !_ept._epStop && _epT1d > 0 &&
                 (_ept._pkFav || 0) >= 0.6 * _epT1d && _epFav <= 0.1 * _epT1d &&
                 !(s.closeRequest && s.closeRequest.active)) {
+              if (_epTight) {
+                if (!_ept._epTightLogged) {
+                  _ept._epTightLogged = true;
+                  const _etMsg = '🛡️ EARLY-PROT SKIPPED (tight-stop exemption, 2026-09-10) — ' + String(_ept.type || '').toUpperCase() + ' @ $' + (+_ept.ep).toFixed(2) + ' peaked +$' + (_ept._pkFav || 0).toFixed(2) + ' then decayed, but SL risk $' + _epRisk.toFixed(2) + ' ≤ 0.7× TP1 $' + _epT1d.toFixed(2) + ' — the tight stop is the protection; holding.';
+                  log(sym, _etMsg); trackBlockedOutcome(sym, _etMsg, true);
+                }
+              } else {
               _ept._epStop = true;
               const _epId = 'protect-' + Date.now();
               s.closeRequest = { active: true, id: _epId, ts: Date.now(), type: _ept.type || '', ep: _ept.ep || 0, source: 'early-protect' };
               log(sym, '🛡️ EARLY PROTECT — ' + String(_ept.type || '').toUpperCase() + ' @ $' + (+_ept.ep).toFixed(2) + ' peaked +$' + (_ept._pkFav || 0).toFixed(2) + ' (≥60% of TP1 $' + _epT1d.toFixed(2) + ') then decayed to +$' + _epFav.toFixed(2) + '; EA close requested — a trade that nearly reached TP1 may not round-trip to a stop (Jean 2026-08-19) [id ' + _epId + '].');
               sendPush('🛡️ ' + sym + ' early protect', 'Closing ' + String(_ept.type || '').toUpperCase() + ' near BE @ $' + price.toFixed(2) + ' (peaked +$' + (_ept._pkFav || 0).toFixed(2) + ')', 'signal');
+              try { trackBlockedOutcome(sym, '🛡️ EARLY-PROT CLOSED ' + String(_ept.type || '').toUpperCase() + ' @ $' + price.toFixed(2) + ' (entry $' + (+_ept.ep).toFixed(2) + ', peaked +$' + (_ept._pkFav || 0).toFixed(2) + ') — bracket grades what holding would have done.', true); } catch (eEPT) {}
+              }
             }
           }
         } catch (eEP) { /* early-protect must never crash the tick */ }
@@ -10520,6 +10541,18 @@ function processPrice(sym, price, hi, lo) {
               _ohT._oteVetted = true; // no valid impulse, or already at/beyond OTE → release to market now
               delete _ohT.oteLimit; delete _ohT.oteExpiry; delete _ohT.oteImpulseHi; delete _ohT.oteImpulseLo; // XAU: server-side hold supersedes the legacy EA-side limit — never send both
               if (_ohOte) log(sym, '🎯 OTE-HOLD skipped — $' + price.toFixed(2) + ' already at/beyond OTE $' + _ohOte.limit.toFixed(2) + '; released at market.');
+              // ===== VISIBILITY STAMP (2026-09-10, Jean's 01:20 case) ===== Instant
+              // releases were invisible: no oteHold field on the row, indistinguishable
+              // from "no auction ran". Both known specimens (9/9 03:46 RSI-91.6 put,
+              // 9/10 01:20 put) were market releases into a still-running rally that
+              // SL'd. Stamp them so the class self-grades; if at-or-beyond releases
+              // keep losing, the fix is holding fades for a stall instead of releasing.
+              try {
+                const _ohSk = s.signals.length ? s.signals[s.signals.length - 1] : null;
+                const _ohSkH = { fill: +price.toFixed(2), sigPrice: _ohT.ep, improve: 0, waitedSec: 0, via: _ohOte ? 'at-or-beyond OTE' : 'no valid impulse' };
+                if (_ohSk && _ohSk.type === _ohDir && !_ohSk.oteHold) _ohSk.oteHold = _ohSkH;
+                if (s.lastHistEntry && s.lastHistEntry.type === _ohDir && !s.lastHistEntry.oteHold) s.lastHistEntry.oteHold = _ohSkH;
+              } catch (eOSk) {}
             } else {
               const _ohSig = s.signals.length ? s.signals[s.signals.length - 1] : null;
               if (_ohSig && _ohSig.type === _ohDir) _ohSig.pendingEntry = true;
@@ -14814,7 +14847,9 @@ function buildCfdTrade(type, price, atr, sym) {
     // their own auction (INVERSAL wide-SL, INV-HOLD resolver fills) set this true
     // right after assignment. V-REC knife-catch scalps and elite TP1-only scalps are
     // timing-critical — born vetted, never held.
-    _oteVetted: sym !== 'XAU' || _vRecActive || _scalp
+    // BUG FIX 2026-09-10: was `sym !== 'XAU'` — NAS100 trades were born already-vetted,
+    // so the NAS OTE auction shipped in 6.44 never engaged (the vet requires === false).
+    _oteVetted: (sym !== 'XAU' && sym !== 'NAS100') || _vRecActive || _scalp
   };
 }
 
@@ -16684,7 +16719,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.45-20260909-nas-rth-vrec-nightmom', // bump on each deploy — lets /state verify what's live
+    build: '6.46-20260910-earlyprot-tightstop', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
