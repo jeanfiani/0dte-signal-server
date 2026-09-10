@@ -8604,15 +8604,33 @@ function processPrice(sym, price, hi, lo) {
     // joins FLOOR-PATH's floor set only at ≥60% blocked-would-LOSE... i.e. promote the
     // block if stamped candidates lose ≥60% over ≥15 resolved.
     try {
-      if ((sym === 'XAU' || sym === 'NAS100') && atrVal > 0 && sig._pdhPdl && /RIDE|TREND|FAST|SUST|SQZ|6\/6/.test(tag) && // NAS 2026-09-09
+      if ((sym === 'XAU' || sym === 'NAS100') && atrVal > 0 && sig._pdhPdl && /RIDE|TREND|FAST|SUST|SQZ|6\/6|STRUCT_LIQ_GRAB|STRUCT_OB_FILL|STRUCT_VWAP/.test(tag) && // NAS 2026-09-09; STRUCT_* added 2026-09-10 (05:41 LIQ_GRAB put fired AT the 9/6 daily-low break and bounced — the class FLOOR-PDL measures, from a detector its regex missed; message carries the tag so the cohort splits by detector)
           !/LHF|LLF|VREV|EXT-FLIP|OBREJ|OBMIT|INVERSAL|SWEEP|CHoCH|ATH|ATL|DIV/.test(tag)) {
         const _pd = sig._pdhPdl;
         let _fpdlHit = '';
         const _fpdlCap = sym === 'XAU' ? 5 : 50; // TP1-cap-scaled (NAS 2026-09-09)
-        if (sig.type === 'put' && _pd.pdl > 0 && (price - _pd.pdl) < _fpdlCap && (price - _pd.pdl) > -0.3 * atrVal)
-          _fpdlHit = 'TP1 path requires the prior-day LOW $' + _pd.pdl.toFixed(2) + ' to break (price $' + (price - _pd.pdl).toFixed(2) + ' from it)';
-        else if (sig.type === 'call' && _pd.pdh > 0 && (_pd.pdh - price) < _fpdlCap && (_pd.pdh - price) > -0.3 * atrVal)
-          _fpdlHit = 'TP1 path requires the prior-day HIGH $' + _pd.pdh.toFixed(2) + ' to break (price $' + (_pd.pdh - price).toFixed(2) + ' from it)';
+        // ===== MULTI-DAY EXTREMES (2026-09-10, the 05:41 LIQ_GRAB put) ===== The 05:41
+        // put fired $0.39 above the 9/6 DAILY LOW 4390.01 and bounced — a floor the
+        // prior-day-only check can't see (9/9's low sat $49 away). Test against EVERY
+        // stored daily extreme (5-day window), nearest match wins; prior-day fields
+        // remain the fallback. Same brackets, same cap, same stamp — only the floor
+        // set widened.
+        let _fpLo = _pd.pdl > 0 ? _pd.pdl : 0, _fpHi = _pd.pdh > 0 ? _pd.pdh : 0, _fpTag = 'prior-day';
+        try {
+          const _fpToday = new Date().toISOString().slice(0, 10);
+          let _fpBestLo = _fpLo > 0 ? Math.abs(price - _fpLo) : Infinity;
+          let _fpBestHi = _fpHi > 0 ? Math.abs(_fpHi - price) : Infinity;
+          const _fpDl = Array.isArray(s.dailyLevels) ? s.dailyLevels : (s.dailyLevels && s.dailyLevels.data) || [];
+          for (const _fd of _fpDl) {
+            if (!_fd || _fd.date === _fpToday) continue;
+            if (sig.type === 'put' && _fd.low > 0 && Math.abs(price - _fd.low) < _fpBestLo) { _fpBestLo = Math.abs(price - _fd.low); _fpLo = _fd.low; _fpTag = _fd.date + ' daily'; }
+            if (sig.type === 'call' && _fd.high > 0 && Math.abs(_fd.high - price) < _fpBestHi) { _fpBestHi = Math.abs(_fd.high - price); _fpHi = _fd.high; _fpTag = _fd.date + ' daily'; }
+          }
+        } catch (eFD) {}
+        if (sig.type === 'put' && _fpLo > 0 && (price - _fpLo) < _fpdlCap && (price - _fpLo) > -0.3 * atrVal)
+          _fpdlHit = 'TP1 path requires the ' + _fpTag + ' LOW $' + _fpLo.toFixed(2) + ' to break (price $' + (price - _fpLo).toFixed(2) + ' from it)';
+        else if (sig.type === 'call' && _fpHi > 0 && (_fpHi - price) < _fpdlCap && (_fpHi - price) > -0.3 * atrVal)
+          _fpdlHit = 'TP1 path requires the ' + _fpTag + ' HIGH $' + _fpHi.toFixed(2) + ' to break (price $' + (_fpHi - price).toFixed(2) + ' from it)';
         if (_fpdlHit) {
           s._fpdlTs = s._fpdlTs || {};
           if (Date.now() - (s._fpdlTs[sig.type] || 0) >= 180000) {
@@ -16746,7 +16764,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.48-20260910-resurrection-guard', // bump on each deploy — lets /state verify what's live
+    build: '6.49-20260910-floor-pdl-multiday', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
