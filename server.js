@@ -2558,7 +2558,18 @@ function loadSignalHistory() {
         if (todaySignals.length > 0) {
           S[sym].signals = todaySignals.map(h => ({
             type: h.type, time: h.time, price: h.price, score: h.score,
-            rsi: h.rsi, macd: h.macd, roc: h.roc, num: h.num, conv: h.conv || null
+            rsi: h.rsi, macd: h.macd, roc: h.roc, num: h.num, conv: h.conv || null,
+            ts: h.ts,
+            // ===== RESURRECTION GUARD (2026-09-10, the "call with no signal") =====
+            // The EA keys rows by time|type|price. An OTE fill rewrites the LIVE row's
+            // price (4416.80 → 4413.35 on the 02:29 call); this restore rebuilds rows
+            // from signalHistory with the ORIGINAL price, so after the 6.47 deploy the
+            // key flipped back and the EA entered a 75-minute-old signal as if it were
+            // new. Restored rows also dropped ts/pendingEntry, bypassing every hide
+            // filter. Nothing restored is ever actionable — the EA saw it all before
+            // the reboot. _restored rows are hidden from the EA feed (display/analytics
+            // keep them via /signals).
+            _restored: true
           }));
           // Count only signals that actually fired — exclude enrichBlocked entries.
           // Blocked TRv2 entries have conv.enrichBlocked = true OR conv.label = 'BLOCKED'.
@@ -16735,7 +16746,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.47-20260910-vetstall-fix', // bump on each deploy — lets /state verify what's live
+    build: '6.48-20260910-resurrection-guard', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
@@ -17002,7 +17013,7 @@ app.get('/prices', (req, res) => {
       // signals[] it would trade rejected setups. Filter to FIRED-ONLY here so a blocked
       // signal can never reach the executor, regardless of EA logic. The `trade` object below
       // is already fired-only (set by buildCfdTrade); analytics keep full history via /signals.
-      signals: s.signals.filter(sg => !(sg && ((sg.conv && (sg.conv.enrichBlocked === true || sg.conv.label === 'BLOCKED')) || sg.pendingEntry === true || ((sym === 'XAU' || sym === 'NAS100') && sg.ts && !sg.entryActual && !sg.oteHold && (Date.now() - sg.ts < 12000 || (s.trade && s.trade.active && s.trade._oteVetted === false && s.trade.type === sg.type)))))).slice(-20), // STATE-based hide added 2026-09-10 (the 02:29 vet-stall leak, −$738): a row stays hidden for as long as its trade sits unvetted — the 12s clock assumed the vet runs next tick, but ATR warm-up after a deploy starved it for 3min and the EA took the naked row @4418.82. Rows un-hide the moment the vet resolves (oteHold stamped on fills AND instant releases since 6.46). // pendingEntry filter 2026-08-25 + 5s XAU youth filter 2026-09-08: the OTE vet marks pendingEntry on the NEXT TICK after fire — an EA poll landing in that ≤1s gap saw the naked row and market-entered DURING the auction (Jean's 02:03 case, EA in @4414 while the server auctioned to 4411.83). Rows younger than 5s stay hidden until the vet has claimed or released them; the EA's own entry delay (15-25s) makes this free.
+      signals: s.signals.filter(sg => !(sg && (sg._restored === true || (sg.conv && (sg.conv.enrichBlocked === true || sg.conv.label === 'BLOCKED')) || sg.pendingEntry === true || ((sym === 'XAU' || sym === 'NAS100') && sg.ts && !sg.entryActual && !sg.oteHold && (Date.now() - sg.ts < 12000 || (s.trade && s.trade.active && s.trade._oteVetted === false && s.trade.type === sg.type)))))).slice(-20), // _restored guard 2026-09-10: reboot-resurrected rows are never served to the EA (the 6.47-deploy "call with no signal" — key flipped back to the pre-fill price and the EA re-entered a 75min-old row) // STATE-based hide added 2026-09-10 (the 02:29 vet-stall leak, −$738): a row stays hidden for as long as its trade sits unvetted — the 12s clock assumed the vet runs next tick, but ATR warm-up after a deploy starved it for 3min and the EA took the naked row @4418.82. Rows un-hide the moment the vet resolves (oteHold stamped on fills AND instant releases since 6.46). // pendingEntry filter 2026-08-25 + 5s XAU youth filter 2026-09-08: the OTE vet marks pendingEntry on the NEXT TICK after fire — an EA poll landing in that ≤1s gap saw the naked row and market-entered DURING the auction (Jean's 02:03 case, EA in @4414 while the server auctioned to 4411.83). Rows younger than 5s stay hidden until the vet has claimed or released them; the EA's own entry delay (15-25s) makes this free.
       // OTE auction visibility (2026-09-04, Jean: "the signal disappeared from the app").
       // While OTE-HOLD auctions the entry, the signal is hidden above (by design — no
       // levels yet) and s.trade is parked, so the mobile monitor showed a black hole.
