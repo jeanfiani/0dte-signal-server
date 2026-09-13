@@ -3673,6 +3673,68 @@ function processPrice(sym, price, hi, lo) {
             }
           }
         } catch (eR5R) {}
+        // ===== BTC-REGIME — EXTREME + REGIME-CHANGE CONFIRMATION (2026-09-13, Jean) =====
+        // Jean's synthesis after the test cycle: "the issue is the volatility and the
+        // short SL — the only way to win on BTC is: price goes to HTF/ATH/ATL, wait
+        // for the regime change, fire with SL equal to the lower point." The evidence
+        // agrees: blind extreme-fades fail (deep arm 0W/1L trapdoor, BTC-INV direction
+        // beta) while CONFIRMED reversals pay (V-REC bench shadow 8W/1L crash week,
+        // RT arm 2W/1L). Third arm: tag the 5-day extreme → WATCH (track the true
+        // extreme while waiting, 48h window) → fire the virtual only when market
+        // structure FLIPS (msTrend crosses against the trend that made the extreme) →
+        // SL AT the tracked extreme (structural — volatility can't wick it without
+        // breaking the thesis), TP at the 5-day mid, far extreme flagged. Dormant,
+        // self-graded into BTC-REGIME / NAS-REGIME; promote ≥60% over ≥15 resolved,
+        // split by weekly direction like every extreme-fade before it.
+        try {
+          const _rgTag = sym === 'BTC' ? 'BTC-REGIME' : 'NAS-REGIME';
+          if (s._r5.regL === undefined) s._r5.regL = null;
+          if (s._r5.regS === undefined) s._r5.regS = null;
+          if (s._r5.regLV === undefined) s._r5.regLV = null;
+          if (s._r5.regSV === undefined) s._r5.regSV = null;
+          // grade active virtuals (same wide brackets as the other arms)
+          [['regLV', 'long'], ['regSV', 'short']].forEach(pr => {
+            const v = s._r5[pr[0]]; if (!v) return;
+            const sd = pr[1];
+            if (!v.farHit && (sd === 'long' ? price >= v.tpFar : price <= v.tpFar)) v.farHit = true;
+            const win = sd === 'long' ? price >= v.tp : price <= v.tp;
+            const loss = sd === 'long' ? price <= v.sl : price >= v.sl;
+            const expired = Date.now() - v.ts > 5 * 86400000;
+            if (win || loss || expired) {
+              const oc = win ? 'win' : loss ? 'loss' : 'scratch';
+              log(sym, '🧭 ' + _rgTag + ' ' + sd.toUpperCase() + ' RESOLVED ' + oc.toUpperCase() + ' — confirmed entry $' + v.ep.toFixed(0) + ', structural SL $' + v.sl.toFixed(0) + ' → ' + (win ? 'TP(mid) $' + v.tp.toFixed(0) : loss ? 'SL hit' : 'expired 5d @ $' + price.toFixed(0)) + (v.farHit ? ' · FAR side reached' : '') + ' (extreme+regime-change arm, Jean 2026-09-13).');
+              try { bumpCohortTally(sym, _rgTag, oc); } catch (eB3) {}
+              s._r5[pr[0]] = null;
+            }
+          });
+          // arm/refresh WATCHES when price tags the 5-day extremes
+          if (!s._r5.regLV && price <= s.rollingLow + 0.1 * _adr) {
+            if (!s._r5.regL) log(sym, '🧭 ' + _rgTag + ' LONG WATCH armed @ $' + price.toFixed(0) + ' — 5-day low tagged; waiting for the regime change (msTrend → up). SL will sit at the tracked extreme.');
+            s._r5.regL = { ext: Math.min(price, (s._r5.regL && s._r5.regL.ext) || price), ts: (s._r5.regL && s._r5.regL.ts) || Date.now(), armedTrend: (s._r5.regL && s._r5.regL.armedTrend) || s._msTrend || null };
+          }
+          if (s._r5.regL) s._r5.regL.ext = Math.min(s._r5.regL.ext, price); // track the TRUE low while waiting
+          if (!s._r5.regSV && price >= s.rollingHigh - 0.1 * _adr) {
+            if (!s._r5.regS) log(sym, '🧭 ' + _rgTag + ' SHORT WATCH armed @ $' + price.toFixed(0) + ' — 5-day high tagged; waiting for the regime change (msTrend → down). SL will sit at the tracked extreme.');
+            s._r5.regS = { ext: Math.max(price, (s._r5.regS && s._r5.regS.ext) || price), ts: (s._r5.regS && s._r5.regS.ts) || Date.now(), armedTrend: (s._r5.regS && s._r5.regS.armedTrend) || s._msTrend || null };
+          }
+          if (s._r5.regS) s._r5.regS.ext = Math.max(s._r5.regS.ext, price);
+          // watches expire after 48h without a confirmed flip
+          if (s._r5.regL && Date.now() - s._r5.regL.ts > 172800000) { log(sym, '🧭 ' + _rgTag + ' LONG WATCH expired 48h — no regime change confirmed.'); s._r5.regL = null; }
+          if (s._r5.regS && Date.now() - s._r5.regS.ts > 172800000) { log(sym, '🧭 ' + _rgTag + ' SHORT WATCH expired 48h — no regime change confirmed.'); s._r5.regS = null; }
+          // REGIME CHANGE → fire the virtual with the structural stop
+          if (s._r5.regL && !s._r5.regLV && s._msTrend === 'up' && s._r5.regL.armedTrend !== 'up') {
+            const _rgSl = +(s._r5.regL.ext - 0.05 * _adr).toFixed(2); // "SL equal to the lower point" (hair of wick buffer)
+            s._r5.regLV = { ep: price, sl: _rgSl, tp: +_mid.toFixed(2), tpFar: s.rollingHigh, ts: Date.now(), farHit: false };
+            log(sym, '🧭 ' + _rgTag + ' LONG FIRED (virtual) @ $' + price.toFixed(0) + ' — regime change confirmed (msTrend ' + (s._r5.regL.armedTrend || '?') + '→up) after 5-day-low tag; extreme $' + s._r5.regL.ext.toFixed(0) + ' · structural SL $' + _rgSl.toFixed(0) + ' · TP mid $' + _mid.toFixed(0) + ' · far $' + s.rollingHigh.toFixed(0) + ' (dormant shadow, Jean 2026-09-13).');
+            s._r5.regL = null;
+          }
+          if (s._r5.regS && !s._r5.regSV && s._msTrend === 'down' && s._r5.regS.armedTrend !== 'down') {
+            const _rgSl2 = +(s._r5.regS.ext + 0.05 * _adr).toFixed(2);
+            s._r5.regSV = { ep: price, sl: _rgSl2, tp: +_mid.toFixed(2), tpFar: s.rollingLow, ts: Date.now(), farHit: false };
+            log(sym, '🧭 ' + _rgTag + ' SHORT FIRED (virtual) @ $' + price.toFixed(0) + ' — regime change confirmed (msTrend ' + (s._r5.regS.armedTrend || '?') + '→down) after 5-day-high tag; extreme $' + s._r5.regS.ext.toFixed(0) + ' · structural SL $' + _rgSl2.toFixed(0) + ' · TP mid $' + _mid.toFixed(0) + ' · far $' + s.rollingLow.toFixed(0) + ' (dormant shadow, Jean 2026-09-13).');
+            s._r5.regS = null;
+          }
+        } catch (eRG) { /* regime arm must never crash the tick */ }
       }
     } catch (eR5) { /* shadow must never crash the tick path */ }
   }
