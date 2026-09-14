@@ -3564,18 +3564,53 @@ function processPrice(sym, price, hi, lo) {
       const _ihz = s._invHold; s._invHold = null;
       log(sym, '🧹 INV-HOLD ' + String(_ihz.dir || '?').toUpperCase() + ' DROPPED stale (ungated watchdog) — ' + (_ihz.expiry > 0 ? ('expired ' + Math.round((Date.now() - _ihz.expiry) / 60000) + 'min ago unresolved') : 'INVALID expiry (zombie hold)') + '; it was blocking the OTE vet.');
     }
-    if (isMT5 && s.trade && s.trade.active && s.trade._oteVetted === false && s.trade.ts && Date.now() - s.trade.ts > 30000) {
-      s.trade._oteVetted = true;
-      // Diagnostic upgraded 2026-09-12: name the blocker so a dead auction is loud in logs,
-      // and stamp the row so /signals shows the release class (was invisible before).
-      const _uvWhy = s._oteHold ? 'stale _oteHold blocking vet' : (s._invHold ? 'stale _invHold blocking vet' : 'ATR warm-up / gate starvation');
-      log(sym, '⚠️ OTE VET STALLED >30s (watchdog) — ' + String(s.trade.type || '').toUpperCase() + ' @ $' + (+s.trade.ep || 0).toFixed(2) + ' force-released at market; cause: ' + _uvWhy + '.');
+    // ===== UNGATED VET (2026-09-14, replaces the 30s dumb-release) =====
+    // 9/13 22:23 and 9/14 03:57: BOTH fires force-released at exactly the 30s bound
+    // with "no stuck hold" — the main vet (inside the zone-map section) is being
+    // STARVED by upstream gating/early returns, and the old watchdog then killed the
+    // auction instead of running it. Every auction since 9/10 died this way. Fix:
+    // once a fresh trade is >10s old unclaimed, run the REAL vet here, ungated —
+    // same decisions as the main vet (release at/beyond OTE, momentum fast-lane, or
+    // ARM the auction with identical geometry). The main vet keeps the same-tick
+    // fast path whenever its section is reachable.
+    if (isMT5 && (sym === 'XAU' || sym === 'NAS100') && s.trade && s.trade.active && s.trade._oteVetted === false && s.trade.ts && Date.now() - s.trade.ts > 10000 && !s._invHold && !s._oteHold) {
       try {
-        const _uvSig = s.signals.length ? s.signals[s.signals.length - 1] : null;
-        const _uvH = { fill: +(s.lastPrice || s.trade.ep || 0).toFixed(2), sigPrice: s.trade.ep, improve: 0, waitedSec: Math.round((Date.now() - s.trade.ts) / 1000), via: 'vet-stall release (' + _uvWhy + ')' };
-        if (_uvSig && _uvSig.type === s.trade.type && !_uvSig.oteHold) _uvSig.oteHold = _uvH;
-        if (s.lastHistEntry && s.lastHistEntry.type === s.trade.type && !s.lastHistEntry.oteHold) s.lastHistEntry.oteHold = _uvH;
-      } catch (eUVs) {}
+        const _uvT = s.trade, _uvDir = _uvT.type;
+        const _uvAge = Math.round((Date.now() - _uvT.ts) / 1000);
+        if (process.env.OTE_DISABLED === '1') { _uvT._oteVetted = true; }
+        else {
+          let _uvOte = null; try { _uvOte = computeOTE(s, sym, _uvDir); } catch (eCO) {}
+          const _uvRoc = s._roc3 || 0;
+          const _uvBeyond = _uvOte && (_uvDir === 'call' ? price <= _uvOte.limit : price >= _uvOte.limit);
+          const _uvFast = _uvDir === 'call' ? _uvRoc >= 0.10 : _uvRoc <= -0.10;
+          if (!_uvOte || _uvBeyond || _uvFast) {
+            _uvT._oteVetted = true;
+            delete _uvT.oteLimit; delete _uvT.oteExpiry; delete _uvT.oteImpulseHi; delete _uvT.oteImpulseLo;
+            const _uvVia = !_uvOte ? 'no valid impulse (ungated vet)' : _uvBeyond ? 'at-or-beyond OTE (ungated vet)' : 'momentum fast-lane (ungated vet)';
+            log(sym, '🎯 OTE-HOLD skipped (ungated vet, ' + _uvAge + 's after fire — main vet starved) — ' + _uvVia + '; released at market @ $' + price.toFixed(2) + '.');
+            try {
+              const _uvSig = s.signals.length ? s.signals[s.signals.length - 1] : null;
+              const _uvH = { fill: +price.toFixed(2), sigPrice: _uvT.ep, improve: 0, waitedSec: _uvAge, via: _uvVia };
+              if (_uvSig && _uvSig.type === _uvDir && !_uvSig.oteHold) _uvSig.oteHold = _uvH;
+              if (s.lastHistEntry && s.lastHistEntry.type === _uvDir && !s.lastHistEntry.oteHold) s.lastHistEntry.oteHold = _uvH;
+            } catch (eUVs) {}
+          } else {
+            const _uvSig = s.signals.length ? s.signals[s.signals.length - 1] : null;
+            if (_uvSig && _uvSig.type === _uvDir) _uvSig.pendingEntry = true;
+            if (s.lastHistEntry && s.lastHistEntry.type === _uvDir) s.lastHistEntry.pendingEntry = true;
+            s._oteHold = { dir: _uvDir, trade: _uvT,
+                           sigRef: (_uvSig && _uvSig.type === _uvDir) ? _uvSig : null,
+                           histRef: (s.lastHistEntry && s.lastHistEntry.type === _uvDir) ? s.lastHistEntry : null,
+                           sigPrice: _uvT.ep, ote: _uvOte.limit,
+                           slPrice: (typeof _uvT.slPrice === 'number' && _uvT.slPrice > 0) ? _uvT.slPrice : null,
+                           runaway: (parseFloat(process.env.OTE_RUNAWAY_MULT) || 0.3) * (_uvT.atr || 0),
+                           armTs: Date.now(), expiry: Date.now() + 240000 };
+            s.trade = { active: false }; // NEVER null (2026-09-07 crash lesson)
+            log(sym, '⏳ OTE-HOLD ' + _uvDir.toUpperCase() + ' armed (ungated vet, ' + _uvAge + 's after fire — main vet starved) @ $' + price.toFixed(2) + ' — auctioning toward OTE $' + _uvOte.limit.toFixed(2) + ' ≤4min; touch / runaway / expiry / SL-invalidation as usual.');
+            sendPush('⏳ ' + sym + ' OTE-HOLD ' + _uvDir.toUpperCase(), 'waiting for $' + _uvOte.limit.toFixed(2) + ' (now $' + price.toFixed(2) + ') · ≤4min', 'signal');
+          }
+        }
+      } catch (eUV2) { if (s.trade && s.trade._oteVetted === false) s.trade._oteVetted = true; /* never strand a trade */ }
     }
   } catch (eUV) { /* watchdog must never crash the tick */ }
 
