@@ -3699,6 +3699,25 @@ function processPrice(sym, price, hi, lo) {
             if (_lvlL && price - _lvlL <= 0.1 * _adr) {
               s._r5.longR = { lvl: _lvlL, ep: price, sl: +(_lvlL - 0.75 * _adr).toFixed(2), tp: +((_lvlL + s.rollingHigh) / 2).toFixed(2), tpFar: s.rollingHigh, ts: Date.now(), farHit: false };
               log(sym, '🎢 ' + _r5Tag + '-RT LONG armed'.replace(' armed','') + ' armed @ $' + price.toFixed(0) + ' — retest of unbroken prior-day low $' + _lvlL.toFixed(0) + ' · SL $' + s._r5.longR.sl.toFixed(0) + ' · TP mid $' + s._r5.longR.tp.toFixed(0) + ' · far $' + s.rollingHigh.toFixed(0) + ' (dormant shadow).');
+              // ===== RANGE5-RT LIVE LANE (2026-09-14, Jean: "get ready — it will be
+              // soon") ===== OFF by default; BTC_RANGE5_LIVE=1 in Railway env arms it
+              // with NO deploy. Fires the SAME retest entry for real, thesis geometry:
+              // structural SL 0.75×ADR beyond the level (cap-exempt via _r5Live), TP1
+              // at the 5-day mid (EA banks half), TP2/TP3 at the far extreme. Cohort
+              // to watch before flipping: BTC-RANGE5-RT (3W/1L at build time).
+              try {
+                if (sym === 'BTC' && process.env.BTC_RANGE5_LIVE === '1' && !btcWeekendClosed() && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold) {
+                  s.dailySignalCount++;
+                  const _rlV = s._r5.longR;
+                  const _rlSig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆RANGE5-RT', rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: _rlV.sl.toFixed(2), tp1: _rlV.tp.toFixed(2), tp2: (+_rlV.tpFar).toFixed(2), tp3: (+_rlV.tpFar).toFixed(2), oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: 'range5-rt level entry' } };
+                  s.signals.push(_rlSig); logSignal(sym, _rlSig);
+                  s.trade = buildCfdTrade('call', price, (s._atr || _adr / 20), sym);
+                  s.trade._oteVetted = true; s.trade._r5Live = true;
+                  s.trade.slPrice = _rlV.sl; s.trade.tp1Price = _rlV.tp; s.trade.tp2Price = +_rlV.tpFar; s.trade.tp3Price = +_rlV.tpFar;
+                  log(sym, '🎢 ' + _r5Tag + '-RT LONG LIVE FIRE @ $' + price.toFixed(0) + ' — retest of unbroken prior-day low $' + _lvlL.toFixed(0) + ' · SL $' + _rlV.sl.toFixed(0) + ' (structural, cap-exempt) · TP1 mid $' + _rlV.tp.toFixed(0) + ' · TP2/3 far $' + (+_rlV.tpFar).toFixed(0) + ' [BTC_RANGE5_LIVE].');
+                  sendPush('🎢 BTC RANGE5-RT LONG #' + s.dailySignalCount, '$' + price.toFixed(0) + ' · SL $' + _rlV.sl.toFixed(0) + ' · TP1 $' + _rlV.tp.toFixed(0), 'signal');
+                }
+              } catch (eRL) { /* live lane must never crash the arm */ }
             }
           }
           if (!s._r5.shortR && Date.now() - s._r5.cdSR > 21600000) {
@@ -3706,6 +3725,20 @@ function processPrice(sym, price, hi, lo) {
             if (_lvlH && _lvlH - price <= 0.1 * _adr) {
               s._r5.shortR = { lvl: _lvlH, ep: price, sl: +(_lvlH + 0.75 * _adr).toFixed(2), tp: +((_lvlH + s.rollingLow) / 2).toFixed(2), tpFar: s.rollingLow, ts: Date.now(), farHit: false };
               log(sym, '🎢 ' + _r5Tag + '-RT SHORT armed'.replace(' armed','') + ' armed @ $' + price.toFixed(0) + ' — retest of unbroken prior-day high $' + _lvlH.toFixed(0) + ' · SL $' + s._r5.shortR.sl.toFixed(0) + ' · TP mid $' + s._r5.shortR.tp.toFixed(0) + ' · far $' + s.rollingLow.toFixed(0) + ' (dormant shadow).');
+              // RANGE5-RT LIVE LANE — short mirror (see long side above; BTC_RANGE5_LIVE=1 arms).
+              try {
+                if (sym === 'BTC' && process.env.BTC_RANGE5_LIVE === '1' && !btcWeekendClosed() && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold) {
+                  s.dailySignalCount++;
+                  const _rsV = s._r5.shortR;
+                  const _rsSig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇RANGE5-RT', rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: _rsV.sl.toFixed(2), tp1: _rsV.tp.toFixed(2), tp2: (+_rsV.tpFar).toFixed(2), tp3: (+_rsV.tpFar).toFixed(2), oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: 'range5-rt level entry' } };
+                  s.signals.push(_rsSig); logSignal(sym, _rsSig);
+                  s.trade = buildCfdTrade('put', price, (s._atr || _adr / 20), sym);
+                  s.trade._oteVetted = true; s.trade._r5Live = true;
+                  s.trade.slPrice = _rsV.sl; s.trade.tp1Price = _rsV.tp; s.trade.tp2Price = +_rsV.tpFar; s.trade.tp3Price = +_rsV.tpFar;
+                  log(sym, '🎢 ' + _r5Tag + '-RT SHORT LIVE FIRE @ $' + price.toFixed(0) + ' — retest of unbroken prior-day high $' + _lvlH.toFixed(0) + ' · SL $' + _rsV.sl.toFixed(0) + ' (structural, cap-exempt) · TP1 mid $' + _rsV.tp.toFixed(0) + ' · TP2/3 far $' + (+_rsV.tpFar).toFixed(0) + ' [BTC_RANGE5_LIVE].');
+                  sendPush('🎢 BTC RANGE5-RT SHORT #' + s.dailySignalCount, '$' + price.toFixed(0) + ' · SL $' + _rsV.sl.toFixed(0) + ' · TP1 $' + _rsV.tp.toFixed(0), 'signal');
+                }
+              } catch (eRS) { /* live lane must never crash the arm */ }
             }
           }
         } catch (eR5R) {}
@@ -15295,7 +15328,11 @@ function checkExit(sym, price) {
     if (!t.t1 && !t.sl && !t._capChecked && t.ep > 0) {
       t._capChecked = true;
       const _capT = sym === 'XAU' ? 5 : sym === 'BTC' ? 100 : sym === 'NAS100' ? 50 : 0;
-      if (_capT > 0) {
+      // RANGE5-LIVE EXEMPTION (2026-09-14, Jean: "get ready to make BTC-RANGE live"):
+      // the thesis IS high SL + very wide TP (structural 0.75×ADR stop, 5-day-mid
+      // target) — clamping it to the scalp caps would gut the design. _r5Live trades
+      // keep their thesis geometry; every other path stays capped.
+      if (_capT > 0 && !t._r5Live) {
         if (typeof t.tp1Price === 'number' && Math.abs(t.ep - t.tp1Price) > _capT + 0.01) {
           const _oldT1 = t.tp1Price;
           t.tp1Price = +(iC ? t.ep + _capT : t.ep - _capT).toFixed(2);
@@ -16964,7 +17001,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.51-20260914-choch-night', // bump on each deploy — lets /state verify what's live
+    build: '6.52-20260914-range5-live-lane', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
