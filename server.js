@@ -1921,6 +1921,7 @@ function cohortFor(reason) {
   if (/EARLY-PROT/.test(reason)) return 'EARLY-PROT'; // early-protect closes + tight-stop skips (2026-09-10, the 00:45 TP3-that-got-flattened case) — SKIPPED rows grade the exemption, CLOSED rows grade the rule itself
   if (/FVG-RT/.test(reason)) return 'FVG-RT'; // mapped-FVG retest dormant arm (2026-09-12, Jean's 9/9 hand trade) — must precede ZONE-* matches
   if (/NIGHT-BENCHED/.test(reason)) return 'NIGHT-BENCH-WF'; // re-benched night-waiver would-fires (2026-09-12) — before the [NIGHT] match so the benched lane grades separately from generic night stamps
+  if (/CHOCH-NIGHT/.test(reason)) return 'CHOCH-NIGHT'; // night CHoCH stand-down (2026-09-14, the 22:23 crest specimen) — must precede CHOCH-V2 and [NIGHT] matches
   if (/V-REC BENCHED/.test(reason)) return 'BTC-VREC-BENCH'; // benched V-REC would-fires (2026-09-09) — must precede any V-REC/detector matches
   if (/SLPAD-SIM/.test(reason)) return 'SLPAD-SIM'; // wick-pad shadow on real stops: SAVE rows' bracket outcome = pad-world verdict; DEEP rows = pad pure cost (2026-09-03)
   if (/CREST-INV/.test(reason)) return 'CREST-INV'; // inverted twin of continuation fires at their own session extreme (2026-09-07, Jean's 19:45 specimen) — split by regime before promoting
@@ -8756,6 +8757,19 @@ function processPrice(sym, price, hi, lo) {
       log(sym, _nrMsg); if (_nrOk) trackBlockedOutcome(sym, _nrMsg, true);
       return false;
     }
+    // ===== CHoCH NIGHT STAND-DOWN (LIVE, 2026-09-14 — Jean: "yes gate CHoCH") =====
+    // 9/13 22:23 specimen: ⬆CHoCH fired at the crest of a +$26 (~4×ATR) overnight leg,
+    // $2 from the session high, MFE 2.02, SL'd in 16min — CHoCH confirms structure
+    // shifts LATE, and at night the bounce is spent by the time the M5 closes through
+    // the swing. The shadow agrees: CHoCH-V2 cohort 58W/132L (30.5%) on XAU. Night
+    // fires (18:00–06:00 ET) go stamp-only into CHOCH-NIGHT; re-earn at ≥60%/≥15.
+    // RTH CHoCH stays live pending its own data.
+    if ((sym === 'XAU' || sym === 'NAS100') && /CHoCH/i.test(tag) && nightTag() !== '') {
+      Object.assign(s, _emitSnapshot);
+      const _cnMsg = '🌙 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — CHOCH-NIGHT stand-down (2026-09-14): CHoCH is a lagging confirmation and its night fires enter at the spent end of the leg (22:23 case; CHoCH-V2 shadow 30.5%).' + nightTag();
+      log(sym, _cnMsg); trackBlockedOutcome(sym, _cnMsg, true);
+      return false;
+    }
     // ===== PROTECTIONS GATE (LIVE, 2026-08-28 — Freqtrade port, Jean: "we can ship
     // the protections module") ===== Placed LAST deliberately: only signals that
     // passed every other gate reach here, so PROTECT stamps measure exactly the
@@ -15273,7 +15287,7 @@ function checkExit(sym, price) {
         try {
           const _ciScore = (s.lastHistEntry && s.lastHistEntry.symbol === sym && s.lastHistEntry.score) || '';
           const _ciAtr = (typeof t.atr === 'number' && t.atr > 0) ? t.atr : 0;
-          if (_ciAtr > 0 && /RIDE|TREND|FAST|SUST/.test(_ciScore)) {
+          if (_ciAtr > 0 && /RIDE|TREND|FAST|SUST|CHoCH/i.test(_ciScore)) { // CHoCH added 2026-09-14 (the 22:23 crest specimen) — its at-extreme fires now grade for inversion too
             const _ciNear = t.type === 'call'
               ? (isFinite(s.sessionHigh) && (s.sessionHigh - t.ep) <= 0.3 * _ciAtr)
               : (isFinite(s.sessionLow) && (t.ep - s.sessionLow) <= 0.3 * _ciAtr);
@@ -16915,7 +16929,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.50-20260912-bench-fastlane-fvgrt-sweeper', // bump on each deploy — lets /state verify what's live
+    build: '6.51-20260914-choch-night', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
