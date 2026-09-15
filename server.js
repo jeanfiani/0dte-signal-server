@@ -1922,6 +1922,8 @@ function cohortFor(reason) {
   if (/FVG-RT/.test(reason)) return 'FVG-RT'; // mapped-FVG retest dormant arm (2026-09-12, Jean's 9/9 hand trade) — must precede ZONE-* matches
   if (/NIGHT-BENCHED/.test(reason)) return 'NIGHT-BENCH-WF'; // re-benched night-waiver would-fires (2026-09-12) — before the [NIGHT] match so the benched lane grades separately from generic night stamps
   if (/CHOCH-NIGHT/.test(reason)) return 'CHOCH-NIGHT'; // night CHoCH stand-down (2026-09-14, the 22:23 crest specimen) — must precede CHOCH-V2 and [NIGHT] matches
+  if (/CHOP-TREND-WF/.test(reason)) return 'CHOP-TREND-WF'; // with-trend continuations refused by chop mode (2026-09-15) — must precede CHOP-* matches; ≥60%/15 promotes a with-trend chop waiver
+  if (/EXTFLIP-C3/.test(reason)) return 'EXTFLIP-C3'; // benched XAU conv-3 EXT-FLIP tier (2026-09-15) — before EXT-FLIP/[NIGHT] matches
   if (/V-REC BENCHED/.test(reason)) return 'BTC-VREC-BENCH'; // benched V-REC would-fires (2026-09-09) — must precede any V-REC/detector matches
   if (/SLPAD-SIM/.test(reason)) return 'SLPAD-SIM'; // wick-pad shadow on real stops: SAVE rows' bracket outcome = pad-world verdict; DEEP rows = pad pure cost (2026-09-03)
   if (/CREST-INV/.test(reason)) return 'CREST-INV'; // inverted twin of continuation fires at their own session extreme (2026-09-07, Jean's 19:45 specimen) — split by regime before promoting
@@ -7796,7 +7798,16 @@ function processPrice(sym, price, hi, lo) {
           // Force-tracked since 5.63 (2026-08-18, Jean: "how many saves vs misses from the chop
           // gate?" — answer was unknowable: sample-only tracking, no cohort). The 3-min global
           // dedupe (2026-08-03) keys this by CHOP-GATE+direction, so spam cannot churn the ring.
-          const _chopMsg = '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' chop mode active (only V-REV / LHF / LLF / OBREJ / OBMIT allowed in chop; other detectors consistently lose in flat range).';
+          // ===== CHOP-TREND-WF TAG (2026-09-15, Jean: "what should we do here") =====
+          // The chop detector overfires on staircase trends (documented since 5/6), and
+          // in chop mode only fade detectors may fire — so on a trending-chop tape the
+          // system can ONLY express itself counter-trend (9/15 08:09 blocked put → 08:13
+          // EXT-FLIP call SL'd; same shape as the 9/9 rally, 9/10 crash, 9/14 slides).
+          // Tag chop-blocked WITH-TREND continuations into their own cohort: if they
+          // grade ≥60% would-win over ≥15, a with-trend chop waiver promotes on data.
+          const _ctwTrend = (s._msTrend === 'up' && sig.type === 'call') || (s._msTrend === 'down' && sig.type === 'put');
+          const _ctwCont = /RIDE|TREND|FAST|SUST|6\/6/.test(tagEarly);
+          const _chopMsg = '🌊 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ' + sym + ' chop mode active (only V-REV / LHF / LLF / OBREJ / OBMIT allowed in chop; other detectors consistently lose in flat range).' + (_ctwTrend && _ctwCont ? ' [CHOP-TREND-WF: with-trend continuation refused in chop, msTrend ' + s._msTrend + ']' : '');
           trackBlockedOutcome(sym, _chopMsg, true);
           log(sym, _chopMsg);
           sig._blockedBy = 'CHOP'; // REGIME-BIAS audition marker (2026-08-31)
@@ -9587,6 +9598,18 @@ function processPrice(sym, price, hi, lo) {
             }
           } catch (eZP) {}
           if (!_nzLive) efReason = 'EXT-FLIP conv floor — conv ' + _efConv + ' < 3 (BTC autopsy 7/24: conv≤2 = 1W/12SL/−$985; conv≥3 = 3W/1L/+$300; XAU 8/2-3: conv≤1 = 0W/2SL)';
+        }
+        else if (sym === 'XAU' && _efConv === 3) {
+          // ===== XAU DAY EXT-FLIP CONV-3 BENCH (2026-09-15, Jean: "what should we do
+          // here") ===== XAU EXT-FLIP runs ~27% lifetime (vs NAS 67% — the 8/21
+          // do-not-pool split); the night half is already benched, and the 9/15 08:13
+          // conv-3 call (MFE $1.67, SL in 4min fading a live down-leg) is the day
+          // half's signature loss. XAU now requires conv ≥4; conv-3 would-fires stamp
+          // EXTFLIP-C3 and re-earn at ≥60% over ≥15. NAS keeps its conv-3-with-zone
+          // door (its lane earns it).
+          const _c3Msg = '🔄 EXT-FLIP ' + EF.dir.toUpperCase() + ' EXTFLIP-C3 BENCHED WOULD-FIRE @ $' + price.toFixed(2) + ' — XAU conv-3 tier benched 2026-09-15 (lane 27% lifetime; conv ≥4 required).' + nightTag();
+          log(sym, _c3Msg); trackBlockedOutcome(sym, _c3Msg, true);
+          efReason = 'XAU EXT-FLIP conv 3 benched (2026-09-15) — lane runs 27% lifetime; conv ≥4 required, conv-3 stamps EXTFLIP-C3 to re-earn';
         }
         else if (_efConv === 3 && !(Array.isArray(s._zoneObs) && s._zoneObs.some(z => z && z.dir === EF.dir && price >= z.lo && price <= z.hi))) efReason = 'EXT-FLIP conv 3 (floor minimum) without mapped zone confluence — flips at the threshold need the map to agree (8/16 23:13 PUT fought the trend from empty space, −$323 real; 2026-08-17)';
         else if (!(EF.burst >= 1.5)) efReason = 'no climax volume (burst ×' + (EF.burst || 0).toFixed(1) + ' < 1.5)';
@@ -17001,7 +17024,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.52-20260914-range5-live-lane', // bump on each deploy — lets /state verify what's live
+    build: '6.52-20260915-range5-choptrend-c3bench', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
