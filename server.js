@@ -1923,6 +1923,7 @@ function cohortFor(reason) {
   if (/NIGHT-BENCHED/.test(reason)) return 'NIGHT-BENCH-WF'; // re-benched night-waiver would-fires (2026-09-12) — before the [NIGHT] match so the benched lane grades separately from generic night stamps
   if (/CHOCH-NIGHT/.test(reason)) return 'CHOCH-NIGHT'; // night CHoCH stand-down (2026-09-14, the 22:23 crest specimen) — must precede CHOCH-V2 and [NIGHT] matches
   if (/CHOP-TREND-WF/.test(reason)) return 'CHOP-TREND-WF'; // with-trend continuations refused by chop mode (2026-09-15) — must precede CHOP-* matches; ≥60%/15 promotes a with-trend chop waiver
+  if (/TREND-CONT-WF/.test(reason)) return 'TREND-CONT-WF'; // ALL-gates with-trend continuation blocks (2026-09-16) — the complete measurement of the missed-leg class; before detector-tag matches
   if (/EXTFLIP-C3/.test(reason)) return 'EXTFLIP-C3'; // benched XAU conv-3 EXT-FLIP tier (2026-09-15) — before EXT-FLIP/[NIGHT] matches
   if (/V-REC BENCHED/.test(reason)) return 'BTC-VREC-BENCH'; // benched V-REC would-fires (2026-09-09) — must precede any V-REC/detector matches
   if (/SLPAD-SIM/.test(reason)) return 'SLPAD-SIM'; // wick-pad shadow on real stops: SAVE rows' bracket outcome = pad-world verdict; DEEP rows = pad pure cost (2026-09-03)
@@ -5226,6 +5227,27 @@ function processPrice(sym, price, hi, lo) {
     const _esPassed = enrichSigCore(sig);
     // Regime cache for latchAdvSource (2026-09-02) — fresh on every scored signal
     try { if (sig && sig._regime) s._lastRegime = { dir: sig._regime.dir, netChgPct: sig._regime.netChgPct, ts: Date.now() }; } catch (eRC) {}
+    // ===== TREND-CONT-WF — ALL-GATES with-trend continuation stamp (2026-09-16) =====
+    // The CHOP-TREND-WF tag (9/15) only catches candidates that REACH the chop gate;
+    // Jean's 9/16 report (4331→4360→4325→4335, zero fires) showed today's with-trend
+    // candidates dying UPSTREAM — macro-alignment lag on the LLF calls, MACD-fading and
+    // Option B++ bands on the FAST puts — so the cohort sat empty while the miss
+    // repeated. Measure at the exit door instead: ANY blocked continuation candidate
+    // whose direction agrees with msTrend stamps here, one per direction per 5 min,
+    // whatever gate killed it. ≥60% would-win over ≥15 → the with-trend ease debate
+    // gets its number. (CHOP-TREND-WF stays as the chop-specific sub-split.)
+    try {
+      if (!_esPassed && (sym === 'XAU' || sym === 'NAS100') && sig && sig.type &&
+          ((s._msTrend === 'up' && sig.type === 'call') || (s._msTrend === 'down' && sig.type === 'put')) &&
+          /RIDE|TREND|FAST|SUST|6\/6/.test(sig.score || '') ) {
+        s._tcwTs = s._tcwTs || {};
+        if (Date.now() - (s._tcwTs[sig.type] || 0) >= 300000) {
+          s._tcwTs[sig.type] = Date.now();
+          const _tcwMsg = '🧵 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' TREND-CONT-WF @ $' + (parseFloat(sig.price) || 0).toFixed(2) + ' — with-trend continuation blocked (msTrend ' + s._msTrend + ', any gate); the class behind the 9/9-9/16 missed legs (2026-09-16).';
+          log(sym, _tcwMsg); trackBlockedOutcome(sym, _tcwMsg, true);
+        }
+      }
+    } catch (eTCW) { /* stamp must never crash enrichment */ }
     // ===== ML-DIR SCORING (DORMANT, 2026-08-29) — every XAU signal, fired or blocked =====
     try {
       if (sym === 'XAU' && sig && sig.type && mlModel && mlModel.w) {
@@ -17046,7 +17068,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.53-20260916-earlyprot-bench-tp3close', // bump on each deploy — lets /state verify what's live
+    build: '6.54-20260916-trendcont-wf', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
