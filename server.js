@@ -3567,6 +3567,22 @@ function processPrice(sym, price, hi, lo) {
       const _ihz = s._invHold; s._invHold = null;
       log(sym, '🧹 INV-HOLD ' + String(_ihz.dir || '?').toUpperCase() + ' DROPPED stale (ungated watchdog) — ' + (_ihz.expiry > 0 ? ('expired ' + Math.round((Date.now() - _ihz.expiry) / 60000) + 'min ago unresolved') : 'INVALID expiry (zombie hold)') + '; it was blocking the OTE vet.');
     }
+    // ===== UNGATED ZONE-MAP RESTORE (2026-09-16, Jean: "FVG/OB frozen on xau.html") =====
+    // The persisted zone map (zones + M5 candles + msTrend) was restored inside the
+    // atrVal-gated zone section, so every deploy served an EMPTY zoneMap and a null
+    // msTrend for ~45min — blinding the dashboards, the ZONE gates, AND the big-leg
+    // state machine below. Restore here on the first tick of every boot instead.
+    try {
+      if (isMT5 && !s._zoneRestored) {
+        s._zoneRestored = true;
+        const _zr = _zoneRestore && _zoneRestore[sym];
+        if (_zr) {
+          s._m5 = _zr.m5 || []; s._zoneObs = _zr.zones || []; s._zoneTouched = _zr.touched || {}; s._msTrend = _zr.msTrend || s._msTrend;
+          log(sym, '🗺️ Zone map restored ungated at boot — ' + (s._zoneObs.length) + ' zones, ' + (s._m5.length) + ' M5 candles, msTrend ' + (s._msTrend || '—') + ' (2026-09-16 fix: no more 45min post-deploy blackout).');
+        }
+      }
+    } catch (eZR) { /* restore must never crash the tick */ }
+
     // ===== BIG-LEG OVERRIDE STATE (2026-09-16, Jean: "sometimes we should not wait
     // for macro — the bot needs to take the right decision on a $30+ rise or a $40
     // drawdown. It's not acceptable.") ===== Five documented sessions (9/9, 9/10,
@@ -10535,12 +10551,10 @@ function processPrice(sym, price, hi, lo) {
     try {
       if (isMT5 && atrVal > 0) {
         const _zNow = Date.now();
-        // restore persisted map once per boot (2026-08-12)
-        if (!s._zoneRestored) {
-          s._zoneRestored = true;
-          const _zr = _zoneRestore && _zoneRestore[sym];
-          if (_zr) { s._m5 = _zr.m5 || []; s._zoneObs = _zr.zones || []; s._zoneTouched = _zr.touched || {}; s._msTrend = _zr.msTrend || s._msTrend; }
-        }
+        // restore moved to the UNGATED early section 2026-09-16 (Jean: "FVG/OB frozen on
+        // xau.html") — living here behind atrVal>0 meant every deploy blanked the map,
+        // msTrend and the big-leg state for ~45min while M5 candles rebuilt, even though
+        // the persisted map was on disk. See the ungated restore near the watchdogs.
         // --- incremental M5 candle aggregation from live ticks ---
         const _zBkt = Math.floor(_zNow / 300000);
         if (!s._m5cur || s._m5cur.b !== _zBkt) {
@@ -17135,7 +17149,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.54-20260916-bigleg-live', // bump on each deploy — lets /state verify what's live
+    build: '6.55-20260916-ungated-zone-restore', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
