@@ -3567,6 +3567,53 @@ function processPrice(sym, price, hi, lo) {
       const _ihz = s._invHold; s._invHold = null;
       log(sym, '🧹 INV-HOLD ' + String(_ihz.dir || '?').toUpperCase() + ' DROPPED stale (ungated watchdog) — ' + (_ihz.expiry > 0 ? ('expired ' + Math.round((Date.now() - _ihz.expiry) / 60000) + 'min ago unresolved') : 'INVALID expiry (zombie hold)') + '; it was blocking the OTE vet.');
     }
+    // ===== BIG-LEG OVERRIDE STATE (2026-09-16, Jean: "sometimes we should not wait
+    // for macro — the bot needs to take the right decision on a $30+ rise or a $40
+    // drawdown. It's not acceptable.") ===== Five documented sessions (9/9, 9/10,
+    // 9/14, 9/15, 9/16) of with-trend continuations refused down/up entire legs by
+    // macro-alignment lag and chop labeling. On an objectively large one-sided session
+    // leg with market structure agreeing, s._bigLeg arms and the macro-alignment,
+    // contra-block and chop gates are WAIVED for with-trend continuations. Protective
+    // gates stay untouched: RSI exhaustion, ZONE-VETO, EXT-GUARD crest logic, STRUCT,
+    // FLOOR checks. Thresholds env-tunable (XAU_BIGLEG_UP=30 / XAU_BIGLEG_DN=40,
+    // NAS_BIGLEG_UP=120 / NAS_BIGLEG_DN=150); BIGLEG_DISABLED=1 kills it without a
+    // deploy. Fired rows carry bigLeg:true; PRE-REGISTERED BENCH RULE: net-negative
+    // over the first 6 bigLeg fires → re-bench, same as the night lane.
+    try {
+      // RESPEC 2026-09-16 (Jean): "if Big_Leg catches only after $30 then it should
+      // catch the REVERSE, not the trend — to fire during the leg we need to catch it
+      // at +$10." The continuation window is a BAND: arm at +$10 (leg confirmed,
+      // majority still ahead), disarm at +$30 up / +$40 down where the leg is mature
+      // and the reversal detectors (EXT-FLIP etc.) are the right tool. Env knobs:
+      // XAU_BIGLEG_UP=10 / XAU_BIGLEG_UP_MAX=30 / XAU_BIGLEG_DN=10 / XAU_BIGLEG_DN_MAX=40
+      // (NAS 40/120 and 50/150).
+      s._bigLeg = null;
+      s._bigLegRev = null; // reset unconditionally so the kill switch can never strand a stale reversal-ready state
+      if (isMT5 && sym !== 'BTC' && process.env.BIGLEG_DISABLED !== '1' && s.sessionHigh > -Infinity && s.sessionLow < Infinity && price > 0) {
+        const _blUp = price - s.sessionLow, _blDn = s.sessionHigh - price;
+        const _blUpMin = sym === 'XAU' ? (parseFloat(process.env.XAU_BIGLEG_UP) || 10) : (parseFloat(process.env.NAS_BIGLEG_UP) || 40);
+        const _blUpMax = sym === 'XAU' ? (parseFloat(process.env.XAU_BIGLEG_UP_MAX) || 30) : (parseFloat(process.env.NAS_BIGLEG_UP_MAX) || 120);
+        const _blDnMin = sym === 'XAU' ? (parseFloat(process.env.XAU_BIGLEG_DN) || 10) : (parseFloat(process.env.NAS_BIGLEG_DN) || 50);
+        const _blDnMax = sym === 'XAU' ? (parseFloat(process.env.XAU_BIGLEG_DN_MAX) || 40) : (parseFloat(process.env.NAS_BIGLEG_DN_MAX) || 150);
+        if (_blUp >= _blUpMin && _blUp < _blUpMax && s._msTrend === 'up' && _blUp > _blDn) s._bigLeg = 'call';
+        else if (_blDn >= _blDnMin && _blDn < _blDnMax && s._msTrend === 'down' && _blDn > _blUp) s._bigLeg = 'put';
+        // ===== REVERSAL-READY (2026-09-16, Jean: "it shouldn't disarm at +$30 — it
+        // should get ready for reversal") ===== Past the band's ceiling the leg is
+        // mature: the continuation waiver closes and the OPPOSITE side arms instead.
+        // Effect: XAU EXT-FLIP's conv-3 tier (benched 9/15 for random fades) reopens
+        // in exactly this state — a mature-leg flip with zone confluence is Jean's
+        // designed reversal context, not a random fade. Fired flips carry bigLegRev.
+        if (isMT5 && sym !== 'BTC' && process.env.BIGLEG_DISABLED !== '1') {
+          if (_blUp >= _blUpMax && _blUp > _blDn) s._bigLegRev = 'put';
+          else if (_blDn >= _blDnMax && _blDn > _blUp) s._bigLegRev = 'call';
+          if (s._bigLegRev && Date.now() - (s._blRevLogTs || 0) > 300000) {
+            s._blRevLogTs = Date.now();
+            log(sym, '🔁 BIG-LEG MATURE — leg ' + (s._bigLegRev === 'put' ? '+$' + _blUp.toFixed(0) + ' up' : '−$' + _blDn.toFixed(0) + ' down') + ' past the band ceiling; reversal-ready ' + s._bigLegRev.toUpperCase() + ' (EXT-FLIP conv-3 door reopens with zone confluence).');
+          }
+        }
+      }
+    } catch (eBL) { /* big-leg state must never crash the tick */ }
+
     // ===== UNGATED VET (2026-09-14, replaces the 30s dumb-release) =====
     // 9/13 22:23 and 9/14 03:57: BOTH fires force-released at exactly the 30s bound
     // with "no stuck hold" — the main vet (inside the zone-map section) is being
@@ -5227,6 +5274,9 @@ function processPrice(sym, price, hi, lo) {
     const _esPassed = enrichSigCore(sig);
     // Regime cache for latchAdvSource (2026-09-02) — fresh on every scored signal
     try { if (sig && sig._regime) s._lastRegime = { dir: sig._regime.dir, netChgPct: sig._regime.netChgPct, ts: Date.now() }; } catch (eRC) {}
+    // BIG-LEG fire marker (2026-09-16): fired rows during an armed big leg carry
+    // bigLeg:true so the nightly grades the override; bench rule = net-negative first 6.
+    try { if (_esPassed && sig && s._bigLeg === sig.type) sig.bigLeg = true; } catch (eBLM) {}
     // ===== TREND-CONT-WF — ALL-GATES with-trend continuation stamp (2026-09-16) =====
     // The CHOP-TREND-WF tag (9/15) only catches candidates that REACH the chop gate;
     // Jean's 9/16 report (4331→4360→4325→4335, zero fires) showed today's with-trend
@@ -7816,6 +7866,14 @@ function processPrice(sym, price, hi, lo) {
               log(sym, _cmMsg); trackBlockedOutcome(sym, _cmMsg, true);
             }
           } catch (eCM) {}
+          // ===== BIG-LEG CHOP WAIVER (2026-09-16, Jean) ===== The chop detector
+          // overfires on staircase trends; on an armed big leg, a with-trend
+          // continuation may pass the chop gate (protective gates downstream still
+          // apply — this is a waiver, not a fire). Checked BEFORE the emit-state
+          // rollback so a waived signal keeps its pre-fire counters intact.
+          if (s._bigLeg === sig.type && /RIDE|TREND|FAST|SUST|6\/6/.test(tagEarly)) {
+            log(sym, '🚀 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' chop gate WAIVED (BIG-LEG 2026-09-16) — with-trend continuation on a one-sided session leg (msTrend ' + s._msTrend + '); proceeding through remaining gates.');
+          } else {
           Object.assign(s, _emitSnapshot);
           // Force-tracked since 5.63 (2026-08-18, Jean: "how many saves vs misses from the chop
           // gate?" — answer was unknowable: sample-only tracking, no cohort). The 3-min global
@@ -7834,6 +7892,7 @@ function processPrice(sym, price, hi, lo) {
           log(sym, _chopMsg);
           sig._blockedBy = 'CHOP'; // REGIME-BIAS audition marker (2026-08-31)
           return false;
+          } // end BIG-LEG chop waiver else (2026-09-16)
         }
       }
     }
@@ -8303,7 +8362,11 @@ function processPrice(sym, price, hi, lo) {
             }
           }
         } catch (eCB) { _rcCB = null; }
-        if (_rcCB) {
+        if (s._bigLeg === sig.type) {
+          // BIG-LEG waiver (2026-09-16, Jean): on a $30+/$40+ one-sided leg with structure
+          // agreeing, don't wait for the macro board — it lags exactly these legs.
+          log(sym, '🚀 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' contra-block WAIVED (BIG-LEG 2026-09-16) — one-sided session leg with msTrend ' + s._msTrend + '; macro lag does not veto large-leg continuation.');
+        } else if (_rcCB) {
           if (_rcCBStruct && typeof _rcCBStruct.structSl === 'number') { s._structSl = _rcCBStruct.structSl; s._structSlUntil = Date.now() + 5000; }
           log(sym, '↪️ ' + tagEarly + ' ' + sig.type.toUpperCase() + ' contra-block WAIVED (Phase 3.97) — conv ' + sig.conv.score + ' + recovery ' + _rcCB.offPct.toFixed(2) + '% off 30-min extreme (held ' + Math.round(_rcCB.ageMin) + 'min)' + (_rcCBStruct && _rcCBStruct.anchorName ? ' · anchored to ' + _rcCBStruct.anchorName + ' $' + _rcCBStruct.anchor.toFixed(2) : '') + '. Macro alignment lags V-reversals.');
         } else {
@@ -9621,7 +9684,10 @@ function processPrice(sym, price, hi, lo) {
           } catch (eZP) {}
           if (!_nzLive) efReason = 'EXT-FLIP conv floor — conv ' + _efConv + ' < 3 (BTC autopsy 7/24: conv≤2 = 1W/12SL/−$985; conv≥3 = 3W/1L/+$300; XAU 8/2-3: conv≤1 = 0W/2SL)';
         }
-        else if (sym === 'XAU' && _efConv === 3) {
+        else if (sym === 'XAU' && _efConv === 3 && s._bigLegRev !== EF.dir) {
+          // (reversal-ready exemption 2026-09-16: when the big leg is mature and this flip
+          // fades it, the conv-3 tier falls through to the ORIGINAL conv-3-with-zone rule
+          // below — full gate chain still applies. Random conv-3 fades stay benched.)
           // ===== XAU DAY EXT-FLIP CONV-3 BENCH (2026-09-15, Jean: "what should we do
           // here") ===== XAU EXT-FLIP runs ~27% lifetime (vs NAS 67% — the 8/21
           // do-not-pool split); the night half is already benched, and the 9/15 08:13
@@ -9681,6 +9747,7 @@ function processPrice(sym, price, hi, lo) {
           s.lastSameDir = EF.dir; s.lastSameDirMacd = Math.abs(macdHist); s.lastSameDirTs = now2; s.lastSameDirPrice = price;
           const sigEf = { type: EF.dir, time: ts(), price: price.toFixed(2), score: (efCall ? '⬆' : '⬇') + 'EXT-FLIP', rsi: rsiV.toFixed(1), macd: macdL.toFixed(3), roc: (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '%', num: s.dailySignalCount };
           if (Date.now() - (s._nzLiveTs || 0) < 5000) sigEf.nightZone = true; // NIGHT-ZONE promoted fire (2026-09-07) — grade these against the 0W/3L bench rule
+          if (s._bigLegRev === EF.dir) sigEf.bigLegRev = true; // mature-leg reversal fire (2026-09-16) — grade the reversal-ready state
           try {
             const cEf = convictionFor(EF.dir);
             sigEf.conv = { score: cEf.score, label: cEf.score >= 5 ? 'HIGH' : cEf.score >= 3 ? 'MOD' : 'LOW', factors: cEf.factors };
@@ -10054,7 +10121,7 @@ function processPrice(sym, price, hi, lo) {
     // paths while QQQ was closed (00:56 LLF −$35, 05:48 CHoCH −$35, both adverseFrac ≥1.0),
     // while the day's fade WINNER (14:51 LLF, adverseFrac 0.45) came during RTH with QQQ
     // trading. On NAS the base paths are no longer sufficient: no QQQ fade fire → no NAS fade.
-    const lhfPutMacroOk  = isNAS ? _lhfQqqMirror : (_lhfMacroBase || _lhfFadeAtHigh);
+    const lhfPutMacroOk  = (isNAS ? _lhfQqqMirror : (_lhfMacroBase || _lhfFadeAtHigh)) || s._bigLeg === 'put'; // BIG-LEG waiver 2026-09-16: on a $40+ drawdown leg, dip-shorts don't wait for the macro board
     const lhfPutFlipOk   = flipCoolFor('put');
     const lhfPutWinOk    = winProtectDir !== 'call';
     if (lhfPutTimingOk && lhfPutDistOk && lhfPutRangeOk && lhfPutCoolOk &&
@@ -10256,7 +10323,7 @@ function processPrice(sym, price, hi, lo) {
       llfCallObOk ||
       llfCallHtfReversalOk;
     // NAS: QQQ mirror exclusive — see LHF PUT site above (2026-08-06).
-    const llfCallMacroOk  = isNAS ? _llfQqqMirror : (_llfMacroBase || _llfFadeAtLow);
+    const llfCallMacroOk  = (isNAS ? _llfQqqMirror : (_llfMacroBase || _llfFadeAtLow)) || s._bigLeg === 'call'; // BIG-LEG waiver 2026-09-16: on a $30+ rise leg, dip-buys don't wait for the macro board
     const llfCallFlipOk   = flipCoolFor('call');
     const llfCallWinOk    = winProtectDir !== 'put';
     // ===== PHASE 3.92 — LLF FRESHNESS GATE (2026-07-06) =====
@@ -17068,7 +17135,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.54-20260916-trendcont-wf', // bump on each deploy — lets /state verify what's live
+    build: '6.54-20260916-bigleg-live', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
