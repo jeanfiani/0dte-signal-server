@@ -10606,13 +10606,25 @@ function processPrice(sym, price, hi, lo) {
                   const _etMsg = '🛡️ EARLY-PROT SKIPPED (tight-stop exemption, 2026-09-10) — ' + String(_ept.type || '').toUpperCase() + ' @ $' + (+_ept.ep).toFixed(2) + ' peaked +$' + (_ept._pkFav || 0).toFixed(2) + ' then decayed, but SL risk $' + _epRisk.toFixed(2) + ' ≤ 0.7× TP1 $' + _epT1d.toFixed(2) + ' — the tight stop is the protection; holding.';
                   log(sym, _etMsg); trackBlockedOutcome(sym, _etMsg, true);
                 }
-              } else {
+              } else if (process.env.EARLY_PROTECT === '1') {
               _ept._epStop = true;
               const _epId = 'protect-' + Date.now();
               s.closeRequest = { active: true, id: _epId, ts: Date.now(), type: _ept.type || '', ep: _ept.ep || 0, source: 'early-protect' };
               log(sym, '🛡️ EARLY PROTECT — ' + String(_ept.type || '').toUpperCase() + ' @ $' + (+_ept.ep).toFixed(2) + ' peaked +$' + (_ept._pkFav || 0).toFixed(2) + ' (≥60% of TP1 $' + _epT1d.toFixed(2) + ') then decayed to +$' + _epFav.toFixed(2) + '; EA close requested — a trade that nearly reached TP1 may not round-trip to a stop (Jean 2026-08-19) [id ' + _epId + '].');
               sendPush('🛡️ ' + sym + ' early protect', 'Closing ' + String(_ept.type || '').toUpperCase() + ' near BE @ $' + price.toFixed(2) + ' (peaked +$' + (_ept._pkFav || 0).toFixed(2) + ')', 'signal');
               try { trackBlockedOutcome(sym, '🛡️ EARLY-PROT CLOSED ' + String(_ept.type || '').toUpperCase() + ' @ $' + price.toFixed(2) + ' (entry $' + (+_ept.ep).toFixed(2) + ', peaked +$' + (_ept._pkFav || 0).toFixed(2) + ') — bracket grades what holding would have done.', true); } catch (eEPT) {}
+              } else {
+              // ===== EARLY PROTECT BENCHED (2026-09-16, Jean: "maybe we should remove
+              // early protect?") ===== Since grading began (9/10) the rule's closed-trade
+              // brackets are 3W/0L/3S — every position it flattened would have WON by
+              // holding, and its signature act was closing Jean's 4-lot TRv2 call at
+              // 23:08:29, four minutes before a 13-second TP1→TP3 sweep (~$3,400 at his
+              // size). The 8/19 motivating case has not recurred. Benched to stamp-only;
+              // EARLY_PROTECT=1 in Railway env re-arms without a deploy. Re-arm bar:
+              // WOULD-CLOSE brackets showing holding LOSES ≥60% over ≥15 resolved.
+              _ept._epStop = true; // one stamp per trade, same as the live rule
+              const _ebMsg = '🛡️ EARLY-PROT WOULD-CLOSE (benched 2026-09-16) — ' + String(_ept.type || '').toUpperCase() + ' @ $' + price.toFixed(2) + ' (entry $' + (+_ept.ep).toFixed(2) + ', peaked +$' + (_ept._pkFav || 0).toFixed(2) + ' then decayed to +$' + _epFav.toFixed(2) + '); holding — bracket grades what the close would have saved.';
+              log(sym, _ebMsg); try { trackBlockedOutcome(sym, _ebMsg, true); } catch (eEB) {}
               }
             }
           }
@@ -15240,6 +15252,16 @@ function updateSignalOutcome(sym, finalPrice) {
       entry.outcomes.tp3Hit = true; entry.outcomes.tp3HitTs = now;
       entry.outcomes.closePrice = finalPrice;
       if (t.ep > 0 && finalPrice > 0) bookPnl(sym, 0.5 * (t.type === 'call' ? finalPrice - t.ep : t.ep - finalPrice) * pnlMultFor(sym, t), 'close');
+      // ===== TP3 CLOSE COMMAND (2026-09-16, Jean's 23:02 TRv2 case) ===== The 9/15
+      // 23:02 call swept TP1→TP3 in THIRTEEN SECONDS; the trade cleared server-side
+      // between EA polls, so the EA never banked the partials — its BE fallback then
+      // gave the whole position back on the 23:47 dip (server +8.56, Jean ~flat). When
+      // the TP3 path closes a trade, tell the EA to flatten at market NOW via the
+      // existing closeRequest channel (id-deduped, 60s TTL; a flat EA just acks).
+      if (!(s.closeRequest && s.closeRequest.active)) {
+        s.closeRequest = { active: true, id: 'tp3-' + Date.now(), ts: Date.now(), type: t.type || '', ep: t.ep || 0, source: 'tp3-close' };
+        log(sym, '🚪 TP3 CLOSE REQUEST → EA — trade swept to TP3 @ $' + (+finalPrice).toFixed(2) + '; flatten at market so fast sweeps can never outrun the poll again (2026-09-16).');
+      }
       // Mark post-TP3 cooldown for this direction (added 2026-05-14). 90 min block on
       // same-direction signals — the move is exhausted, chasing it leads to losers
       // (5/14 signal #2 SL'd 32 min after signal #1 hit TP3 in same direction).
@@ -17024,7 +17046,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.52-20260915-range5-choptrend-c3bench', // bump on each deploy — lets /state verify what's live
+    build: '6.53-20260916-earlyprot-bench-tp3close', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
