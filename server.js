@@ -3765,14 +3765,16 @@ function processPrice(sym, price, hi, lo) {
             if (_lvlL && price - _lvlL <= 0.1 * _adr) {
               s._r5.longR = { lvl: _lvlL, ep: price, sl: +(_lvlL - 0.75 * _adr).toFixed(2), tp: +((_lvlL + s.rollingHigh) / 2).toFixed(2), tpFar: s.rollingHigh, ts: Date.now(), farHit: false };
               log(sym, '🎢 ' + _r5Tag + '-RT LONG armed'.replace(' armed','') + ' armed @ $' + price.toFixed(0) + ' — retest of unbroken prior-day low $' + _lvlL.toFixed(0) + ' · SL $' + s._r5.longR.sl.toFixed(0) + ' · TP mid $' + s._r5.longR.tp.toFixed(0) + ' · far $' + s.rollingHigh.toFixed(0) + ' (dormant shadow).');
-              // ===== RANGE5-RT LIVE LANE (2026-09-14, Jean: "get ready — it will be
-              // soon") ===== OFF by default; BTC_RANGE5_LIVE=1 in Railway env arms it
-              // with NO deploy. Fires the SAME retest entry for real, thesis geometry:
+              // ===== RANGE5-RT LIVE LANE (2026-09-14; LIVE 2026-09-17, Jean: "BTC-Range
+              // goes live" — shadow cohort 5W/1L incl. same-day 09:39 low-retest win) =====
+              // ON by default; BTC_RANGE5_LIVE=0 in Railway env is the kill switch (no
+              // deploy needed). Fires the retest entry for real, thesis geometry:
               // structural SL 0.75×ADR beyond the level (cap-exempt via _r5Live), TP1
-              // at the 5-day mid (EA banks half), TP2/TP3 at the far extreme. Cohort
-              // to watch before flipping: BTC-RANGE5-RT (3W/1L at build time).
+              // at the 5-day mid (EA banks half), TP2/TP3 at the far extreme.
+              // BENCH RULE (pre-registered): net-negative over the first 6 resolved live
+              // fires → back to shadow. Shadow arm keeps grading BTC-RANGE5-RT regardless.
               try {
-                if (sym === 'BTC' && process.env.BTC_RANGE5_LIVE === '1' && !btcWeekendClosed() && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold) {
+                if (sym === 'BTC' && process.env.BTC_RANGE5_LIVE !== '0' && !btcWeekendClosed() && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold) {
                   s.dailySignalCount++;
                   const _rlV = s._r5.longR;
                   const _rlSig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆RANGE5-RT', rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: _rlV.sl.toFixed(2), tp1: _rlV.tp.toFixed(2), tp2: (+_rlV.tpFar).toFixed(2), tp3: (+_rlV.tpFar).toFixed(2), oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: 'range5-rt level entry' } };
@@ -3791,9 +3793,9 @@ function processPrice(sym, price, hi, lo) {
             if (_lvlH && _lvlH - price <= 0.1 * _adr) {
               s._r5.shortR = { lvl: _lvlH, ep: price, sl: +(_lvlH + 0.75 * _adr).toFixed(2), tp: +((_lvlH + s.rollingLow) / 2).toFixed(2), tpFar: s.rollingLow, ts: Date.now(), farHit: false };
               log(sym, '🎢 ' + _r5Tag + '-RT SHORT armed'.replace(' armed','') + ' armed @ $' + price.toFixed(0) + ' — retest of unbroken prior-day high $' + _lvlH.toFixed(0) + ' · SL $' + s._r5.shortR.sl.toFixed(0) + ' · TP mid $' + s._r5.shortR.tp.toFixed(0) + ' · far $' + s.rollingLow.toFixed(0) + ' (dormant shadow).');
-              // RANGE5-RT LIVE LANE — short mirror (see long side above; BTC_RANGE5_LIVE=1 arms).
+              // RANGE5-RT LIVE LANE — short mirror (see long side above; LIVE 2026-09-17, BTC_RANGE5_LIVE=0 kills).
               try {
-                if (sym === 'BTC' && process.env.BTC_RANGE5_LIVE === '1' && !btcWeekendClosed() && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold) {
+                if (sym === 'BTC' && process.env.BTC_RANGE5_LIVE !== '0' && !btcWeekendClosed() && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold) {
                   s.dailySignalCount++;
                   const _rsV = s._r5.shortR;
                   const _rsSig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇RANGE5-RT', rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: _rsV.sl.toFixed(2), tp1: _rsV.tp.toFixed(2), tp2: (+_rsV.tpFar).toFixed(2), tp3: (+_rsV.tpFar).toFixed(2), oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: 'range5-rt level entry' } };
@@ -15282,9 +15284,14 @@ function attachTpSl(sig, type, price, atr, sym) {
   // XAU TP1 hard-capped at $5 (mirrors buildCfdTrade — added 2026-05-19)
   const tp1D = isXAU ? 5.0 : Math.max(atr * mults.t1, 5);
   const slD = isXAU ? Math.min(Math.max(atr * mults.sl, 5), 10) : Math.max(atr * mults.sl, 5);
+  // Birth-order enforcement (2026-09-17): XAU's TP1 is a fixed $5 while TP2/TP3 are
+  // ATR multiples — in a dead-ATR tape the ATR ladder can be born INSIDE TP1 (the
+  // 03:10 call's inverted panel). Never emit tp2 nearer than tp1, or tp3 nearer than tp2.
+  let tp2D = Math.max(atr * mults.t2, tp1D);
+  let tp3D = Math.max(atr * mults.t3, tp2D);
   sig.tp1 = (iC ? price + tp1D : price - tp1D).toFixed(2);
-  sig.tp2 = (iC ? price + atr * mults.t2 : price - atr * mults.t2).toFixed(2);
-  sig.tp3 = (iC ? price + atr * mults.t3 : price - atr * mults.t3).toFixed(2);
+  sig.tp2 = (iC ? price + tp2D : price - tp2D).toFixed(2);
+  sig.tp3 = (iC ? price + tp3D : price - tp3D).toFixed(2);
   sig.sl = (iC ? price - slD : price + slD).toFixed(2);
   return sig;
 }
@@ -15463,6 +15470,7 @@ function checkExit(sym, price) {
     // instantly cascades TP2/TP3 (carried R-1). Enforce order every tick pre-TP1
     // (idempotent, also re-fixes OTE-fill level shifts): call tp1≤tp2≤tp3, put mirrored.
     if (!t.t1 && !t.sl && typeof t.tp1Price === 'number' && typeof t.tp2Price === 'number') {
+      const _mb2 = t.tp2Price, _mb3 = t.tp3Price;
       if (iC) {
         if (t.tp2Price < t.tp1Price) t.tp2Price = t.tp1Price;
         if (typeof t.tp3Price === 'number' && t.tp3Price < t.tp2Price) t.tp3Price = t.tp2Price;
@@ -15470,6 +15478,16 @@ function checkExit(sym, price) {
         if (t.tp2Price > t.tp1Price) t.tp2Price = t.tp1Price;
         if (typeof t.tp3Price === 'number' && t.tp3Price > t.tp2Price) t.tp3Price = t.tp2Price;
       }
+      // Row write-through (2026-09-17, the 03:10 call): when the clamp reorders the live
+      // ladder, the history row must follow — dashboards/mobile/EA render the ROW, and a
+      // silently-fixed trade left the panel showing TP2 below TP1 for the whole trade.
+      try {
+        if ((t.tp2Price !== _mb2 || t.tp3Price !== _mb3) && entry && entry.symbol === sym) {
+          entry.tp2 = +t.tp2Price.toFixed(2);
+          if (typeof t.tp3Price === 'number') entry.tp3 = +t.tp3Price.toFixed(2);
+          log(sym, '📐 LADDER-REORDERED — ' + t.type.toUpperCase() + ' TP2 ' + (_mb2 !== t.tp2Price ? '$' + _mb2.toFixed(2) + '→$' + t.tp2Price.toFixed(2) : 'ok') + ', TP3 ' + (_mb3 !== t.tp3Price && typeof _mb3 === 'number' ? '$' + _mb3.toFixed(2) + '→$' + t.tp3Price.toFixed(2) : 'ok') + ' (monotonicity clamp, row synced 2026-09-17).');
+        }
+      } catch (eMB) {}
     }
     // ===== UNIVERSAL TP1/SL CAP — SAFETY NET (2026-09-04, Jean's 9/4 fires) =====
     // Two live escapes on 9/4: the 10:18 EXT-FLIP put served TP1 $14.60 from entry
@@ -17158,8 +17176,8 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.56-20260917-flash-marker-capsync', // bump on each deploy — lets /state verify what's live
-    btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
+    build: '6.58-20260917-btc-range5-live', // bump on each deploy — lets /state verify what's live
+    btcMode: BTC_TRADING_ENABLED ? 'FULL' : (process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE + V-REC (all other detectors dormant)' : 'V-REC ONLY (all other detectors dormant)'),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     gexLevels: sym === 'NAS100' || sym === 'QQQ' ? _gexLevels : undefined, // QQQ dealer gamma map (2026-08-12)
