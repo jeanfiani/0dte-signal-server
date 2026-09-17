@@ -1919,7 +1919,8 @@ function cohortFor(reason) {
   if (/NAS-RTH/.test(reason)) return 'NAS-RTH'; // RTH-only gate blocks (2026-09-09) — early so detector tags in the message don't steal the row
   if (/NIGHT-MOMVETO/.test(reason)) return 'NIGHT-MOMVETO'; // night momentum-minimum vetoes (2026-09-09) — must precede the [NIGHT] match; if vetoed fires WIN ≥60%/15 the thresholds are too tight
   if (/EARLY-PROT/.test(reason)) return 'EARLY-PROT'; // early-protect closes + tight-stop skips (2026-09-10, the 00:45 TP3-that-got-flattened case) — SKIPPED rows grade the exemption, CLOSED rows grade the rule itself
-  if (/FVG-RT/.test(reason)) return 'FVG-RT'; // mapped-FVG retest dormant arm (2026-09-12, Jean's 9/9 hand trade) — must precede ZONE-* matches
+  if (/FVG-RT2/.test(reason)) return 'FVG-RT2'; // v2 zone-anchored re-grade (2026-09-17, Jean "approve the v2 zone") — must precede FVG-RT
+  if (/FVG-RT/.test(reason)) return 'FVG-RT'; // mapped-FVG retest dormant arm (2026-09-12, Jean's 9/9 hand trade) — must precede ZONE-* matches; v1 tally frozen 2026-09-17 (8W/41L verdict on ±cap grading)
   if (/NIGHT-BENCHED/.test(reason)) return 'NIGHT-BENCH-WF'; // re-benched night-waiver would-fires (2026-09-12) — before the [NIGHT] match so the benched lane grades separately from generic night stamps
   if (/CHOCH-NIGHT/.test(reason)) return 'CHOCH-NIGHT'; // night CHoCH stand-down (2026-09-14, the 22:23 crest specimen) — must precede CHOCH-V2 and [NIGHT] matches
   if (/CHOP-TREND-WF/.test(reason)) return 'CHOP-TREND-WF'; // with-trend continuations refused by chop mode (2026-09-15) — must precede CHOP-* matches; ≥60%/15 promotes a with-trend chop waiver
@@ -2277,9 +2278,10 @@ function updateBlockedOutcomes(sym, price) {
       const beReached = b.type === 'call' ? price <= b.price : price >= b.price;
       if (beReached) { b.slHit = true; b.slHitTs = now; }
     }
-    // Close conditions: 60min elapsed OR resolved (TP1+SL=scratch, SL only=loss, etc.)
+    // Close conditions: 60min elapsed (or per-entry maxMin — FVG-RT2's structural 1.5R
+    // targets need ~3h, the 9/9 hand-trade's duration; 2026-09-17) OR resolved.
     const resolved = (b.tp1Hit && b.slHit) || (b.slHit && !b.tp1Hit);
-    if (elapsedMin >= 60 || resolved) {
+    if (elapsedMin >= (b.maxMin || 60) || resolved) {
       if (b.tp1Hit && b.slHit) b.outcome = 'scratch';
       else if (b.tp1Hit && !b.slHit) b.outcome = 'win';
       else if (b.slHit && !b.tp1Hit) b.outcome = 'loss';
@@ -10626,8 +10628,30 @@ function processPrice(sym, price, hi, lo) {
                 if (_frZ) {
                   s._fvgRtTs[_frDir] = Date.now();
                   const _frSl = _frDir === 'call' ? _frZ.lo : _frZ.hi;
-                  const _frMsg = '🟦 FVG-RT ' + _frDir.toUpperCase() + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — retest of mapped ' + _frZ.tf + ' ' + _frDir + ' FVG $' + _frZ.lo.toFixed(2) + '-$' + _frZ.hi.toFixed(2) + ' with msTrend ' + s._msTrend + '; SL would anchor beyond $' + _frSl.toFixed(2) + ' (2026-09-12, Jean’s 9/9 +$3,113 hand trade).';
-                  log(sym, _frMsg); trackBlockedOutcome(sym, _frMsg, true);
+                  // ===== FVG-RT v2 — ZONE-ANCHORED RE-GRADE (2026-09-17, Jean: "approve the
+                  // v2 zone") ===== v1's symmetric ±cap bracket graded 8W/41L (16%) — but it
+                  // measured a scalp the lane never proposed. The thesis is structural: SL
+                  // beyond the zone's far edge (+0.15×ATR buffer), TP at 1.5× risk — the
+                  // geometry of the 9/9 hand trade. v1 tally FROZEN as the verdict on
+                  // symmetric grading; v2 builds cohort FVG-RT2 fresh. Promote at ≥60%
+                  // over ≥15 resolved, macro-aligned vs contra split via the message.
+                  const _frAtr = s._atr || 0;
+                  if (_frAtr > 0) {
+                    const _frSl2 = _frDir === 'call' ? +(_frZ.lo - 0.15 * _frAtr).toFixed(2) : +(_frZ.hi + 0.15 * _frAtr).toFixed(2);
+                    const _frRisk = Math.abs(price - _frSl2);
+                    const _frTp2 = _frDir === 'call' ? +(price + 1.5 * _frRisk).toFixed(2) : +(price - 1.5 * _frRisk).toFixed(2);
+                    const _frMsg2 = '🟦 FVG-RT2 ' + _frDir.toUpperCase() + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — retest of mapped ' + _frZ.tf + ' ' + _frDir + ' FVG $' + _frZ.lo.toFixed(2) + '-$' + _frZ.hi.toFixed(2) + ' with msTrend ' + s._msTrend + ' · zone-anchored SL $' + _frSl2.toFixed(2) + ' (risk $' + _frRisk.toFixed(2) + ') · TP 1.5R $' + _frTp2.toFixed(2) + ' (v2 re-grade, Jean 2026-09-17; v1 ±cap frozen 8W/41L).';
+                    s.blockedOutcomes = s.blockedOutcomes || [];
+                    s.blockedOutcomes.push({
+                      ts: Date.now(), time: ts(), symbol: sym, detector: 'FVG-RT2', type: _frDir,
+                      price: price, virtualTp1: _frTp2, virtualSl: _frSl2, maxMin: 180,
+                      blockReason: _frMsg2,
+                      snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+                      tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null,
+                      closed: false, closedTs: null, outcome: null
+                    });
+                    log(sym, _frMsg2);
+                  }
                 }
               }
             }
@@ -17176,7 +17200,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.58-20260917-btc-range5-live', // bump on each deploy — lets /state verify what's live
+    build: '6.59-20260917-fvgrt2-regrade', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : (process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE + V-REC (all other detectors dormant)' : 'V-REC ONLY (all other detectors dormant)'),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
