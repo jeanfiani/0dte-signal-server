@@ -15341,6 +15341,11 @@ function updateSignalOutcome(sym, finalPrice) {
       }
     }
   } catch (eMae) { /* MAE/MFE recording must never affect outcome stamping */ }
+  // FLASH-TRADE MARKER (2026-09-17): a trade whose first outcome lands <12s after
+  // activation lived entirely inside the EA's visibility window — no one could have
+  // taken it. Mark the row so tallies/reports can separate server-only flashes from
+  // real trades (the 9/16 15:09 NAS put counted as a fire nobody saw).
+  try { if (t.ts && now - t.ts < 12000 && !entry.outcomes.flash) entry.outcomes.flash = true; } catch (eFL) {}
   if (t.t1 && !entry.outcomes.tp1Hit) {
     entry.outcomes.tp1Hit = true; entry.outcomes.tp1HitTs = now;
     // book the realized TP1 half (2026-08-17)
@@ -15485,6 +15490,10 @@ function checkExit(sym, price) {
           const _oldT1 = t.tp1Price;
           t.tp1Price = +(iC ? t.ep + _capT : t.ep - _capT).toFixed(2);
           log(sym, '📏 TP1-CAPPED — ' + t.type.toUpperCase() + ' TP1 $' + _oldT1.toFixed(2) + ' was $' + Math.abs(t.ep - _oldT1).toFixed(2) + ' from entry (cap $' + _capT + '); clamped to $' + t.tp1Price.toFixed(2) + ' (universal net, 2026-09-04).');
+          // Display sync (2026-09-17, the 9/16 15:09 NAS phantom-put confusion): the row
+          // kept the PRE-clamp tp1 (251pts away) while the trade traded the clamped one —
+          // rewrite the row so app/EA/analytics all see the real bracket.
+          try { if (s.lastHistEntry && s.lastHistEntry.symbol === sym && s.lastHistEntry.tp1) s.lastHistEntry.tp1 = t.tp1Price.toFixed(2); } catch (eCS) {}
         }
         if (typeof t.slPrice === 'number' && t.slPrice > 0 && Math.abs(t.ep - t.slPrice) > 2.5 * _capT + 0.01) {
           const _oldSl = t.slPrice;
@@ -17149,7 +17158,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.55-20260916-ungated-zone-restore', // bump on each deploy — lets /state verify what's live
+    build: '6.56-20260917-flash-marker-capsync', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : 'V-REC ONLY (all other detectors dormant)',
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
