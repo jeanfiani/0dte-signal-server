@@ -3613,14 +3613,35 @@ function processPrice(sym, price, hi, lo) {
       // (NAS 40/120 and 50/150).
       s._bigLeg = null;
       s._bigLegRev = null; // reset unconditionally so the kill switch can never strand a stale reversal-ready state
-      if (isMT5 && sym !== 'BTC' && process.env.BIGLEG_DISABLED !== '1' && s.sessionHigh > -Infinity && s.sessionLow < Infinity && price > 0) {
-        const _blUp = price - s.sessionLow, _blDn = s.sessionHigh - price;
+      if (isMT5 && sym !== 'BTC' && process.env.BIGLEG_DISABLED !== '1' && price > 0) {
+        // ===== PIVOT-BASED LEG MEASURE (2026-09-18, Jean: "if there are 3-4 big legs
+        // in a day the bot needs to see them all") ===== The session-extreme measure +
+        // dominance tie-breaker could only ever see the day's FIRST leg: on 9/18 the
+        // $54 down-leg (08:00-10:30) and the $37 recovery (11:45-12:45) were both
+        // structurally invisible because the session was already $58 wide and the
+        // opposite extreme always dominated. The leg is now measured from the LAST
+        // STRUCTURE PIVOT — the price extreme reached since msTrend last flipped —
+        // so every swing of the day gets its own band. Bands, waivers, bench rule
+        // and BIGLEG_DISABLED kill switch unchanged.
+        try {
+          if (s._msTrend === 'up' || s._msTrend === 'down') {
+            if (!s._legPivot || s._legPivot.trend !== s._msTrend) s._legPivot = { trend: s._msTrend, ext: price, ts: Date.now() };
+            else s._legPivot.ext = s._msTrend === 'up' ? Math.min(s._legPivot.ext, price) : Math.max(s._legPivot.ext, price);
+          }
+        } catch (eLP) {}
+        const _blUp = (s._legPivot && s._legPivot.trend === 'up') ? price - s._legPivot.ext : 0;
+        const _blDn = (s._legPivot && s._legPivot.trend === 'down') ? s._legPivot.ext - price : 0;
         const _blUpMin = sym === 'XAU' ? (parseFloat(process.env.XAU_BIGLEG_UP) || 10) : (parseFloat(process.env.NAS_BIGLEG_UP) || 40);
         const _blUpMax = sym === 'XAU' ? (parseFloat(process.env.XAU_BIGLEG_UP_MAX) || 30) : (parseFloat(process.env.NAS_BIGLEG_UP_MAX) || 120);
         const _blDnMin = sym === 'XAU' ? (parseFloat(process.env.XAU_BIGLEG_DN) || 10) : (parseFloat(process.env.NAS_BIGLEG_DN) || 50);
         const _blDnMax = sym === 'XAU' ? (parseFloat(process.env.XAU_BIGLEG_DN_MAX) || 40) : (parseFloat(process.env.NAS_BIGLEG_DN_MAX) || 150);
-        if (_blUp >= _blUpMin && _blUp < _blUpMax && s._msTrend === 'up' && _blUp > _blDn) s._bigLeg = 'call';
-        else if (_blDn >= _blDnMin && _blDn < _blDnMax && s._msTrend === 'down' && _blDn > _blUp) s._bigLeg = 'put';
+        if (_blUp >= _blUpMin && _blUp < _blUpMax && s._msTrend === 'up') s._bigLeg = 'call';
+        else if (_blDn >= _blDnMin && _blDn < _blDnMax && s._msTrend === 'down') s._bigLeg = 'put';
+        // Arm log (2026-09-18, throttled 5min) — verification that legs are being seen.
+        if (s._bigLeg && Date.now() - (s._blArmLogTs || 0) > 300000) {
+          s._blArmLogTs = Date.now();
+          log(sym, '🦵 BIG-LEG ARMED ' + s._bigLeg.toUpperCase() + ' — leg ' + (s._bigLeg === 'call' ? '+$' + _blUp.toFixed(1) : '−$' + _blDn.toFixed(1)) + ' from pivot $' + (s._legPivot ? s._legPivot.ext.toFixed(2) : '?') + ' (msTrend ' + s._msTrend + '; band, waivers live).');
+        }
         // ===== REVERSAL-READY (2026-09-16, Jean: "it shouldn't disarm at +$30 — it
         // should get ready for reversal") ===== Past the band's ceiling the leg is
         // mature: the continuation waiver closes and the OPPOSITE side arms instead.
@@ -3628,8 +3649,10 @@ function processPrice(sym, price, hi, lo) {
         // in exactly this state — a mature-leg flip with zone confluence is Jean's
         // designed reversal context, not a random fade. Fired flips carry bigLegRev.
         if (isMT5 && sym !== 'BTC' && process.env.BIGLEG_DISABLED !== '1') {
-          if (_blUp >= _blUpMax && _blUp > _blDn) s._bigLegRev = 'put';
-          else if (_blDn >= _blDnMax && _blDn > _blUp) s._bigLegRev = 'call';
+          // Pivot measure (2026-09-18): a leg past its ceiling is mature wherever it
+          // sits in the session — dominance tie-breaker dropped with the re-measure.
+          if (_blUp >= _blUpMax) s._bigLegRev = 'put';
+          else if (_blDn >= _blDnMax) s._bigLegRev = 'call';
           if (s._bigLegRev && Date.now() - (s._blRevLogTs || 0) > 300000) {
             s._blRevLogTs = Date.now();
             log(sym, '🔁 BIG-LEG MATURE — leg ' + (s._bigLegRev === 'put' ? '+$' + _blUp.toFixed(0) + ' up' : '−$' + _blDn.toFixed(0) + ' down') + ' past the band ceiling; reversal-ready ' + s._bigLegRev.toUpperCase() + ' (EXT-FLIP conv-3 door reopens with zone confluence).');
@@ -10642,53 +10665,15 @@ function processPrice(sym, price, hi, lo) {
           // pruning, not display cleanup.
           s._zoneObs = s._zoneObs.filter(z => z && (_zNow - z.ts) < 1500 * 60000);
           if (s._zoneObs.length > 60) s._zoneObs = s._zoneObs.slice(-60);
-          // ===== FVG-RT — MAPPED-FVG RETEST, DORMANT ARM (2026-09-12, Jean: "go ahead
-          // with all") ===== Jean's 9/9 hand trade: bought the mapped M15 call FVG
-          // 4392.51-4398.61 at 4394.61 and made +$3,113 (+$15.57/oz) while the bot sat
-          // out the whole 4394→4420 rally (13 blocked base calls, ALL would-win, killed
-          // by macro contra-block + EXT-GUARD). Same gap inverted on the 9/10 crash.
-          // The lane: price re-enters a mapped SAME-direction M10/M15 FVG while the
-          // higher-TF trend agrees and chop is off → stamp a would-fire with the ±cap
-          // bracket (SL conceptually beyond the zone's far edge). Stamp-only; promote
-          // at ≥60% over ≥15 resolved, split by macro-aligned vs contra (message says
-          // which, so the nightly can decide if waiving macro there is safe).
-          try {
-            if ((sym === 'XAU' || sym === 'NAS100') && !s.chopActive && s._msTrend && Array.isArray(s._zoneObs)) {
-              const _frDir = s._msTrend === 'up' ? 'call' : s._msTrend === 'down' ? 'put' : null;
-              s._fvgRtTs = s._fvgRtTs || {};
-              if (_frDir && Date.now() - (s._fvgRtTs[_frDir] || 0) >= 900000) {
-                const _frZ = s._zoneObs.find(z => z && z.kind === 'FVG' && (z.tf === 'M10' || z.tf === 'M15') && z.dir === _frDir && price >= z.lo && price <= z.hi);
-                if (_frZ) {
-                  s._fvgRtTs[_frDir] = Date.now();
-                  const _frSl = _frDir === 'call' ? _frZ.lo : _frZ.hi;
-                  // ===== FVG-RT v2 — ZONE-ANCHORED RE-GRADE (2026-09-17, Jean: "approve the
-                  // v2 zone") ===== v1's symmetric ±cap bracket graded 8W/41L (16%) — but it
-                  // measured a scalp the lane never proposed. The thesis is structural: SL
-                  // beyond the zone's far edge (+0.15×ATR buffer), TP at 1.5× risk — the
-                  // geometry of the 9/9 hand trade. v1 tally FROZEN as the verdict on
-                  // symmetric grading; v2 builds cohort FVG-RT2 fresh. Promote at ≥60%
-                  // over ≥15 resolved, macro-aligned vs contra split via the message.
-                  const _frAtr = s._atr || 0;
-                  if (_frAtr > 0) {
-                    const _frSl2 = _frDir === 'call' ? +(_frZ.lo - 0.15 * _frAtr).toFixed(2) : +(_frZ.hi + 0.15 * _frAtr).toFixed(2);
-                    const _frRisk = Math.abs(price - _frSl2);
-                    const _frTp2 = _frDir === 'call' ? +(price + 1.5 * _frRisk).toFixed(2) : +(price - 1.5 * _frRisk).toFixed(2);
-                    const _frMsg2 = '🟦 FVG-RT2 ' + _frDir.toUpperCase() + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — retest of mapped ' + _frZ.tf + ' ' + _frDir + ' FVG $' + _frZ.lo.toFixed(2) + '-$' + _frZ.hi.toFixed(2) + ' with msTrend ' + s._msTrend + ' · zone-anchored SL $' + _frSl2.toFixed(2) + ' (risk $' + _frRisk.toFixed(2) + ') · TP 1.5R $' + _frTp2.toFixed(2) + ' (v2 re-grade, Jean 2026-09-17; v1 ±cap frozen 8W/41L).';
-                    s.blockedOutcomes = s.blockedOutcomes || [];
-                    s.blockedOutcomes.push({
-                      ts: Date.now(), time: ts(), symbol: sym, detector: 'FVG-RT2', type: _frDir,
-                      price: price, virtualTp1: _frTp2, virtualSl: _frSl2, maxMin: 180,
-                      blockReason: _frMsg2,
-                      snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
-                      tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null,
-                      closed: false, closedTs: null, outcome: null
-                    });
-                    log(sym, _frMsg2);
-                  }
-                }
-              }
-            }
-          } catch (eFR) { /* dormant arm must never crash the tick */ }
+          // ===== FVG-RT — RETIRED (2026-09-18, Jean: "ok to retire rt2") =====
+          // The mapped-FVG retest lane (2026-09-12, born from Jean's 9/9 +$3,113 hand
+          // trade) failed in BOTH grading geometries: v1 symmetric ±cap 8W/41L (16%),
+          // v2 zone-anchored SL + 1.5R target 1W/17L (6%). The thesis is dead as an
+          // auto-fire: price re-entering a same-direction FVG with msTrend agreeing is
+          // NOT sufficient — the 9/9 winner's real edge was the leg context, which the
+          // BIG-LEG pivot machine (6.61) now owns. Cohorts FVG-RT / FVG-RT2 frozen in
+          // the tally as the permanent record; cohortFor mappings retained so any
+          // in-flight entries resolve into the right buckets.
         }
         // ===== BREAKOUT TIME-STOP (2026-08-19, Jean) =====
         // 8/19 16:57 TREND CALL @4523.40: fired through the live-break window (fresh
@@ -17233,7 +17218,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.60-20260918-bigleg-ease-gatename', // bump on each deploy — lets /state verify what's live
+    build: '6.62-20260918-fvgrt-retired', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : (process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE + V-REC (all other detectors dormant)' : 'V-REC ONLY (all other detectors dormant)'),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
