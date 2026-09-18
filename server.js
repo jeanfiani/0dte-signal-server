@@ -1978,6 +1978,8 @@ function cohortFor(reason) {
   if (/P381-BYPASS/.test(reason)) return 'P381-BYPASS'; // RSI-exhaustion bypass fires, finally cohort-stamped (2026-08-27, 06:40 bottom-tick case)
   if (/FLOOR-PDL/.test(reason)) return 'FLOOR-PDL'; // TP1-into-prior-day-extreme stamps, dormant (2026-09-04, 02:57 case) — must precede FLOOR-PATH
   if (/FLOOR-PATH/.test(reason)) return 'FLOOR-PATH'; // TP1-into-defended-floor blocks (2026-08-28, 21:57/06:40 cases)
+  if (/NAS-RANGE5-BRK/.test(reason)) return 'NAS-RANGE5-BRK'; // range-EXPANSION arm, NAS clone (2026-09-18)
+  if (/BTC-RANGE5-BRK/.test(reason)) return 'BTC-RANGE5-BRK'; // range-EXPANSION arm: confirmed break of the prior 5-day extreme ridden with-trend (2026-09-18, Jean's "4K growth" chart) — must precede the -RT/plain matches
   if (/NAS-RANGE5-RT/.test(reason)) return 'NAS-RANGE5-RT'; // NAS clone (2026-09-08, Jean: "same model applies to NAS")
   if (/NAS-RANGE5/.test(reason)) return 'NAS-RANGE5';
   if (/BTC-RANGE5-RT/.test(reason)) return 'BTC-RANGE5-RT'; // retest arm: nearest unbroken prior-day extreme (2026-09-07) — must precede the plain match
@@ -3851,6 +3853,37 @@ function processPrice(sym, price, hi, lo) {
               } catch (eRS) { /* live lane must never crash the arm */ }
             }
           }
+          // ===== RANGE5-BRK — RANGE-EXPANSION ARM, DORMANT (2026-09-18, Jean: "we need
+          // to be able to find such amazing setups as the 4K growth") ===== The 9/18
+          // breakout: prior 5-day high $79,589 broken ~12:30 with msTrend up, ran to
+          // $81,240 (+$4,860 session) while every continuation detector sat dormant and
+          // the fade arms watched their thesis die (−$2,375 live short). The mirror
+          // trade: when price CONFIRMS beyond the PRIOR-days extreme (+0.15×ADR past it,
+          // structure agreeing) the range hasn't failed — it's EXPANDING; ride it. SL
+          // back inside the broken range at extreme ∓0.25×ADR (a real break must hold
+          // its level as support/resistance), TP1 0.75×ADR beyond entry, 12h window.
+          // Virtual-only; cohorts BTC/NAS-RANGE5-BRK; promote at ≥60% over ≥15 resolved.
+          try {
+            const _pHiB = Math.max.apply(null, _prior.map(d0 => d0.high).filter(h0 => h0 > 0).concat([-Infinity]));
+            const _pLoB = Math.min.apply(null, _prior.map(d0 => d0.low).filter(l0 => l0 > 0).concat([Infinity]));
+            s._r5.brkL = s._r5.brkL || 0; s._r5.brkS = s._r5.brkS || 0;
+            if (isFinite(_pHiB) && _pHiB > 0 && price >= _pHiB + 0.15 * _adr && s._msTrend === 'up' && Date.now() - s._r5.brkL > 43200000) {
+              s._r5.brkL = Date.now();
+              const _bkSl = +(_pHiB - 0.25 * _adr).toFixed(2), _bkTp = +(price + 0.75 * _adr).toFixed(2);
+              const _bkMsg = '🚀 ' + _r5Tag + '-BRK CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — prior 5-day high $' + _pHiB.toFixed(0) + ' broken +0.15×ADR with msTrend up (range EXPANSION, the 9/18 +$4,860 class) · SL $' + _bkSl.toFixed(0) + ' (back inside range) · TP $' + _bkTp.toFixed(0) + ' (0.75×ADR).';
+              s.blockedOutcomes = s.blockedOutcomes || [];
+              s.blockedOutcomes.push({ ts: Date.now(), time: ts(), symbol: sym, detector: _r5Tag + '-BRK', type: 'call', price: price, virtualTp1: _bkTp, virtualSl: _bkSl, maxMin: 720, blockReason: _bkMsg, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+              log(sym, _bkMsg);
+            }
+            if (isFinite(_pLoB) && _pLoB > 0 && price <= _pLoB - 0.15 * _adr && s._msTrend === 'down' && Date.now() - s._r5.brkS > 43200000) {
+              s._r5.brkS = Date.now();
+              const _bkSl2 = +(_pLoB + 0.25 * _adr).toFixed(2), _bkTp2 = +(price - 0.75 * _adr).toFixed(2);
+              const _bkMsg2 = '🚀 ' + _r5Tag + '-BRK PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — prior 5-day low $' + _pLoB.toFixed(0) + ' broken −0.15×ADR with msTrend down (range EXPANSION) · SL $' + _bkSl2.toFixed(0) + ' (back inside range) · TP $' + _bkTp2.toFixed(0) + ' (0.75×ADR).';
+              s.blockedOutcomes = s.blockedOutcomes || [];
+              s.blockedOutcomes.push({ ts: Date.now(), time: ts(), symbol: sym, detector: _r5Tag + '-BRK', type: 'put', price: price, virtualTp1: _bkTp2, virtualSl: _bkSl2, maxMin: 720, blockReason: _bkMsg2, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+              log(sym, _bkMsg2);
+            }
+          } catch (eBK) { /* expansion arm must never crash the tick */ }
         } catch (eR5R) {}
         // ===== BTC-REGIME — EXTREME + REGIME-CHANGE CONFIRMATION (2026-09-13, Jean) =====
         // Jean's synthesis after the test cycle: "the issue is the volatility and the
@@ -17229,7 +17262,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.63-20260918-r5-extremes-only', // bump on each deploy — lets /state verify what's live
+    build: '6.64-20260918-range5-brk-arm', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : (process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE + V-REC (all other detectors dormant)' : 'V-REC ONLY (all other detectors dormant)'),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
