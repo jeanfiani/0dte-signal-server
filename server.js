@@ -1697,6 +1697,12 @@ function trackBlockedOutcome(sym, msg, force) {
   const typeMatch = msg.match(/\b(CALL|PUT)\b/);
   if (!typeMatch) return; // can't determine direction — skip
   const type = typeMatch[1].toLowerCase();
+  // GATE-NAME RECORDER (2026-09-18, the 9/18 night-leg autopsy): remember the last REAL
+  // gate block per direction so TREND-CONT-WF stamps can name the killer gate instead of
+  // "(any gate)" — the 01:08-01:59 misses took tally-delta forensics to attribute. Only
+  // actual blocks/deferrals qualify; dormant validator stamps (DORMANT-WOULD-FIRE,
+  // CONF-SCORE, ARMED...) never overwrite it.
+  try { if (/BLOCKED|DEFERRED/.test(msg) && !/DORMANT|WOULD-FIRE|TREND-CONT-WF/.test(msg)) { s._lastBlock = s._lastBlock || {}; s._lastBlock[type] = { msg: msg.slice(0, 200), ts: now }; } } catch (eLB) {}
   // ===== BTC COUNTER-TREND TRACKING RETIRED (2026-08-21, Jean) =====
   // "remove all the counter-trend signals definitely, not even needed as dormant."
   // 2-day verdict at honest ATR brackets: counter-trend puts into the melt went
@@ -5313,7 +5319,16 @@ function processPrice(sym, price, hi, lo) {
         s._tcwTs = s._tcwTs || {};
         if (Date.now() - (s._tcwTs[sig.type] || 0) >= 300000) {
           s._tcwTs[sig.type] = Date.now();
-          const _tcwMsg = '🧵 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' TREND-CONT-WF @ $' + (parseFloat(sig.price) || 0).toFixed(2) + ' — with-trend continuation blocked (msTrend ' + s._msTrend + ', any gate); the class behind the 9/9-9/16 missed legs (2026-09-16).';
+          // Gate attribution (2026-09-18): name the killer gate via the recorder in
+          // trackBlockedOutcome. Hyphens swapped for middle dots so the embedded gate
+          // name can't hijack this row's cohort in cohortFor (NIGHT-MOMVETO etc. are
+          // tested before TREND-CONT-WF).
+          let _tcwGate = 'unattributed';
+          try {
+            const _lb = s._lastBlock && s._lastBlock[sig.type];
+            if (_lb && Date.now() - _lb.ts < 15000) _tcwGate = String(cohortFor(_lb.msg) || 'unmatched').replace(/-/g, '·');
+          } catch (eTG) {}
+          const _tcwMsg = '🧵 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' TREND-CONT-WF @ $' + (parseFloat(sig.price) || 0).toFixed(2) + ' — with-trend continuation blocked (msTrend ' + s._msTrend + ', gate: ' + _tcwGate + '); the class behind the 9/9-9/16 missed legs (2026-09-16; gate named 2026-09-18).';
           log(sym, _tcwMsg); trackBlockedOutcome(sym, _tcwMsg, true);
         }
       }
@@ -6522,8 +6537,21 @@ function processPrice(sym, price, hi, lo) {
               const _egEase = latchAdvSource(s, sig.type) && (sig.type === 'put'
                 ? ((s.sessionLowUpdateTs || 0) > 0 && (Date.now() - s.sessionLowUpdateTs) < 900000)
                 : ((s.sessionHighUpdateTs || 0) > 0 && (Date.now() - s.sessionHighUpdateTs) < 900000));
-              if (_egEase) {
-                const _egEaseMsg = '📈 LATCH-ADV-EASE — ' + tagEarly + ' ' + sig.type.toUpperCase() + ' EXT-GUARD deferred @ $' + price.toFixed(2) + ' (' + Math.round(_egPos * 100) + '% of $' + _egRange.toFixed(2) + ' impulse): with-trend latch + session extreme advancing <15min — trend extending, not cresting (2026-09-01).';
+              // ===== BIG-LEG EXT-GUARD EASE (2026-09-18, Jean "go ahead with 1&2") =====
+              // The 9/18 night-leg autopsy (4341→4399, three would-win RIDE+MACRO calls
+              // blocked 01:08-01:59): overnight tally deltas put the kills on EXT-GUARD
+              // (+2 would-wins) — on a relentless leg the "wait for the retest" doctrine
+              // forces entries to the crest, because the retest never comes until the top.
+              // While s._bigLeg is armed in the fire direction (one-sided $10-30 leg,
+              // msTrend agreeing — the band where entering mid-leg IS the thesis),
+              // continuation tags pass EXT-GUARD. Fired rows carry bigLeg:true (wrapper
+              // marker); bench rule = BIG-LEG's own: net-negative first 6 → revert;
+              // BIGLEG_DISABLED=1 kills the whole state machine including this ease.
+              const _egBigLeg = s._bigLeg === sig.type && process.env.BIGLEG_DISABLED !== '1' && /RIDE|TREND|FAST|SUST|6\/6/.test(tagEarly || '');
+              if (_egEase || _egBigLeg) {
+                const _egEaseMsg = _egEase
+                  ? '📈 LATCH-ADV-EASE — ' + tagEarly + ' ' + sig.type.toUpperCase() + ' EXT-GUARD deferred @ $' + price.toFixed(2) + ' (' + Math.round(_egPos * 100) + '% of $' + _egRange.toFixed(2) + ' impulse): with-trend latch + session extreme advancing <15min — trend extending, not cresting (2026-09-01).'
+                  : '🚀 BIGLEG-EG-EASE — ' + tagEarly + ' ' + sig.type.toUpperCase() + ' EXT-GUARD deferred @ $' + price.toFixed(2) + ' (' + Math.round(_egPos * 100) + '% of $' + _egRange.toFixed(2) + ' impulse): BIG-LEG armed ' + sig.type + ' — young one-sided leg, mid-leg entry is the thesis (2026-09-18, the 01:08-01:59 night-leg autopsy).';
                 log(sym, _egEaseMsg); trackBlockedOutcome(sym, _egEaseMsg, true);
               } else {
               Object.assign(s, _emitSnapshot);
@@ -8948,7 +8976,12 @@ function processPrice(sym, price, hi, lo) {
     // the swing. The shadow agrees: CHoCH-V2 cohort 58W/132L (30.5%) on XAU. Night
     // fires (18:00–06:00 ET) go stamp-only into CHOCH-NIGHT; re-earn at ≥60%/≥15.
     // RTH CHoCH stays live pending its own data.
-    if ((sym === 'XAU' || sym === 'NAS100') && /CHoCH/i.test(tag) && nightTag() !== '') {
+    // BIG-LEG exception (2026-09-18, Jean "go ahead with 1&2"): while a young one-sided
+    // leg is armed in the fire direction, a with-leg CHoCH at night is continuation
+    // confirmation, not a spent-end fade — it passes. Bench rule = BIG-LEG's (net-negative
+    // first 6 bigLeg fires → revert); BIGLEG_DISABLED=1 kills the exception too.
+    if ((sym === 'XAU' || sym === 'NAS100') && /CHoCH/i.test(tag) && nightTag() !== '' &&
+        !(s._bigLeg === sig.type && process.env.BIGLEG_DISABLED !== '1')) {
       Object.assign(s, _emitSnapshot);
       const _cnMsg = '🌙 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — CHOCH-NIGHT stand-down (2026-09-14): CHoCH is a lagging confirmation and its night fires enter at the spent end of the leg (22:23 case; CHoCH-V2 shadow 30.5%).' + nightTag();
       log(sym, _cnMsg); trackBlockedOutcome(sym, _cnMsg, true);
@@ -17200,7 +17233,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.59-20260917-fvgrt2-regrade', // bump on each deploy — lets /state verify what's live
+    build: '6.60-20260918-bigleg-ease-gatename', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : (process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE + V-REC (all other detectors dormant)' : 'V-REC ONLY (all other detectors dormant)'),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
