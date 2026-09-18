@@ -3805,7 +3805,15 @@ function processPrice(sym, price, hi, lo) {
               // BENCH RULE (pre-registered): net-negative over the first 6 resolved live
               // fires → back to shadow. Shadow arm keeps grading BTC-RANGE5-RT regardless.
               try {
-                if (sym === 'BTC' && process.env.BTC_RANGE5_LIVE !== '0' && !btcWeekendClosed() && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold) {
+                // EXTREMES-ONLY FILTER (2026-09-18, Jean: "as per our rule it should have
+                // taken a CALL at 76000, not a PUT" — the 9/17 22:27 live short faded a
+                // prior-day high at 42% of the 5-day range, mid-range, −$2,375 on the
+                // breakout; the winning 09:39 shadow long was at 23%). The thesis is fade
+                // the EXTREMES: live longs only when the level sits in the BOTTOM THIRD
+                // of the 5-day range, live shorts only in the TOP third. Shadow arms keep
+                // grading every level so the filter's cost stays measured.
+                const _r5Rng = (s.rollingHigh > s.rollingLow) ? s.rollingHigh - s.rollingLow : 0;
+                if (sym === 'BTC' && process.env.BTC_RANGE5_LIVE !== '0' && _r5Rng > 0 && _lvlL <= s.rollingLow + 0.33 * _r5Rng && !btcWeekendClosed() && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold) {
                   s.dailySignalCount++;
                   const _rlV = s._r5.longR;
                   const _rlSig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆RANGE5-RT', rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: _rlV.sl.toFixed(2), tp1: _rlV.tp.toFixed(2), tp2: (+_rlV.tpFar).toFixed(2), tp3: (+_rlV.tpFar).toFixed(2), oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: 'range5-rt level entry' } };
@@ -3825,8 +3833,11 @@ function processPrice(sym, price, hi, lo) {
               s._r5.shortR = { lvl: _lvlH, ep: price, sl: +(_lvlH + 0.75 * _adr).toFixed(2), tp: +((_lvlH + s.rollingLow) / 2).toFixed(2), tpFar: s.rollingLow, ts: Date.now(), farHit: false };
               log(sym, '🎢 ' + _r5Tag + '-RT SHORT armed'.replace(' armed','') + ' armed @ $' + price.toFixed(0) + ' — retest of unbroken prior-day high $' + _lvlH.toFixed(0) + ' · SL $' + s._r5.shortR.sl.toFixed(0) + ' · TP mid $' + s._r5.shortR.tp.toFixed(0) + ' · far $' + s.rollingLow.toFixed(0) + ' (dormant shadow).');
               // RANGE5-RT LIVE LANE — short mirror (see long side above; LIVE 2026-09-17, BTC_RANGE5_LIVE=0 kills).
+              // EXTREMES-ONLY (2026-09-18): shorts fire only when the level sits in the TOP
+              // THIRD of the 5-day range — the 22:27 mid-range short (42%) is the case this kills.
               try {
-                if (sym === 'BTC' && process.env.BTC_RANGE5_LIVE !== '0' && !btcWeekendClosed() && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold) {
+                const _r5RngS = (s.rollingHigh > s.rollingLow) ? s.rollingHigh - s.rollingLow : 0;
+                if (sym === 'BTC' && process.env.BTC_RANGE5_LIVE !== '0' && _r5RngS > 0 && _lvlH >= s.rollingHigh - 0.33 * _r5RngS && !btcWeekendClosed() && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold) {
                   s.dailySignalCount++;
                   const _rsV = s._r5.shortR;
                   const _rsSig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇RANGE5-RT', rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: _rsV.sl.toFixed(2), tp1: _rsV.tp.toFixed(2), tp2: (+_rsV.tpFar).toFixed(2), tp3: (+_rsV.tpFar).toFixed(2), oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: 'range5-rt level entry' } };
@@ -17218,7 +17229,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.62-20260918-fvgrt-retired', // bump on each deploy — lets /state verify what's live
+    build: '6.63-20260918-r5-extremes-only', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : (process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE + V-REC (all other detectors dormant)' : 'V-REC ONLY (all other detectors dormant)'),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
