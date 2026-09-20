@@ -1978,6 +1978,7 @@ function cohortFor(reason) {
   if (/P381-BYPASS/.test(reason)) return 'P381-BYPASS'; // RSI-exhaustion bypass fires, finally cohort-stamped (2026-08-27, 06:40 bottom-tick case)
   if (/FLOOR-PDL/.test(reason)) return 'FLOOR-PDL'; // TP1-into-prior-day-extreme stamps, dormant (2026-09-04, 02:57 case) — must precede FLOOR-PATH
   if (/FLOOR-PATH/.test(reason)) return 'FLOOR-PATH'; // TP1-into-defended-floor blocks (2026-08-28, 21:57/06:40 cases)
+  if (/FUNDED-GUARD/.test(reason)) return 'FUNDED-GUARD'; // Neura account-level breaker blocks (2026-09-20) — measures what the guard suppressed
   if (/BTC-BIGLEG/.test(reason)) return 'BTC-BIGLEG'; // pivot-leg continuation shadow on BTC (2026-09-20, the 76k→81k case) — must precede detector matches
   if (/NAS-RANGE5-BRK/.test(reason)) return 'NAS-RANGE5-BRK'; // range-EXPANSION arm, NAS clone (2026-09-18)
   if (/BTC-RANGE5-BRK/.test(reason)) return 'BTC-RANGE5-BRK'; // range-EXPANSION arm: confirmed break of the prior 5-day extreme ridden with-trend (2026-09-18, Jean's "4K growth" chart) — must precede the -RT/plain matches
@@ -3819,6 +3820,21 @@ function processPrice(sym, price, hi, lo) {
           [['longR', 'long'], ['shortR', 'short']].forEach(pair => {
             const key = pair[0], sd = pair[1], v = s._r5[key]; if (!v) return;
             if (!v.farHit && (sd === 'long' ? price >= v.tpFar : price <= v.tpFar)) v.farHit = true;
+            // TIGHT-SL TWIN (2026-09-20, Jean: "$1,000 SL is way enough... $3,000 worst
+            // case"): every BTC arm also grades a $1,000-stop version of itself into
+            // BTC-RANGE5-RT-TIGHT. If TIGHT holds ≥60% alongside the structural arm, Jean's
+            // sizing is right and we tighten for real; if the wiggle eats it, the
+            // structural stop keeps the lane. Data decides, not doctrine.
+            if (sym === 'BTC' && !v.tightOc) {
+              const _tW = sd === 'long' ? price >= v.tp : price <= v.tp;
+              const _tL = sd === 'long' ? price <= v.ep - 1000 : price >= v.ep + 1000;
+              if (_tW) v.tightOc = 'win'; else if (_tL) v.tightOc = 'loss';
+              else if (Date.now() - v.ts > 5 * 86400000) v.tightOc = 'scratch';
+              if (v.tightOc) {
+                try { bumpCohortTally(sym, _r5Tag + '-RT-TIGHT', v.tightOc); } catch (eTT) {}
+                log(sym, '🎯 ' + _r5Tag + '-RT-TIGHT ' + sd.toUpperCase() + ' RESOLVED ' + v.tightOc.toUpperCase() + ' — $1,000-SL twin of the ' + (sd === 'long' ? 'low' : 'high') + '-retest arm @ $' + v.ep.toFixed(0) + ' (structural arm grades separately; Jean’s tight-stop hypothesis, 2026-09-20).');
+              }
+            }
             const win = sd === 'long' ? price >= v.tp : price <= v.tp;
             const loss = sd === 'long' ? price <= v.sl : price >= v.sl;
             const expired = Date.now() - v.ts > 5 * 86400000;
@@ -9132,6 +9148,47 @@ function processPrice(sym, price, hi, lo) {
           Object.assign(s, _emitSnapshot);
           return false;
         }
+        // ===== FUNDED-ACCOUNT GUARD (2026-09-20, Jean: Neura $400K — "we are allowed
+        // to lose only 4% on a day and they kick us out at 8% total, so $16K/day") =====
+        // ACCOUNT-level, all symbols combined, on booked ledger dollars. Trips at 75%
+        // of each Neura limit (FUNDED_DAY_LIMIT=12000 / FUNDED_TOTAL_LIMIT=24000,
+        // env-tunable) leaving headroom for open-trade drift the ledger can't see.
+        // Cumulative counts from FUNDED_START_DATE (default 2026-09-21, test day one).
+        // One 50% warning push per day. HONESTY NOTE: this is only as accurate as
+        // PNL_MULT_XAU/NAS/BTC — recalibrate those to the 3/30/3-lot sizing against
+        // the first real MT5 fills.
+        const _fdLim = parseFloat(process.env.FUNDED_DAY_LIMIT || '12000');
+        const _ftLim = parseFloat(process.env.FUNDED_TOTAL_LIMIT || '24000');
+        const _fStart = process.env.FUNDED_START_DATE || '2026-09-21';
+        let _fDay = 0, _fTot = 0;
+        try {
+          const _t0 = todayDateET();
+          for (const _fd of Object.keys(pnlLedger)) {
+            if (_fd < _fStart) continue;
+            for (const _fs of Object.keys(pnlLedger[_fd])) {
+              const _fp = pnlLedger[_fd][_fs] && pnlLedger[_fd][_fs].pnl;
+              if (typeof _fp === 'number') { _fTot += _fp; if (_fd === _t0) _fDay += _fp; }
+            }
+          }
+        } catch (eFD) {}
+        global._fundedGuard = { day: +_fDay.toFixed(2), dayLimit: _fdLim, total: +_fTot.toFixed(2), totalLimit: _ftLim, since: _fStart };
+        if (_fDay <= -_fdLim || _fTot <= -_ftLim) {
+          const _fMsg = '🏦 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — FUNDED-GUARD: ' + (_fDay <= -_fdLim ? 'account day P&L $' + _fDay.toFixed(0) + ' ≤ -$' + _fdLim.toFixed(0) + ' (Neura 4%/day = $16K; guard at 75%)' : 'cumulative P&L $' + _fTot.toFixed(0) + ' since ' + _fStart + ' ≤ -$' + _ftLim.toFixed(0) + ' (Neura 8% total = $32K; guard at 75%)') + ' — no new fires. Virtual tracking continues (2026-09-20).';
+          log(sym, _fMsg); trackBlockedOutcome(sym, _fMsg, true);
+          try { sendPush('🏦 FUNDED-GUARD ACTIVE', 'Day $' + _fDay.toFixed(0) + ' / Total $' + _fTot.toFixed(0) + ' — firing stopped', 'alert'); } catch (eFP) {}
+          Object.assign(s, _emitSnapshot);
+          return false;
+        }
+        try { // 50% early warning, once per ET day
+          global._fundedWarn = global._fundedWarn || {};
+          const _t0b = todayDateET();
+          if (global._fundedWarn.d !== _t0b) global._fundedWarn = { d: _t0b, half: false };
+          if (!global._fundedWarn.half && (_fDay <= -0.5 * _fdLim || _fTot <= -0.5 * _ftLim)) {
+            global._fundedWarn.half = true;
+            log(sym, '⚠️ FUNDED-GUARD 50% — account day $' + _fDay.toFixed(0) + ' (limit -$' + _fdLim.toFixed(0) + ') / cumulative $' + _fTot.toFixed(0) + ' (limit -$' + _ftLim.toFixed(0) + ').');
+            try { sendPush('⚠️ FUNDED-GUARD 50%', 'Day $' + _fDay.toFixed(0) + ' of -$' + _fdLim.toFixed(0) + ' · Total $' + _fTot.toFixed(0) + ' of -$' + _ftLim.toFixed(0), 'alert'); } catch (eFP2) {}
+          }
+        } catch (eFW) {}
       }
     } catch (ePR) { /* protections must never crash enrichment */ }
     return true;
@@ -17319,10 +17376,11 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.67-20260920-r5-weekend-split', // bump on each deploy — lets /state verify what's live
+    build: '6.69-20260920-funded-guard', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : (process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE + V-REC (all other detectors dormant)' : 'V-REC ONLY (all other detectors dormant)'),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
+    fundedGuard: global._fundedGuard || null, // Neura $400K guard readout (2026-09-20): account day/total vs limits
     gexLevels: sym === 'NAS100' || sym === 'QQQ' ? _gexLevels : undefined, // QQQ dealer gamma map (2026-08-12)
     zoneMap: (S[sym] && S[sym]._zoneObs || []).map(z => ({ kind: z.kind || 'OB', tf: z.tf || '', dir: z.dir, lo: +z.lo.toFixed(2), hi: +z.hi.toFixed(2), ageMin: Math.round((Date.now() - z.ts) / 60000) })), // live FVG/OB zones (2026-08-11)
     msTrend: (S[sym] && S[sym]._msTrend) || null, // CHOCH-V2 structure state
