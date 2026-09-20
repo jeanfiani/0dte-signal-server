@@ -1982,6 +1982,7 @@ function cohortFor(reason) {
   if (/FLOOR-PDL/.test(reason)) return 'FLOOR-PDL'; // TP1-into-prior-day-extreme stamps, dormant (2026-09-04, 02:57 case) — must precede FLOOR-PATH
   if (/FLOOR-PATH/.test(reason)) return 'FLOOR-PATH'; // TP1-into-defended-floor blocks (2026-08-28, 21:57/06:40 cases)
   if (/FUNDED-GUARD/.test(reason)) return 'FUNDED-GUARD'; // Neura account-level breaker blocks (2026-09-20) — measures what the guard suppressed
+  if (/VA-FADE/.test(reason)) return 'VA-FADE'; // value-area-edge fades from the session tick profile (2026-09-20) — compare with SESS-EXTREME (price-only extremes)
   if (/BTC-BIGLEG/.test(reason)) return 'BTC-BIGLEG'; // pivot-leg continuation shadow on BTC (2026-09-20, the 76k→81k case) — must precede detector matches
   if (/NAS-RANGE5-BRK/.test(reason)) return 'NAS-RANGE5-BRK'; // range-EXPANSION arm, NAS clone (2026-09-18)
   if (/BTC-RANGE5-BRK/.test(reason)) return 'BTC-RANGE5-BRK'; // range-EXPANSION arm: confirmed break of the prior 5-day extreme ridden with-trend (2026-09-18, Jean's "4K growth" chart) — must precede the -RT/plain matches
@@ -2079,7 +2080,7 @@ setInterval(() => {
     const out = {};
     for (const sy of ['XAU', 'BTC', 'NAS100']) {
       const st = S[sy]; if (!st) continue;
-      out[sy] = { zones: st._zoneObs || [], touched: st._zoneTouched || {}, m5: (st._m5 || []).slice(-72), msTrend: st._msTrend || null };
+      out[sy] = { zones: st._zoneObs || [], touched: st._zoneTouched || {}, m5: (st._m5 || []).slice(-72), m5h: (st._m5hist || []).slice(-2016), msTrend: st._msTrend || null }; // m5h: week-long M5 ring for the Lorentzian prep (2026-09-20)
     }
     fs.writeFileSync(ZONE_MAP_FILE, JSON.stringify(out));
   } catch (e) {}
@@ -2242,7 +2243,7 @@ function _flushPersist() {
     const out = {};
     for (const sy of ['XAU', 'BTC', 'NAS100']) {
       const st = S[sy]; if (!st) continue;
-      out[sy] = { zones: st._zoneObs || [], touched: st._zoneTouched || {}, m5: (st._m5 || []).slice(-72), msTrend: st._msTrend || null };
+      out[sy] = { zones: st._zoneObs || [], touched: st._zoneTouched || {}, m5: (st._m5 || []).slice(-72), m5h: (st._m5hist || []).slice(-2016), msTrend: st._msTrend || null };
     }
     fs.writeFileSync(ZONE_MAP_FILE, JSON.stringify(out));
     fs.writeFileSync(COHORT_TALLY_FILE, JSON.stringify(cohortTally));
@@ -3593,6 +3594,7 @@ function processPrice(sym, price, hi, lo) {
         const _zr = _zoneRestore && _zoneRestore[sym];
         if (_zr) {
           s._m5 = _zr.m5 || []; s._zoneObs = _zr.zones || []; s._zoneTouched = _zr.touched || {}; s._msTrend = _zr.msTrend || s._msTrend;
+          if (Array.isArray(_zr.m5h) && _zr.m5h.length) s._m5hist = _zr.m5h; // week-long ring restore (2026-09-20)
           log(sym, '🗺️ Zone map restored ungated at boot — ' + (s._zoneObs.length) + ' zones, ' + (s._m5.length) + ' M5 candles, msTrend ' + (s._msTrend || '—') + ' (2026-09-16 fix: no more 45min post-deploy blackout).');
         }
       }
@@ -3636,6 +3638,49 @@ function processPrice(sym, price, hi, lo) {
         if (_lbl !== _prev) log(sym, '🧭 REGIME ' + (_prev ? _prev + ' → ' : '') + _lbl + ' — KER ' + _ker.toFixed(2) + ' · CHOP ' + _chop.toFixed(0) + ' · Hurst ' + _hurst.toFixed(2) + ' (36×M5 window; KER+CHOP+Hurst composite, 2026-09-20).');
       }
     } catch (eRG) { /* classifier must never crash the tick */ }
+
+    // ===== SESSION VOLUME PROFILE — POC / VALUE AREA + VA-FADE SHADOW (2026-09-20) =====
+    // Derived once a minute from the tick histogram: POC = busiest bin; value area =
+    // expand from POC toward the heavier neighbor until ≥70% of session ticks are
+    // inside → VAL/VAH. Our "extremes" have been price-only (session H/L, 5-day levels);
+    // the value area says where the auction actually happened. Shadow lane VA-FADE:
+    // first push of the session beyond VAH stamps a PUT virtual (mirror at VAL), once
+    // per side per 30min, ±cap bracket so it's comparable with SESS-EXTREME. Needs
+    // ≥600 ticks and a value area ≥1×ATR wide to count. Promote at ≥60%/≥15.
+    try {
+      if (isMT5 && s._vpHist && s._vpHist.ticks >= 600 && Date.now() - (s._vpTs || 0) >= 60000) {
+        s._vpTs = Date.now();
+        const _vb = s._vpHist.bins, _vk = Object.keys(_vb).map(Number).sort((a, b) => a - b);
+        if (_vk.length >= 5) {
+          let _poc = _vk[0]; for (const k of _vk) if (_vb[k] > _vb[_poc]) _poc = k;
+          const _tot = s._vpHist.ticks, _pi = _vk.indexOf(_poc);
+          let lo = _pi, hi = _pi, acc = _vb[_poc];
+          while (acc < 0.7 * _tot && (lo > 0 || hi < _vk.length - 1)) {
+            const dn = lo > 0 ? _vb[_vk[lo - 1]] : -1, up = hi < _vk.length - 1 ? _vb[_vk[hi + 1]] : -1;
+            if (up >= dn) { hi++; acc += _vb[_vk[hi]]; } else { lo--; acc += _vb[_vk[lo]]; }
+          }
+          const _prevVp = s._vp;
+          s._vp = { key: s._vpHist.key, poc: _poc, vah: _vk[hi], val: _vk[lo], ticks: _tot, bins: _vk.length, ts: Date.now() };
+          if (!_prevVp || _prevVp.key !== s._vp.key || Math.abs(_prevVp.poc - _poc) > 0) {
+            if (!_prevVp || _prevVp.key !== s._vp.key || Date.now() - (s._vpLogTs || 0) > 900000) { s._vpLogTs = Date.now(); log(sym, '📊 VOLUME PROFILE — POC $' + _poc.toFixed(2) + ' · VA $' + _vk[lo].toFixed(2) + '–$' + _vk[hi].toFixed(2) + ' (' + _tot + ' ticks, ' + _vk.length + ' bins; session ' + s._vp.key + ').'); }
+          }
+          // VA-FADE shadow stamps
+          const _vpAtr = s._atr || 0;
+          if (_vpAtr > 0 && (s._vp.vah - s._vp.val) >= _vpAtr) {
+            s._vaFadeTs = s._vaFadeTs || {};
+            if (price > s._vp.vah && Date.now() - (s._vaFadeTs.put || 0) >= 1800000) {
+              s._vaFadeTs.put = Date.now();
+              const _vfM = '📊 VA-FADE PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — price above value-area high $' + s._vp.vah.toFixed(2) + ' (POC $' + _poc.toFixed(2) + ', VA $' + s._vp.val.toFixed(2) + '–$' + s._vp.vah.toFixed(2) + ', ' + _tot + ' ticks); auction-defined extreme vs the price-only session high $' + (isFinite(s.sessionHigh) ? s.sessionHigh.toFixed(2) : '?') + ' (2026-09-20).';
+              log(sym, _vfM); trackBlockedOutcome(sym, _vfM, true);
+            } else if (price < s._vp.val && Date.now() - (s._vaFadeTs.call || 0) >= 1800000) {
+              s._vaFadeTs.call = Date.now();
+              const _vfM2 = '📊 VA-FADE CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — price below value-area low $' + s._vp.val.toFixed(2) + ' (POC $' + _poc.toFixed(2) + ', VA $' + s._vp.val.toFixed(2) + '–$' + s._vp.vah.toFixed(2) + ', ' + _tot + ' ticks); auction-defined extreme vs the price-only session low $' + (isFinite(s.sessionLow) ? s.sessionLow.toFixed(2) : '?') + ' (2026-09-20).';
+              log(sym, _vfM2); trackBlockedOutcome(sym, _vfM2, true);
+            }
+          }
+        }
+      }
+    } catch (eVPD) { /* profile must never crash the tick */ }
 
     // ===== BIG-LEG OVERRIDE STATE (2026-09-16, Jean: "sometimes we should not wait
     // for macro — the bot needs to take the right decision on a $30+ rise or a $40
@@ -10828,6 +10873,13 @@ function processPrice(sym, price, hi, lo) {
             s._m5 = s._m5 || [];
             s._m5.push({ o: s._m5cur.o, h: s._m5cur.h, l: s._m5cur.l, c: s._m5cur.c, ts: s._m5cur.b * 300000 });
             if (s._m5.length > 72) s._m5.shift();
+            // LONG M5 HISTORY (2026-09-20, Jean "go" on Lorentzian prep): a separate
+            // 2,016-bar ring (one week) so the kNN classifier has neighbors to compare
+            // against. Kept apart from s._m5 on purpose — the zone engine's FVG/OB
+            // detection and mitigation semantics are built around the 6h window.
+            s._m5hist = s._m5hist || [];
+            s._m5hist.push({ o: s._m5cur.o, h: s._m5cur.h, l: s._m5cur.l, c: s._m5cur.c, n: s._m5cur.n, ts: s._m5cur.b * 300000 });
+            if (s._m5hist.length > 2016) s._m5hist.shift();
           }
           s._m5cur = { b: _zBkt, o: price, h: price, l: price, c: price, n: 0 };
         }
@@ -16607,6 +16659,18 @@ function processTicks(symbols) {
       s.vrevSnaps.push({ ts: Date.now(), p: price });
       const cutoff = Date.now() - 1200000; // 20 min
       while (s.vrevSnaps.length > 0 && s.vrevSnaps[0].ts < cutoff) s.vrevSnaps.shift();
+      // ===== SESSION VOLUME PROFILE — TICK HISTOGRAM (2026-09-20, Jean "go" on #4) =====
+      // Every tick lands in a price bin for the current 18:00-ET-anchored session; the
+      // POC / value area (70%) are derived once a minute in the ungated section. CFDs
+      // carry no true volume — tick count is the standard proxy. Bins: XAU $0.50,
+      // NAS 2pt, BTC $25. Rolls with the session key (day shifted +6h = 18:00 ET start).
+      try {
+        const _vpKey = new Date(Date.now() + 21600000).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+        if (!s._vpHist || s._vpHist.key !== _vpKey) s._vpHist = { key: _vpKey, bins: {}, ticks: 0 };
+        const _vpBin = isXAUt ? 0.5 : isNASt ? 2 : 25;
+        const _vpB = Math.round(price / _vpBin) * _vpBin;
+        s._vpHist.bins[_vpB] = (s._vpHist.bins[_vpB] || 0) + 1; s._vpHist.ticks++;
+      } catch (eVP) {}
     }
 
     // === TREND RIDE TRAILING STOP — monitor every tick for TREND signals ===
@@ -17309,6 +17373,15 @@ app.get('/ea/:sym', (req, res) => {
   });
 });
 
+// M5 history + zone export (2026-09-20) — feeds the smartmoneyconcepts cross-check
+// script (tools/smc_diff.py) and, later, the Lorentzian classifier research.
+app.get('/m5hist/:sym', (req, res) => {
+  try {
+    const sym = String(req.params.sym || '').toUpperCase();
+    const s = S[sym]; if (!s) return res.status(404).json({ error: 'unknown symbol' });
+    res.json({ symbol: sym, bars: s._m5hist || [], zones: s._zoneObs || [], msTrend: s._msTrend || null, atr: s._atr || null, ts: Date.now() });
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
 app.get('/blocked-outcomes/:sym', (req, res) => {
   const sym = resolveSymbol(req.params.sym); // broker alias aware
   const s = S[sym];
@@ -17469,12 +17542,14 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.70-20260920-regime-avwap', // bump on each deploy — lets /state verify what's live
+    build: '6.71-20260920-volume-profile', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : (process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE + V-REC (all other detectors dormant)' : 'V-REC ONLY (all other detectors dormant)'),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     fundedGuard: global._fundedGuard || null, // Neura $400K guard readout (2026-09-20): account day/total vs limits
     regimeScore: s._dayRegime || null, // KER+CHOP+Hurst composite classifier (2026-09-20): {label TREND|RANGE|MIXED, ker, chop, hurst, n, ts}
+    volumeProfile: s._vp ? { poc: s._vp.poc, vah: s._vp.vah, val: s._vp.val, ticks: s._vp.ticks, session: s._vp.key } : null, // session tick-profile POC / value area (2026-09-20)
+    m5HistBars: (s._m5hist || []).length, // week-long M5 ring fill level — Lorentzian classifier needs ~2,000 (2026-09-20)
     gexLevels: sym === 'NAS100' || sym === 'QQQ' ? _gexLevels : undefined, // QQQ dealer gamma map (2026-08-12)
     zoneMap: (S[sym] && S[sym]._zoneObs || []).map(z => ({ kind: z.kind || 'OB', tf: z.tf || '', dir: z.dir, lo: +z.lo.toFixed(2), hi: +z.hi.toFixed(2), ageMin: Math.round((Date.now() - z.ts) / 60000) })), // live FVG/OB zones (2026-08-11)
     msTrend: (S[sym] && S[sym]._msTrend) || null, // CHOCH-V2 structure state
