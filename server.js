@@ -1930,7 +1930,10 @@ function cohortFor(reason) {
   if (/NIGHT-BENCHED/.test(reason)) return 'NIGHT-BENCH-WF'; // re-benched night-waiver would-fires (2026-09-12) — before the [NIGHT] match so the benched lane grades separately from generic night stamps
   if (/CHOCH-NIGHT/.test(reason)) return 'CHOCH-NIGHT'; // night CHoCH stand-down (2026-09-14, the 22:23 crest specimen) — must precede CHOCH-V2 and [NIGHT] matches
   if (/CHOP-TREND-WF/.test(reason)) return 'CHOP-TREND-WF'; // with-trend continuations refused by chop mode (2026-09-15) — must precede CHOP-* matches; ≥60%/15 promotes a with-trend chop waiver
-  if (/TREND-CONT-WF/.test(reason)) return 'TREND-CONT-WF'; // ALL-gates with-trend continuation blocks (2026-09-16) — the complete measurement of the missed-leg class; before detector-tag matches
+  if (/TREND-CONT-WF-T/.test(reason)) return 'TREND-CONT-WF-T'; // regime split (2026-09-20): classifier said TREND when the continuation was blocked
+  if (/TREND-CONT-WF-R/.test(reason)) return 'TREND-CONT-WF-R'; // classifier said RANGE
+  if (/TREND-CONT-WF-M/.test(reason)) return 'TREND-CONT-WF-M'; // classifier said MIXED
+  if (/TREND-CONT-WF/.test(reason)) return 'TREND-CONT-WF'; // ALL-gates with-trend continuation blocks (2026-09-16) — the complete measurement of the missed-leg class; before detector-tag matches (pre-split tally frozen 2026-09-20 at 25W/53L)
   if (/EXTFLIP-C3/.test(reason)) return 'EXTFLIP-C3'; // benched XAU conv-3 EXT-FLIP tier (2026-09-15) — before EXT-FLIP/[NIGHT] matches
   if (/V-REC BENCHED/.test(reason)) return 'BTC-VREC-BENCH'; // benched V-REC would-fires (2026-09-09) — must precede any V-REC/detector matches
   if (/SLPAD-SIM/.test(reason)) return 'SLPAD-SIM'; // wick-pad shadow on real stops: SAVE rows' bracket outcome = pad-world verdict; DEEP rows = pad pure cost (2026-09-03)
@@ -3595,6 +3598,45 @@ function processPrice(sym, price, hi, lo) {
       }
     } catch (eZR) { /* restore must never crash the tick */ }
 
+    // ===== REGIME SCORE — KER + CHOP + HURST COMPOSITE (2026-09-20, Jean: "ship 1 & 2") =====
+    // TREND-CONT-WF proved the gate family is regime-dependent (right on 9/16 whipsaw,
+    // wrong on 9/17-18 trends) — but the bot only knew the regime after the fact. This
+    // classifies it live, once a minute, from the M5 candles: Kaufman Efficiency Ratio
+    // (net move / path length — rises in clean trends), Choppiness Index (summed true
+    // range vs window span, log-scaled — rises in congestion), and a single-window R/S
+    // Hurst exponent with an Anis-Lloyd-style small-n correction (persistence >0.5).
+    // Votes: TREND needs ≥2 trend votes and 0 range votes; RANGE mirrored; else MIXED.
+    // Consumers today: TREND-CONT-WF stamps split into -T/-R/-M cohorts (so the
+    // classifier's discriminating power is measured before any gate keys off it) and
+    // the BIG-LEG arm log. Thresholds are first-pass; the split calibrates them.
+    try {
+      if (isMT5 && Array.isArray(s._m5) && s._m5.length >= 24 && Date.now() - (s._rgTs || 0) >= 60000) {
+        s._rgTs = Date.now();
+        const _rgAll = s._m5.slice(-64), _rgW = _rgAll.slice(-36);
+        const _rgNet = Math.abs(_rgW[_rgW.length - 1].c - _rgW[0].c);
+        let _rgPath = 0; for (let i = 1; i < _rgW.length; i++) _rgPath += Math.abs(_rgW[i].c - _rgW[i - 1].c);
+        const _ker = _rgPath > 0 ? _rgNet / _rgPath : 0;
+        let _trSum = 0, _wHi = -Infinity, _wLo = Infinity;
+        for (let i = 1; i < _rgW.length; i++) { const c0 = _rgW[i], p0 = _rgW[i - 1]; _trSum += Math.max(c0.h - c0.l, Math.abs(c0.h - p0.c), Math.abs(c0.l - p0.c)); if (c0.h > _wHi) _wHi = c0.h; if (c0.l < _wLo) _wLo = c0.l; }
+        const _chop = (_wHi > _wLo && _trSum > 0) ? 100 * Math.log10(_trSum / (_wHi - _wLo)) / Math.log10(_rgW.length - 1) : 50;
+        let _hurst = 0.5;
+        if (_rgAll.length >= 32) {
+          const _r = []; for (let i = 1; i < _rgAll.length; i++) if (_rgAll[i - 1].c > 0 && _rgAll[i].c > 0) _r.push(Math.log(_rgAll[i].c / _rgAll[i - 1].c));
+          const n = _r.length; const mu = _r.reduce((a, b) => a + b, 0) / n;
+          let cum = 0, mx = -Infinity, mn = Infinity, v = 0;
+          for (const x of _r) { cum += x - mu; if (cum > mx) mx = cum; if (cum < mn) mn = cum; v += (x - mu) * (x - mu); }
+          const sd = Math.sqrt(v / n);
+          if (sd > 0 && mx > mn && n > 8) { const rs = (mx - mn) / sd; const hRaw = Math.log(rs) / Math.log(n); const hRand = Math.log(Math.sqrt(n * Math.PI / 2)) / Math.log(n); _hurst = hRaw - (hRand - 0.5); }
+        }
+        const _tv = (_ker >= 0.40 ? 1 : 0) + (_chop <= 45 ? 1 : 0) + (_hurst >= 0.55 ? 1 : 0);
+        const _rv = (_ker <= 0.20 ? 1 : 0) + (_chop >= 58 ? 1 : 0) + (_hurst <= 0.45 ? 1 : 0);
+        const _lbl = (_tv >= 2 && _rv === 0) ? 'TREND' : (_rv >= 2 && _tv === 0) ? 'RANGE' : 'MIXED';
+        const _prev = s._dayRegime ? s._dayRegime.label : null;
+        s._dayRegime = { label: _lbl, ker: +_ker.toFixed(3), chop: +_chop.toFixed(1), hurst: +_hurst.toFixed(3), n: _rgW.length, ts: Date.now() };
+        if (_lbl !== _prev) log(sym, '🧭 REGIME ' + (_prev ? _prev + ' → ' : '') + _lbl + ' — KER ' + _ker.toFixed(2) + ' · CHOP ' + _chop.toFixed(0) + ' · Hurst ' + _hurst.toFixed(2) + ' (36×M5 window; KER+CHOP+Hurst composite, 2026-09-20).');
+      }
+    } catch (eRG) { /* classifier must never crash the tick */ }
+
     // ===== BIG-LEG OVERRIDE STATE (2026-09-16, Jean: "sometimes we should not wait
     // for macro — the bot needs to take the right decision on a $30+ rise or a $40
     // drawdown. It's not acceptable.") ===== Five documented sessions (9/9, 9/10,
@@ -3644,7 +3686,7 @@ function processPrice(sym, price, hi, lo) {
         // Arm log (2026-09-18, throttled 5min) — verification that legs are being seen.
         if (s._bigLeg && Date.now() - (s._blArmLogTs || 0) > 300000) {
           s._blArmLogTs = Date.now();
-          log(sym, '🦵 BIG-LEG ARMED ' + s._bigLeg.toUpperCase() + ' — leg ' + (s._bigLeg === 'call' ? '+$' + _blUp.toFixed(1) : '−$' + _blDn.toFixed(1)) + ' from pivot $' + (s._legPivot ? s._legPivot.ext.toFixed(2) : '?') + ' (msTrend ' + s._msTrend + '; band, waivers live).');
+          log(sym, '🦵 BIG-LEG ARMED ' + s._bigLeg.toUpperCase() + ' — leg ' + (s._bigLeg === 'call' ? '+$' + _blUp.toFixed(1) : '−$' + _blDn.toFixed(1)) + ' from pivot $' + (s._legPivot ? s._legPivot.ext.toFixed(2) : '?') + ' (msTrend ' + s._msTrend + '; regime ' + ((s._dayRegime && s._dayRegime.label) || 'n/a') + '; band, waivers live).');
         }
         // ===== REVERSAL-READY (2026-09-16, Jean: "it shouldn't disarm at +$30 — it
         // should get ready for reversal") ===== Past the band's ceiling the leg is
@@ -3735,16 +3777,17 @@ function processPrice(sym, price, hi, lo) {
             const _uvSig = s.signals.length ? s.signals[s.signals.length - 1] : null;
             if (_uvSig && _uvSig.type === _uvDir) _uvSig.pendingEntry = true;
             if (s.lastHistEntry && s.lastHistEntry.type === _uvDir) s.lastHistEntry.pendingEntry = true;
+            const _uvPick = pickAuctionLimit(s, _uvDir, price, _uvOte.limit, _uvT.atr || 0); // pivot-AVWAP vs OTE (2026-09-20)
             s._oteHold = { dir: _uvDir, trade: _uvT,
                            sigRef: (_uvSig && _uvSig.type === _uvDir) ? _uvSig : null,
                            histRef: (s.lastHistEntry && s.lastHistEntry.type === _uvDir) ? s.lastHistEntry : null,
-                           sigPrice: _uvT.ep, ote: _uvOte.limit,
+                           sigPrice: _uvT.ep, ote: _uvPick.limit, limVia: _uvPick.via, oteFib: _uvOte.limit, avwap: _uvPick.avwap,
                            slPrice: (typeof _uvT.slPrice === 'number' && _uvT.slPrice > 0) ? _uvT.slPrice : null,
                            runaway: (parseFloat(process.env.OTE_RUNAWAY_MULT) || 0.3) * (_uvT.atr || 0),
                            armTs: Date.now(), expiry: Date.now() + 240000 };
             s.trade = { active: false }; // NEVER null (2026-09-07 crash lesson)
-            log(sym, '⏳ OTE-HOLD ' + _uvDir.toUpperCase() + ' armed (ungated vet, ' + _uvAge + 's after fire — main vet starved) @ $' + price.toFixed(2) + ' — auctioning toward OTE $' + _uvOte.limit.toFixed(2) + ' ≤4min; touch / runaway / expiry / SL-invalidation as usual.');
-            sendPush('⏳ ' + sym + ' OTE-HOLD ' + _uvDir.toUpperCase(), 'waiting for $' + _uvOte.limit.toFixed(2) + ' (now $' + price.toFixed(2) + ') · ≤4min', 'signal');
+            log(sym, '⏳ OTE-HOLD ' + _uvDir.toUpperCase() + ' armed (ungated vet, ' + _uvAge + 's after fire — main vet starved) @ $' + price.toFixed(2) + ' — auctioning toward ' + _uvPick.via + ' $' + _uvPick.limit.toFixed(2) + (_uvPick.via === 'AVWAP' ? ' (pivot-anchored, ' + _uvPick.basis + ' n=' + _uvPick.n + ', leg ' + _uvPick.ageMin + 'min; OTE fib was $' + _uvOte.limit.toFixed(2) + ')' : (_uvPick.avwap ? ' (AVWAP $' + _uvPick.avwap.toFixed(2) + ' not eligible)' : '')) + ' ≤4min; touch / runaway / expiry / SL-invalidation as usual.');
+            sendPush('⏳ ' + sym + ' OTE-HOLD ' + _uvDir.toUpperCase(), 'waiting for ' + _uvPick.via + ' $' + _uvPick.limit.toFixed(2) + ' (now $' + price.toFixed(2) + ') · ≤4min', 'signal');
           }
         }
       } catch (eUV2) { if (s.trade && s.trade._oteVetted === false) s.trade._oteVetted = true; /* never strand a trade */ }
@@ -5451,7 +5494,12 @@ function processPrice(sym, price, hi, lo) {
             const _lb = s._lastBlock && s._lastBlock[sig.type];
             if (_lb && Date.now() - _lb.ts < 15000) _tcwGate = String(cohortFor(_lb.msg) || 'unmatched').replace(/-/g, '·');
           } catch (eTG) {}
-          const _tcwMsg = '🧵 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' TREND-CONT-WF @ $' + (parseFloat(sig.price) || 0).toFixed(2) + ' — with-trend continuation blocked (msTrend ' + s._msTrend + ', gate: ' + _tcwGate + '); the class behind the 9/9-9/16 missed legs (2026-09-16; gate named 2026-09-18).';
+          // Regime split (2026-09-20): the -T/-R/-M token routes each stamp into its own
+          // cohort, so we learn whether "blocked with-trend continuation" wins on
+          // classifier-TREND days and loses on classifier-RANGE days — the whole test of
+          // whether the regime score deserves to steer gates. Aggregate = sum of the three.
+          const _tcwRg = (s._dayRegime && s._dayRegime.label) || 'MIXED';
+          const _tcwMsg = '🧵 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' TREND-CONT-WF @ $' + (parseFloat(sig.price) || 0).toFixed(2) + ' — with-trend continuation blocked (msTrend ' + s._msTrend + ', gate: ' + _tcwGate + ', regime: ' + _tcwRg + (s._dayRegime ? ' KER' + s._dayRegime.ker.toFixed(2) + '/CHOP' + s._dayRegime.chop.toFixed(0) + '/H' + s._dayRegime.hurst.toFixed(2) : '') + '); the class behind the 9/9-9/16 missed legs (2026-09-16; gate named 2026-09-18). TREND-CONT-WF-' + _tcwRg.charAt(0);
           log(sym, _tcwMsg); trackBlockedOutcome(sym, _tcwMsg, true);
         }
       }
@@ -11172,10 +11220,11 @@ function processPrice(sym, price, hi, lo) {
               const _ohSig = s.signals.length ? s.signals[s.signals.length - 1] : null;
               if (_ohSig && _ohSig.type === _ohDir) _ohSig.pendingEntry = true;
               if (s.lastHistEntry && s.lastHistEntry.type === _ohDir) s.lastHistEntry.pendingEntry = true;
+              const _ohPick = pickAuctionLimit(s, _ohDir, price, _ohOte.limit, atrVal > 0 ? atrVal : (_ohT.atr || 0)); // pivot-AVWAP vs OTE (2026-09-20)
               s._oteHold = { dir: _ohDir, trade: _ohT,
                              sigRef: (_ohSig && _ohSig.type === _ohDir) ? _ohSig : null,
                              histRef: (s.lastHistEntry && s.lastHistEntry.type === _ohDir) ? s.lastHistEntry : null,
-                             sigPrice: _ohT.ep, ote: _ohOte.limit,
+                             sigPrice: _ohT.ep, ote: _ohPick.limit, limVia: _ohPick.via, oteFib: _ohOte.limit, avwap: _ohPick.avwap,
                              slPrice: (typeof _ohT.slPrice === 'number' && _ohT.slPrice > 0) ? _ohT.slPrice : null,
                              // Runaway leash 0.5→0.3×ATR (2026-09-12, Jean): runaway fills averaged −$2.15
                              // vs signal this week; releasing ~$1.3 earlier halves the chase. OTE_RUNAWAY_MULT
@@ -11183,8 +11232,8 @@ function processPrice(sym, price, hi, lo) {
                              runaway: (parseFloat(process.env.OTE_RUNAWAY_MULT) || 0.3) * (atrVal > 0 ? atrVal : (_ohT.atr || 0)),
                              armTs: _zNow, expiry: _zNow + 240000 };
               s.trade = { active: false }; // NEVER null (2026-09-07 crash: /prices//status/checkExit read .active unguarded — the 18:48 MFLIP auction nulled this and crash-looped the server)
-              log(sym, '⏳ OTE-HOLD ' + _ohDir.toUpperCase() + ' armed @ $' + price.toFixed(2) + ' — auctioning toward OTE $' + _ohOte.limit.toFixed(2) + ' (70.5% of impulse $' + _ohOte.impulseLo.toFixed(2) + '-$' + _ohOte.impulseHi.toFixed(2) + ') ≤4min; early fire on touch or ≥0.5×ATR runaway; invalidates at SL' + (s._oteHold.slPrice ? ' $' + s._oteHold.slPrice.toFixed(2) : '') + ' (Jean 2026-08-26).');
-              sendPush('⏳ XAU OTE-HOLD ' + _ohDir.toUpperCase(), 'waiting for $' + _ohOte.limit.toFixed(2) + ' (now $' + price.toFixed(2) + ') · ≤4min', 'signal');
+              log(sym, '⏳ OTE-HOLD ' + _ohDir.toUpperCase() + ' armed @ $' + price.toFixed(2) + ' — auctioning toward ' + _ohPick.via + ' $' + _ohPick.limit.toFixed(2) + (_ohPick.via === 'AVWAP' ? ' (pivot-anchored VWAP, ' + _ohPick.basis + ' n=' + _ohPick.n + ', leg ' + _ohPick.ageMin + 'min; OTE fib was $' + _ohOte.limit.toFixed(2) + ')' : ' (70.5% of impulse $' + _ohOte.impulseLo.toFixed(2) + '-$' + _ohOte.impulseHi.toFixed(2) + (_ohPick.avwap ? '; AVWAP $' + _ohPick.avwap.toFixed(2) + ' not eligible' : '') + ')') + ' ≤4min; early fire on touch or ≥0.5×ATR runaway; invalidates at SL' + (s._oteHold.slPrice ? ' $' + s._oteHold.slPrice.toFixed(2) : '') + ' (Jean 2026-08-26; AVWAP candidate 2026-09-20).');
+              sendPush('⏳ ' + sym + ' OTE-HOLD ' + _ohDir.toUpperCase(), 'waiting for ' + _ohPick.via + ' $' + _ohPick.limit.toFixed(2) + ' (now $' + price.toFixed(2) + ') · ≤4min', 'signal');
             }
           }
         } catch (eOV) { if (s.trade && s.trade._oteVetted === false) s.trade._oteVetted = true; /* never strand a trade unvetted */ }
@@ -11239,7 +11288,7 @@ function processPrice(sym, price, hi, lo) {
               delete _t.oteLimit; delete _t.oteExpiry; delete _t.oteImpulseHi; delete _t.oteImpulseLo; // server-side hold supersedes the legacy EA-side OTE limit on XAU
               _t._oteVetted = true;
               s.trade = _t;
-              const _ohWhy = _ohTouch ? 'OTE touch' : _ohRun ? 'runaway ≥0.5×ATR' : 'window expiry';
+              const _ohWhy = _ohTouch ? (_oh.limVia === 'AVWAP' ? 'AVWAP touch' : 'OTE touch') : _ohRun ? 'runaway ≥0.5×ATR' : 'window expiry'; // 'AVWAP touch' = pivot-anchored VWAP limit filled (2026-09-20) — grades as its own via class
               const _ohInfo = { fill: +price.toFixed(2), sigPrice: +_oh.sigPrice.toFixed(2), improve: +_ohImp.toFixed(2), waitedSec: Math.round((_zNow - _oh.armTs) / 1000), via: _ohWhy };
               if (_oh.sigRef) { _oh.sigRef.pendingEntry = false; _oh.sigRef.entryActual = _ohInfo.fill; _oh.sigRef.oteHold = _ohInfo; _oh.sigRef.price = price.toFixed(2); /* 2026-09-08: the EA anchors its chase-guard (and its dedupe key) on sig.price — a fill un-hiding a minutes-old row must present the FILL, not the stale signal price */ if (typeof _t.slPrice === 'number') { _oh.sigRef.sl = _t.slPrice.toFixed(2); _oh.sigRef.tp1 = _t.tp1Price.toFixed(2); _oh.sigRef.tp2 = _t.tp2Price.toFixed(2); _oh.sigRef.tp3 = _t.tp3Price.toFixed(2); } }
               if (_oh.histRef) { _oh.histRef.pendingEntry = false; _oh.histRef.oteHold = _ohInfo; if (typeof _t.slPrice === 'number') { _oh.histRef.sl = _t.slPrice; _oh.histRef.tp1 = _t.tp1Price; _oh.histRef.tp2 = _t.tp2Price; _oh.histRef.tp3 = _t.tp3Price; } }
@@ -15091,6 +15140,50 @@ function processPrice(sym, price, hi, lo) {
 //   - Impulse direction doesn't match the signal direction
 //     (PUT needs UP-impulse to fade — high more recent than low)
 //     (CALL needs DOWN-impulse — low more recent than high)
+// ===== PIVOT-ANCHORED VWAP — SECOND AUCTION LIMIT (2026-09-20, Jean: "ship 1 & 2") =====
+// The entry problem in one line: on a relentless leg the OTE 70.5% retrace never comes
+// and the fire releases at market near the crest. The institutional pullback reference
+// for a leg in progress is the VWAP anchored at the leg's origin — and since 6.61 we
+// track exactly that origin (s._legPivot, the extreme since msTrend last flipped).
+// Weighting: CFDs carry no true volume, so ≤20-min legs use the tick-snapshot ring
+// (tick-count weighted, the standard proxy); older legs fall back to M5 typical price,
+// time-weighted. Only WITH-leg pullbacks qualify (a call needs an up-leg pivot).
+function computeAVWAP(s, dir) {
+  try {
+    const pv = s._legPivot; if (!pv || !pv.ts) return null;
+    if ((dir === 'call' && pv.trend !== 'up') || (dir === 'put' && pv.trend !== 'down')) return null;
+    const now = Date.now(), age = now - pv.ts;
+    let sum = 0, n = 0, basis = 'ticks';
+    if (age <= 1200000 && Array.isArray(s.vrevSnaps)) {
+      for (const sn of s.vrevSnaps) if (sn.ts >= pv.ts) { sum += sn.p; n++; }
+      if (n < 20) return null;
+    } else if (Array.isArray(s._m5)) {
+      basis = 'M5';
+      for (const c of s._m5) if (c && c.ts >= pv.ts - 300000) { sum += (c.h + c.l + c.c) / 3; n++; }
+      if (s._m5cur && typeof s._m5cur.c === 'number') { sum += (s._m5cur.h + s._m5cur.l + s._m5cur.c) / 3; n++; }
+      if (n < 2) return null;
+    } else return null;
+    return { avwap: sum / n, n: n, ageMin: Math.round(age / 60000), basis: basis };
+  } catch (e) { return null; }
+}
+// Picks the auction limit: the NEARER of the two valid pullback references (OTE fib vs
+// pivot-AVWAP), each required to sit at least 0.05×ATR on the pullback side of price.
+// Nearer = fills more often while still improving on market; the deep OTE stays the
+// limit when the AVWAP is invalid, deeper, or already crossed. Returns {limit, via}.
+function pickAuctionLimit(s, dir, price, oteLimit, atr) {
+  const out = { limit: oteLimit, via: 'OTE', avwap: null };
+  try {
+    const av = computeAVWAP(s, dir);
+    if (!av || !(atr > 0)) return out;
+    out.avwap = +av.avwap.toFixed(2);
+    const ok = dir === 'call'
+      ? (av.avwap < price - 0.05 * atr && av.avwap > oteLimit)
+      : (av.avwap > price + 0.05 * atr && av.avwap < oteLimit);
+    if (ok) { out.limit = +av.avwap.toFixed(2); out.via = 'AVWAP'; out.basis = av.basis; out.n = av.n; out.ageMin = av.ageMin; }
+  } catch (e) {}
+  return out;
+}
+
 function computeOTE(s, sym, dir) {
   if (!s.vrevSnaps || s.vrevSnaps.length < 30) return null;
   const lookbackMs = 900000; // 15 min
@@ -17376,11 +17469,12 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.69-20260920-funded-guard', // bump on each deploy — lets /state verify what's live
+    build: '6.70-20260920-regime-avwap', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : (process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE + V-REC (all other detectors dormant)' : 'V-REC ONLY (all other detectors dormant)'),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     fundedGuard: global._fundedGuard || null, // Neura $400K guard readout (2026-09-20): account day/total vs limits
+    regimeScore: s._dayRegime || null, // KER+CHOP+Hurst composite classifier (2026-09-20): {label TREND|RANGE|MIXED, ker, chop, hurst, n, ts}
     gexLevels: sym === 'NAS100' || sym === 'QQQ' ? _gexLevels : undefined, // QQQ dealer gamma map (2026-08-12)
     zoneMap: (S[sym] && S[sym]._zoneObs || []).map(z => ({ kind: z.kind || 'OB', tf: z.tf || '', dir: z.dir, lo: +z.lo.toFixed(2), hi: +z.hi.toFixed(2), ageMin: Math.round((Date.now() - z.ts) / 60000) })), // live FVG/OB zones (2026-08-11)
     msTrend: (S[sym] && S[sym]._msTrend) || null, // CHOCH-V2 structure state
