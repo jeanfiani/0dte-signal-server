@@ -2090,11 +2090,19 @@ setInterval(() => {
 // Books the EA's actual management: +50% of the TP1 distance when TP1 hits, and the
 // remaining fraction at the real close price (captures BE-trails as ~0, full SLs as -1x,
 // TP2/TP3 closes at their true distance). XAU multiplier x50 per Jean 2026-08-17.
-const PNL_MULT = { XAU: parseFloat(process.env.PNL_MULT_XAU || '50'), NAS100: parseFloat(process.env.PNL_MULT_NAS || '30'), BTC: parseFloat(process.env.PNL_MULT_BTC || '1') }; // NAS ×30 per Jean 2026-08-20
+// FUNDED-TEST RECALIBRATION (2026-09-21, from Jean's MT5 deal #14546701: buy 3 lots
+// 4378.50→4375.38 = −$936 → $300 per $1 on XAU = 3 × 100oz; BTC 5 lots 14.74pts = −$73.70
+// → $1 per $1 per lot → 3 lots = ×3; NAS 30 lots ≈ $30/pt unchanged). Defaults now match
+// the 3/3/30 sizing; env still overrides. The funded guard reads these numbers — they
+// must track the EA's lot inputs whenever Jean changes them.
+const PNL_MULT = { XAU: parseFloat(process.env.PNL_MULT_XAU || '300'), NAS100: parseFloat(process.env.PNL_MULT_NAS || '30'), BTC: parseFloat(process.env.PNL_MULT_BTC || '3') };
 const NAS_WIDE_SL = parseFloat(process.env.NAS_WIDE_SL || '25'); // NAS stops wider than this book at 20x, else 30x (Jean 2026-08-20: "if SL is high we will take 20X only")
 function pnlMultFor(sym, t) {
   try {
     if (sym === 'NAS100' && t && t.ep > 0 && t.slPrice > 0 && Math.abs(t.ep - t.slPrice) > NAS_WIDE_SL) return 20;
+    // RANGE5 live fires trade at HALF the symbol lot in the EA (2026-09-20 half-lot rule) —
+    // book them at half the multiplier so the ledger and the funded guard see real dollars.
+    if (sym === 'BTC' && t && t._r5Live) return (PNL_MULT[sym] || 1) * 0.5;
   } catch (e) {}
   return PNL_MULT[sym] || 1;
 }
@@ -17319,6 +17327,25 @@ app.post('/trade/close', (req, res) => {
 });
 
 // EA acknowledges it has flattened the position → clear the flag (idempotent by id).
+// ===== EA EVENT REPORTER (2026-09-21, the 00:00 RANGE5 put the EA never took) =====
+// The EA POSTs its own execution failures/skips here — ORDER_FAILED, SKIPPED, INIT_SKIP,
+// REJECTED — so a miss reaches Jean's phone the minute it happens instead of the next
+// morning's autopsy. Logged under the symbol, pushed (60s throttle per kind).
+global._eaEvtTs = global._eaEvtTs || {};
+app.post('/ea/event', (req, res) => {
+  try {
+    const b = req.body || {};
+    const sym = String(b.sym || '?').toUpperCase(), kind = String(b.kind || 'EVENT'), detail = String(b.detail || '').slice(0, 300);
+    const line = '🤖 EA ' + kind + ' — ' + detail;
+    if (S[sym]) log(sym, line); else console.log('[' + ts() + '] ' + sym + ' ' + line);
+    const k = sym + '|' + kind;
+    if (Date.now() - (global._eaEvtTs[k] || 0) > 60000) {
+      global._eaEvtTs[k] = Date.now();
+      try { sendPush('⚠️ EA ' + kind + ' ' + sym, detail.slice(0, 120), 'alert'); } catch (e) {}
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ ok: false, error: String(e) }); }
+});
 app.post('/trade/close/ack', (req, res) => {
   const sym = resolveSymbol(req.body && req.body.sym);
   const id = req.body && req.body.id;
@@ -17542,7 +17569,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.71-20260920-volume-profile', // bump on each deploy — lets /state verify what's live
+    build: '6.74-20260921-ea-events', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : (process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE + V-REC (all other detectors dormant)' : 'V-REC ONLY (all other detectors dormant)'),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
@@ -17550,6 +17577,7 @@ app.get('/state/:sym', (req, res) => {
     regimeScore: s._dayRegime || null, // KER+CHOP+Hurst composite classifier (2026-09-20): {label TREND|RANGE|MIXED, ker, chop, hurst, n, ts}
     volumeProfile: s._vp ? { poc: s._vp.poc, vah: s._vp.vah, val: s._vp.val, ticks: s._vp.ticks, session: s._vp.key } : null, // session tick-profile POC / value area (2026-09-20)
     m5HistBars: (s._m5hist || []).length, // week-long M5 ring fill level — Lorentzian classifier needs ~2,000 (2026-09-20)
+    eaHeartbeat: (function () { try { const hb = global._eaHb || {}; return { seen: !!hb.lastSeen, lastSeenSec: hb.lastSeen ? Math.round((Date.now() - hb.lastSeen) / 1000) : null, online: !!hb.lastSeen && (Date.now() - hb.lastSeen) <= 90000, offlineSinceMin: hb.offline && hb.offlineSince ? Math.round((Date.now() - hb.offlineSince) / 60000) : null }; } catch (e) { return null; } })(), // EA poll heartbeat (2026-09-21)
     gexLevels: sym === 'NAS100' || sym === 'QQQ' ? _gexLevels : undefined, // QQQ dealer gamma map (2026-08-12)
     zoneMap: (S[sym] && S[sym]._zoneObs || []).map(z => ({ kind: z.kind || 'OB', tf: z.tf || '', dir: z.dir, lo: +z.lo.toFixed(2), hi: +z.hi.toFixed(2), ageMin: Math.round((Date.now() - z.ts) / 60000) })), // live FVG/OB zones (2026-08-11)
     msTrend: (S[sym] && S[sym]._msTrend) || null, // CHOCH-V2 structure state
@@ -17732,7 +17760,46 @@ setInterval(() => {
 }, 30 * 1000);
 
 // Full prices + indicators endpoint for mobile PWA polling
+// ===== EA HEARTBEAT (2026-09-21, Jean: "looks like the EA was off, I don't know why") =====
+// The Sunday 19:46 RIDE put swept TP3 server-side (+$8.38) while the EA wasn't running;
+// nobody knew until the morning autopsy. The EA now polls /prices?ea=1; the server
+// timestamps it, exposes eaHeartbeat in /state, and pushes 🔴 EA OFFLINE when no poll
+// arrives for 90s during market hours (XAU: Sun 18:00 → Fri 17:00 ET), re-pushing every
+// 15min while dark, and 🟢 EA ONLINE on return with the outage length.
+global._eaHb = global._eaHb || { lastSeen: 0, offline: false, offlineSince: 0, lastPush: 0 };
+function _marketOpenET() {
+  try {
+    const p = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', weekday: 'short', hour: 'numeric', hour12: false }).formatToParts(new Date());
+    const wd = (p.find(x => x.type === 'weekday') || {}).value, hr = parseInt((p.find(x => x.type === 'hour') || {}).value, 10);
+    if (wd === 'Sat') return false;
+    if (wd === 'Sun') return hr >= 18;
+    if (wd === 'Fri') return hr < 17;
+    return true;
+  } catch (e) { return true; }
+}
+setInterval(() => {
+  try {
+    const hb = global._eaHb; if (!hb.lastSeen) return; // never seen an EA yet — nothing to judge
+    const gap = Date.now() - hb.lastSeen;
+    if (_marketOpenET() && gap > 90000) {
+      if (!hb.offline) { hb.offline = true; hb.offlineSince = hb.lastSeen; }
+      if (Date.now() - hb.lastPush > 900000) {
+        hb.lastPush = Date.now();
+        const m = '🔴 EA OFFLINE — no /prices?ea=1 poll for ' + Math.round(gap / 60000) + 'min (market open). Server trades are NOT being executed.';
+        console.log('[' + ts() + '] ' + m);
+        try { sendPush('🔴 EA OFFLINE', Math.round(gap / 60000) + 'min without a poll — check MT5 / VPS', 'alert'); } catch (e) {}
+      }
+    } else if (hb.offline && gap <= 90000) {
+      const out = Math.round((Date.now() - hb.offlineSince) / 60000);
+      hb.offline = false; hb.lastPush = 0;
+      console.log('[' + ts() + '] 🟢 EA ONLINE — back after ~' + out + 'min.');
+      try { sendPush('🟢 EA ONLINE', 'back after ~' + out + 'min offline', 'alert'); } catch (e) {}
+    }
+  } catch (e) {}
+}, 30000).unref();
+
 app.get('/prices', (req, res) => {
+  try { if (req.query && req.query.ea === '1') { global._eaHb.lastSeen = Date.now(); } } catch (e) {}
   const data = {};
   SYMBOLS.forEach(sym => {
     const s = S[sym];
@@ -17839,6 +17906,7 @@ app.get('/prices', (req, res) => {
       })(),
       trade: s.trade && s.trade.active && s.trade._oteVetted !== false ? {
         active: true, type: s.trade.type, ep: s.trade.ep,
+        ageSec: s.trade.ts ? Math.round((Date.now() - s.trade.ts) / 1000) : null, // EA smart initial-sync (2026-09-21): a young active trade on attach is NOT "old"
         t1: s.trade.t1, t2: s.trade.t2, sl: s.trade.sl, rev: s.trade.rev,
         isTrend: s.trade.isTrend || false,
         isCfd: s.trade.isCfd || false,
