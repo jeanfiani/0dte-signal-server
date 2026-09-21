@@ -1982,8 +1982,10 @@ function cohortFor(reason) {
   if (/FLOOR-PDL/.test(reason)) return 'FLOOR-PDL'; // TP1-into-prior-day-extreme stamps, dormant (2026-09-04, 02:57 case) — must precede FLOOR-PATH
   if (/FLOOR-PATH/.test(reason)) return 'FLOOR-PATH'; // TP1-into-defended-floor blocks (2026-08-28, 21:57/06:40 cases)
   if (/FUNDED-GUARD/.test(reason)) return 'FUNDED-GUARD'; // Neura account-level breaker blocks (2026-09-20) — measures what the guard suppressed
+  if (/LB-TIMESTOP-HELD/.test(reason)) return 'LB-TIMESTOP-HELD'; // benched breakout time-stop (2026-09-21): real outcome of trades held through the would-close; re-arm only if held LOSES ≥60%/≥10
   if (/VA-FADE/.test(reason)) return 'VA-FADE'; // value-area-edge fades from the session tick profile (2026-09-20) — compare with SESS-EXTREME (price-only extremes)
-  if (/BTC-BIGLEG/.test(reason)) return 'BTC-BIGLEG'; // pivot-leg continuation shadow on BTC (2026-09-20, the 76k→81k case) — must precede detector matches
+  if (/BTC-BIGLEG-WKND/.test(reason)) return 'BTC-BIGLEG-WKND'; // weekend-armed legs, split out 2026-09-21 (Jean: both losses were weekend) — must precede the plain match
+  if (/BTC-BIGLEG/.test(reason)) return 'BTC-BIGLEG'; // pivot-leg continuation shadow on BTC (2026-09-20, the 76k→81k case) — weekday-only promotion cohort from 2026-09-21
   if (/NAS-RANGE5-BRK/.test(reason)) return 'NAS-RANGE5-BRK'; // range-EXPANSION arm, NAS clone (2026-09-18)
   if (/BTC-RANGE5-BRK/.test(reason)) return 'BTC-RANGE5-BRK'; // range-EXPANSION arm: confirmed break of the prior 5-day extreme ridden with-trend (2026-09-18, Jean's "4K growth" chart) — must precede the -RT/plain matches
   // RANGE5-RT sub-cohorts (2026-09-21 routing fix: bumpCohortTally runs names through
@@ -2109,7 +2111,7 @@ function pnlMultFor(sym, t) {
     if (sym === 'NAS100' && t && t.ep > 0 && t.slPrice > 0 && Math.abs(t.ep - t.slPrice) > NAS_WIDE_SL) return 20;
     // RANGE5 live fires trade at HALF the symbol lot in the EA (2026-09-20 half-lot rule) —
     // book them at half the multiplier so the ledger and the funded guard see real dollars.
-    if (sym === 'BTC' && t && t._r5Live) return (PNL_MULT[sym] || 1) * 0.5;
+    if (sym === 'BTC' && t && (t._r5Live || t._legLive)) return (PNL_MULT[sym] || 1) * 0.5; // BIGLEG live rows also trade at half lot (EA matches "BIGLEG", 2026-09-21)
   } catch (e) {}
   return PNL_MULT[sym] || 1;
 }
@@ -3804,12 +3806,39 @@ function processPrice(sym, price, hi, lo) {
           s._bblTs = s._bblTs || {};
           if (_bLeg >= 0.15 * _bAdr && _bLeg < 0.6 * _bAdr && Date.now() - (s._bblTs[_bDir] || 0) >= 1800000) {
             s._bblTs[_bDir] = Date.now();
+            // WEEKEND SPLIT (2026-09-21, Jean: "remove from weekend, both losses were during
+            // the weekend") — weekend arms grade into BTC-BIGLEG-WKND and never fire live;
+            // the promotion cohort BTC-BIGLEG is weekday-only from here (5W/0L weekday, 0W/2L weekend at the split).
+            const _bWk = btcWeekendClosed();
+            const _bLane = _bWk ? 'BTC-BIGLEG-WKND' : 'BTC-BIGLEG';
             const _bSl = _bDir === 'call' ? +(s._legPivot.ext - 0.1 * _bAdr).toFixed(2) : +(s._legPivot.ext + 0.1 * _bAdr).toFixed(2);
             const _bTp = _bDir === 'call' ? +(price + 0.5 * _bAdr).toFixed(2) : +(price - 0.5 * _bAdr).toFixed(2);
-            const _bMsg = '🦵 BTC-BIGLEG ' + _bDir.toUpperCase() + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — one-sided leg $' + _bLeg.toFixed(0) + ' (' + (_bLeg / _bAdr).toFixed(2) + '×ADR) from pivot $' + s._legPivot.ext.toFixed(0) + ' with msTrend ' + s._legPivot.trend + ' · SL $' + _bSl.toFixed(0) + ' (pivot) · TP $' + _bTp.toFixed(0) + ' (0.5×ADR) — the 76k→81k class (2026-09-20).';
+            const _bMsg = '🦵 ' + _bLane + ' ' + _bDir.toUpperCase() + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — one-sided leg $' + _bLeg.toFixed(0) + ' (' + (_bLeg / _bAdr).toFixed(2) + '×ADR) from pivot $' + s._legPivot.ext.toFixed(0) + ' with msTrend ' + s._legPivot.trend + ' · SL $' + _bSl.toFixed(0) + ' (pivot) · TP $' + _bTp.toFixed(0) + ' (0.5×ADR) — the 76k→81k class (2026-09-20' + (_bWk ? '; weekend split 2026-09-21' : '') + ').';
             s.blockedOutcomes = s.blockedOutcomes || [];
-            s.blockedOutcomes.push({ ts: Date.now(), time: ts(), symbol: sym, detector: 'BTC-BIGLEG', type: _bDir, price: price, virtualTp1: _bTp, virtualSl: _bSl, maxMin: 720, blockReason: _bMsg, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+            s.blockedOutcomes.push({ ts: Date.now(), time: ts(), symbol: sym, detector: _bLane, type: _bDir, price: price, virtualTp1: _bTp, virtualSl: _bSl, maxMin: 720, blockReason: _bMsg, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
             log(sym, _bMsg);
+            // ===== BTC-BIGLEG LIVE LANE (built 2026-09-21, Jean "OK for BTC BIGLEG") =====
+            // Flip-ready behind BTC_BIGLEG_LIVE=1 (Railway env, no deploy). Weekdays only.
+            // Real trade with the leg's geometry: SL at the pivot −0.1×ADR (leg dead if the
+            // pivot breaks), TP1 0.25×ADR secure leg (EA banks half), TP2 0.5×ADR, TP3
+            // 1.0×ADR. _legLive exempts the universal $100 caps and books at the EA's
+            // half-lot multiplier. Pre-registered bench rule: net-negative over the first
+            // 6 live fires → back to shadow. Promotion bar for flipping: ≥60% over ≥15
+            // weekday-resolved BTC-BIGLEG (5W/0L at build time).
+            try {
+              if (!_bWk && process.env.BTC_BIGLEG_LIVE === '1' && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold) {
+                const _lTp1 = _bDir === 'call' ? +(price + 0.25 * _bAdr).toFixed(2) : +(price - 0.25 * _bAdr).toFixed(2);
+                const _lTp3 = _bDir === 'call' ? +(price + 1.0 * _bAdr).toFixed(2) : +(price - 1.0 * _bAdr).toFixed(2);
+                s.dailySignalCount++;
+                const _lSig = { type: _bDir, time: ts(), price: price.toFixed(2), score: (_bDir === 'call' ? '⬆' : '⬇') + 'BIGLEG', rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: _bSl.toFixed(2), tp1: _lTp1.toFixed(2), tp2: _bTp.toFixed(2), tp3: _lTp3.toFixed(2), bigLeg: true, oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: 'bigleg leg entry' } };
+                s.signals.push(_lSig); logSignal(sym, _lSig);
+                s.trade = buildCfdTrade(_bDir, price, (s._atr || _bAdr / 20), sym);
+                s.trade._oteVetted = true; s.trade._legLive = true; s.trade.bigLeg = true;
+                s.trade.slPrice = _bSl; s.trade.tp1Price = _lTp1; s.trade.tp2Price = _bTp; s.trade.tp3Price = _lTp3;
+                log(sym, '🦵 BTC-BIGLEG ' + _bDir.toUpperCase() + ' LIVE FIRE @ $' + price.toFixed(0) + ' — leg $' + _bLeg.toFixed(0) + ' (' + (_bLeg / _bAdr).toFixed(2) + '×ADR) from pivot $' + s._legPivot.ext.toFixed(0) + ' · SL $' + _bSl.toFixed(0) + ' (pivot, risk $' + Math.abs(price - _bSl).toFixed(0) + ') · TP1 $' + _lTp1.toFixed(0) + ' · TP2 $' + _bTp.toFixed(0) + ' · TP3 $' + _lTp3.toFixed(0) + ' [BTC_BIGLEG_LIVE].');
+                sendPush('🦵 BTC BIGLEG ' + _bDir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(0) + ' · SL $' + _bSl.toFixed(0) + ' · TP1 $' + _lTp1.toFixed(0), 'signal');
+              }
+            } catch (eBLL) { /* live lane must never crash the shadow */ }
           }
         }
       }
@@ -4046,7 +4075,13 @@ function processPrice(sym, price, hi, lo) {
             const _pHiB = Math.max.apply(null, _prior.map(d0 => d0.high).filter(h0 => h0 > 0).concat([-Infinity]));
             const _pLoB = Math.min.apply(null, _prior.map(d0 => d0.low).filter(l0 => l0 > 0).concat([Infinity]));
             s._r5.brkL = s._r5.brkL || 0; s._r5.brkS = s._r5.brkS || 0;
-            if (isFinite(_pHiB) && _pHiB > 0 && price >= _pHiB + 0.15 * _adr && s._msTrend === 'up' && Date.now() - s._r5.brkL > 43200000) {
+            // msTrend lag fix (2026-09-21): BTC structure read stayed "down" through the first
+            // $2,000 of the 9/21 expansion, so BRK entered near 85,100 instead of ~82,650. A
+            // closed M5 beyond the prior extreme is confirmation in its own right.
+            const _lcB = (Array.isArray(s._m5) && s._m5.length) ? s._m5[s._m5.length - 1] : null;
+            const _bkUp = s._msTrend === 'up' || (_lcB && _lcB.c > _pHiB);
+            const _bkDn = s._msTrend === 'down' || (_lcB && isFinite(_pLoB) && _lcB.c < _pLoB);
+            if (isFinite(_pHiB) && _pHiB > 0 && price >= _pHiB + 0.15 * _adr && _bkUp && Date.now() - s._r5.brkL > 43200000) {
               s._r5.brkL = Date.now();
               // TP recalibrated 0.75→0.5×ADR (2026-09-20): specimen #1 rode the 9/18 break
               // +$1,805 MFE and still graded no_resolve — entry already pays a 0.15×ADR
@@ -4057,7 +4092,7 @@ function processPrice(sym, price, hi, lo) {
               s.blockedOutcomes.push({ ts: Date.now(), time: ts(), symbol: sym, detector: _r5Tag + '-BRK', type: 'call', price: price, virtualTp1: _bkTp, virtualSl: _bkSl, maxMin: 720, blockReason: _bkMsg, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
               log(sym, _bkMsg);
             }
-            if (isFinite(_pLoB) && _pLoB > 0 && price <= _pLoB - 0.15 * _adr && s._msTrend === 'down' && Date.now() - s._r5.brkS > 43200000) {
+            if (isFinite(_pLoB) && _pLoB > 0 && price <= _pLoB - 0.15 * _adr && _bkDn && Date.now() - s._r5.brkS > 43200000) {
               s._r5.brkS = Date.now();
               const _bkSl2 = +(_pLoB + 0.25 * _adr).toFixed(2), _bkTp2 = +(price - 0.5 * _adr).toFixed(2); // 0.75→0.5×ADR, 2026-09-20 (see long side)
               const _bkMsg2 = '🚀 ' + _r5Tag + '-BRK PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — prior 5-day low $' + _pLoB.toFixed(0) + ' broken −0.15×ADR with msTrend down (range EXPANSION) · SL $' + _bkSl2.toFixed(0) + ' (back inside range) · TP $' + _bkTp2.toFixed(0) + ' (0.5×ADR).';
@@ -11015,11 +11050,32 @@ function processPrice(sym, price, hi, lo) {
               const _tbFav = _tb.type === 'call' ? price - _tb.ep : _tb.ep - price;
               if (_tbFav < 0.5 * atrVal) {
                 _tb._lbStop = true;
-                const _tbId = 'lbstop-' + Date.now();
-                s.closeRequest = { active: true, id: _tbId, ts: Date.now(), type: _tb.type || '', ep: _tb.ep || 0, source: 'breakout-time-stop' };
-                const _tbMsg = '⏱️ BREAKOUT TIME-STOP — ' + String(_tb.type || '').toUpperCase() + ' @ $' + (+_tb.ep).toFixed(2) + ' showed ' + _tbFav.toFixed(2) + ' (<0.5×ATR $' + (0.5 * atrVal).toFixed(2) + ') after 15min; live-break premise dead, EA close requested (~flat exit vs full SL) [id ' + _tbId + '].';
-                log(sym, _tbMsg);
-                sendPush('⏱️ ' + sym + ' breakout time-stop', 'Closing stalled ' + String(_tb.type || '').toUpperCase() + ' @ $' + price.toFixed(2) + ' (entry $' + (+_tb.ep).toFixed(2) + ')', 'signal');
+                // ===== BENCHED 2026-09-21 (Jean: "why did the EA close the first NAS call
+                // which was going directly to TP3") ===== Record: 8/19 save (flat 30min →
+                // full SL) vs 9/21 09:53 NAS call flattened at +10pts at the 15-min tick,
+                // TP1 4min later, TP3 15min after that (MFE +107). Same shape as EARLY-PROT
+                // (benched 3W/0L). Default = WOULD-CLOSE stamp; the trade runs on and its
+                // real outcome grades LB-TIMESTOP-HELD: re-arm (LB_TIMESTOP=1) only if held
+                // trades from this state LOSE ≥60% over ≥10. Live path also fixed: it now
+                // closes the SERVER trade too — before, the ledger kept booking TP1/TP3 on a
+                // position the EA had already flattened (today's +$2,583 NAS ledger vs ~+$450 real).
+                if (process.env.LB_TIMESTOP === '1') {
+                  const _tbId = 'lbstop-' + Date.now();
+                  s.closeRequest = { active: true, id: _tbId, ts: Date.now(), type: _tb.type || '', ep: _tb.ep || 0, source: 'breakout-time-stop' };
+                  const _tbMsg = '⏱️ BREAKOUT TIME-STOP — ' + String(_tb.type || '').toUpperCase() + ' @ $' + (+_tb.ep).toFixed(2) + ' showed ' + _tbFav.toFixed(2) + ' (<0.5×ATR $' + (0.5 * atrVal).toFixed(2) + ') after 15min; live-break premise dead, EA close requested (~flat exit vs full SL) [id ' + _tbId + '].';
+                  log(sym, _tbMsg);
+                  sendPush('⏱️ ' + sym + ' breakout time-stop', 'Closing stalled ' + String(_tb.type || '').toUpperCase() + ' @ $' + price.toFixed(2) + ' (entry $' + (+_tb.ep).toFixed(2) + ')', 'signal');
+                  // Server-side close to match the EA (2026-09-21): book the flat exit, end the trade.
+                  try {
+                    const _tbE = s.lastHistEntry;
+                    if (_tbE && _tbE.symbol === sym) { _tbE.outcomes = _tbE.outcomes || {}; _tbE.outcomes.timeStopExit = +price.toFixed(2); _tbE.outcomes.closePrice = +price.toFixed(2); }
+                    bookPnl(sym, _tbFav * pnlMultFor(sym, _tb), 'close');
+                    s.trade = { active: false };
+                  } catch (eTBc) {}
+                } else {
+                  _tb._lbStopWouldClose = { ts: Date.now(), price: price, fav: +_tbFav.toFixed(2) };
+                  log(sym, '⏱️ BREAKOUT TIME-STOP WOULD-CLOSE (benched 2026-09-21) — ' + String(_tb.type || '').toUpperCase() + ' @ $' + (+_tb.ep).toFixed(2) + ' shows ' + _tbFav.toFixed(2) + ' (<0.5×ATR $' + (0.5 * atrVal).toFixed(2) + ') after 15min; holding — real outcome grades LB-TIMESTOP-HELD. LB_TIMESTOP=1 re-arms.');
+                }
               }
             }
           }
@@ -15760,6 +15816,8 @@ function updateSignalOutcome(sym, finalPrice) {
       entry.outcomes.tp3Hit = true; entry.outcomes.tp3HitTs = now;
       entry.outcomes.closePrice = finalPrice;
       if (t.ep > 0 && finalPrice > 0) bookPnl(sym, 0.5 * (t.type === 'call' ? finalPrice - t.ep : t.ep - finalPrice) * pnlMultFor(sym, t), 'close');
+      // LB-TIMESTOP-HELD grading (2026-09-21): a benched time-stop would have flattened this trade; held, it swept TP3.
+      try { if (t._lbStopWouldClose) { bumpCohortTally(sym, 'LB-TIMESTOP-HELD', 'win'); log(sym, '⏱️ LB-TIMESTOP-HELD → WIN (held through the would-close at $' + (+t._lbStopWouldClose.price).toFixed(2) + ', swept TP3 @ $' + (+finalPrice).toFixed(2) + ').'); } } catch (eLBH) {}
       // ===== TP3 CLOSE COMMAND (2026-09-16, Jean's 23:02 TRv2 case) ===== The 9/15
       // 23:02 call swept TP1→TP3 in THIRTEEN SECONDS; the trade cleared server-side
       // between EA polls, so the EA never banked the partials — its BE fallback then
@@ -15780,6 +15838,8 @@ function updateSignalOutcome(sym, finalPrice) {
       entry.outcomes.slHit = true; entry.outcomes.slHitTs = now;
       entry.outcomes.closePrice = finalPrice;
       if (t.ep > 0 && finalPrice > 0) bookPnl(sym, (entry.outcomes.tp1Hit ? 0.5 : 1.0) * (t.type === 'call' ? finalPrice - t.ep : t.ep - finalPrice) * pnlMultFor(sym, t), 'close');
+      // LB-TIMESTOP-HELD grading (2026-09-21): held through a benched would-close and stopped — TP1 first = scratch, else loss.
+      try { if (t._lbStopWouldClose) { const _lbOc = entry.outcomes.tp1Hit ? 'scratch' : 'loss'; bumpCohortTally(sym, 'LB-TIMESTOP-HELD', _lbOc); log(sym, '⏱️ LB-TIMESTOP-HELD → ' + _lbOc.toUpperCase() + ' (would-close was at $' + (+t._lbStopWouldClose.price).toFixed(2) + ' showing ' + t._lbStopWouldClose.fav + '; the time-stop would have saved ' + (t.type === 'call' ? (t._lbStopWouldClose.price - finalPrice) : (finalPrice - t._lbStopWouldClose.price)).toFixed(2) + ').'); } } catch (eLBH2) {}
     }
   }
   // Persist after outcome update (added 2026-05-14). Outcomes are critical for audit —
@@ -15896,7 +15956,7 @@ function checkExit(sym, price) {
       // the thesis IS high SL + very wide TP (structural 0.75×ADR stop, 5-day-mid
       // target) — clamping it to the scalp caps would gut the design. _r5Live trades
       // keep their thesis geometry; every other path stays capped.
-      if (_capT > 0 && !t._r5Live) {
+      if (_capT > 0 && !t._r5Live && !t._legLive) { // _legLive (BTC-BIGLEG live lane, 2026-09-21) keeps its ADR-scale geometry too
         if (typeof t.tp1Price === 'number' && Math.abs(t.ep - t.tp1Price) > _capT + 0.01) {
           const _oldT1 = t.tp1Price;
           t.tp1Price = +(iC ? t.ep + _capT : t.ep - _capT).toFixed(2);
@@ -17609,8 +17669,8 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.76-20260921-bigleg-zone-ease-mfe', // bump on each deploy — lets /state verify what's live
-    btcMode: BTC_TRADING_ENABLED ? 'FULL' : (process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE + V-REC (all other detectors dormant)' : 'V-REC ONLY (all other detectors dormant)'),
+    build: '6.78-20260921-btc-bigleg-lane', // bump on each deploy — lets /state verify what's live
+    btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' ? ' + BIGLEG LIVE' : '') + (process.env.BTC_VREC_ENABLED !== '0' ? ' + V-REC' : '') + ' (all other detectors dormant)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     fundedGuard: global._fundedGuard || null, // Neura $400K guard readout (2026-09-20): account day/total vs limits
