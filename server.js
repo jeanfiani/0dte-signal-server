@@ -1702,7 +1702,7 @@ function trackBlockedOutcome(sym, msg, force) {
   // "(any gate)" — the 01:08-01:59 misses took tally-delta forensics to attribute. Only
   // actual blocks/deferrals qualify; dormant validator stamps (DORMANT-WOULD-FIRE,
   // CONF-SCORE, ARMED...) never overwrite it.
-  try { if (/BLOCKED|DEFERRED/.test(msg) && !/DORMANT|WOULD-FIRE|TREND-CONT-WF/.test(msg)) { s._lastBlock = s._lastBlock || {}; s._lastBlock[type] = { msg: msg.slice(0, 200), ts: now }; } } catch (eLB) {}
+  try { if (/BLOCKED|DEFERRED|REFUSED|SKIPPED|conv \d+ < \d+|below (the )?floor|too (low|weak)/i.test(msg) && !/DORMANT|WOULD-FIRE|TREND-CONT-WF|ARMED \(dormant/.test(msg)) { s._lastBlock = s._lastBlock || {}; s._lastBlock[type] = { msg: msg.slice(0, 200), ts: now }; } } catch (eLB) {} // pattern widened 2026-09-21 (08:04 'unattributed' — conviction-floor messages don't say BLOCKED)
   // ===== BTC COUNTER-TREND TRACKING RETIRED (2026-08-21, Jean) =====
   // "remove all the counter-trend signals definitely, not even needed as dormant."
   // 2-day verdict at honest ATR brackets: counter-trend puts into the melt went
@@ -1986,6 +1986,13 @@ function cohortFor(reason) {
   if (/BTC-BIGLEG/.test(reason)) return 'BTC-BIGLEG'; // pivot-leg continuation shadow on BTC (2026-09-20, the 76k→81k case) — must precede detector matches
   if (/NAS-RANGE5-BRK/.test(reason)) return 'NAS-RANGE5-BRK'; // range-EXPANSION arm, NAS clone (2026-09-18)
   if (/BTC-RANGE5-BRK/.test(reason)) return 'BTC-RANGE5-BRK'; // range-EXPANSION arm: confirmed break of the prior 5-day extreme ridden with-trend (2026-09-18, Jean's "4K growth" chart) — must precede the -RT/plain matches
+  // RANGE5-RT sub-cohorts (2026-09-21 routing fix: bumpCohortTally runs names through
+  // cohortFor, so these MUST precede the plain -RT match or they collapse into it):
+  if (/RANGE5-RT-TIGHT/.test(reason)) return (/^NAS|NAS-RANGE5/.test(reason) ? 'NAS' : 'BTC') + '-RANGE5-RT-TIGHT'; // $1,000-SL twin (2026-09-20)
+  if (/RANGE5-RT-WKND/.test(reason)) return (/NAS-RANGE5/.test(reason) ? 'NAS' : 'BTC') + '-RANGE5-RT-WKND'; // weekend-armed retests (2026-09-20)
+  if (/RANGE5-RT-RGT/.test(reason)) return (/NAS-RANGE5/.test(reason) ? 'NAS' : 'BTC') + '-RANGE5-RT-RGT'; // regime split: armed in TREND (2026-09-21)
+  if (/RANGE5-RT-RGR/.test(reason)) return (/NAS-RANGE5/.test(reason) ? 'NAS' : 'BTC') + '-RANGE5-RT-RGR'; // armed in RANGE
+  if (/RANGE5-RT-RGM/.test(reason)) return (/NAS-RANGE5/.test(reason) ? 'NAS' : 'BTC') + '-RANGE5-RT-RGM'; // armed in MIXED
   if (/NAS-RANGE5-RT/.test(reason)) return 'NAS-RANGE5-RT'; // NAS clone (2026-09-08, Jean: "same model applies to NAS")
   if (/NAS-RANGE5/.test(reason)) return 'NAS-RANGE5';
   if (/BTC-RANGE5-RT/.test(reason)) return 'BTC-RANGE5-RT'; // retest arm: nearest unbroken prior-day extreme (2026-09-07) — must precede the plain match
@@ -2288,6 +2295,9 @@ function updateBlockedOutcomes(sym, price) {
     if (b.snaps.p15m == null && elapsedMin >= 15) b.snaps.p15m = +price.toFixed(2);
     if (b.snaps.p30m == null && elapsedMin >= 30) b.snaps.p30m = +price.toFixed(2);
     if (b.snaps.p60m == null && elapsedMin >= 60) b.snaps.p60m = +price.toFixed(2);
+    // MFE tracking (2026-09-21, Jean's 07:33 chart): peak favorable excursion per entry,
+    // so the resolver can tell a "scratch after +$17" from a "scratch after +$5.10".
+    try { const _fav = b.type === 'call' ? price - b.price : b.price - price; if (_fav > (b.mfe || 0)) b.mfe = +_fav.toFixed(2); } catch (eMF) {}
     // TP1/SL hit detection
     if (!b.tp1Hit && !b.slHit) {
       const tp1Reached = b.type === 'call' ? price >= b.virtualTp1 : price <= b.virtualTp1;
@@ -2308,6 +2318,15 @@ function updateBlockedOutcomes(sym, price) {
       else if (b.tp1Hit && !b.slHit) b.outcome = 'win';
       else if (b.slHit && !b.tp1Hit) b.outcome = 'loss';
       else b.outcome = 'no_resolve';
+      // SWEEP-WIN (2026-09-21): the ±bracket grader only knows TP1 and "back to entry" —
+      // it stamped the 9/21 07:33 call (TP1 in minutes, ran +$17 through TP2/TP3, then
+      // revisited entry an hour later) as SCRATCH. A real trade banks 50% at TP1 and
+      // trails the rest — a ≥2×TP1 run is a WIN in account terms. Re-grade: scratch with
+      // MFE ≥ 2× the TP1 distance → win, tagged in the reason so the split stays visible.
+      try {
+        const _t1d = Math.abs(b.virtualTp1 - b.price);
+        if (b.outcome === 'scratch' && _t1d > 0 && (b.mfe || 0) >= 2 * _t1d) { b.outcome = 'win'; b.sweepWin = true; b.blockReason += ' [mfe2R·win $' + b.mfe.toFixed(2) + ' ≥ 2×TP1]'; } // token chosen not to collide with any cohortFor/detector regex
+      } catch (eSW) {}
       b.closed = true;
       b.closedTs = now;
       bumpCohortTally(b.symbol || sym, b.blockReason, b.outcome); // persistent cohort score (2026-07-31)
@@ -3912,10 +3931,55 @@ function processPrice(sym, price, hi, lo) {
           s._r5.longR = s._r5.longR !== undefined ? s._r5.longR : null;
           s._r5.shortR = s._r5.shortR !== undefined ? s._r5.shortR : null;
           s._r5.cdLR = s._r5.cdLR || 0; s._r5.cdSR = s._r5.cdSR || 0;
+          // ===== RANGE5-RT LIVE FIRE — REJECTION-CONFIRMED (2026-09-21, Jean "ok go ahead") =====
+          // v1 fired live at ARM time — up to 0.1×ADR BEFORE the level was even touched (the
+          // 9/21 00:00 short entered $352 early, then watched price poke $261 through). v2:
+          // the arm is shadow-only; the live fire waits for (a) price to TAG the level
+          // (within 0.03×ADR or through it) and (b) the first M5 CLOSE back inside the range
+          // — the rejection. Geometry: SL at the INVALIDATION (5-day extreme ∓0.1×ADR, never
+          // wider than the old 0.75×ADR), TP1 secure leg 0.25×ADR, TP2 5-day mid, TP3 far
+          // extreme. The blind arm keeps grading as the benchmark the confirmed entry must beat.
+          const _r5LiveFire = (sd, v) => {
+            try {
+              if (sym !== 'BTC' || process.env.BTC_RANGE5_LIVE === '0') return false;
+              if (!(!btcWeekendClosed() || process.env.BTC_R5_WEEKEND === '1')) return false;
+              if ((s.trade && s.trade.active) || s._oteHold || s._invHold) return false;
+              const isL = sd === 'long';
+              const _sl = isL ? Math.max(s.rollingLow - 0.1 * _adr, v.lvl - 0.75 * _adr) : Math.min(s.rollingHigh + 0.1 * _adr, v.lvl + 0.75 * _adr);
+              const _tp1 = isL ? price + 0.25 * _adr : price - 0.25 * _adr;
+              if (isL ? (_sl >= price || _tp1 <= price) : (_sl <= price || _tp1 >= price)) return false; // degenerate geometry (price already past the extreme)
+              s.dailySignalCount++;
+              const _sig = { type: isL ? 'call' : 'put', time: ts(), price: price.toFixed(2), score: (isL ? '⬆' : '⬇') + 'RANGE5-RT', rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: _sl.toFixed(2), tp1: _tp1.toFixed(2), tp2: (+v.tp).toFixed(2), tp3: (+v.tpFar).toFixed(2), regime: v.regime || null, oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: Math.round((Date.now() - v.ts) / 1000), via: 'range5-rt rejection entry' } };
+              s.signals.push(_sig); logSignal(sym, _sig);
+              s.trade = buildCfdTrade(isL ? 'call' : 'put', price, (s._atr || _adr / 20), sym);
+              s.trade._oteVetted = true; s.trade._r5Live = true; s.trade._r5Regime = v.regime || null;
+              s.trade.slPrice = +_sl.toFixed(2); s.trade.tp1Price = +_tp1.toFixed(2); s.trade.tp2Price = +(+v.tp).toFixed(2); s.trade.tp3Price = +(+v.tpFar).toFixed(2);
+              log(sym, '🎢 ' + _r5Tag + '-RT ' + sd.toUpperCase() + ' LIVE FIRE (rejection-confirmed) @ $' + price.toFixed(0) + ' — level $' + v.lvl.toFixed(0) + ' tagged ' + Math.round((Date.now() - (v.tagTs || v.ts)) / 60000) + 'min ago, M5 closed back inside · SL $' + _sl.toFixed(0) + ' (extreme-anchored, risk $' + Math.abs(price - _sl).toFixed(0) + ') · TP1 $' + _tp1.toFixed(0) + ' (0.25×ADR) · TP2 mid $' + (+v.tp).toFixed(0) + ' · TP3 far $' + (+v.tpFar).toFixed(0) + ' · regime ' + (v.regime || '?') + ' [v2 2026-09-21].');
+              sendPush('🎢 BTC RANGE5-RT ' + sd.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(0) + ' · SL $' + _sl.toFixed(0) + ' · TP1 $' + _tp1.toFixed(0) + ' · rejection-confirmed', 'signal');
+              return true;
+            } catch (eLF) { return false; }
+          };
           // grade active retest virtuals
           [['longR', 'long'], ['shortR', 'short']].forEach(pair => {
             const key = pair[0], sd = pair[1], v = s._r5[key]; if (!v) return;
             if (!v.farHit && (sd === 'long' ? price >= v.tpFar : price <= v.tpFar)) v.farHit = true;
+            // Rejection-confirmation state machine for the live lane (2026-09-21)
+            if (sym === 'BTC' && v.liveEligible && !v.liveFired) {
+              try {
+                if (!v.tagged && (sd === 'long' ? price <= v.lvl + 0.03 * _adr : price >= v.lvl - 0.03 * _adr)) {
+                  v.tagged = true; v.tagTs = Date.now();
+                  log(sym, '🎢 ' + _r5Tag + '-RT ' + sd.toUpperCase() + ' level TAGGED @ $' + price.toFixed(0) + ' (level $' + v.lvl.toFixed(0) + ') — waiting for an M5 close back inside the range to fire live.');
+                }
+                if (v.tagged) {
+                  const _lc = (Array.isArray(s._m5) && s._m5.length) ? s._m5[s._m5.length - 1] : null;
+                  if (_lc && _lc.ts !== v.m5Ts) {
+                    v.m5Ts = _lc.ts;
+                    const _rej = (_lc.ts + 300000 >= (v.tagTs || 0)) && (sd === 'long' ? _lc.c > v.lvl : _lc.c < v.lvl);
+                    if (_rej && _r5LiveFire(sd, v)) v.liveFired = true;
+                  }
+                }
+              } catch (eRC) {}
+            }
             // TIGHT-SL TWIN (2026-09-20, Jean: "$1,000 SL is way enough... $3,000 worst
             // case"): every BTC arm also grades a $1,000-stop version of itself into
             // BTC-RANGE5-RT-TIGHT. If TIGHT holds ≥60% alongside the structural arm, Jean's
@@ -3936,8 +4000,9 @@ function processPrice(sym, price, hi, lo) {
             const expired = Date.now() - v.ts > 5 * 86400000;
             if (win || loss || expired) {
               const oc = win ? 'win' : loss ? 'loss' : 'scratch';
-              log(sym, '🎢 ' + _r5Tag + '-RT ' + sd.toUpperCase() + ' RESOLVED ' + oc.toUpperCase() + ' — level $' + v.lvl.toFixed(0) + ', armed $' + v.ep.toFixed(0) + ' → ' + (win ? 'TP(mid) $' + v.tp.toFixed(0) : loss ? 'SL $' + v.sl.toFixed(0) : 'expired 5d @ $' + price.toFixed(0)) + (v.farHit ? ' · FAR side reached' : '') + ' (retest arm, Jean 2026-09-07).');
+              log(sym, '🎢 ' + _r5Tag + '-RT ' + sd.toUpperCase() + ' RESOLVED ' + oc.toUpperCase() + ' — level $' + v.lvl.toFixed(0) + ', armed $' + v.ep.toFixed(0) + ' → ' + (win ? 'TP(mid) $' + v.tp.toFixed(0) : loss ? 'SL $' + v.sl.toFixed(0) : 'expired 5d @ $' + price.toFixed(0)) + (v.farHit ? ' · FAR side reached' : '') + ' · ' + Math.round((Date.now() - v.ts) / 60000) + 'min · regime ' + (v.regime || '?') + (v.tagged ? ' · tagged' + (v.liveFired ? '+fired' : ', no rejection close') : ' · never tagged') + ' (retest arm, Jean 2026-09-07; duration/regime 2026-09-21).');
               try { bumpCohortTally(sym, _r5Tag + '-RT' + (v.wknd ? '-WKND' : ''), oc); } catch (eB2) {} // -WKND sub-cohort (2026-09-20): weekend-armed retests grade separately; weekend live unlocks at ≥60% over ≥10
+              try { bumpCohortTally(sym, _r5Tag + '-RT-RG' + String(v.regime || 'MIXED').charAt(0), oc); } catch (eB3) {} // regime split (2026-09-21): -RGT / -RGR / -RGM — "no fades in TREND" becomes a gate when this says so
               s._r5[key] = null; s._r5[sd === 'long' ? 'cdLR' : 'cdSR'] = Date.now();
             }
           });
@@ -3945,61 +4010,26 @@ function processPrice(sym, price, hi, lo) {
           if (!s._r5.longR && Date.now() - s._r5.cdLR > 21600000) {
             const _lvlL = _prior.map(d0 => d0.low).filter(l0 => l0 > 0 && l0 < price && l0 > s.rollingLow + 0.1 * _adr && (!isFinite(s.sessionLow) || s.sessionLow > l0 - 0.1 * _adr)).sort((a0, b0) => b0 - a0)[0];
             if (_lvlL && price - _lvlL <= 0.1 * _adr) {
-              s._r5.longR = { lvl: _lvlL, ep: price, sl: +(_lvlL - 0.75 * _adr).toFixed(2), tp: +((_lvlL + s.rollingHigh) / 2).toFixed(2), tpFar: s.rollingHigh, ts: Date.now(), farHit: false, wknd: (sym === 'BTC' && btcWeekendClosed()) }; // wknd split 2026-09-20 (Jean: "should we override the weekend rules?") — weekend arms grade into their own cohort
-              log(sym, '🎢 ' + _r5Tag + '-RT LONG armed'.replace(' armed','') + ' armed @ $' + price.toFixed(0) + ' — retest of unbroken prior-day low $' + _lvlL.toFixed(0) + ' · SL $' + s._r5.longR.sl.toFixed(0) + ' · TP mid $' + s._r5.longR.tp.toFixed(0) + ' · far $' + s.rollingHigh.toFixed(0) + ' (dormant shadow).');
-              // ===== RANGE5-RT LIVE LANE (2026-09-14; LIVE 2026-09-17, Jean: "BTC-Range
-              // goes live" — shadow cohort 5W/1L incl. same-day 09:39 low-retest win) =====
-              // ON by default; BTC_RANGE5_LIVE=0 in Railway env is the kill switch (no
-              // deploy needed). Fires the retest entry for real, thesis geometry:
-              // structural SL 0.75×ADR beyond the level (cap-exempt via _r5Live), TP1
-              // at the 5-day mid (EA banks half), TP2/TP3 at the far extreme.
-              // BENCH RULE (pre-registered): net-negative over the first 6 resolved live
-              // fires → back to shadow. Shadow arm keeps grading BTC-RANGE5-RT regardless.
-              try {
-                // EXTREMES-ONLY FILTER (2026-09-18, Jean: "as per our rule it should have
-                // taken a CALL at 76000, not a PUT" — the 9/17 22:27 live short faded a
-                // prior-day high at 42% of the 5-day range, mid-range, −$2,375 on the
-                // breakout; the winning 09:39 shadow long was at 23%). The thesis is fade
-                // the EXTREMES: live longs only when the level sits in the BOTTOM THIRD
-                // of the 5-day range, live shorts only in the TOP third. Shadow arms keep
-                // grading every level so the filter's cost stays measured.
-                const _r5Rng = (s.rollingHigh > s.rollingLow) ? s.rollingHigh - s.rollingLow : 0;
-                if (sym === 'BTC' && process.env.BTC_RANGE5_LIVE !== '0' && _r5Rng > 0 && _lvlL <= s.rollingLow + 0.33 * _r5Rng && (!btcWeekendClosed() || process.env.BTC_R5_WEEKEND === '1') && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold) { // BTC_R5_WEEKEND=1 unlocks weekend fires (2026-09-20); earn it via the -WKND cohort ≥60%/≥10
-                  s.dailySignalCount++;
-                  const _rlV = s._r5.longR;
-                  const _rlSig = { type: 'call', time: ts(), price: price.toFixed(2), score: '⬆RANGE5-RT', rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: _rlV.sl.toFixed(2), tp1: _rlV.tp.toFixed(2), tp2: (+_rlV.tpFar).toFixed(2), tp3: (+_rlV.tpFar).toFixed(2), oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: 'range5-rt level entry' } };
-                  s.signals.push(_rlSig); logSignal(sym, _rlSig);
-                  s.trade = buildCfdTrade('call', price, (s._atr || _adr / 20), sym);
-                  s.trade._oteVetted = true; s.trade._r5Live = true;
-                  s.trade.slPrice = _rlV.sl; s.trade.tp1Price = _rlV.tp; s.trade.tp2Price = +_rlV.tpFar; s.trade.tp3Price = +_rlV.tpFar;
-                  log(sym, '🎢 ' + _r5Tag + '-RT LONG LIVE FIRE @ $' + price.toFixed(0) + ' — retest of unbroken prior-day low $' + _lvlL.toFixed(0) + ' · SL $' + _rlV.sl.toFixed(0) + ' (structural, cap-exempt) · TP1 mid $' + _rlV.tp.toFixed(0) + ' · TP2/3 far $' + (+_rlV.tpFar).toFixed(0) + ' [BTC_RANGE5_LIVE].');
-                  sendPush('🎢 BTC RANGE5-RT LONG #' + s.dailySignalCount, '$' + price.toFixed(0) + ' · SL $' + _rlV.sl.toFixed(0) + ' · TP1 $' + _rlV.tp.toFixed(0), 'signal');
-                }
-              } catch (eRL) { /* live lane must never crash the arm */ }
+              // ARM = SHADOW ONLY since 2026-09-21 (v2). The live lane fires from the grading
+              // loop above once the level is tagged and an M5 closes back inside the range.
+              // liveEligible = the EXTREMES-ONLY filter (2026-09-18: bottom third for longs,
+              // top third for shorts); regime = classifier label at arm for the -RG split.
+              const _r5Rng = (s.rollingHigh > s.rollingLow) ? s.rollingHigh - s.rollingLow : 0;
+              const _lcL = (Array.isArray(s._m5) && s._m5.length) ? s._m5[s._m5.length - 1].ts : 0;
+              s._r5.longR = { lvl: _lvlL, ep: price, sl: +(_lvlL - 0.75 * _adr).toFixed(2), tp: +((_lvlL + s.rollingHigh) / 2).toFixed(2), tpFar: s.rollingHigh, ts: Date.now(), farHit: false, wknd: (sym === 'BTC' && btcWeekendClosed()),
+                             regime: (s._dayRegime && s._dayRegime.label) || 'MIXED', liveEligible: (_r5Rng > 0 && _lvlL <= s.rollingLow + 0.33 * _r5Rng), tagged: false, tagTs: 0, liveFired: false, m5Ts: _lcL };
+              log(sym, '🎢 ' + _r5Tag + '-RT LONG armed @ $' + price.toFixed(0) + ' — retest of unbroken prior-day low $' + _lvlL.toFixed(0) + ' · shadow SL $' + s._r5.longR.sl.toFixed(0) + ' · TP mid $' + s._r5.longR.tp.toFixed(0) + ' · far $' + s.rollingHigh.toFixed(0) + ' · regime ' + s._r5.longR.regime + (s._r5.longR.liveEligible && sym === 'BTC' ? ' · LIVE-ELIGIBLE (bottom third) — fires on tag + M5 rejection close' : ' · shadow only') + '.');
             }
           }
           if (!s._r5.shortR && Date.now() - s._r5.cdSR > 21600000) {
             const _lvlH = _prior.map(d0 => d0.high).filter(h0 => h0 > 0 && h0 > price && h0 < s.rollingHigh - 0.1 * _adr && (!isFinite(s.sessionHigh) || s.sessionHigh < h0 + 0.1 * _adr)).sort((a0, b0) => a0 - b0)[0];
             if (_lvlH && _lvlH - price <= 0.1 * _adr) {
-              s._r5.shortR = { lvl: _lvlH, ep: price, sl: +(_lvlH + 0.75 * _adr).toFixed(2), tp: +((_lvlH + s.rollingLow) / 2).toFixed(2), tpFar: s.rollingLow, ts: Date.now(), farHit: false, wknd: (sym === 'BTC' && btcWeekendClosed()) }; // wknd split 2026-09-20
-              log(sym, '🎢 ' + _r5Tag + '-RT SHORT armed'.replace(' armed','') + ' armed @ $' + price.toFixed(0) + ' — retest of unbroken prior-day high $' + _lvlH.toFixed(0) + ' · SL $' + s._r5.shortR.sl.toFixed(0) + ' · TP mid $' + s._r5.shortR.tp.toFixed(0) + ' · far $' + s.rollingLow.toFixed(0) + ' (dormant shadow).');
-              // RANGE5-RT LIVE LANE — short mirror (see long side above; LIVE 2026-09-17, BTC_RANGE5_LIVE=0 kills).
-              // EXTREMES-ONLY (2026-09-18): shorts fire only when the level sits in the TOP
-              // THIRD of the 5-day range — the 22:27 mid-range short (42%) is the case this kills.
-              try {
-                const _r5RngS = (s.rollingHigh > s.rollingLow) ? s.rollingHigh - s.rollingLow : 0;
-                if (sym === 'BTC' && process.env.BTC_RANGE5_LIVE !== '0' && _r5RngS > 0 && _lvlH >= s.rollingHigh - 0.33 * _r5RngS && (!btcWeekendClosed() || process.env.BTC_R5_WEEKEND === '1') && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold) { // BTC_R5_WEEKEND=1 unlocks weekend fires (2026-09-20)
-                  s.dailySignalCount++;
-                  const _rsV = s._r5.shortR;
-                  const _rsSig = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇RANGE5-RT', rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: _rsV.sl.toFixed(2), tp1: _rsV.tp.toFixed(2), tp2: (+_rsV.tpFar).toFixed(2), tp3: (+_rsV.tpFar).toFixed(2), oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: 'range5-rt level entry' } };
-                  s.signals.push(_rsSig); logSignal(sym, _rsSig);
-                  s.trade = buildCfdTrade('put', price, (s._atr || _adr / 20), sym);
-                  s.trade._oteVetted = true; s.trade._r5Live = true;
-                  s.trade.slPrice = _rsV.sl; s.trade.tp1Price = _rsV.tp; s.trade.tp2Price = +_rsV.tpFar; s.trade.tp3Price = +_rsV.tpFar;
-                  log(sym, '🎢 ' + _r5Tag + '-RT SHORT LIVE FIRE @ $' + price.toFixed(0) + ' — retest of unbroken prior-day high $' + _lvlH.toFixed(0) + ' · SL $' + _rsV.sl.toFixed(0) + ' (structural, cap-exempt) · TP1 mid $' + _rsV.tp.toFixed(0) + ' · TP2/3 far $' + (+_rsV.tpFar).toFixed(0) + ' [BTC_RANGE5_LIVE].');
-                  sendPush('🎢 BTC RANGE5-RT SHORT #' + s.dailySignalCount, '$' + price.toFixed(0) + ' · SL $' + _rsV.sl.toFixed(0) + ' · TP1 $' + _rsV.tp.toFixed(0), 'signal');
-                }
-              } catch (eRS) { /* live lane must never crash the arm */ }
+              // ARM = SHADOW ONLY since 2026-09-21 (v2) — see long side. liveEligible = top third.
+              const _r5RngS = (s.rollingHigh > s.rollingLow) ? s.rollingHigh - s.rollingLow : 0;
+              const _lcS = (Array.isArray(s._m5) && s._m5.length) ? s._m5[s._m5.length - 1].ts : 0;
+              s._r5.shortR = { lvl: _lvlH, ep: price, sl: +(_lvlH + 0.75 * _adr).toFixed(2), tp: +((_lvlH + s.rollingLow) / 2).toFixed(2), tpFar: s.rollingLow, ts: Date.now(), farHit: false, wknd: (sym === 'BTC' && btcWeekendClosed()),
+                              regime: (s._dayRegime && s._dayRegime.label) || 'MIXED', liveEligible: (_r5RngS > 0 && _lvlH >= s.rollingHigh - 0.33 * _r5RngS), tagged: false, tagTs: 0, liveFired: false, m5Ts: _lcS };
+              log(sym, '🎢 ' + _r5Tag + '-RT SHORT armed @ $' + price.toFixed(0) + ' — retest of unbroken prior-day high $' + _lvlH.toFixed(0) + ' · shadow SL $' + s._r5.shortR.sl.toFixed(0) + ' · TP mid $' + s._r5.shortR.tp.toFixed(0) + ' · far $' + s.rollingLow.toFixed(0) + ' · regime ' + s._r5.shortR.regime + (s._r5.shortR.liveEligible && sym === 'BTC' ? ' · LIVE-ELIGIBLE (top third) — fires on tag + M5 rejection close' : ' · shadow only') + '.');
             }
           }
           // ===== RANGE5-BRK — RANGE-EXPANSION ARM, DORMANT (2026-09-18, Jean: "we need
@@ -7025,11 +7055,21 @@ function processPrice(sym, price, hi, lo) {
         // right); today new lows printed every few minutes (zones failing in real
         // time). Ease: with-trend latch armed AND the session extreme updated within
         // 15min → the inside-zone veto defers (8/19 footprints logic, made precise).
-        const _zvInEase = _zvIn && latchAdvSource(s, sig.type) && (sig.type === 'put'
+        // ===== BIG-LEG ZONE EASE (2026-09-21, Jean's 06:45-08:05 chart: 4342→4373 with
+        // BIG-LEG ARMED and every good entry vetoed INSIDE the OBs left by the 06:00
+        // decline) ===== Same logic as the 9/1 failing-zone ease, with the leg band as
+        // the discriminator instead of the trend-day latch (which arms too late for a
+        // young leg): a one-sided $10-30 move with structure agreeing IS zones failing
+        // in real time. Second independent leg where ZONE-VETO killed the entry (9/18
+        // noon: 5 vetoes on a +$37 rally, all graded wins). Continuation tags only;
+        // counter-trend and non-BIG-LEG fires keep the full veto. Bench rule = BIG-LEG's.
+        const _zvBigLeg = s._bigLeg === sig.type && process.env.BIGLEG_DISABLED !== '1' && /RIDE|TREND|FAST|SUST|6\/6/.test(tagEarly || '');
+        const _zvInLatch = _zvIn && latchAdvSource(s, sig.type) && (sig.type === 'put'
           ? ((s.sessionLowUpdateTs || 0) > 0 && (Date.now() - s.sessionLowUpdateTs) < 900000)
           : ((s.sessionHighUpdateTs || 0) > 0 && (Date.now() - s.sessionHighUpdateTs) < 900000));
+        const _zvInEase = _zvIn && (_zvInLatch || _zvBigLeg);
         if (_zvInEase) {
-          log(sym, '📈 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' INSIDE-ZONE veto DEFERRED — with-trend latch + session extreme advancing <15min: the opposing ' + (_zvIn.kind || 'OB') + ' ' + (_zvIn.tf || '') + ' $' + _zvIn.lo.toFixed(2) + '-$' + _zvIn.hi.toFixed(2) + ' is failing in real time (2026-09-01 waterfall fix; defended-zone blocks unchanged).');
+          log(sym, (_zvInLatch ? '📈 ' : '🚀 ') + tagEarly + ' ' + sig.type.toUpperCase() + ' INSIDE-ZONE veto DEFERRED — ' + (_zvInLatch ? 'with-trend latch + session extreme advancing <15min' : 'BIG-LEG armed ' + sig.type + ' (BIGLEG-ZONE-EASE 2026-09-21)') + ': the opposing ' + (_zvIn.kind || 'OB') + ' ' + (_zvIn.tf || '') + ' $' + _zvIn.lo.toFixed(2) + '-$' + _zvIn.hi.toFixed(2) + ' is failing in real time (defended-zone blocks unchanged).');
         }
         if (_zvIn && !_zvInEase) {
           Object.assign(s, _emitSnapshot);
@@ -7038,10 +7078,10 @@ function processPrice(sym, price, hi, lo) {
           log(sym, _zvInMsg); trackBlockedOutcome(sym, _zvInMsg, true);
           return false;
         }
-        if (tdLatchEase(s, sig.type)) {
+        if (tdLatchEase(s, sig.type) || _zvBigLeg) {
           const _zvE = s._zoneObs.find(z => z && z.dir !== sig.type &&
             (_zvC ? (z.lo >= price && z.lo <= price + 1.2 * atrVal) : (z.hi <= price && z.hi >= price - 1.2 * atrVal)));
-          if (_zvE) log(sym, '📈 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' TREND-CONT EASE — ZONE-VETO waived: opposing ' + (_zvE.kind || 'OB') + ' ' + (_zvE.tf || '') + ' ahead ignored, trend-day latch with-trend (2026-08-19, 8/19 launch case).');
+          if (_zvE) log(sym, (_zvBigLeg && !tdLatchEase(s, sig.type) ? '🚀 ' : '📈 ') + tagEarly + ' ' + sig.type.toUpperCase() + ' TREND-CONT EASE — ZONE-VETO waived: opposing ' + (_zvE.kind || 'OB') + ' ' + (_zvE.tf || '') + ' ahead ignored, ' + (_zvBigLeg && !tdLatchEase(s, sig.type) ? 'BIG-LEG armed (BIGLEG-ZONE-EASE 2026-09-21)' : 'trend-day latch with-trend (2026-08-19, 8/19 launch case)') + '.');
         } else {
         // INSIDE-ZONE EXTENSION (2026-08-27, Jean's 20:03 autopsy): the veto only saw
         // zones AHEAD of price (z.lo >= price for calls) — a signal firing INSIDE an
@@ -17569,7 +17609,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.74-20260921-ea-events', // bump on each deploy — lets /state verify what's live
+    build: '6.76-20260921-bigleg-zone-ease-mfe', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : (process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE + V-REC (all other detectors dormant)' : 'V-REC ONLY (all other detectors dormant)'),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
