@@ -1982,6 +1982,8 @@ function cohortFor(reason) {
   if (/FLOOR-PDL/.test(reason)) return 'FLOOR-PDL'; // TP1-into-prior-day-extreme stamps, dormant (2026-09-04, 02:57 case) — must precede FLOOR-PATH
   if (/FLOOR-PATH/.test(reason)) return 'FLOOR-PATH'; // TP1-into-defended-floor blocks (2026-08-28, 21:57/06:40 cases)
   if (/FUNDED-GUARD/.test(reason)) return 'FUNDED-GUARD'; // Neura account-level breaker blocks (2026-09-20) — measures what the guard suppressed
+  if (/LC-AGREE/.test(reason)) return 'LC-AGREE'; // Lorentzian classifier agreed with the blocked candidate (2026-09-21) — would-win here vs LC-DISAGREE is the whole test
+  if (/LC-DISAGREE/.test(reason)) return 'LC-DISAGREE';
   if (/LB-TIMESTOP-HELD/.test(reason)) return 'LB-TIMESTOP-HELD'; // benched breakout time-stop (2026-09-21): real outcome of trades held through the would-close; re-arm only if held LOSES ≥60%/≥10
   if (/VA-FADE/.test(reason)) return 'VA-FADE'; // value-area-edge fades from the session tick profile (2026-09-20) — compare with SESS-EXTREME (price-only extremes)
   if (/BTC-BIGLEG-WKND/.test(reason)) return 'BTC-BIGLEG-WKND'; // weekend-armed legs, split out 2026-09-21 (Jean: both losses were weekend) — must precede the plain match
@@ -3710,6 +3712,86 @@ function processPrice(sym, price, hi, lo) {
         }
       }
     } catch (eVPD) { /* profile must never crash the tick */ }
+
+    // ===== LORENTZIAN CLASSIFICATION — SHADOW ENTRY SCORE (2026-09-21, Jean: "implement 3") =====
+    // Port of Dehorty's kNN classifier (github.com/artificial-intelligence-edge/lorentzian-
+    // classification): features RSI(14), WaveTrend(10,11), CCI(20), ADX(20), RSI(9) per M5
+    // bar, min-max normalized over the ring; label = direction 4 bars ahead; prediction =
+    // sum of the labels of the k=8 nearest historical bars by Lorentzian distance
+    // Σlog(1+|Δf|), candidates spaced every 4th bar. Score ∈ [−8,+8]. Recomputed once per
+    // closed M5 bar from the week-long ring (needs ≥120 bars; ~2,000 for the real thing).
+    // DORMANT: every signal candidate carries _lc; blocked candidates stamp LC-AGREE /
+    // LC-DISAGREE (|score|≥4) so the cohort split tells us whether agreement predicts wins.
+    try {
+      const _lcH = s._m5hist;
+      if (isMT5 && Array.isArray(_lcH) && _lcH.length >= 120) {
+        const _lcLast = _lcH[_lcH.length - 1].ts;
+        if (s._lcTs !== _lcLast) {
+          s._lcTs = _lcLast;
+          const n = _lcH.length, C = _lcH.map(b => b.c), H = _lcH.map(b => b.h), L = _lcH.map(b => b.l);
+          const rsi = (len) => { const out = new Array(n).fill(null); let g = 0, l = 0; for (let i = 1; i < n; i++) { const d = C[i] - C[i - 1]; const up = d > 0 ? d : 0, dn = d < 0 ? -d : 0; if (i <= len) { g += up; l += dn; if (i === len) { g /= len; l /= len; out[i] = l === 0 ? 100 : 100 - 100 / (1 + g / l); } } else { g = (g * (len - 1) + up) / len; l = (l * (len - 1) + dn) / len; out[i] = l === 0 ? 100 : 100 - 100 / (1 + g / l); } } return out; };
+          const ema = (arr, len) => { const out = new Array(arr.length).fill(null); const k = 2 / (len + 1); let e = null; for (let i = 0; i < arr.length; i++) { if (arr[i] === null || !isFinite(arr[i])) { out[i] = e; continue; } e = e === null ? arr[i] : arr[i] * k + e * (1 - k); out[i] = e; } return out; };
+          const wt = (() => { const hlc3 = _lcH.map(b => (b.h + b.l + b.c) / 3); const esa = ema(hlc3, 10); const d = ema(hlc3.map((v, i) => esa[i] === null ? null : Math.abs(v - esa[i])), 10); const ci = hlc3.map((v, i) => (esa[i] === null || d[i] === null || d[i] === 0) ? null : (v - esa[i]) / (0.015 * d[i])); return ema(ci, 11); })();
+          const cci = (() => { const len = 20, out = new Array(n).fill(null); const tp = _lcH.map(b => (b.h + b.l + b.c) / 3); for (let i = len - 1; i < n; i++) { let m = 0; for (let j = i - len + 1; j <= i; j++) m += tp[j]; m /= len; let md = 0; for (let j = i - len + 1; j <= i; j++) md += Math.abs(tp[j] - m); md /= len; out[i] = md === 0 ? 0 : (tp[i] - m) / (0.015 * md); } return out; })();
+          const adx = (() => { const len = 20, out = new Array(n).fill(null); let tr = 0, pdm = 0, ndm = 0, dxs = []; for (let i = 1; i < n; i++) { const t = Math.max(H[i] - L[i], Math.abs(H[i] - C[i - 1]), Math.abs(L[i] - C[i - 1])); const up = H[i] - H[i - 1], dn = L[i - 1] - L[i]; const p = (up > dn && up > 0) ? up : 0, q = (dn > up && dn > 0) ? dn : 0; if (i <= len) { tr += t; pdm += p; ndm += q; } else { tr = tr - tr / len + t; pdm = pdm - pdm / len + p; ndm = ndm - ndm / len + q; } if (i >= len && tr > 0) { const pdi = 100 * pdm / tr, ndi = 100 * ndm / tr; const dx = (pdi + ndi) > 0 ? 100 * Math.abs(pdi - ndi) / (pdi + ndi) : 0; dxs.push(dx); if (dxs.length > len) dxs.shift(); out[i] = dxs.reduce((a, b) => a + b, 0) / dxs.length; } } return out; })();
+          const F = [rsi(14), wt, cci, adx, rsi(9)];
+          const norm = F.map(arr => { let mn = Infinity, mx = -Infinity; for (const v of arr) if (v !== null && isFinite(v)) { if (v < mn) mn = v; if (v > mx) mx = v; } const r = mx - mn; return arr.map(v => (v === null || !isFinite(v) || r === 0) ? null : (v - mn) / r); });
+          const feat = (i) => { const f = []; for (let k = 0; k < 5; k++) { if (norm[k][i] === null) return null; f.push(norm[k][i]); } return f; };
+          const q = feat(n - 1);
+          if (q) {
+            const nb = []; // [dist, label]
+            for (let i = 0; i + 4 < n - 1; i += 4) { const f = feat(i); if (!f) continue; let d = 0; for (let k = 0; k < 5; k++) d += Math.log(1 + Math.abs(q[k] - f[k])); const lbl = C[i + 4] > C[i] ? 1 : C[i + 4] < C[i] ? -1 : 0; if (nb.length < 8) { nb.push([d, lbl]); nb.sort((a, b) => a[0] - b[0]); } else if (d < nb[7][0]) { nb[7] = [d, lbl]; nb.sort((a, b) => a[0] - b[0]); } }
+            if (nb.length === 8) {
+              const score = nb.reduce((a, b) => a + b[1], 0);
+              const prev = s._lc ? s._lc.score : null;
+              s._lc = { score, dir: score > 0 ? 'call' : score < 0 ? 'put' : null, k: 8, n, adx: adx[n - 1] !== null ? +adx[n - 1].toFixed(1) : null, ts: Date.now() };
+              if (prev === null || Math.sign(prev) !== Math.sign(score)) log(sym, '🧠 LORENTZIAN ' + (score > 0 ? 'LONG' : score < 0 ? 'SHORT' : 'FLAT') + ' ' + (score >= 0 ? '+' : '') + score + '/8 — kNN over ' + n + ' M5 bars (RSI14·WT·CCI·ADX·RSI9, Lorentzian distance; shadow score, 2026-09-21).');
+            }
+          }
+        }
+      }
+    } catch (eLC) { /* classifier must never crash the tick */ }
+
+    // ===== SMC CROSS-CHECK — REFERENCE BOS/CHoCH vs OUR STRUCTURE FLIPS (2026-09-21, "implement 5") =====
+    // In-process port of the smartmoneyconcepts reference (joshyattridge): swing highs/lows
+    // with swing_length=5 on M5, then a close through the last swing = BOS (with trend) or
+    // CHoCH (against it). Our engine's structure read is msTrend; every flip is recorded
+    // here. Once per closed bar we compare the last 6h: reference CHoCH events matched to
+    // our flips (same direction, ±60min) with the lag in bars, reference events we never
+    // flipped on, our flips the reference never confirmed, and reference FVG count (no
+    // size filter) vs ours (0.3×ATR gap + displacement). Exposed as smcDiff in /state —
+    // if our CHoCH trails the reference by ≥2 bars consistently, the M5-close-through-
+    // swing rule is the lag and a shorter swing length is the fix.
+    try {
+      if (isMT5) {
+        if (s._msTrend && s._msTrend !== s._msSeen) { s._msSeen = s._msTrend; s._msFlips = s._msFlips || []; s._msFlips.push({ dir: s._msTrend, ts: Date.now() }); if (s._msFlips.length > 60) s._msFlips.shift(); }
+        const _sh = s._m5hist;
+        if (Array.isArray(_sh) && _sh.length >= 40) {
+          const _shLast = _sh[_sh.length - 1].ts;
+          if (s._smcTs !== _shLast) {
+            s._smcTs = _shLast;
+            const n = _sh.length, Lw = 5, from = Math.max(Lw, n - 72 - 2 * Lw);
+            let lastSH = null, lastSL = null, trend = 0; const events = [];
+            for (let i = from; i < n - Lw; i++) {
+              let isH = true, isL = true;
+              for (let j = i - Lw; j <= i + Lw; j++) { if (j === i) continue; if (_sh[j].h >= _sh[i].h) isH = false; if (_sh[j].l <= _sh[i].l) isL = false; if (!isH && !isL) break; }
+              if (isH) lastSH = { p: _sh[i].h, i }; if (isL) lastSL = { p: _sh[i].l, i };
+              const k = i + Lw; // bar whose close can break the swing confirmed at i
+              if (lastSH && _sh[k].c > lastSH.p) { events.push({ kind: trend === -1 ? 'CHoCH' : 'BOS', dir: 'up', ts: _sh[k].ts, level: lastSH.p }); trend = 1; lastSH = null; }
+              else if (lastSL && _sh[k].c < lastSL.p) { events.push({ kind: trend === 1 ? 'CHoCH' : 'BOS', dir: 'down', ts: _sh[k].ts, level: lastSL.p }); trend = -1; lastSL = null; }
+            }
+            const win = _sh.slice(-72); let refFvg = 0;
+            for (let i = 2; i < win.length; i++) { if (win[i - 2].h < win[i].l || win[i - 2].l > win[i].h) refFvg++; }
+            const ch = events.filter(e => e.kind === 'CHoCH' && e.ts >= Date.now() - 6 * 3600000);
+            const flips = (s._msFlips || []).filter(f => f.ts >= Date.now() - 7 * 3600000);
+            let matched = 0, lags = [];
+            for (const e of ch) { const f = flips.find(x => x.dir === (e.dir === 'up' ? 'up' : 'down') && Math.abs(x.ts - (e.ts + 300000)) <= 3600000); if (f) { matched++; lags.push(Math.round((f.ts - (e.ts + 300000)) / 300000)); } }
+            lags.sort((a, b) => a - b);
+            s._smcDiff = { window: '6h', swingLen: Lw, refChoch: ch.length, refBos: events.filter(e => e.kind === 'BOS' && e.ts >= Date.now() - 6 * 3600000).length, ourFlips: flips.filter(f => f.ts >= Date.now() - 6 * 3600000).length, matched, unmatchedRef: ch.length - matched, medianLagBars: lags.length ? lags[Math.floor(lags.length / 2)] : null, refFvg6h: refFvg, ourFvg: (s._zoneObs || []).filter(z => z.kind === 'FVG').length, lastRef: ch.length ? { dir: ch[ch.length - 1].dir, level: +ch[ch.length - 1].level.toFixed(2), ageMin: Math.round((Date.now() - ch[ch.length - 1].ts) / 60000) } : null, ts: Date.now() };
+          }
+        }
+      }
+    } catch (eSMC) { /* cross-check must never crash the tick */ }
 
     // ===== BIG-LEG OVERRIDE STATE (2026-09-16, Jean: "sometimes we should not wait
     // for macro — the bot needs to take the right decision on a $30+ rise or a $40
@@ -5587,6 +5669,25 @@ function processPrice(sym, price, hi, lo) {
     // BIG-LEG fire marker (2026-09-16): fired rows during an armed big leg carry
     // bigLeg:true so the nightly grades the override; bench rule = net-negative first 6.
     try { if (_esPassed && sig && s._bigLeg === sig.type) sig.bigLeg = true; } catch (eBLM) {}
+    // LORENTZIAN stamp (2026-09-21, shadow): every candidate carries the classifier's score;
+    // blocked candidates with a majority score (|s|≥4) stamp LC-AGREE / LC-DISAGREE (5-min
+    // throttle per direction) so the cohorts answer "does agreement predict would-win?".
+    // Fired rows carry _lc for the nightly's fired-outcome split. No firing effect.
+    try {
+      if (sig && sig.type && s._lc && (sym === 'XAU' || sym === 'NAS100' || sym === 'BTC')) {
+        sig.lc = s._lc.score;
+        if (!_esPassed && Math.abs(s._lc.score) >= 4) {
+          const _lcAgree = s._lc.dir === sig.type;
+          s._lcStampTs = s._lcStampTs || {};
+          const _lcK = sig.type + (_lcAgree ? 'A' : 'D');
+          if (Date.now() - (s._lcStampTs[_lcK] || 0) >= 300000) {
+            s._lcStampTs[_lcK] = Date.now();
+            const _lcMsg = '🧠 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' ' + (_lcAgree ? 'LC-AGREE' : 'LC-DISAGREE') + ' @ $' + (parseFloat(sig.price) || 0).toFixed(2) + ' — Lorentzian ' + (s._lc.score >= 0 ? '+' : '') + s._lc.score + '/8 ' + (s._lc.dir || 'flat').toUpperCase() + ' vs candidate ' + sig.type.toUpperCase() + ' (n=' + s._lc.n + ' bars; shadow 2026-09-21).';
+            log(sym, _lcMsg); trackBlockedOutcome(sym, _lcMsg, true);
+          }
+        }
+      }
+    } catch (eLCS) {}
     // ===== TREND-CONT-WF — ALL-GATES with-trend continuation stamp (2026-09-16) =====
     // The CHOP-TREND-WF tag (9/15) only catches candidates that REACH the chop gate;
     // Jean's 9/16 report (4331→4360→4325→4335, zero fires) showed today's with-trend
@@ -17669,7 +17770,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.78-20260921-btc-bigleg-lane', // bump on each deploy — lets /state verify what's live
+    build: '6.79-20260921-lorentzian-smcdiff', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' ? ' + BIGLEG LIVE' : '') + (process.env.BTC_VREC_ENABLED !== '0' ? ' + V-REC' : '') + ' (all other detectors dormant)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
@@ -17677,6 +17778,8 @@ app.get('/state/:sym', (req, res) => {
     regimeScore: s._dayRegime || null, // KER+CHOP+Hurst composite classifier (2026-09-20): {label TREND|RANGE|MIXED, ker, chop, hurst, n, ts}
     volumeProfile: s._vp ? { poc: s._vp.poc, vah: s._vp.vah, val: s._vp.val, ticks: s._vp.ticks, session: s._vp.key } : null, // session tick-profile POC / value area (2026-09-20)
     m5HistBars: (s._m5hist || []).length, // week-long M5 ring fill level — Lorentzian classifier needs ~2,000 (2026-09-20)
+    lorentzian: s._lc || null, // kNN entry score {score −8..+8, dir, n bars, adx} (shadow, 2026-09-21)
+    smcDiff: s._smcDiff || null, // reference BOS/CHoCH + FVG vs our structure/zones, last 6h (2026-09-21)
     eaHeartbeat: (function () { try { const hb = global._eaHb || {}; return { seen: !!hb.lastSeen, lastSeenSec: hb.lastSeen ? Math.round((Date.now() - hb.lastSeen) / 1000) : null, online: !!hb.lastSeen && (Date.now() - hb.lastSeen) <= 90000, offlineSinceMin: hb.offline && hb.offlineSince ? Math.round((Date.now() - hb.offlineSince) / 60000) : null }; } catch (e) { return null; } })(), // EA poll heartbeat (2026-09-21)
     gexLevels: sym === 'NAS100' || sym === 'QQQ' ? _gexLevels : undefined, // QQQ dealer gamma map (2026-08-12)
     zoneMap: (S[sym] && S[sym]._zoneObs || []).map(z => ({ kind: z.kind || 'OB', tf: z.tf || '', dir: z.dir, lo: +z.lo.toFixed(2), hi: +z.hi.toFixed(2), ageMin: Math.round((Date.now() - z.ts) / 60000) })), // live FVG/OB zones (2026-08-11)
