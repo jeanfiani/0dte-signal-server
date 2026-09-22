@@ -1982,6 +1982,8 @@ function cohortFor(reason) {
   if (/FLOOR-PDL/.test(reason)) return 'FLOOR-PDL'; // TP1-into-prior-day-extreme stamps, dormant (2026-09-04, 02:57 case) — must precede FLOOR-PATH
   if (/FLOOR-PATH/.test(reason)) return 'FLOOR-PATH'; // TP1-into-defended-floor blocks (2026-08-28, 21:57/06:40 cases)
   if (/FUNDED-GUARD/.test(reason)) return 'FUNDED-GUARD'; // Neura account-level breaker blocks (2026-09-20) — measures what the guard suppressed
+  if (/BIGLEG-CT-WF/.test(reason)) return 'BIGLEG-CT-WF'; // CT-VETO blocks while BIG-LEG armed (2026-09-22) — must precede the CT-VETO match; ≥60%/15 earns the waiver
+  if (/support-proximity|resistance-proximity/.test(reason)) return 'LEVEL-PROX'; // Asian-low/high proximity blocks (2026-09-22) — was 'unmatched'; the 9/21 night put-killer, 2W/2L/1S on its first look
   if (/LC-AGREE/.test(reason)) return 'LC-AGREE'; // Lorentzian classifier agreed with the blocked candidate (2026-09-21) — would-win here vs LC-DISAGREE is the whole test
   if (/LC-DISAGREE/.test(reason)) return 'LC-DISAGREE';
   if (/LB-TIMESTOP-HELD/.test(reason)) return 'LB-TIMESTOP-HELD'; // benched breakout time-stop (2026-09-21): real outcome of trades held through the would-close; re-arm only if held LOSES ≥60%/≥10
@@ -5668,7 +5670,7 @@ function processPrice(sym, price, hi, lo) {
     try { if (sig && sig._regime) s._lastRegime = { dir: sig._regime.dir, netChgPct: sig._regime.netChgPct, ts: Date.now() }; } catch (eRC) {}
     // BIG-LEG fire marker (2026-09-16): fired rows during an armed big leg carry
     // bigLeg:true so the nightly grades the override; bench rule = net-negative first 6.
-    try { if (_esPassed && sig && s._bigLeg === sig.type) sig.bigLeg = true; } catch (eBLM) {}
+    try { if (_esPassed && sig && s._bigLeg === sig.type) { sig.bigLeg = true; if (s.lastHistEntry && s.lastHistEntry.symbol === sym && s.lastHistEntry.type === sig.type && !s.lastHistEntry.bigLeg) s.lastHistEntry.bigLeg = true; } if (_esPassed && sig && s._bigLegRev === sig.type) { sig.bigLegRev = true; if (s.lastHistEntry && s.lastHistEntry.symbol === sym && s.lastHistEntry.type === sig.type) s.lastHistEntry.bigLegRev = true; } } catch (eBLM) {} // history-row write-through added 2026-09-22 (the 20:13 CHoCH row carried no marker although the leg door let it through)
     // LORENTZIAN stamp (2026-09-21, shadow): every candidate carries the classifier's score;
     // blocked candidates with a majority score (|s|≥4) stamp LC-AGREE / LC-DISAGREE (5-min
     // throttle per direction) so the cohorts answer "does agreement predict would-win?".
@@ -6466,11 +6468,22 @@ function processPrice(sym, price, hi, lo) {
         // signals hit TP1 first; the TREND subset was the driver. Jean: "YES EXEMPT FOR
         // TREND". Revert if exempted TREND fires run net-negative over ~6 fires.
         const _ctTrendExempt = /TREND/.test(_ctTag);
+        // BIG-LEG × CT-VETO — MEASUREMENT ONLY (2026-09-22). I first shipped this as a live
+        // waiver on the inference that CT-VETO killed the 9/21 night puts; the full block
+        // window showed it was support-proximity / MACD-DEFER / ZONE-VETO instead, and the
+        // one verified CT-VETO-on-a-leg case (9/18 15:58) graded LOSS. So: no waiver. While
+        // BIG-LEG is armed and CT-VETO blocks a with-leg continuation, the stamp routes to
+        // BIGLEG-CT-WF; ≥60% would-win over ≥15 earns the waiver, not a hunch.
+        const _ctBigLeg = s._bigLeg === sig.type && process.env.BIGLEG_DISABLED !== '1';
         if (_ctCont && _ctCounter && _ctTrendExempt) {
           sig._ctTrendExempt = true;
           log(sym, '🧭 ' + _ctTag + ' ' + sig.type.toUpperCase() + ' CT-VETO WAIVED — TREND exemption (2026-08-26, cohort 4W/1L/1S) — firing live vs ' + sig._regime.dir.toUpperCase() + ' regime');
         }
         if (_ctCont && _ctCounter && !_ctTrendExempt) {
+          if (_ctBigLeg) {
+            const _ctWf = '🧵 ' + _ctTag + ' ' + sig.type.toUpperCase() + ' BIGLEG-CT-WF @ $' + price.toFixed(2) + ' — CT-VETO blocked a with-leg continuation while BIG-LEG was armed ' + sig.type + ' (5-day ' + sig._regime.dir.toUpperCase() + '); measured, not waived (2026-09-22).';
+            log(sym, _ctWf); trackBlockedOutcome(sym, _ctWf, true);
+          }
           const _ctMsg = '🧭 ' + _ctTag + ' ' + sig.type.toUpperCase() + ' BLOCKED — CT-VETO: counter-trend continuation vs ' + sig._regime.dir.toUpperCase() + ' regime (s' + sig._regime.strength + ', ' + sig._regime.netChgPct + '% ' + (sig._regime.window || '') + ') — gate-report promotion 2026-08-21, 3 batches +16.7..+61pp.';
           log(sym, _ctMsg); trackBlockedOutcome(sym, _ctMsg, true);
           Object.assign(s, _emitSnapshot);
@@ -9397,8 +9410,13 @@ function processPrice(sym, price, hi, lo) {
     // leg is armed in the fire direction, a with-leg CHoCH at night is continuation
     // confirmation, not a spent-end fade — it passes. Bench rule = BIG-LEG's (net-negative
     // first 6 bigLeg fires → revert); BIGLEG_DISABLED=1 kills the exception too.
+    // TIGHTENED 2026-09-22 (Jean's overnight autopsy, the 20:13 CHoCH call: conf 1/6 —
+    // str0 mom0 held0 — fired at the crest of a +$21 night leg through this exception,
+    // auction "improved" into the reversal, SL'd −$540): the BIG-LEG door for a night CHoCH
+    // now also needs the validator's structure+momentum agreement (conf ≥3/6). A young
+    // leg with zero confirmation is exactly the spent-end fade the stand-down exists for.
     if ((sym === 'XAU' || sym === 'NAS100') && /CHoCH/i.test(tag) && nightTag() !== '' &&
-        !(s._bigLeg === sig.type && process.env.BIGLEG_DISABLED !== '1')) {
+        !(s._bigLeg === sig.type && process.env.BIGLEG_DISABLED !== '1' && (sig._confScore || 0) >= 3)) {
       Object.assign(s, _emitSnapshot);
       const _cnMsg = '🌙 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — CHOCH-NIGHT stand-down (2026-09-14): CHoCH is a lagging confirmation and its night fires enter at the spent end of the leg (22:23 case; CHoCH-V2 shadow 30.5%).' + nightTag();
       log(sym, _cnMsg); trackBlockedOutcome(sym, _cnMsg, true);
@@ -17770,7 +17788,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.79-20260921-lorentzian-smcdiff', // bump on each deploy — lets /state verify what's live
+    build: '6.80-20260922-night-autopsy', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' ? ' + BIGLEG LIVE' : '') + (process.env.BTC_VREC_ENABLED !== '0' ? ' + V-REC' : '') + ' (all other detectors dormant)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
