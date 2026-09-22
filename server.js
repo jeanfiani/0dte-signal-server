@@ -1983,6 +1983,7 @@ function cohortFor(reason) {
   if (/FLOOR-PATH/.test(reason)) return 'FLOOR-PATH'; // TP1-into-defended-floor blocks (2026-08-28, 21:57/06:40 cases)
   if (/FUNDED-GUARD/.test(reason)) return 'FUNDED-GUARD'; // Neura account-level breaker blocks (2026-09-20) — measures what the guard suppressed
   if (/BIGLEG-CT-WF/.test(reason)) return 'BIGLEG-CT-WF'; // CT-VETO blocks while BIG-LEG armed (2026-09-22) — must precede the CT-VETO match; ≥60%/15 earns the waiver
+  if (/BTC-SESS-REJ/.test(reason)) return 'BTC-SESS-REJ'; // confirmed session-extreme rejection in RANGE regime (2026-09-22, the 86,670 case) — must precede SESS-EXTREME
   if (/support-proximity|resistance-proximity/.test(reason)) return 'LEVEL-PROX'; // Asian-low/high proximity blocks (2026-09-22) — was 'unmatched'; the 9/21 night put-killer, 2W/2L/1S on its first look
   if (/LC-AGREE/.test(reason)) return 'LC-AGREE'; // Lorentzian classifier agreed with the blocked candidate (2026-09-21) — would-win here vs LC-DISAGREE is the whole test
   if (/LC-DISAGREE/.test(reason)) return 'LC-DISAGREE';
@@ -2238,7 +2239,13 @@ app.get('/ml', (req, res) => {
 // self-measures — revert with evidence like any gate.
 const PROTECT_MAX_STREAK = parseInt(process.env.PROTECT_MAX_STREAK || '3', 10);
 const PROTECT_PAUSE_MIN = parseInt(process.env.PROTECT_PAUSE_MIN || '90', 10);
-const PROTECT_DAY_LOSS = parseFloat(process.env.PROTECT_DAY_LOSS || '1200');
+// RESCALED 2026-09-22 (Jean's 9/22 autopsy): $1,200 was calibrated to the old ×50
+// accounting. At the funded sizing (×300 XAU) it equals a $4 move — it tripped after the
+// 06:00 SL and silently flattened XAU for the ENTIRE day, including the 13:00-15:46
+// +$33 rally where every call that cleared the other gates died here (15:31 stamp:
+// gate PROTECT). New default $6,000 ≈ two full XAU stops at 3 lots; the account-level
+// FUNDED-GUARD (−$12,000) remains the hard line. Env still overrides.
+const PROTECT_DAY_LOSS = parseFloat(process.env.PROTECT_DAY_LOSS || '6000');
 const PNL_LEDGER_FILE = path.join(DATA_DIR, 'pnl_ledger.json');
 let pnlLedger = {};
 try { pnlLedger = JSON.parse(fs.readFileSync(PNL_LEDGER_FILE, 'utf8')) || {}; } catch (e) { pnlLedger = {}; }
@@ -3714,6 +3721,39 @@ function processPrice(sym, price, hi, lo) {
         }
       }
     } catch (eVPD) { /* profile must never crash the tick */ }
+
+    // ===== BTC SESS-REJ — CONFIRMED SESSION-EXTREME REJECTION, SHADOW (2026-09-22, Jean:
+    // "too bad BTC didn't take a PUT at 86670 — it was the extreme, price came back to
+    // 86650 but never broke it") ===== BTC-INV (blind session-extreme bounces) decayed to
+    // coin-flip and was retired; this is NOT that. Conditions: regime RANGE (classifier),
+    // price beyond the value-area edge, session extreme TAGGED (within 0.02×ADR), then the
+    // first M5 CLOSE back inside the value area = rejection → virtual fade. SL = session
+    // extreme ∓0.1×ADR (a new extreme kills it), TP = session POC. One per side per 2h.
+    // Cohort BTC-SESS-REJ; promote at ≥60% over ≥15. Weekdays only.
+    try {
+      if (isMT5 && sym === 'BTC' && s._vp && s._dayRegime && s._dayRegime.label === 'RANGE' && !btcWeekendClosed() && isFinite(s.sessionHigh) && isFinite(s.sessionLow)) {
+        const _srDl = Array.isArray(s.dailyLevels) ? s.dailyLevels : [];
+        const _srAdr = _srDl.length >= 3 ? _srDl.reduce((a, d0) => a + (d0.high - d0.low), 0) / _srDl.length : 0;
+        if (_srAdr > 0) {
+          s._sr = s._sr || { hiTag: 0, loTag: 0, hiTs: 0, loTs: 0, m5Ts: 0 };
+          if (price >= s.sessionHigh - 0.02 * _srAdr && price > s._vp.vah) s._sr.hiTag = Date.now();
+          if (price <= s.sessionLow + 0.02 * _srAdr && price < s._vp.val) s._sr.loTag = Date.now();
+          const _lc = (Array.isArray(s._m5) && s._m5.length) ? s._m5[s._m5.length - 1] : null;
+          if (_lc && _lc.ts !== s._sr.m5Ts) {
+            s._sr.m5Ts = _lc.ts;
+            const _fresh = (t0) => t0 > 0 && Date.now() - t0 < 5400000; // tag within the last 90min
+            if (_fresh(s._sr.hiTag) && _lc.c < s._vp.vah && Date.now() - s._sr.hiTs > 7200000) {
+              s._sr.hiTs = Date.now(); const _sl = +(s.sessionHigh + 0.1 * _srAdr).toFixed(2), _tp = +s._vp.poc.toFixed(2);
+              if (_tp < price) { const m = '🎯 BTC-SESS-REJ PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session high $' + s.sessionHigh.toFixed(0) + ' tagged, M5 closed back below VAH $' + s._vp.vah.toFixed(0) + ' (regime RANGE) · SL $' + _sl.toFixed(0) + ' · TP POC $' + _tp.toFixed(0) + ' (2026-09-22, the 86,670 case).'; s.blockedOutcomes = s.blockedOutcomes || []; s.blockedOutcomes.push({ ts: Date.now(), time: ts(), symbol: sym, detector: 'BTC-SESS-REJ', type: 'put', price: price, virtualTp1: _tp, virtualSl: _sl, maxMin: 480, blockReason: m, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null }); log(sym, m); }
+            }
+            if (_fresh(s._sr.loTag) && _lc.c > s._vp.val && Date.now() - s._sr.loTs > 7200000) {
+              s._sr.loTs = Date.now(); const _sl = +(s.sessionLow - 0.1 * _srAdr).toFixed(2), _tp = +s._vp.poc.toFixed(2);
+              if (_tp > price) { const m = '🎯 BTC-SESS-REJ CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session low $' + s.sessionLow.toFixed(0) + ' tagged, M5 closed back above VAL $' + s._vp.val.toFixed(0) + ' (regime RANGE) · SL $' + _sl.toFixed(0) + ' · TP POC $' + _tp.toFixed(0) + ' (2026-09-22).'; s.blockedOutcomes = s.blockedOutcomes || []; s.blockedOutcomes.push({ ts: Date.now(), time: ts(), symbol: sym, detector: 'BTC-SESS-REJ', type: 'call', price: price, virtualTp1: _tp, virtualSl: _sl, maxMin: 480, blockReason: m, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null }); log(sym, m); }
+            }
+          }
+        }
+      }
+    } catch (eSR) { /* shadow lane must never crash the tick */ }
 
     // ===== LORENTZIAN CLASSIFICATION — SHADOW ENTRY SCORE (2026-09-21, Jean: "implement 3") =====
     // Port of Dehorty's kNN classifier (github.com/artificial-intelligence-edge/lorentzian-
@@ -17788,7 +17828,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.80-20260922-night-autopsy', // bump on each deploy — lets /state verify what's live
+    build: '6.82-20260922-btc-sess-rej', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' ? ' + BIGLEG LIVE' : '') + (process.env.BTC_VREC_ENABLED !== '0' ? ' + V-REC' : '') + ' (all other detectors dormant)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
