@@ -3986,7 +3986,16 @@ function processPrice(sym, price, hi, lo) {
           let _uvOte = null; try { _uvOte = computeOTE(s, sym, _uvDir); } catch (eCO) {}
           const _uvRoc = s._roc3 || 0;
           const _uvBeyond = _uvOte && (_uvDir === 'call' ? price <= _uvOte.limit : price >= _uvOte.limit);
-          const _uvFast = _uvDir === 'call' ? _uvRoc >= 0.10 : _uvRoc <= -0.10;
+          // MACD-aware fast-lane (2026-09-23, Jean: "when MACD and ROC are high OTE should not
+          // intervene" — the 01:39 TREND put, MACD −0.236 / ROC −0.093%, sat under the 0.10
+          // ROC line, auctioned 221s, released on RUNAWAY $2 worse, MAE $4.56 against a $5
+          // stop before sweeping TP3; the 21:03 put at MACD −0.489 went fast-lane and swept
+          // clean). Momentum-confirmed fires release at market: ROC ≥0.10% OR (|MACD| ≥0.20
+          // AND |ROC| ≥0.07%), both in the fire direction. Env: OTE_FAST_MACD / OTE_FAST_ROC2.
+          const _uvMacd = (typeof s._macdLine === 'number') ? s._macdLine : (s.lastHistEntry && s.lastHistEntry.type === _uvDir ? parseFloat(s.lastHistEntry.macd) : NaN);
+          const _fmM = parseFloat(process.env.OTE_FAST_MACD) || 0.20, _fmR = parseFloat(process.env.OTE_FAST_ROC2) || 0.07;
+          const _uvFastM = isFinite(_uvMacd) && (_uvDir === 'call' ? (_uvMacd >= _fmM && _uvRoc >= _fmR) : (_uvMacd <= -_fmM && _uvRoc <= -_fmR));
+          const _uvFast = (_uvDir === 'call' ? _uvRoc >= 0.10 : _uvRoc <= -0.10) || _uvFastM;
           if (!_uvOte || _uvBeyond || _uvFast) {
             _uvT._oteVetted = true;
             delete _uvT.oteLimit; delete _uvT.oteExpiry; delete _uvT.oteImpulseHi; delete _uvT.oteImpulseLo;
@@ -11514,7 +11523,8 @@ function processPrice(sym, price, hi, lo) {
                 if (_ohSk && _ohSk.type === _ohDir && !_ohSk.oteHold) _ohSk.oteHold = _ohSkH;
                 if (s.lastHistEntry && s.lastHistEntry.type === _ohDir && !s.lastHistEntry.oteHold) s.lastHistEntry.oteHold = _ohSkH;
               } catch (eOSk) {}
-            } else if (_ohDir === 'call' ? roc3 >= 0.10 : roc3 <= -0.10) {
+            } else if ((_ohDir === 'call' ? roc3 >= 0.10 : roc3 <= -0.10) ||
+                       (isFinite(macdL) && (_ohDir === 'call' ? (macdL >= (parseFloat(process.env.OTE_FAST_MACD) || 0.20) && roc3 >= (parseFloat(process.env.OTE_FAST_ROC2) || 0.07)) : (macdL <= -(parseFloat(process.env.OTE_FAST_MACD) || 0.20) && roc3 <= -(parseFloat(process.env.OTE_FAST_ROC2) || 0.07))))) { // MACD-aware fast-lane 2026-09-23 (see ungated vet)
               // ===== MOMENTUM FAST-LANE (2026-09-12, Jean: "go ahead with all") =====
               // Week-of-9/8 fill audit: every OTE-touch fill improved (+0.37…+3.45) and
               // every runaway fill chased (−1.56…−3.04, avg −2.15) — runaways happen when
@@ -17828,7 +17838,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.82-20260922-btc-sess-rej', // bump on each deploy — lets /state verify what's live
+    build: '6.83-20260923-macd-fastlane', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' ? ' + BIGLEG LIVE' : '') + (process.env.BTC_VREC_ENABLED !== '0' ? ' + V-REC' : '') + ' (all other detectors dormant)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
