@@ -3732,24 +3732,32 @@ function processPrice(sym, price, hi, lo) {
     // extreme ∓0.1×ADR (a new extreme kills it), TP = session POC. One per side per 2h.
     // Cohort BTC-SESS-REJ; promote at ≥60% over ≥15. Weekdays only.
     try {
-      if (isMT5 && sym === 'BTC' && s._vp && s._dayRegime && s._dayRegime.label === 'RANGE' && !btcWeekendClosed() && isFinite(s.sessionHigh) && isFinite(s.sessionLow)) {
+      // VP-INDEPENDENT since 2026-09-24 (the 82,879 ATL bounce: 12 would-win calls off the
+      // low, SESS-REJ blind because BTC's volume profile was null after the deploy). The
+      // profile is now a bonus, not a dependency: without it the "inside" line is the
+      // extreme ±0.05×ADR and the target is 0.3×ADR (POC when available).
+      if (isMT5 && sym === 'BTC' && s._dayRegime && s._dayRegime.label === 'RANGE' && !btcWeekendClosed() && isFinite(s.sessionHigh) && isFinite(s.sessionLow)) {
         const _srDl = Array.isArray(s.dailyLevels) ? s.dailyLevels : [];
         const _srAdr = _srDl.length >= 3 ? _srDl.reduce((a, d0) => a + (d0.high - d0.low), 0) / _srDl.length : 0;
         if (_srAdr > 0) {
+          const _vp = s._vp || null;
+          const _hiIn = _vp ? _vp.vah : s.sessionHigh - 0.05 * _srAdr; // "back inside" line for the high
+          const _loIn = _vp ? _vp.val : s.sessionLow + 0.05 * _srAdr;  // and for the low
           s._sr = s._sr || { hiTag: 0, loTag: 0, hiTs: 0, loTs: 0, m5Ts: 0 };
-          if (price >= s.sessionHigh - 0.02 * _srAdr && price > s._vp.vah) s._sr.hiTag = Date.now();
-          if (price <= s.sessionLow + 0.02 * _srAdr && price < s._vp.val) s._sr.loTag = Date.now();
+          if (price >= s.sessionHigh - 0.02 * _srAdr && (!_vp || price > _vp.vah)) s._sr.hiTag = Date.now();
+          if (price <= s.sessionLow + 0.02 * _srAdr && (!_vp || price < _vp.val)) s._sr.loTag = Date.now();
           const _lc = (Array.isArray(s._m5) && s._m5.length) ? s._m5[s._m5.length - 1] : null;
           if (_lc && _lc.ts !== s._sr.m5Ts) {
             s._sr.m5Ts = _lc.ts;
             const _fresh = (t0) => t0 > 0 && Date.now() - t0 < 5400000; // tag within the last 90min
-            if (_fresh(s._sr.hiTag) && _lc.c < s._vp.vah && Date.now() - s._sr.hiTs > 7200000) {
-              s._sr.hiTs = Date.now(); const _sl = +(s.sessionHigh + 0.1 * _srAdr).toFixed(2), _tp = +s._vp.poc.toFixed(2);
-              if (_tp < price) { const m = '🎯 BTC-SESS-REJ PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session high $' + s.sessionHigh.toFixed(0) + ' tagged, M5 closed back below VAH $' + s._vp.vah.toFixed(0) + ' (regime RANGE) · SL $' + _sl.toFixed(0) + ' · TP POC $' + _tp.toFixed(0) + ' (2026-09-22, the 86,670 case).'; s.blockedOutcomes = s.blockedOutcomes || []; s.blockedOutcomes.push({ ts: Date.now(), time: ts(), symbol: sym, detector: 'BTC-SESS-REJ', type: 'put', price: price, virtualTp1: _tp, virtualSl: _sl, maxMin: 480, blockReason: m, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null }); log(sym, m); }
+            const _push = (dir, sl, tp, m) => { s.blockedOutcomes = s.blockedOutcomes || []; s.blockedOutcomes.push({ ts: Date.now(), time: ts(), symbol: sym, detector: 'BTC-SESS-REJ', type: dir, price: price, virtualTp1: tp, virtualSl: sl, maxMin: 480, blockReason: m, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null }); log(sym, m); };
+            if (_fresh(s._sr.hiTag) && _lc.c < _hiIn && Date.now() - s._sr.hiTs > 7200000) {
+              s._sr.hiTs = Date.now(); const _sl = +(s.sessionHigh + 0.1 * _srAdr).toFixed(2), _tp = +((_vp && _vp.poc < price) ? _vp.poc : price - 0.3 * _srAdr).toFixed(2);
+              if (_tp < price) _push('put', _sl, _tp, '🎯 BTC-SESS-REJ PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session high $' + s.sessionHigh.toFixed(0) + ' tagged, M5 closed back inside (' + (_vp ? 'VAH $' + _vp.vah.toFixed(0) : 'extreme −0.05×ADR, no profile') + '; regime RANGE) · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp ? ' (POC)' : ' (0.3×ADR)') + ' (2026-09-22; VP-independent 2026-09-24).');
             }
-            if (_fresh(s._sr.loTag) && _lc.c > s._vp.val && Date.now() - s._sr.loTs > 7200000) {
-              s._sr.loTs = Date.now(); const _sl = +(s.sessionLow - 0.1 * _srAdr).toFixed(2), _tp = +s._vp.poc.toFixed(2);
-              if (_tp > price) { const m = '🎯 BTC-SESS-REJ CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session low $' + s.sessionLow.toFixed(0) + ' tagged, M5 closed back above VAL $' + s._vp.val.toFixed(0) + ' (regime RANGE) · SL $' + _sl.toFixed(0) + ' · TP POC $' + _tp.toFixed(0) + ' (2026-09-22).'; s.blockedOutcomes = s.blockedOutcomes || []; s.blockedOutcomes.push({ ts: Date.now(), time: ts(), symbol: sym, detector: 'BTC-SESS-REJ', type: 'call', price: price, virtualTp1: _tp, virtualSl: _sl, maxMin: 480, blockReason: m, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null }); log(sym, m); }
+            if (_fresh(s._sr.loTag) && _lc.c > _loIn && Date.now() - s._sr.loTs > 7200000) {
+              s._sr.loTs = Date.now(); const _sl = +(s.sessionLow - 0.1 * _srAdr).toFixed(2), _tp = +((_vp && _vp.poc > price) ? _vp.poc : price + 0.3 * _srAdr).toFixed(2);
+              if (_tp > price) _push('call', _sl, _tp, '🎯 BTC-SESS-REJ CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session low $' + s.sessionLow.toFixed(0) + ' tagged, M5 closed back inside (' + (_vp ? 'VAL $' + _vp.val.toFixed(0) : 'extreme +0.05×ADR, no profile') + '; regime RANGE) · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp ? ' (POC)' : ' (0.3×ADR)') + ' (the 82,879 ATL case, 2026-09-24).');
             }
           }
         }
@@ -17854,7 +17862,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.84-20260924-regime-gates-legs', // bump on each deploy — lets /state verify what's live
+    build: '6.85-20260924-sessrej-vp-independent', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' ? ' + BIGLEG LIVE' : '') + (process.env.BTC_VREC_ENABLED !== '0' ? ' + V-REC' : '') + ' (all other detectors dormant)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
