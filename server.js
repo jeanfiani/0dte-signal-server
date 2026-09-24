@@ -1990,6 +1990,7 @@ function cohortFor(reason) {
   if (/LB-TIMESTOP-HELD/.test(reason)) return 'LB-TIMESTOP-HELD'; // benched breakout time-stop (2026-09-21): real outcome of trades held through the would-close; re-arm only if held LOSES ≥60%/≥10
   if (/VA-FADE/.test(reason)) return 'VA-FADE'; // value-area-edge fades from the session tick profile (2026-09-20) — compare with SESS-EXTREME (price-only extremes)
   if (/BTC-BIGLEG-WKND/.test(reason)) return 'BTC-BIGLEG-WKND'; // weekend-armed legs, split out 2026-09-21 (Jean: both losses were weekend) — must precede the plain match
+  if (/BTC-BIGLEG-RNG/.test(reason)) return 'BTC-BIGLEG-RNG'; // legs armed while the classifier read RANGE (2026-09-24, the whipsaw that took 4 pending puts) — must precede the plain match
   if (/BTC-BIGLEG/.test(reason)) return 'BTC-BIGLEG'; // pivot-leg continuation shadow on BTC (2026-09-20, the 76k→81k case) — weekday-only promotion cohort from 2026-09-21
   if (/NAS-RANGE5-BRK/.test(reason)) return 'NAS-RANGE5-BRK'; // range-EXPANSION arm, NAS clone (2026-09-18)
   if (/BTC-RANGE5-BRK/.test(reason)) return 'BTC-RANGE5-BRK'; // range-EXPANSION arm: confirmed break of the prior 5-day extreme ridden with-trend (2026-09-18, Jean's "4K growth" chart) — must precede the -RT/plain matches
@@ -3881,6 +3882,17 @@ function processPrice(sym, price, hi, lo) {
         const _blDnMax = sym === 'XAU' ? (parseFloat(process.env.XAU_BIGLEG_DN_MAX) || 40) : (parseFloat(process.env.NAS_BIGLEG_DN_MAX) || 150);
         if (_blUp >= _blUpMin && _blUp < _blUpMax && s._msTrend === 'up') s._bigLeg = 'call';
         else if (_blDn >= _blDnMin && _blDn < _blDnMax && s._msTrend === 'down') s._bigLeg = 'put';
+        // REGIME GATE (2026-09-24, Jean: "yes the rule is correct"): the 9/24 whipsaw
+        // (XAU 4245-4296, every $15-25 reversed) graded blocked continuations 8W/18L while
+        // the classifier read RANGE all day; NAS TREND-CONT-WF splits 14W/5L on TREND vs
+        // 1W/4L on RANGE. The leg waivers exist for trend days — in RANGE they hand the
+        // tape a fake every leg. BIG-LEG does not arm while the regime reads RANGE (the
+        // reversal-ready state is unaffected — fades are the RANGE tool). Suppressions log
+        // once per 5min so we can see what the gate held back.
+        if (s._bigLeg && s._dayRegime && s._dayRegime.label === 'RANGE') {
+          if (Date.now() - (s._blRngLogTs || 0) > 300000) { s._blRngLogTs = Date.now(); log(sym, '🦵 BIG-LEG ' + s._bigLeg.toUpperCase() + ' SUPPRESSED — regime RANGE (KER ' + s._dayRegime.ker.toFixed(2) + ' · CHOP ' + s._dayRegime.chop.toFixed(0) + ' · H ' + s._dayRegime.hurst.toFixed(2) + '); leg ' + (s._bigLeg === 'call' ? '+$' + _blUp.toFixed(1) : '−$' + _blDn.toFixed(1)) + ' would have armed (regime gate 2026-09-24).'); }
+          s._bigLeg = null;
+        }
         // Arm log (2026-09-18, throttled 5min) — verification that legs are being seen.
         if (s._bigLeg && Date.now() - (s._blArmLogTs || 0) > 300000) {
           s._blArmLogTs = Date.now();
@@ -3934,7 +3946,11 @@ function processPrice(sym, price, hi, lo) {
             // the weekend") — weekend arms grade into BTC-BIGLEG-WKND and never fire live;
             // the promotion cohort BTC-BIGLEG is weekday-only from here (5W/0L weekday, 0W/2L weekend at the split).
             const _bWk = btcWeekendClosed();
-            const _bLane = _bWk ? 'BTC-BIGLEG-WKND' : 'BTC-BIGLEG';
+            // REGIME SPLIT (2026-09-24): arms during classifier-RANGE grade into BTC-BIGLEG-RNG
+            // (the 9/24 whipsaw turned four +$770-1,800 MFE puts into losses — 10W/7L → 10W/11L)
+            // and never fire live; the promotion cohort BTC-BIGLEG is weekday, non-RANGE.
+            const _bRng = !!(s._dayRegime && s._dayRegime.label === 'RANGE');
+            const _bLane = _bWk ? 'BTC-BIGLEG-WKND' : _bRng ? 'BTC-BIGLEG-RNG' : 'BTC-BIGLEG';
             const _bSl = _bDir === 'call' ? +(s._legPivot.ext - 0.1 * _bAdr).toFixed(2) : +(s._legPivot.ext + 0.1 * _bAdr).toFixed(2);
             const _bTp = _bDir === 'call' ? +(price + 0.5 * _bAdr).toFixed(2) : +(price - 0.5 * _bAdr).toFixed(2);
             const _bMsg = '🦵 ' + _bLane + ' ' + _bDir.toUpperCase() + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — one-sided leg $' + _bLeg.toFixed(0) + ' (' + (_bLeg / _bAdr).toFixed(2) + '×ADR) from pivot $' + s._legPivot.ext.toFixed(0) + ' with msTrend ' + s._legPivot.trend + ' · SL $' + _bSl.toFixed(0) + ' (pivot) · TP $' + _bTp.toFixed(0) + ' (0.5×ADR) — the 76k→81k class (2026-09-20' + (_bWk ? '; weekend split 2026-09-21' : '') + ').';
@@ -3950,7 +3966,7 @@ function processPrice(sym, price, hi, lo) {
             // 6 live fires → back to shadow. Promotion bar for flipping: ≥60% over ≥15
             // weekday-resolved BTC-BIGLEG (5W/0L at build time).
             try {
-              if (!_bWk && process.env.BTC_BIGLEG_LIVE === '1' && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold) {
+              if (!_bWk && !_bRng && process.env.BTC_BIGLEG_LIVE === '1' && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold) { // !_bRng: no live leg fires in RANGE regime (2026-09-24)
                 const _lTp1 = _bDir === 'call' ? +(price + 0.25 * _bAdr).toFixed(2) : +(price - 0.25 * _bAdr).toFixed(2);
                 const _lTp3 = _bDir === 'call' ? +(price + 1.0 * _bAdr).toFixed(2) : +(price - 1.0 * _bAdr).toFixed(2);
                 s.dailySignalCount++;
@@ -17838,7 +17854,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.83-20260923-macd-fastlane', // bump on each deploy — lets /state verify what's live
+    build: '6.84-20260924-regime-gates-legs', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' ? ' + BIGLEG LIVE' : '') + (process.env.BTC_VREC_ENABLED !== '0' ? ' + V-REC' : '') + ' (all other detectors dormant)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
