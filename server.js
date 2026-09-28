@@ -3656,7 +3656,14 @@ function processPrice(sym, price, hi, lo) {
     try {
       if (isMT5 && Array.isArray(s._m5) && s._m5.length >= 24 && Date.now() - (s._rgTs || 0) >= 60000) {
         s._rgTs = Date.now();
-        const _rgAll = s._m5.slice(-64), _rgW = _rgAll.slice(-36);
+        // SESSION-GAP CUT (2026-09-28, the Sunday-reopen mislabel): bars from before a
+        // ≥30-min gap (weekend / holiday) are dropped — at 18:01 the window straddled
+        // Friday's close and read RANGE (KER 0.05) while a $100 leg was starting, which
+        // suppressed BIG-LEG for its first $40. Fewer than 12 post-gap bars → no label change.
+        let _rgAll = s._m5.slice(-64);
+        for (let i = _rgAll.length - 1; i > 0; i--) { if (_rgAll[i].ts - _rgAll[i - 1].ts > 1800000) { _rgAll = _rgAll.slice(i); break; } }
+        if (_rgAll.length < 12) throw new Error('regime: post-gap window too short');
+        const _rgW = _rgAll.slice(-36);
         const _rgNet = Math.abs(_rgW[_rgW.length - 1].c - _rgW[0].c);
         let _rgPath = 0; for (let i = 1; i < _rgW.length; i++) _rgPath += Math.abs(_rgW[i].c - _rgW[i - 1].c);
         const _ker = _rgPath > 0 ? _rgNet / _rgPath : 0;
@@ -3904,8 +3911,14 @@ function processPrice(sym, price, hi, lo) {
         const _blUpMax = sym === 'XAU' ? (parseFloat(process.env.XAU_BIGLEG_UP_MAX) || 30) : (parseFloat(process.env.NAS_BIGLEG_UP_MAX) || 120);
         const _blDnMin = sym === 'XAU' ? (parseFloat(process.env.XAU_BIGLEG_DN) || 10) : (parseFloat(process.env.NAS_BIGLEG_DN) || 50);
         const _blDnMax = sym === 'XAU' ? (parseFloat(process.env.XAU_BIGLEG_DN_MAX) || 40) : (parseFloat(process.env.NAS_BIGLEG_DN_MAX) || 150);
-        if (_blUp >= _blUpMin && _blUp < _blUpMax && s._msTrend === 'up') s._bigLeg = 'call';
-        else if (_blDn >= _blDnMin && _blDn < _blDnMax && s._msTrend === 'down') s._bigLeg = 'put';
+        // TREND LIFTS THE CEILING (2026-09-28, the 9/27 $100 waterfall): with the pivot
+        // never resetting on a one-way leg, the [10,30/40) band covered only the first $40
+        // and then flipped to reversal-ready while 20 of 29 blocked with-trend puts graded
+        // wins. While the classifier reads TREND and msTrend agrees, the band is [min, ∞):
+        // the leg stays armed for its whole life. The RANGE gate (9/24) is the mirror.
+        const _blTrend = !!(s._dayRegime && s._dayRegime.label === 'TREND');
+        if (_blUp >= _blUpMin && (_blTrend || _blUp < _blUpMax) && s._msTrend === 'up') s._bigLeg = 'call';
+        else if (_blDn >= _blDnMin && (_blTrend || _blDn < _blDnMax) && s._msTrend === 'down') s._bigLeg = 'put';
         // REGIME GATE (2026-09-24, Jean: "yes the rule is correct"): the 9/24 whipsaw
         // (XAU 4245-4296, every $15-25 reversed) graded blocked continuations 8W/18L while
         // the classifier read RANGE all day; NAS TREND-CONT-WF splits 14W/5L on TREND vs
@@ -3931,8 +3944,10 @@ function processPrice(sym, price, hi, lo) {
         if (isMT5 && sym !== 'BTC' && process.env.BIGLEG_DISABLED !== '1') {
           // Pivot measure (2026-09-18): a leg past its ceiling is mature wherever it
           // sits in the session — dominance tie-breaker dropped with the re-measure.
-          if (_blUp >= _blUpMax) s._bigLegRev = 'put';
-          else if (_blDn >= _blDnMax) s._bigLegRev = 'call';
+          // In TREND the continuation band has no ceiling, so reversal-ready waits for the
+          // regime to leave TREND (2026-09-28); otherwise past-ceiling = mature as before.
+          if (_blUp >= _blUpMax && !_blTrend) s._bigLegRev = 'put';
+          else if (_blDn >= _blDnMax && !_blTrend) s._bigLegRev = 'call';
           if (s._bigLegRev && Date.now() - (s._blRevLogTs || 0) > 300000) {
             s._blRevLogTs = Date.now();
             log(sym, '🔁 BIG-LEG MATURE — leg ' + (s._bigLegRev === 'put' ? '+$' + _blUp.toFixed(0) + ' up' : '−$' + _blDn.toFixed(0) + ' down') + ' past the band ceiling; reversal-ready ' + s._bigLegRev.toUpperCase() + ' (EXT-FLIP conv-3 door reopens with zone confluence).');
@@ -17877,7 +17892,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.86-20260924-vrec-retired-crash-arm', // bump on each deploy — lets /state verify what's live
+    build: '6.87-20260928-trend-lifts-ceiling', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' ? ' + BIGLEG LIVE' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
