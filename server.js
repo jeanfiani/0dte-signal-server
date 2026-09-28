@@ -1984,6 +1984,8 @@ function cohortFor(reason) {
   if (/FUNDED-GUARD/.test(reason)) return 'FUNDED-GUARD'; // Neura account-level breaker blocks (2026-09-20) — measures what the guard suppressed
   if (/BIGLEG-CT-WF/.test(reason)) return 'BIGLEG-CT-WF'; // CT-VETO blocks while BIG-LEG armed (2026-09-22) — must precede the CT-VETO match; ≥60%/15 earns the waiver
   if (/BE-HELD/.test(reason)) return 'BE-HELD'; // post-TP1 break-even scratches held with the original SL toward TP2 (2026-09-28) — ≥60%/15 loosens the BE move
+  if (/ZONE-MICRO-WF/.test(reason)) return 'ZONE-MICRO-WF'; // inside-zone vetoes skipped because the zone was < 0.5×ATR tall (2026-09-28) — must precede ZONE-VETO
+  if (/EOD-CONT-WF/.test(reason)) return 'EOD-CONT-WF'; // with-trend blocks in the last 90min of RTH (2026-09-28, Jean's end-of-session drift hypothesis) — must precede TREND-CONT-WF
   if (/LADDER-77/.test(reason)) return 'LADDER-77'; // proportional 7/7 ladder sim on live XAU fires (2026-09-28)
   if (/LADDER-510/.test(reason)) return 'LADDER-510'; // current 5/10 ladder, same fires, same sequence rule
   if (/BTC-SESS-REJ-CRASH/.test(reason)) return 'BTC-SESS-REJ-CRASH'; // V-REC v2: ≥2×ATR flush + rejection close, any regime (2026-09-24) — must precede the plain match
@@ -5858,6 +5860,10 @@ function processPrice(sym, price, hi, lo) {
           // classifier-TREND days and loses on classifier-RANGE days — the whole test of
           // whether the regime score deserves to steer gates. Aggregate = sum of the three.
           const _tcwRg = (s._dayRegime && s._dayRegime.label) || 'MIXED';
+          // EOD split (2026-09-28, Jean: "previous to end of session price tends to draw
+          // down"): with-trend blocks in the last 90min of RTH (14:30-16:00 ET) also stamp
+          // EOD-CONT-WF so the hypothesis gets its own tally.
+          try { const _m = gET(); if (_m >= 870 && _m < 960) { const _eodM = '🕓 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' EOD-CONT-WF @ $' + (parseFloat(sig.price) || 0).toFixed(2) + ' — with-trend continuation blocked in the last 90min of RTH (msTrend ' + s._msTrend + '); end-of-session drift test (2026-09-28).'; log(sym, _eodM); trackBlockedOutcome(sym, _eodM, true); } } catch (eEOD) {}
           const _tcwMsg = '🧵 ' + (sig.score || '') + ' ' + sig.type.toUpperCase() + ' TREND-CONT-WF @ $' + (parseFloat(sig.price) || 0).toFixed(2) + ' — with-trend continuation blocked (msTrend ' + s._msTrend + ', gate: ' + _tcwGate + ', regime: ' + _tcwRg + (s._dayRegime ? ' KER' + s._dayRegime.ker.toFixed(2) + '/CHOP' + s._dayRegime.chop.toFixed(0) + '/H' + s._dayRegime.hurst.toFixed(2) : '') + '); the class behind the 9/9-9/16 missed legs (2026-09-16; gate named 2026-09-18). TREND-CONT-WF-' + _tcwRg.charAt(0);
           log(sym, _tcwMsg); trackBlockedOutcome(sym, _tcwMsg, true);
         }
@@ -7332,7 +7338,21 @@ function processPrice(sym, price, hi, lo) {
         // armed → whole veto skipped) — the zone had absorbed every test for 14h,
         // bounced it to SL (-$254), then launched +$42 off that same block. Inside-zone
         // blocks run FIRST, latch or no latch; the ahead-of-price ease is unchanged.
-        const _zvIn = s._zoneObs.find(z => z && z.dir !== sig.type && price >= z.lo && price <= z.hi);
+        // MICRO-ZONE FLOOR (2026-09-28, Jean's 14:30-15:20 circled put): a $1.83-wide M15
+        // FVG (4132.23-4134.06, < 0.5×ATR) vetoed twelve puts for an hour while structure
+        // was down and the close-drop paid +13..+17. A gap that small is noise, not a level.
+        // Inside-zone vetoes need a zone ≥0.5×ATR tall; smaller ones stamp ZONE-MICRO-WF
+        // (measured, not vetoed) so the floor's cost is graded like everything else.
+        const _zvInAny = s._zoneObs.find(z => z && z.dir !== sig.type && price >= z.lo && price <= z.hi);
+        const _zvIn = (_zvInAny && atrVal > 0 && (_zvInAny.hi - _zvInAny.lo) < 0.5 * atrVal) ? null : _zvInAny;
+        if (_zvInAny && !_zvIn) {
+          s._zmTs = s._zmTs || {};
+          if (Date.now() - (s._zmTs[sig.type] || 0) >= 300000) {
+            s._zmTs[sig.type] = Date.now();
+            const _zmM = '🔬 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' ZONE-MICRO-WF @ $' + price.toFixed(2) + ' — inside a micro ' + (_zvInAny.kind || 'OB') + ' ' + (_zvInAny.tf || '') + ' $' + _zvInAny.lo.toFixed(2) + '-$' + _zvInAny.hi.toFixed(2) + ' (' + (_zvInAny.hi - _zvInAny.lo).toFixed(2) + ' < 0.5×ATR); veto skipped, outcome measured (2026-09-28).';
+            log(sym, _zmM); trackBlockedOutcome(sym, _zmM, true);
+          }
+        }
         // ===== FAILING-ZONE EASE (2026-09-01, the 4444→4363 waterfall) =====
         // The unconditional inside-zone rule (8/28) blocked SIX consecutive with-trend
         // puts 03:21-04:00 — ALL graded wins — because a breakdown traverses stale
@@ -17993,7 +18013,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.95-20260928-bigleg-tiers', // bump on each deploy — lets /state verify what's live
+    build: '6.96-20260928-micro-zone-floor', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
