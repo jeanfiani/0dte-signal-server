@@ -4000,7 +4000,13 @@ function processPrice(sym, price, hi, lo) {
           const _bLeg = s._legPivot.trend === 'up' ? price - s._legPivot.ext : s._legPivot.ext - price;
           const _bDir = s._legPivot.trend === 'up' ? 'call' : 'put';
           s._bblTs = s._bblTs || {};
-          if (_bLeg >= 0.15 * _bAdr && _bLeg < 0.6 * _bAdr && Date.now() - (s._bblTs[_bDir] || 0) >= 1800000) {
+          // NO ARM AT THE EXTREME (2026-09-29, the 9/28 evening: five shadow puts at 82,927-
+          // 83,210 within $300 of the session low after a $2,000 drop, all lost — the XAU/NAS
+          // rule from 9/28, now on BTC too): a leg does not begin within 0.1×ADR of the
+          // session extreme in its own direction.
+          const _bAtExt = _bDir === 'put' ? (isFinite(s.sessionLow) && price - s.sessionLow <= 0.1 * _bAdr) : (isFinite(s.sessionHigh) && s.sessionHigh - price <= 0.1 * _bAdr);
+          if (_bAtExt && _bLeg >= 0.15 * _bAdr && Date.now() - (s._bblExtTs || 0) > 300000) { s._bblExtTs = Date.now(); log(sym, '🦵 BTC-BIGLEG ' + _bDir.toUpperCase() + ' NOT ARMED — within 0.1×ADR of the session extreme (2026-09-29).'); }
+          if (!_bAtExt && _bLeg >= 0.15 * _bAdr && _bLeg < 0.6 * _bAdr && Date.now() - (s._bblTs[_bDir] || 0) >= 1800000) {
             s._bblTs[_bDir] = Date.now();
             // WEEKEND SPLIT (2026-09-21, Jean: "remove from weekend, both losses were during
             // the weekend") — weekend arms grade into BTC-BIGLEG-WKND and never fire live;
@@ -4034,14 +4040,19 @@ function processPrice(sym, price, hi, lo) {
               // net-negative over the first 6 live fires → back to shadow.
               if (!_bWk && !_bRng && process.env.BTC_BIGLEG_LIVE !== '0' && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold) { // !_bRng: no live leg fires in RANGE regime (2026-09-24)
                 const _lTp1 = _bDir === 'call' ? +(price + 0.25 * _bAdr).toFixed(2) : +(price - 0.25 * _bAdr).toFixed(2);
+                // TP2 explicit 0.5×ADR (2026-09-29, Jean's monitor screenshot): the live lane
+                // had been reusing the SHADOW target (_bTp), which 6.88 cut to 0.25×ADR — so
+                // TP1 == TP2, TP2 "hit" with TP1 and the trail locked at TP1. Two live fires
+                // paid the secure leg and nothing else. The runner needs its ladder back.
+                const _lTp2 = _bDir === 'call' ? +(price + 0.5 * _bAdr).toFixed(2) : +(price - 0.5 * _bAdr).toFixed(2);
                 const _lTp3 = _bDir === 'call' ? +(price + 1.0 * _bAdr).toFixed(2) : +(price - 1.0 * _bAdr).toFixed(2);
                 s.dailySignalCount++;
-                const _lSig = { type: _bDir, time: ts(), price: price.toFixed(2), score: (_bDir === 'call' ? '⬆' : '⬇') + 'BIGLEG', rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: _bSl.toFixed(2), tp1: _lTp1.toFixed(2), tp2: _bTp.toFixed(2), tp3: _lTp3.toFixed(2), bigLeg: true, oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: 'bigleg leg entry' } };
+                const _lSig = { type: _bDir, time: ts(), price: price.toFixed(2), score: (_bDir === 'call' ? '⬆' : '⬇') + 'BIGLEG', rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: _bSl.toFixed(2), tp1: _lTp1.toFixed(2), tp2: _lTp2.toFixed(2), tp3: _lTp3.toFixed(2), bigLeg: true, oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: 'bigleg leg entry' } };
                 s.signals.push(_lSig); logSignal(sym, _lSig);
                 s.trade = buildCfdTrade(_bDir, price, (s._atr || _bAdr / 20), sym);
                 s.trade._oteVetted = true; s.trade._legLive = true; s.trade.bigLeg = true;
-                s.trade.slPrice = _bSl; s.trade.tp1Price = _lTp1; s.trade.tp2Price = _bTp; s.trade.tp3Price = _lTp3;
-                log(sym, '🦵 BTC-BIGLEG ' + _bDir.toUpperCase() + ' LIVE FIRE @ $' + price.toFixed(0) + ' — leg $' + _bLeg.toFixed(0) + ' (' + (_bLeg / _bAdr).toFixed(2) + '×ADR) from pivot $' + s._legPivot.ext.toFixed(0) + ' · SL $' + _bSl.toFixed(0) + ' (pivot, risk $' + Math.abs(price - _bSl).toFixed(0) + ') · TP1 $' + _lTp1.toFixed(0) + ' · TP2 $' + _bTp.toFixed(0) + ' · TP3 $' + _lTp3.toFixed(0) + ' [BTC_BIGLEG_LIVE].');
+                s.trade.slPrice = _bSl; s.trade.tp1Price = _lTp1; s.trade.tp2Price = _lTp2; s.trade.tp3Price = _lTp3;
+                log(sym, '🦵 BTC-BIGLEG ' + _bDir.toUpperCase() + ' LIVE FIRE @ $' + price.toFixed(0) + ' — leg $' + _bLeg.toFixed(0) + ' (' + (_bLeg / _bAdr).toFixed(2) + '×ADR) from pivot $' + s._legPivot.ext.toFixed(0) + ' · SL $' + _bSl.toFixed(0) + ' (pivot, risk $' + Math.abs(price - _bSl).toFixed(0) + ') · TP1 $' + _lTp1.toFixed(0) + ' · TP2 $' + _lTp2.toFixed(0) + ' · TP3 $' + _lTp3.toFixed(0) + ' [BTC_BIGLEG_LIVE].');
                 sendPush('🦵 BTC BIGLEG ' + _bDir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(0) + ' · SL $' + _bSl.toFixed(0) + ' · TP1 $' + _lTp1.toFixed(0), 'signal');
               }
             } catch (eBLL) { /* live lane must never crash the shadow */ }
@@ -18013,7 +18024,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.96-20260928-micro-zone-floor', // bump on each deploy — lets /state verify what's live
+    build: '6.98-20260929-bigleg-tp2-fix', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
