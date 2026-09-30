@@ -1702,7 +1702,22 @@ function trackBlockedOutcome(sym, msg, force) {
   // "(any gate)" — the 01:08-01:59 misses took tally-delta forensics to attribute. Only
   // actual blocks/deferrals qualify; dormant validator stamps (DORMANT-WOULD-FIRE,
   // CONF-SCORE, ARMED...) never overwrite it.
-  try { if (/BLOCKED|DEFERRED|REFUSED|SKIPPED|conv \d+ < \d+|below (the )?floor|too (low|weak)/i.test(msg) && !/DORMANT|WOULD-FIRE|TREND-CONT-WF|ARMED \(dormant/.test(msg)) { s._lastBlock = s._lastBlock || {}; s._lastBlock[type] = { msg: msg.slice(0, 200), ts: now }; } } catch (eLB) {} // pattern widened 2026-09-21 (08:04 'unattributed' — conviction-floor messages don't say BLOCKED)
+  try { if (/BLOCKED|DEFERRED|REFUSED|SKIPPED|conv \d+ < \d+|below (the )?floor|too (low|weak)/i.test(msg) && !/DORMANT|WOULD-FIRE|TREND-CONT-WF|ARMED \(dormant/.test(msg)) { s._lastBlock = s._lastBlock || {}; s._lastBlock[type] = { msg: msg.slice(0, 200), ts: now };
+    // GATE JOURNAL (2026-09-30): the blocked-outcomes buffer keeps 50 rows, so by the
+    // afternoon the morning's gate names are gone (9/30: twelve with-trend XAU puts blocked
+    // on a $64 staircase and no way to name the gates by 17:00). A 24h ring of
+    // {ts, dir, detector, gate, regime, price} per symbol, served on /state/:sym.gateJournal.
+    try {
+      const _gj = s._gateJournal = s._gateJournal || [];
+      const _det = (msg.match(/[⬆⬇]\s*([A-Z0-9_\-\/+]+)/) || [])[1] || (msg.match(/^[^A-Za-z]*([A-Z][A-Z0-9_\-\/]{2,})/) || [])[1] || '?';
+      const _gate = String(cohortFor(msg) || 'unmatched');
+      const _last = _gj[_gj.length - 1];
+      if (!(_last && _last.g === _gate && _last.d === type && now - _last.ts < 60000)) { // 1/min per gate+dir — no 3s tick spam
+        _gj.push({ ts: now, t: ts(), d: type, det: _det, g: _gate, rg: (s._dayRegime && s._dayRegime.label) || null, p: +(s.lastPrice || 0).toFixed(2) });
+        while (_gj.length > 400 || (_gj.length && now - _gj[0].ts > 86400000)) _gj.shift();
+      }
+    } catch (eGJ) {}
+  } } catch (eLB) {} // pattern widened 2026-09-21 (08:04 'unattributed' — conviction-floor messages don't say BLOCKED)
   // ===== BTC COUNTER-TREND TRACKING RETIRED (2026-08-21, Jean) =====
   // "remove all the counter-trend signals definitely, not even needed as dormant."
   // 2-day verdict at honest ATR brackets: counter-trend puts into the melt went
@@ -1984,6 +1999,7 @@ function cohortFor(reason) {
   if (/FUNDED-GUARD/.test(reason)) return 'FUNDED-GUARD'; // Neura account-level breaker blocks (2026-09-20) — measures what the guard suppressed
   if (/BIGLEG-CT-WF/.test(reason)) return 'BIGLEG-CT-WF'; // CT-VETO blocks while BIG-LEG armed (2026-09-22) — must precede the CT-VETO match; ≥60%/15 earns the waiver
   if (/BE-HELD/.test(reason)) return 'BE-HELD'; // post-TP1 break-even scratches held with the original SL toward TP2 (2026-09-28) — ≥60%/15 loosens the BE move
+  if (/FAST-PRE BLOCKED/.test(reason)) { const m = /pre-gates failed: ([a-z0-9+-]+)/.exec(reason); return 'FAST-PRE-' + (m ? m[1].split('+')[0].toUpperCase() : 'X'); } // FAST's own pre-gates, split by the FIRST failing gate (2026-09-29) — must precede FAST detector matches
   if (/ZONE-MICRO-WF/.test(reason)) return 'ZONE-MICRO-WF'; // inside-zone vetoes skipped because the zone was < 0.5×ATR tall (2026-09-28) — must precede ZONE-VETO
   if (/EOD-CONT-WF/.test(reason)) return 'EOD-CONT-WF'; // with-trend blocks in the last 90min of RTH (2026-09-28, Jean's end-of-session drift hypothesis) — must precede TREND-CONT-WF
   if (/LADDER-77/.test(reason)) return 'LADDER-77'; // proportional 7/7 ladder sim on live XAU fires (2026-09-28)
@@ -2260,6 +2276,10 @@ let _plDirty = false;
 function bookPnl(sym, amount, kind) {
   try {
     if (!isFinite(amount)) return;
+    // NO-FILL LEDGER GUARD (2026-09-30): the EA reported ORDER_FAILED for this trade (e.g.
+    // 10027 autotrading disabled) — nothing is open at the broker, so the ledger and the
+    // FUNDED-GUARD must not book phantom P&L on it. Shadow grading of the row continues.
+    if (S[sym] && S[sym].trade && S[sym].trade._eaFailed) { log(sym, '💰 P&L NOT booked (' + (amount >= 0 ? '+' : '') + '$' + amount.toFixed(2) + ' ' + kind + ') — EA reported ORDER_FAILED for this trade; no broker position exists (2026-09-30).'); return; }
     const d = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
     pnlLedger[d] = pnlLedger[d] || {};
     const row = pnlLedger[d][sym] = pnlLedger[d][sym] || { pnl: 0, t1Legs: 0, closes: 0 };
@@ -2937,7 +2957,29 @@ function loadRuntimeState() {
         });
       }
     } catch (eLP) {}
-    console.log('[' + ts() + '] Runtime state: stale (not today) — fresh runtime (prices carried).');
+    // ===== CROSS-DAY TRADE CARRY (2026-09-30, Jean: "BTC trades are not going through
+    // the next days — server stopped at 6am following the trade") ===== "Trades belong
+    // to their day" killed every BTC position opened in the US afternoon at the next
+    // morning's deploy (the 9/29 14:40 RANGE5-RT call vanished with no outcome; the 9/21
+    // short before it). An open position does not care what day it is. On a stale
+    // checkpoint, active trades still restore if younger than the carry window — 5 days
+    // for BTC (24/7, RANGE5 thesis horizon), 24h for XAU/NAS — and not already terminal.
+    try {
+      if (raw && raw.symbols) {
+        const _nowC = Date.now();
+        SYMBOLS.forEach(sym => {
+          const s = S[sym]; const d = raw.symbols[sym]; if (!s || !d || !d.trade || !d.trade.active || !d.trade.ts) return;
+          const _win = sym === 'BTC' ? 5 * 86400000 : 24 * 3600000;
+          const _lh = d.lastHistTs ? signalHistory.find(h => h.ts === d.lastHistTs && h.symbol === sym) : null;
+          const _term = !!(_lh && _lh.outcomes && (_lh.outcomes.slHit || _lh.outcomes.tp3Hit));
+          if ((_nowC - d.trade.ts) < _win && !_term) {
+            d.trade._oteVetted = true; s.trade = d.trade; if (_lh) s.lastHistEntry = _lh;
+            console.log('[' + ts() + '] ' + sym + ' — ACTIVE TRADE carried ACROSS DAYS: ' + String(d.trade.type).toUpperCase() + ' @ $' + (+d.trade.ep).toFixed(2) + ' (age ' + Math.round((_nowC - d.trade.ts) / 3600000) + 'h, SL $' + (+d.trade.slPrice || 0).toFixed(2) + ') — management resumes (2026-09-30).');
+          }
+        });
+      }
+    } catch (eCC) {}
+    console.log('[' + ts() + '] Runtime state: stale (not today) — fresh runtime (prices + live trades carried).');
     return;
   }
   const now = Date.now();
@@ -2950,7 +2992,8 @@ function loadRuntimeState() {
       // only if no fresh tick has arrived since boot.
       if (!(s.lastPrice > 0) && d.lastPrice > 0) s.lastPrice = d.lastPrice;
       // 1) Active trade — the critical restore. Original ts kept (EA identity).
-      if (d.trade && d.trade.active && d.trade.ts && (now - d.trade.ts) < 12 * 3600000) {
+      //    Age cap 12h → 5 days for BTC / 24h for XAU-NAS (2026-09-30, cross-day carry).
+      if (d.trade && d.trade.active && d.trade.ts && (now - d.trade.ts) < (sym === 'BTC' ? 5 * 86400000 : 24 * 3600000)) {
         d.trade._oteVetted = true; // never re-vet a restored trade
         s.trade = d.trade;
         console.log('[' + ts() + '] ' + sym + ' — ACTIVE TRADE restored: ' + String(d.trade.type).toUpperCase() + ' @ $' + (+d.trade.ep).toFixed(2) + ' (age ' + Math.round((now - d.trade.ts) / 60000) + 'min, SL $' + (+d.trade.slPrice || 0).toFixed(2) + ') — management resumes.');
@@ -13635,6 +13678,29 @@ function processPrice(sym, price, hi, lo) {
           }
         }
 
+        // ===== FAST-PRE STAMPS (2026-09-29, Jean: "as per our fast rule we should have had a
+        // call tentative around 4147-4152 — the issue is deeper") ===== FAST's twelve pre-gates
+        // (May-era: RSI winners-only, MACD line direction, gap, room, $50 wall, chase guard,
+        // Option B++) block BEFORE a signal object exists — log line only, no row, no cohort.
+        // The 13:30 $17 spike produced no candidate at all. Every failed pre-gate now stamps a
+        // FAST-PRE virtual (±cap bracket, 3-min throttle per direction) naming the gates that
+        // failed, so each one finally gets a would-win tally like every other gate.
+        try {
+          const _fpFails = [];
+          if (!fmRecentTpSlOk) _fpFails.push('chase-guard'); if (!fmRsiOk) _fpFails.push('rsi'); if (!fmRocOk) _fpFails.push('roc');
+          if (!fmMacdOk) _fpFails.push('macd-dir'); if (!fmGapOk) _fpFails.push('gap'); if (!fmRoomOk) _fpFails.push('room');
+          if (!fmRoundOk) _fpFails.push('round50'); if (!fmXauConvOk) _fpFails.push('conv'); if (!fmXauConflOk) _fpFails.push('confluence');
+          if (!fmXauCandleOk) _fpFails.push('burst'); if (!fmXauHtfOk) _fpFails.push('htf'); if (!flipCoolFor(fmDir)) _fpFails.push('flip-cool');
+          if (!(winProtectDir === null || winProtectDir === fmDir)) _fpFails.push('win-protect');
+          if (_fpFails.length && isMT5) {
+            s._fpTs = s._fpTs || {};
+            if (now2 - (s._fpTs[fmDir] || 0) >= 180000) {
+              s._fpTs[fmDir] = now2;
+              const _fpM = '⚡ ' + (fmDir === 'call' ? '⬆' : '⬇') + 'FAST ' + fmDir.toUpperCase() + ' FAST-PRE BLOCKED @ $' + price.toFixed(2) + ' — $' + fmAbsDelta.toFixed(2) + ' move in ' + (fmWindow / 60000).toFixed(0) + 'min; pre-gates failed: ' + _fpFails.join('+') + ' (RSI ' + rsiV.toFixed(1) + ', MACD ' + macdL.toFixed(3) + ', ROC ' + roc3.toFixed(3) + '%) — measured, 2026-09-29.';
+              log(sym, _fpM); trackBlockedOutcome(sym, _fpM, true);
+            }
+          }
+        } catch (eFP) {}
         if (fmRecentTpSlOk && fmRsiOk && fmRocOk && fmMacdOk && fmGapOk && fmRoomOk && fmRoundOk && fmXauConvOk && fmXauConflOk && fmXauCandleOk && fmXauHtfOk && flipCoolFor(fmDir) && (winProtectDir === null || winProtectDir === fmDir)) {
           s.fastMoveLastTs = now2;
           s.fastLastDir = fmDir; // for 30-min opposite-direction flip-cool
@@ -17674,7 +17740,7 @@ setInterval(() => {
       // carry the signal over until the trade closes.
       const _coTerminal = !!(s.lastHistEntry && s.lastHistEntry.outcomes &&
         (s.lastHistEntry.outcomes.slHit || s.lastHistEntry.outcomes.tp3Hit));
-      const _coStale = s.trade && s.trade.ts && (Date.now() - s.trade.ts) > 86400000;
+      const _coStale = s.trade && s.trade.ts && (Date.now() - s.trade.ts) > (sym === 'BTC' ? 5 * 86400000 : 86400000); // BTC: 5-day carry (2026-09-30) — RANGE5/BIGLEG trades run on multi-day horizons
       if (s.trade && s.trade.active && (_coTerminal || _coStale)) {
         // GHOST GUARD (2026-08-25): a QQQ paper trade SL'd 8/24 09:36 kept active=true and
         // was carried across midnight forever, blocking the one-trade-at-a-time lane and
@@ -17750,9 +17816,37 @@ app.post('/trade', (req, res) => {
 });
 
 // Clear trade monitor
+// ===== SILENT KILL SWITCH CLOSED (2026-09-30, Jean: "the BTC trades are not going through
+// the next days — server stopped at 6am following the trade") ===== This endpoint wiped
+// s.trade with NO log, NO outcome stamp and NO EA close. Every dashboard called it from
+// its date-roll handler at 00:00 ET (= 06:00 broker time) whenever its panel showed a
+// trade — so any BTC position opened in the US afternoon died at midnight: the 9/29 14:40
+// RANGE5-RT call (outcomes {}), the 9/21 short before it. The MT5 position stayed open,
+// unmanaged, with only the broker SL. Now: every clear is logged with its source; a live
+// CFD trade (XAU/BTC/NAS100) is cleared ONLY by an explicit manual request (the Exit
+// button sends manual:true) — automated clears are refused, so even a stale dashboard tab
+// can no longer kill a position. Manual clears stamp outcomes.manualClear on the row.
 app.post('/trade/clear', (req, res) => {
-  const { sym } = req.body;
-  if (S[sym]) S[sym].trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
+  const { sym } = req.body || {};
+  const s = S[sym];
+  if (!s) return res.json({ ok: true });
+  const t = s.trade;
+  const live = !!(t && t.active);
+  const isCfd = sym === 'XAU' || sym === 'BTC' || sym === 'NAS100';
+  const manual = req.body && req.body.manual === true;
+  const src = String((req.body && req.body.source) || 'unknown').slice(0, 40);
+  if (live && isCfd && !manual) {
+    log(sym, '⛔ /trade/clear REFUSED — automated clear of a LIVE ' + String(t.type || '').toUpperCase() + ' @ $' + (+t.ep || 0).toFixed(2) + ' (source ' + src + ', ua ' + String(req.headers['user-agent'] || '').slice(0, 40) + '). Only the Exit button (manual:true) may clear a live CFD trade (2026-09-30).');
+    return res.status(409).json({ ok: false, refused: true, reason: 'live CFD trade — manual clear required' });
+  }
+  if (live) {
+    try {
+      const _h = s.lastHistEntry;
+      if (_h && _h.symbol === sym) { _h.outcomes = _h.outcomes || {}; _h.outcomes.manualClear = +(s.lastPrice || 0).toFixed(2); _h.outcomes.manualClearTs = Date.now(); }
+    } catch (eMC) {}
+    log(sym, '🧹 MANUAL CLEAR — ' + String(t.type || '').toUpperCase() + ' @ $' + (+t.ep || 0).toFixed(2) + ' cleared from the dashboard (source ' + src + ') @ $' + (+s.lastPrice || 0).toFixed(2) + ' · age ' + Math.round((Date.now() - (t.ts || Date.now())) / 60000) + 'min. NOTE: this stops server management only — the MT5 position is NOT closed; use 🛑 Close Trade @ Market for that.');
+  }
+  s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
   res.json({ ok: true });
 });
 
@@ -17793,6 +17887,19 @@ app.post('/ea/event', (req, res) => {
     const sym = String(b.sym || '?').toUpperCase(), kind = String(b.kind || 'EVENT'), detail = String(b.detail || '').slice(0, 300);
     const line = '🤖 EA ' + kind + ' — ' + detail;
     if (S[sym]) log(sym, line); else console.log('[' + ts() + '] ' + sym + ' ' + line);
+    // ORDER_FAILED → mark the live trade as unfilled (2026-09-30, the 13:48 XAU put refused
+    // with 10027 "Autotrading disabled by client"): the row is stamped eaFailed for the
+    // nightly report and bookPnl() skips it, so the funded ledger only counts real fills.
+    try {
+      // INIT_SKIP (EA re-attached, live trade too old to adopt) and SKIPPED (chase guard)
+      // also mean "no broker position for this server trade" → same no-fill treatment.
+      if (/ORDER_FAILED|INIT_SKIP|SKIPPED/i.test(kind) && S[sym] && S[sym].trade && S[sym].trade.active) {
+        S[sym].trade._eaFailed = detail.slice(0, 120);
+        const _h = S[sym].lastHistEntry;
+        if (_h && _h.symbol === sym) { _h.outcomes = _h.outcomes || {}; _h.outcomes.eaFailed = detail.slice(0, 120); }
+        log(sym, '🧾 trade marked NO-FILL — EA could not open it; P&L booking suspended for this trade (grading continues as shadow).');
+      }
+    } catch (eEF) {}
     const k = sym + '|' + kind;
     if (Date.now() - (global._eaEvtTs[k] || 0) > 60000) {
       global._eaEvtTs[k] = Date.now();
@@ -18024,12 +18131,13 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '6.98-20260929-bigleg-tp2-fix', // bump on each deploy — lets /state verify what's live
+    build: '7.00-20260930-trade-clear-guard', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     fundedGuard: global._fundedGuard || null, // Neura $400K guard readout (2026-09-20): account day/total vs limits
     regimeScore: s._dayRegime || null, // KER+CHOP+Hurst composite classifier (2026-09-20): {label TREND|RANGE|MIXED, ker, chop, hurst, n, ts}
+    gateJournal: (s._gateJournal || []).slice(-150), // 24h ring of real blocks {t, d, det, g(ate cohort), rg(regime), p} — 1/min per gate+dir (2026-09-30)
     volumeProfile: s._vp ? { poc: s._vp.poc, vah: s._vp.vah, val: s._vp.val, ticks: s._vp.ticks, session: s._vp.key } : null, // session tick-profile POC / value area (2026-09-20)
     m5HistBars: (s._m5hist || []).length, // week-long M5 ring fill level — Lorentzian classifier needs ~2,000 (2026-09-20)
     lorentzian: s._lc || null, // kNN entry score {score −8..+8, dir, n bars, adx} (shadow, 2026-09-21)
