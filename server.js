@@ -1692,32 +1692,35 @@ function trackBlockedOutcome(sym, msg, force) {
   if (!Array.isArray(s.prices) || s.prices.length === 0) return;
   const now = Date.now();
   s.lastBlockTrackedTs = s.lastBlockTrackedTs || 0;
-  if (!force && now - s.lastBlockTrackedTs < BLOCK_TRACK_COOLDOWN_MS) return;
   // Parse direction from message (most block logs contain "CALL" or "PUT")
   const typeMatch = msg.match(/\b(CALL|PUT)\b/);
   if (!typeMatch) return; // can't determine direction — skip
   const type = typeMatch[1].toLowerCase();
-  // GATE-NAME RECORDER (2026-09-18, the 9/18 night-leg autopsy): remember the last REAL
-  // gate block per direction so TREND-CONT-WF stamps can name the killer gate instead of
-  // "(any gate)" — the 01:08-01:59 misses took tally-delta forensics to attribute. Only
-  // actual blocks/deferrals qualify; dormant validator stamps (DORMANT-WOULD-FIRE,
-  // CONF-SCORE, ARMED...) never overwrite it.
-  try { if (/BLOCKED|DEFERRED|REFUSED|SKIPPED|conv \d+ < \d+|below (the )?floor|too (low|weak)/i.test(msg) && !/DORMANT|WOULD-FIRE|TREND-CONT-WF|ARMED \(dormant/.test(msg)) { s._lastBlock = s._lastBlock || {}; s._lastBlock[type] = { msg: msg.slice(0, 200), ts: now };
-    // GATE JOURNAL (2026-09-30): the blocked-outcomes buffer keeps 50 rows, so by the
-    // afternoon the morning's gate names are gone (9/30: twelve with-trend XAU puts blocked
-    // on a $64 staircase and no way to name the gates by 17:00). A 24h ring of
-    // {ts, dir, detector, gate, regime, price} per symbol, served on /state/:sym.gateJournal.
-    try {
+  // GATE-NAME RECORDER (2026-09-18) + GATE JOURNAL (2026-09-30) — runs for EVERY block
+  // message, BEFORE the 35-min sampling cooldown below. Until 2026-10-01 it sat after the
+  // cooldown, so it only ever saw forced stamps (the dormant validators) — which is why
+  // TREND-CONT-WF kept naming "CONF·HELD0" (the CONF-SCORE validator line, which says
+  // "incl. blocked") instead of the real gate, and why the NAS night of 9/30→10/1 showed
+  // 50 journal rows of CONF-HELD0 for a +$360 leg blocked by NAS-OVERNIGHT/NAS-RTH.
+  // Only actual blocks/deferrals qualify; validator/dormant lines are excluded explicitly.
+  try {
+    const _isBlockMsg = /BLOCKED|DEFERRED|REFUSED|SKIPPED|conv \d+ < \d+|below (the )?floor|too (low|weak)/i.test(msg)
+      && !/DORMANT|WOULD-FIRE|TREND-CONT-WF|ARMED \(dormant|CONF-SCORE|dormant validator|no firing effect|LC-AGREE|LC-DISAGREE|ML-DIR|EOD-CONT-WF|BIGLEG-CT-WF|FAST-PRE|LADDER-|BE-HELD|ZONE-MICRO-WF|LEVEL-PROX/i.test(msg);
+    if (_isBlockMsg) {
+      s._lastBlock = s._lastBlock || {}; s._lastBlock[type] = { msg: msg.slice(0, 200), ts: now };
       const _gj = s._gateJournal = s._gateJournal || [];
       const _det = (msg.match(/[⬆⬇]\s*([A-Z0-9_\-\/+]+)/) || [])[1] || (msg.match(/^[^A-Za-z]*([A-Z][A-Z0-9_\-\/]{2,})/) || [])[1] || '?';
       const _gate = String(cohortFor(msg) || 'unmatched');
-      const _last = _gj[_gj.length - 1];
-      if (!(_last && _last.g === _gate && _last.d === type && now - _last.ts < 60000)) { // 1/min per gate+dir — no 3s tick spam
+      // 1 row per gate+dir per minute (scan the last 12 rows — gates interleave on a tick stream)
+      let _dup = false;
+      for (let _k = _gj.length - 1; _k >= 0 && _k >= _gj.length - 12; _k--) { const _e = _gj[_k]; if (now - _e.ts > 60000) break; if (_e.g === _gate && _e.d === type) { _dup = true; break; } }
+      if (!_dup) {
         _gj.push({ ts: now, t: ts(), d: type, det: _det, g: _gate, rg: (s._dayRegime && s._dayRegime.label) || null, p: +(s.lastPrice || 0).toFixed(2) });
-        while (_gj.length > 400 || (_gj.length && now - _gj[0].ts > 86400000)) _gj.shift();
+        while (_gj.length > 600 || (_gj.length && now - _gj[0].ts > 86400000)) _gj.shift();
       }
-    } catch (eGJ) {}
-  } } catch (eLB) {} // pattern widened 2026-09-21 (08:04 'unattributed' — conviction-floor messages don't say BLOCKED)
+    }
+  } catch (eLB) {}
+  if (!force && now - s.lastBlockTrackedTs < BLOCK_TRACK_COOLDOWN_MS) return;
   // ===== BTC COUNTER-TREND TRACKING RETIRED (2026-08-21, Jean) =====
   // "remove all the counter-trend signals definitely, not even needed as dormant."
   // 2-day verdict at honest ATR brackets: counter-trend puts into the melt went
@@ -1924,6 +1927,41 @@ function grindReclaimTag(s, sigType, price, zone, atrVal) {
 function nightTag() {
   try { const m = gET(); return (m >= 1080 || m < 360) ? ' [NIGHT]' : ''; } catch (e) { return ''; }
 }
+// ===== NAS NIGHT-TREND LANE (LIVE, 2026-10-01 — Jean: "activate the signal during trend
+// regime only and dismiss during mixed and range") =====
+// Evidence: the 9/30→10/1 night, +$360 NAS leg, 10 with-trend calls blocked by the two
+// off-hours gates, 8 shadow wins; NAS TREND-CONT-WF-T (with-trend continuation blocked
+// while the classifier says TREND) 16W/9L = 64% over 28 resolved — past the bar. The
+// off-hours gates measure 29% winners OVERALL, so the lane is deliberately narrow:
+//   • outside RTH only matters here — RTH behaviour unchanged
+//   • classifier label TREND, computed within the last 10 min (not MIXED, not RANGE)
+//   • with-trend only: msTrend up → calls, msTrend down → puts (counter-trend stays blocked)
+//   • everything after the two gates (EXT-GUARD, ZONE-VETO, MACD rules…) still applies
+// Rows carry nightTrend:true. Bench rule, pre-registered and ENFORCED here: once ≥6 live
+// night-trend rows have resolved (TP1 = win, SL without TP1 = loss), a net-negative
+// record closes the lane automatically (shadow stamps continue). NAS_NIGHT_TREND=0 kills.
+function nasNightTrendOk(sym, s, sigType) {
+  try {
+    if (sym !== 'NAS100' || process.env.NAS_NIGHT_TREND === '0') return false;
+    if (!s || !s._dayRegime || s._dayRegime.label !== 'TREND' || Date.now() - (s._dayRegime.ts || 0) > 600000) return false;
+    const _wt = (s._msTrend === 'up' && sigType === 'call') || (s._msTrend === 'down' && sigType === 'put');
+    if (!_wt) return false;
+    // bench check (cached 10 min)
+    const _now = Date.now();
+    if (!global._nasNightBenchTs || _now - global._nasNightBenchTs > 600000) {
+      global._nasNightBenchTs = _now;
+      let w = 0, l = 0;
+      for (const h of signalHistory) {
+        if (h.symbol !== 'NAS100' || h.nightTrend !== true || !h.outcomes) continue;
+        if (h.outcomes.tp1Hit) w++; else if (h.outcomes.slHit) l++;
+      }
+      const benched = (w + l >= 6) && (w < l);
+      if (benched && !global._nasNightBenched) log(sym, '🛏️ NAS NIGHT-TREND lane BENCHED — live record ' + w + 'W/' + l + 'L over the first ' + (w + l) + ' resolved fires is net-negative (pre-registered bench rule, 2026-10-01). Off-hours gates back to full block; shadow -TW stamps continue. Re-earn at ≥60% over ≥15.');
+      global._nasNightBenched = benched; global._nasNightRec = { w, l };
+    }
+    return !global._nasNightBenched;
+  } catch (e) { return false; }
+}
 function nasRthBlocked(sym) {
   // ===== NAS RTH-ONLY GATE (2026-09-09, Jean: "yes for nas only during opening hours") =====
   // NAS100 fires only 09:30–16:00 ET (cash session). All 3 live NAS winners this week fired
@@ -1937,6 +1975,7 @@ function nasRthBlocked(sym) {
 function cohortFor(reason) {
   if (/GRIND-RECLAIM-V/.test(reason)) return 'GRIND-RECLAIM-V'; // V-recovery arm, no latch (2026-09-07, 9/7 RIDE-call 8W/2L specimen) — must precede the plain match
   if (/GRIND-RECLAIM/.test(reason)) return 'GRIND-RECLAIM'; // must precede ZONE-VETO/EXT-GUARD — the tag rides on their block messages (2026-09-02)
+  { const _nm = reason.match(/\b(NAS-RTH|NAS-OVERNIGHT)-([TRM])([WC])\b/); if (_nm) return _nm[1] + '-' + _nm[2] + _nm[3]; } // off-hours gates split by regime × direction (2026-10-01): -TW = TREND regime, with-trend … -MC = MIXED, counter-trend. Promotion target NAS-*-TW ≥60% over ≥15.
   if (/NAS-RTH/.test(reason)) return 'NAS-RTH'; // RTH-only gate blocks (2026-09-09) — early so detector tags in the message don't steal the row
   if (/NIGHT-MOMVETO/.test(reason)) return 'NIGHT-MOMVETO'; // night momentum-minimum vetoes (2026-09-09) — must precede the [NIGHT] match; if vetoed fires WIN ≥60%/15 the thresholds are too tight
   if (/EARLY-PROT/.test(reason)) return 'EARLY-PROT'; // early-protect closes + tight-stop skips (2026-09-10, the 00:45 TP3-that-got-flattened case) — SKIPPED rows grade the exemption, CLOSED rows grade the rule itself
@@ -2272,6 +2311,31 @@ const PROTECT_DAY_LOSS = parseFloat(process.env.PROTECT_DAY_LOSS || '6000');
 const PNL_LEDGER_FILE = path.join(DATA_DIR, 'pnl_ledger.json');
 let pnlLedger = {};
 try { pnlLedger = JSON.parse(fs.readFileSync(PNL_LEDGER_FILE, 'utf8')) || {}; } catch (e) { pnlLedger = {}; }
+// ===== FUNDED ACCOUNT EPOCH (2026-10-01, Jean: "put the numbers back to 0, we have a new
+// account funded from Neura") ===== The guard used to count from FUNDED_START_DATE (env,
+// redeploy to change). An epoch file overrides it at runtime: { since, sinceTs, label,
+// base: { 'YYYY-MM-DD': { SYM: pnlAtReset } } }. `base` holds the ledger dollars already
+// booked on the reset day BEFORE the reset, so a mid-day reset starts the guard at $0
+// without rewriting history. Set via GET /admin/funded-reset (below). Ledger untouched.
+const FUNDED_EPOCH_FILE = path.join(DATA_DIR, 'funded_epoch.json');
+let fundedEpoch = null;
+try { fundedEpoch = JSON.parse(fs.readFileSync(FUNDED_EPOCH_FILE, 'utf8')) || null; } catch (e) { fundedEpoch = null; }
+function fundedTotals() {
+  const since = (fundedEpoch && fundedEpoch.since) || process.env.FUNDED_START_DATE || '2026-09-21';
+  const base = (fundedEpoch && fundedEpoch.base) || {};
+  const t0 = todayDateET();
+  let day = 0, tot = 0;
+  for (const d of Object.keys(pnlLedger)) {
+    if (d < since) continue;
+    for (const sym of Object.keys(pnlLedger[d])) {
+      const p = pnlLedger[d][sym] && pnlLedger[d][sym].pnl;
+      if (typeof p !== 'number') continue;
+      const b = (base[d] && typeof base[d][sym] === 'number') ? base[d][sym] : 0;
+      tot += p - b; if (d === t0) day += p - b;
+    }
+  }
+  return { day: +day.toFixed(2), total: +tot.toFixed(2), since, label: (fundedEpoch && fundedEpoch.label) || null, resetAt: (fundedEpoch && fundedEpoch.sinceTs) || null };
+}
 let _plDirty = false;
 function bookPnl(sym, amount, kind) {
   try {
@@ -3353,6 +3417,9 @@ function logSignal(sym, sig) {
     // gradable from /signals real outcomes (06:40 bottom-tick case — revert rule: bypass
     // net-negative over ~8 fires → drop the bypass entirely).
     p381Bypass: sig._p381 === true || undefined,
+    // NAS NIGHT-TREND lane marker (2026-10-01): off-hours fire waived through the night gates
+    // because regime=TREND and with-trend. Bench rule reads these rows (nasNightTrendOk).
+    nightTrend: sig._nightTrend === true || undefined,
     // ML-DIR learned-scorer probability (dormant, 2026-08-29) — grade fired rows by
     // p-bucket in the nightly report; promotion requires holdout AND live agreement.
     mlP: (typeof sig._mlP === 'number') ? +sig._mlP.toFixed(3) : undefined,
@@ -7358,10 +7425,27 @@ function processPrice(sym, price, hi, lo) {
     // stack). 0W/4L, −$162, all adverseFrac ≥1.0. The architecture's own logic: QQQ is
     // NAS's brain; when the brain sleeps, NAS sleeps. Shadow-tracked for the reopen case.
     try {
-      if (isNAS && typeof rthEtfFresh === 'function' && !rthEtfFresh()) {
+      if (isNAS && typeof rthEtfFresh === 'function' && !rthEtfFresh() && nasNightTrendOk(sym, s, sig.type)) {
+        // NIGHT-TREND lane (2026-10-01): QQQ asleep, but the classifier says TREND and the
+        // candidate rides it — the stand-down steps aside; the NAS-RTH gate below waives too.
+        sig._nightTrend = true;
+        log(sym, '🌙 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' NAS-OVERNIGHT stand-down WAIVED — NIGHT-TREND lane (regime TREND, msTrend ' + s._msTrend + ', with-trend).');
+      } else if (isNAS && typeof rthEtfFresh === 'function' && !rthEtfFresh()) {
         Object.assign(s, _emitSnapshot);
-        const _noMsg = '🌙 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — NAS-OVERNIGHT stand-down: QQQ closed, no confirmation available (overnight fires 0W/4L −$162 since 8/2; 2026-08-11).';
+        // Regime × direction token (2026-10-01, the 9/30→10/1 night: +$360 NAS leg, every with-trend
+        // call blocked here while NAS-OVERNIGHT sits at 4W/10L overall). NAS-OVERNIGHT-TW/TC/RW/RC/MW/MC
+        // sub-cohorts answer the only question that matters: does with-trend continuation in a
+        // TREND regime pay outside RTH? ≥60% over ≥15 → regime-conditional night lane.
+        const _noTok = (function () { try { const _r = (s._dayRegime && s._dayRegime.label) ? s._dayRegime.label.charAt(0) : 'M'; const _wt = (s._msTrend === 'up' && sig.type === 'call') || (s._msTrend === 'down' && sig.type === 'put'); return 'NAS-OVERNIGHT-' + _r + (_wt ? 'W' : 'C'); } catch (e) { return 'NAS-OVERNIGHT-MC'; } })();
+        const _noMsg = '🌙 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — NAS-OVERNIGHT stand-down: QQQ closed, no confirmation available (overnight fires 0W/4L −$162 since 8/2; 2026-08-11). ' + _noTok;
         log(sym, _noMsg);
+        // Forced shadow per detector+direction per 3 min (2026-10-01) — the 35-min sampler
+        // alone would need weeks to fill the -TW sub-cohort; mirrors the NAS-RTH dedupe.
+        try {
+          s._nasOnTrackTs = s._nasOnTrackTs || {};
+          const _noK = (tagEarly || 'x') + ':' + sig.type;
+          if (Date.now() - (s._nasOnTrackTs[_noK] || 0) >= 180000) { s._nasOnTrackTs[_noK] = Date.now(); trackBlockedOutcome(sym, _noMsg, true); }
+        } catch (eNT) {}
         return false;
       }
     } catch (eNO) { /* overnight gate must never crash enrichment */ }
@@ -9597,9 +9681,14 @@ function processPrice(sym, price, hi, lo) {
     // measures what firing outside the cash session would have paid. NAS_RTH_ONLY=0
     // in Railway env disables without a deploy. Dedupe mirrors the BTC dormant gate:
     // one tracked shadow per detector+direction per 3 min (logging untouched).
-    if (nasRthBlocked(sym)) {
+    if (nasRthBlocked(sym) && nasNightTrendOk(sym, s, sig.type)) {
+      // NIGHT-TREND lane (2026-10-01): TREND regime + with-trend → the RTH gate steps aside.
+      sig._nightTrend = true;
+      log(sym, '🌙 ' + tag + ' ' + sig.type.toUpperCase() + ' NAS-RTH gate WAIVED — NIGHT-TREND lane: regime TREND (KER ' + (s._dayRegime.ker || 0).toFixed(2) + ' / CHOP ' + (s._dayRegime.chop || 0).toFixed(0) + ' / H ' + (s._dayRegime.hurst || 0).toFixed(2) + '), msTrend ' + s._msTrend + ', with-trend. Live record ' + ((global._nasNightRec && global._nasNightRec.w) || 0) + 'W/' + ((global._nasNightRec && global._nasNightRec.l) || 0) + 'L (bench at net-negative over ≥6).');
+    } else if (nasRthBlocked(sym)) {
       Object.assign(s, _emitSnapshot);
-      const _nrMsg = '🕥 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — NAS-RTH gate: outside 09:30-16:00 ET (2026-09-09). NAS pays on RTH extreme reversals; overnight futures drift is not its edge. NAS_RTH_ONLY=0 re-enables 24h.';
+      const _nrTok = (function () { try { const _r = (s._dayRegime && s._dayRegime.label) ? s._dayRegime.label.charAt(0) : 'M'; const _wt = (s._msTrend === 'up' && sig.type === 'call') || (s._msTrend === 'down' && sig.type === 'put'); return 'NAS-RTH-' + _r + (_wt ? 'W' : 'C'); } catch (e) { return 'NAS-RTH-MC'; } })(); // regime × direction split (2026-10-01)
+      const _nrMsg = '🕥 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — NAS-RTH gate: outside 09:30-16:00 ET (2026-09-09). NAS pays on RTH extreme reversals; overnight futures drift is not its edge. NAS_RTH_ONLY=0 re-enables 24h. ' + _nrTok;
       let _nrOk = true;
       try {
         s._nasRthTrackTs = s._nasRthTrackTs || {};
@@ -9665,19 +9754,11 @@ function processPrice(sym, price, hi, lo) {
         // the first real MT5 fills.
         const _fdLim = parseFloat(process.env.FUNDED_DAY_LIMIT || '12000');
         const _ftLim = parseFloat(process.env.FUNDED_TOTAL_LIMIT || '24000');
-        const _fStart = process.env.FUNDED_START_DATE || '2026-09-21';
-        let _fDay = 0, _fTot = 0;
-        try {
-          const _t0 = todayDateET();
-          for (const _fd of Object.keys(pnlLedger)) {
-            if (_fd < _fStart) continue;
-            for (const _fs of Object.keys(pnlLedger[_fd])) {
-              const _fp = pnlLedger[_fd][_fs] && pnlLedger[_fd][_fs].pnl;
-              if (typeof _fp === 'number') { _fTot += _fp; if (_fd === _t0) _fDay += _fp; }
-            }
-          }
-        } catch (eFD) {}
-        global._fundedGuard = { day: +_fDay.toFixed(2), dayLimit: _fdLim, total: +_fTot.toFixed(2), totalLimit: _ftLim, since: _fStart };
+        // Account epoch aware (2026-10-01): fundedTotals() honours the runtime reset file
+        // (new Neura account) — day/total start at $0 from the reset moment.
+        let _fDay = 0, _fTot = 0, _fStart = process.env.FUNDED_START_DATE || '2026-09-21', _fEp = null;
+        try { _fEp = fundedTotals(); _fDay = _fEp.day; _fTot = _fEp.total; _fStart = _fEp.since; } catch (eFD) {}
+        global._fundedGuard = { day: +_fDay.toFixed(2), dayLimit: _fdLim, total: +_fTot.toFixed(2), totalLimit: _ftLim, since: _fStart, account: (_fEp && _fEp.label) || null, resetAt: (_fEp && _fEp.resetAt) || null };
         if (_fDay <= -_fdLim || _fTot <= -_ftLim) {
           const _fMsg = '🏦 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — FUNDED-GUARD: ' + (_fDay <= -_fdLim ? 'account day P&L $' + _fDay.toFixed(0) + ' ≤ -$' + _fdLim.toFixed(0) + ' (Neura 4%/day = $16K; guard at 75%)' : 'cumulative P&L $' + _fTot.toFixed(0) + ' since ' + _fStart + ' ≤ -$' + _ftLim.toFixed(0) + ' (Neura 8% total = $32K; guard at 75%)') + ' — no new fires. Virtual tracking continues (2026-09-20).';
           log(sym, _fMsg); trackBlockedOutcome(sym, _fMsg, true);
@@ -18131,10 +18212,10 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.00-20260930-trade-clear-guard', // bump on each deploy — lets /state verify what's live
+    build: '7.02-20261001-nas-night-trend-lane', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
-    pnlLedger: (function(){ try { const out = {}; let wk = 0; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; wk += pnlLedger[d][sym].pnl; } } out.weekTotal = +wk.toFixed(2); return out; } catch (e) { return {}; } })(), // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
+    pnlLedger: (function(){ try { const out = {}; let wk = 0; const _since = (fundedEpoch && fundedEpoch.since) || ''; const _base = (fundedEpoch && fundedEpoch.base) || {}; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; if (d >= _since) wk += pnlLedger[d][sym].pnl - ((_base[d] && typeof _base[d][sym] === 'number') ? _base[d][sym] : 0); } } out.weekTotal = +wk.toFixed(2); out.account = (fundedEpoch && fundedEpoch.label) || null; return out; } catch (e) { return {}; } })(), // weekTotal counts the current funded-account epoch only (2026-10-01) // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     fundedGuard: global._fundedGuard || null, // Neura $400K guard readout (2026-09-20): account day/total vs limits
     regimeScore: s._dayRegime || null, // KER+CHOP+Hurst composite classifier (2026-09-20): {label TREND|RANGE|MIXED, ker, chop, hurst, n, ts}
     gateJournal: (s._gateJournal || []).slice(-150), // 24h ring of real blocks {t, d, det, g(ate cohort), rg(regime), p} — 1/min per gate+dir (2026-09-30)
@@ -18745,6 +18826,41 @@ app.get('/admin/fix-level', (req, res) => {
   };
   console.log('[' + ts() + '] 🔧 ADMIN fix-level ' + sym + ' — before ' + JSON.stringify(before) + ' after ' + JSON.stringify(after));
   res.json({ ok: true, sym: sym, before: before, after: after });
+});
+
+// ===== ADMIN: FUNDED ACCOUNT RESET (2026-10-01) =====
+// New Neura account → guard back to $0 without touching the ledger history.
+//   GET /admin/funded-reset?label=Neura-2            (reset NOW: today's already-booked $ become the baseline)
+//   GET /admin/funded-reset?since=2026-10-01&label=…  (reset from a date boundary, no baseline)
+//   GET /admin/funded-reset?show=1                    (read the current epoch + totals)
+//   GET /admin/funded-reset?clear=1                   (remove the override → env FUNDED_START_DATE again)
+//   Add &key=<ADMIN_KEY> if ADMIN_KEY env var is set.
+app.get('/admin/funded-reset', (req, res) => {
+  const adminKey = process.env.ADMIN_KEY || '';
+  if (adminKey && req.query.key !== adminKey) return res.status(403).json({ error: 'forbidden' });
+  try {
+    if (req.query.show) return res.json({ ok: true, epoch: fundedEpoch, totals: fundedTotals(), guard: global._fundedGuard || null });
+    if (req.query.clear) {
+      fundedEpoch = null; try { fs.unlinkSync(FUNDED_EPOCH_FILE); } catch (e) {}
+      console.log('[' + ts() + '] 🏦 ADMIN funded-reset CLEARED — guard counts from env FUNDED_START_DATE again.');
+      return res.json({ ok: true, epoch: null, totals: fundedTotals() });
+    }
+    const today = todayDateET();
+    const since = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.since || '')) ? String(req.query.since) : today;
+    const ep = { since, sinceTs: Date.now(), label: String(req.query.label || 'funded-' + since).slice(0, 40), base: {} };
+    if (since === today && pnlLedger[today]) { // mid-day reset: what is already booked today is the baseline
+      ep.base[today] = {};
+      for (const sym of Object.keys(pnlLedger[today])) { const p = pnlLedger[today][sym] && pnlLedger[today][sym].pnl; if (typeof p === 'number') ep.base[today][sym] = p; }
+    }
+    fundedEpoch = ep;
+    fs.writeFileSync(FUNDED_EPOCH_FILE, JSON.stringify(ep));
+    try { global._fundedWarn = null; } catch (e) {}
+    const tot = fundedTotals();
+    global._fundedGuard = Object.assign({}, global._fundedGuard || {}, { day: tot.day, total: tot.total, since: tot.since, account: ep.label, resetAt: ep.sinceTs });
+    console.log('[' + ts() + '] 🏦 ADMIN funded-reset — new account epoch "' + ep.label + '" since ' + since + (ep.base[today] ? ' (baseline ' + JSON.stringify(ep.base[today]) + ')' : '') + ' → guard day $' + tot.day + ' / total $' + tot.total + '.');
+    try { sendPush('🏦 Funded guard reset', 'New account "' + ep.label + '" — day $0 / total $0 from now', 'alert'); } catch (e) {}
+    res.json({ ok: true, epoch: ep, totals: tot });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
 
 app.get('/admin/seed-daily-levels', (req, res) => {
