@@ -6651,12 +6651,22 @@ function processPrice(sym, price, hi, lo) {
           const _improved = _md ? Math.abs(_ml) < Math.abs(_md.macd) : false;
           const _worse25 = _md ? Math.abs(_ml) >= 1.25 * Math.abs(_md.macd) : false;
           if (_fresh && _improved && (_mdAge >= 60000 || _turning)) {
-            s._macdDefer = null;
+            s._macdDefer = null; s._macdHold = null;
             sig._macdRelease = { waitedSec: Math.round(_mdAge / 1000), from: +_md.macd.toFixed(3), to: +_ml.toFixed(3), accel: +macdAccel.toFixed(3) };
             log(sym, '⏱️ ' + _tagX + ' ' + sig.type.toUpperCase() + ' MACD-DEFER RELEASED — waited ' + Math.round(_mdAge / 1000) + 's, MACD line ' + (_md.macd >= 0 ? '+' : '') + _md.macd.toFixed(3) + ' → ' + (_ml >= 0 ? '+' : '') + _ml.toFixed(3) + ' (reversing toward ' + sig.type.toUpperCase() + (_turning ? ', accel ' + macdAccel.toFixed(3) : ', ≥60s of improvement') + '). Momentum turning — allowed (loosened 2026-10-02).');
           } else {
             const _restart = !_md || _mdAge > _mdWin || _worse25;
             if (_restart) s._macdDefer = { dir: sig.type, ts: _nowMd, macd: _ml }; // first sighting / expired / momentum re-accelerating against → (re)start the clock
+            // MACD-HOLD (2026-10-02, Jean: "once the signal fires on wrong-sense MACD it just waits
+            // for MACD to turn to the right direction and fires, right?") — until now, no: the gate
+            // only released a NEW candidate from the detector. Now the candidate itself is parked and
+            // the per-tick resolver fires it the moment the line turns (re-vetted through every
+            // downstream gate first), without waiting for the detector to re-fire.
+            try {
+              const _hk = Object.assign({}, sig); delete _hk.conv; delete _hk.ts; delete _hk.num; delete _hk._confScore; delete _hk._confClass; delete _hk._confBreakdown; delete _hk.pendingEntry; delete _hk.oteHold; delete _hk.entryActual;
+              const _prev = (s._macdHold && s._macdHold.dir === sig.type && !_restart) ? s._macdHold : null;
+              s._macdHold = { sig: _hk, dir: sig.type, tag: _tagX, ts0: _prev ? _prev.ts0 : s._macdDefer.ts, macd0: _prev ? _prev.macd0 : s._macdDefer.macd, sigPrice: price, lastSeen: _nowMd };
+            } catch (eMH) {}
             Object.assign(s, _emitSnapshot);
             const _waited = (!_restart && _md) ? Math.round(_mdAge / 1000) + 's waited' : (_md && _worse25 ? 'clock restarted (line ' + (_md.macd >= 0 ? '+' : '') + _md.macd.toFixed(3) + ' → ' + (_ml >= 0 ? '+' : '') + _ml.toFixed(3) + ', further against)' : 'clock started');
             const _m = '📉 ' + _tagX + ' ' + sig.type.toUpperCase() + ' DEFERRED — MACD line ' + (_ml >= 0 ? '+' : '') + _ml.toFixed(3) + ' against direction (need ' + (sig.type === 'call' ? '≥0' : '≤0') + '); ' + _waited + (_md && !_restart ? (_improved ? ', improving but <60s' : ', not reversing yet') : '') + ' (accel ' + macdAccel.toFixed(3) + '). Releases within 30s-' + Math.round(_mdWin / 60000) + 'min once the line reverses toward the trade (7/27 rule, loosened 2026-10-02).';
@@ -6664,7 +6674,7 @@ function processPrice(sym, price, hi, lo) {
             return false;
           }
         } else if (s._macdDefer && s._macdDefer.dir === sig.type) {
-          s._macdDefer = null; // line fully aligned — clear any pending defer
+          s._macdDefer = null; s._macdHold = null; // line fully aligned — clear any pending defer/hold (this candidate fires on its own)
         }
       }
     } catch (eML) { /* macd-line gate must never crash enrichment */ }
@@ -12010,6 +12020,46 @@ function processPrice(sym, price, hi, lo) {
             }
           }
         } catch (eOV) { if (s.trade && s.trade._oteVetted === false) s.trade._oteVetted = true; /* never strand a trade unvetted */ }
+        // ===== MACD-HOLD RESOLVER (2026-10-02, Jean) ===== A continuation candidate deferred
+        // for a wrong-sense MACD line is parked in s._macdHold. Every tick: the line turned
+        // (crossed to the trade's side, or moved toward it for ≥60s / with aligned acceleration)
+        // → re-vet the parked candidate through enrichSig (all downstream gates, current price)
+        // and fire it via buildCfdTrade (XAU/NAS born unvetted → the auction / extreme hold
+        // still applies). Window = MACD_DEFER_WIN_SEC (5 min) from the FIRST sighting; expiry
+        // drops it (the DEFER shadow already measures what the market did).
+        try {
+          const _mh = s._macdHold;
+          if (_mh && isMT5 && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold) {
+            const _mhWin = (parseInt(process.env.MACD_DEFER_WIN_SEC, 10) || 300) * 1000;
+            const _mhAge = _zNow - _mh.ts0;
+            if (_mhAge > _mhWin) {
+              s._macdHold = null;
+              log(sym, '⏱️ MACD-HOLD ' + _mh.dir.toUpperCase() + ' (' + _mh.tag + ' @ $' + (+_mh.sigPrice).toFixed(2) + ') EXPIRED — line ' + (_mh.macd0 >= 0 ? '+' : '') + (+_mh.macd0).toFixed(3) + ' → ' + (macdL >= 0 ? '+' : '') + macdL.toFixed(3) + ' never turned within ' + Math.round(_mhWin / 60000) + 'min; no trade (2026-10-02).');
+            } else if (_mhAge >= 30000) {
+              const _mhC = _mh.dir === 'call';
+              const _aligned = _mhC ? macdL >= 0 : macdL <= 0;
+              const _impr = Math.abs(macdL) < Math.abs(_mh.macd0);
+              const _turn = _mhC ? macdAccel > 0 : macdAccel < 0;
+              if (_aligned || (_impr && (_mhAge >= 60000 || _turn))) {
+                s._macdHold = null; s._macdDefer = null;
+                const _sig2 = Object.assign({}, _mh.sig, { time: ts(), price: price.toFixed(2), macd: macdL.toFixed(3) });
+                _sig2._macdRelease = { waitedSec: Math.round(_mhAge / 1000), from: +(+_mh.macd0).toFixed(3), to: +macdL.toFixed(3), accel: +macdAccel.toFixed(3), hold: true, sigPrice: +(+_mh.sigPrice).toFixed(2) };
+                log(sym, '⏱️ MACD-HOLD ' + _mh.dir.toUpperCase() + ' (' + _mh.tag + ') RELEASED — waited ' + Math.round(_mhAge / 1000) + 's, MACD line ' + (_mh.macd0 >= 0 ? '+' : '') + (+_mh.macd0).toFixed(3) + ' → ' + (macdL >= 0 ? '+' : '') + macdL.toFixed(3) + (_aligned ? ' (crossed to the ' + _mh.dir + ' side)' : ' (reversing, accel ' + macdAccel.toFixed(3) + ')') + '; parked @ $' + (+_mh.sigPrice).toFixed(2) + ', now $' + price.toFixed(2) + ' — re-vetting through the remaining gates (2026-10-02).');
+                if (enrichSig(_sig2)) {
+                  s.dailySignalCount++; _sig2.num = s.dailySignalCount;
+                  s.lastSignalDir = _sig2.type; s.lastSignalTs = _zNow; s.lastNTs = _zNow; s.lastAT = _sig2.type;
+                  if (_sig2.type === 'call') s.nC++; else s.nP++;
+                  s.signals.push(_sig2); logSignal(sym, _sig2);
+                  s.trade = buildCfdTrade(_sig2.type, price, atrVal, sym);
+                  log(sym, '🚀 ' + (_sig2.score || _mh.tag) + ' ' + _sig2.type.toUpperCase() + ' FIRED on MACD turn @ $' + price.toFixed(2) + ' (parked $' + (+_mh.sigPrice).toFixed(2) + ', ' + Math.round(_mhAge / 1000) + 's) · SL $' + (+s.trade.slPrice || 0).toFixed(2) + ' · TP1 $' + (+s.trade.tp1Price || 0).toFixed(2) + ' · TP2 $' + (+s.trade.tp2Price || 0).toFixed(2) + ' · TP3 $' + (+s.trade.tp3Price || 0).toFixed(2) + ' [#' + s.dailySignalCount + ', MACD-RELEASED]');
+                  sendPush('⏱️ ' + sym + ' ' + _sig2.type.toUpperCase() + ' on MACD turn #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · SL $' + (+s.trade.slPrice || 0).toFixed(2) + ' · TP1 $' + (+s.trade.tp1Price || 0).toFixed(2) + ' · waited ' + Math.round(_mhAge / 1000) + 's', 'signal');
+                } else {
+                  log(sym, '⏱️ MACD-HOLD ' + _mh.dir.toUpperCase() + ' released but a downstream gate refused it at $' + price.toFixed(2) + ' (see the block above) — no trade; hold cleared.');
+                }
+              }
+            }
+          }
+        } catch (eMHR) { /* macd-hold must never crash the tick */ }
         // ===== OTE-HOLD RESOLVER (2026-08-26, Jean) =====
         try {
           const _oh = s._oteHold;
@@ -18013,6 +18063,7 @@ setInterval(() => {
       s.vrevSnaps = []; s.vrevLastTs = 0;
       s.breakRange = []; s.breakHi = 0; s.breakLo = Infinity; s.breakCoilStart = 0; s.breakCoilActive = false; s.breakFrozenHi = 0; s.breakFrozenLo = Infinity; s.breakLastTs = 0; s.breakLastDir = null; s.breakLastPrice = 0; s._pendingBreakout = null;
       s.macroPrevDir = null; s.macroFlipTs = 0; s.superFlipTs = 0;
+      s._macdHold = null; s._macdDefer = null; // parked MACD candidates do not survive the day roll (2026-10-02)
       s.lastAT = ''; s.lastNTs = 0; s.lastReversalTs = 0;
       // s.lastPrice NO LONGER zeroed at daily reset (2026-09-04): zeroing it made the
       // FIRST tick after every 20:00 ET reset bypass quarantineCheck entirely — a garbage
@@ -18493,7 +18544,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.10-20261002-leg-mode', // bump on each deploy — lets /state verify what's live
+    build: '7.11-20261002-macd-hold', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const _since = (fundedEpoch && fundedEpoch.since) || ''; const _base = (fundedEpoch && fundedEpoch.base) || {}; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; if (d >= _since) wk += pnlLedger[d][sym].pnl - ((_base[d] && typeof _base[d][sym] === 'number') ? _base[d][sym] : 0); } } out.weekTotal = +wk.toFixed(2); out.account = (fundedEpoch && fundedEpoch.label) || null; return out; } catch (e) { return {}; } })(), // weekTotal counts the current funded-account epoch only (2026-10-01) // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
