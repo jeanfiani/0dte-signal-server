@@ -1974,7 +1974,9 @@ function nasRthBlocked(sym) {
 }
 function cohortFor(reason) {
   { const _tw = reason.match(/\bTREND-(WT|CT)\b/); if (_tw) return 'TREND-' + _tw[1]; }
-  { const _pb = reason.match(/\bEXT-PB-(LEFT|EXPIRED)\b/); if (_pb) return 'EXT-PB-' + _pb[1]; } // extreme-pullback hold cancellations (2026-10-01): win = waiting cost a winner, loss = the rule paid // trend-regime tracker (2026-10-01) — first: the row names its detector AND its gate, either would hijack it
+  { const _pb = reason.match(/\bEXT-PB-(LEFT|EXPIRED)\b/); if (_pb) return 'EXT-PB-' + _pb[1]; }
+  { const _zt = reason.match(/\bZONE-VETO-(WT|CT)\b/); if (_zt) return 'ZONE-VETO-' + _zt[1]; } // live-direction split of the zone veto (2026-10-02)
+  { const _ct = reason.match(/\bCT-VETO-S([12])([WC])\b/); if (_ct) return 'CT-VETO-S' + _ct[1] + _ct[2]; } // strength × live-direction split of the counter-trend veto (2026-10-02) // extreme-pullback hold cancellations (2026-10-01): win = waiting cost a winner, loss = the rule paid // trend-regime tracker (2026-10-01) — first: the row names its detector AND its gate, either would hijack it
   if (/GRIND-RECLAIM-V/.test(reason)) return 'GRIND-RECLAIM-V'; // V-recovery arm, no latch (2026-09-07, 9/7 RIDE-call 8W/2L specimen) — must precede the plain match
   if (/GRIND-RECLAIM/.test(reason)) return 'GRIND-RECLAIM'; // must precede ZONE-VETO/EXT-GUARD — the tag rides on their block messages (2026-09-02)
   { const _nm = reason.match(/\b(NAS-RTH|NAS-OVERNIGHT)-([TRM])([WC])\b/); if (_nm) return _nm[1] + '-' + _nm[2] + _nm[3]; } // off-hours gates split by regime × direction (2026-10-01): -TW = TREND regime, with-trend … -MC = MIXED, counter-trend. Promotion target NAS-*-TW ≥60% over ≥15.
@@ -3529,7 +3531,9 @@ function logSignal(sym, sig) {
     // NAS NIGHT-TREND lane marker (2026-10-01): off-hours fire waived through the night gates
     // because regime=TREND and with-trend. Bench rule reads these rows (nasNightTrendOk).
     nightTrend: sig._nightTrend === true || undefined,
-    macdRelease: sig._macdRelease || undefined, // fired after a MACD-DEFER release (2026-10-02): {waitedSec, from, to, accel} — grades as its own class
+    macdRelease: sig._macdRelease || undefined,
+    ctWaived: sig._ctWaived || undefined, // CT-VETO waived under LEG MODE (2026-10-02)
+    legMode: sig._legMode === true || undefined, // ZONE-VETO waived under LEG MODE (2026-10-02) // fired after a MACD-DEFER release (2026-10-02): {waitedSec, from, to, accel} — grades as its own class
     // ML-DIR learned-scorer probability (dormant, 2026-08-29) — grade fired rows by
     // p-bucket in the nightly report; promotion requires holdout AND live agreement.
     mlP: (typeof sig._mlP === 'number') ? +sig._mlP.toFixed(3) : undefined,
@@ -6912,16 +6916,28 @@ function processPrice(sym, price, hi, lo) {
         // BIG-LEG is armed and CT-VETO blocks a with-leg continuation, the stamp routes to
         // BIGLEG-CT-WF; ≥60% would-win over ≥15 earns the waiver, not a hunch.
         const _ctBigLeg = s._bigLeg === sig.type && process.env.BIGLEG_DISABLED !== '1';
+        // BIG-LEG WAIVER PROMOTED (2026-10-02): BIGLEG-CT-WF reached 8W/5L/3S = 62% over 16
+        // resolved — the pre-registered bar (≥60% over ≥15) set on 2026-09-22. A live leg in
+        // the candidate's direction outranks a stale 5-day label. LEG MODE (leg ≥1.5×ATR, any
+        // classifier tier) is the condition; rows carry ctWaived:'bigleg'. Bench: BIG-LEG's.
+        const _ctLeg = _ctBigLeg && legModeActive(s, sym, sig.type, atrVal);
         if (_ctCont && _ctCounter && _ctTrendExempt) {
           sig._ctTrendExempt = true;
           log(sym, '🧭 ' + _ctTag + ' ' + sig.type.toUpperCase() + ' CT-VETO WAIVED — TREND exemption (2026-08-26, cohort 4W/1L/1S) — firing live vs ' + sig._regime.dir.toUpperCase() + ' regime');
+        } else if (_ctCont && _ctCounter && _ctLeg) {
+          sig._ctWaived = 'bigleg';
+          log(sym, '🦵 ' + _ctTag + ' ' + sig.type.toUpperCase() + ' CT-VETO WAIVED — LEG MODE: BIG-LEG armed ' + sig.type + ' with a ≥1.5×ATR leg from pivot $' + (s._legPivot ? (+s._legPivot.ext).toFixed(2) : '?') + ' vs 5-day ' + sig._regime.dir.toUpperCase() + ' (s' + sig._regime.strength + '). BIGLEG-CT-WF earned it: 8W/5L/3S (promoted 2026-10-02; bench net-negative first 6).');
         }
-        if (_ctCont && _ctCounter && !_ctTrendExempt) {
+        if (_ctCont && _ctCounter && !_ctTrendExempt && !_ctLeg) {
           if (_ctBigLeg) {
-            const _ctWf = '🧵 ' + _ctTag + ' ' + sig.type.toUpperCase() + ' BIGLEG-CT-WF @ $' + price.toFixed(2) + ' — CT-VETO blocked a with-leg continuation while BIG-LEG was armed ' + sig.type + ' (5-day ' + sig._regime.dir.toUpperCase() + '); measured, not waived (2026-09-22).';
+            const _ctWf = '🧵 ' + _ctTag + ' ' + sig.type.toUpperCase() + ' BIGLEG-CT-WF @ $' + price.toFixed(2) + ' — CT-VETO blocked a with-leg continuation while BIG-LEG was armed ' + sig.type + ' but the leg is still <1.5×ATR (5-day ' + sig._regime.dir.toUpperCase() + '); measured (2026-09-22; LEG MODE threshold 2026-10-02).';
             log(sym, _ctWf); trackBlockedOutcome(sym, _ctWf, true);
           }
-          const _ctMsg = '🧭 ' + _ctTag + ' ' + sig.type.toUpperCase() + ' BLOCKED — CT-VETO: counter-trend continuation vs ' + sig._regime.dir.toUpperCase() + ' regime (s' + sig._regime.strength + ', ' + sig._regime.netChgPct + '% ' + (sig._regime.window || '') + ') — gate-report promotion 2026-08-21, 3 batches +16.7..+61pp.';
+          // Strength × live-direction token (2026-10-02): CT-VETO-S1W = weak 5-day regime, candidate WITH
+          // the live msTrend … S2C = strong regime, candidate against msTrend. The 10/01-02 sample was
+          // 18/18 at s1 (9W/7L); if S1W clears ≥60% over ≥15, weak regimes stop vetoing live trends.
+          const _ctTok = 'CT-VETO-S' + (sig._regime.strength || 1) + (((s._msTrend === 'up' && sig.type === 'call') || (s._msTrend === 'down' && sig.type === 'put')) ? 'W' : 'C');
+          const _ctMsg = '🧭 ' + _ctTag + ' ' + sig.type.toUpperCase() + ' BLOCKED — CT-VETO: counter-trend continuation vs ' + sig._regime.dir.toUpperCase() + ' regime (s' + sig._regime.strength + ', ' + sig._regime.netChgPct + '% ' + (sig._regime.window || '') + ') — gate-report promotion 2026-08-21, 3 batches +16.7..+61pp. ' + _ctTok;
           log(sym, _ctMsg); trackBlockedOutcome(sym, _ctMsg, true);
           Object.assign(s, _emitSnapshot);
           return false;
@@ -7680,18 +7696,24 @@ function processPrice(sym, price, hi, lo) {
         // in real time. Second independent leg where ZONE-VETO killed the entry (9/18
         // noon: 5 vetoes on a +$37 rally, all graded wins). Continuation tags only;
         // counter-trend and non-BIG-LEG fires keep the full veto. Bench rule = BIG-LEG's.
-        const _zvBigLeg = s._bigLeg === sig.type && s._bigLegTier === 'FULL' && process.env.BIGLEG_DISABLED !== '1' && /RIDE|TREND|FAST|SUST|6\/6/.test(tagEarly || ''); // FULL tier only (TREND regime), 2026-09-28
+        // LEG MODE (2026-10-02): FULL tier (classifier TREND) OR a ≥1.5×ATR leg from the BIG-LEG pivot —
+        // the 9/28 FULL-only restriction assumed the classifier would call the trend; on 10/01-02 it
+        // never did while the legs ran 2-10×ATR (with-trend ZONE-VETO blocks graded 11W/3L across the
+        // two nights). The exhaustion risk that motivated 9/28 is now the extreme-pullback hold's job.
+        const _zvBigLeg = s._bigLeg === sig.type && process.env.BIGLEG_DISABLED !== '1' && /RIDE|TREND|FAST|SUST|6\/6|CHoCH|SWEEP/.test(tagEarly || '') && legModeActive(s, sym, sig.type, atrVal);
+        if (_zvBigLeg) sig._legMode = true;
+        const _zvTok = ' ZONE-VETO-' + (((s._msTrend === 'up' && sig.type === 'call') || (s._msTrend === 'down' && sig.type === 'put')) ? 'WT' : 'CT'); // live-direction split (2026-10-02): the 31h sample read with-trend 67% vs counter-trend 40%
         const _zvInLatch = _zvIn && latchAdvSource(s, sig.type) && (sig.type === 'put'
           ? ((s.sessionLowUpdateTs || 0) > 0 && (Date.now() - s.sessionLowUpdateTs) < 900000)
           : ((s.sessionHighUpdateTs || 0) > 0 && (Date.now() - s.sessionHighUpdateTs) < 900000));
         const _zvInEase = _zvIn && (_zvInLatch || _zvBigLeg);
         if (_zvInEase) {
-          log(sym, (_zvInLatch ? '📈 ' : '🚀 ') + tagEarly + ' ' + sig.type.toUpperCase() + ' INSIDE-ZONE veto DEFERRED — ' + (_zvInLatch ? 'with-trend latch + session extreme advancing <15min' : 'BIG-LEG armed ' + sig.type + ' (BIGLEG-ZONE-EASE 2026-09-21)') + ': the opposing ' + (_zvIn.kind || 'OB') + ' ' + (_zvIn.tf || '') + ' $' + _zvIn.lo.toFixed(2) + '-$' + _zvIn.hi.toFixed(2) + ' is failing in real time (defended-zone blocks unchanged).');
+          log(sym, (_zvInLatch ? '📈 ' : '🚀 ') + tagEarly + ' ' + sig.type.toUpperCase() + ' INSIDE-ZONE veto DEFERRED — ' + (_zvInLatch ? 'with-trend latch + session extreme advancing <15min' : 'LEG MODE — BIG-LEG armed ' + sig.type + ' with a ≥1.5×ATR leg (BIGLEG-ZONE-EASE 2026-09-21; LEG MODE 2026-10-02)') + ': the opposing ' + (_zvIn.kind || 'OB') + ' ' + (_zvIn.tf || '') + ' $' + _zvIn.lo.toFixed(2) + '-$' + _zvIn.hi.toFixed(2) + ' is failing in real time (defended-zone blocks unchanged).');
         }
         if (_zvIn && !_zvInEase) {
           Object.assign(s, _emitSnapshot);
           const _zvInAge = _zvIn.ts ? Math.round((Date.now() - _zvIn.ts) / 60000) : null;
-          const _zvInMsg = '🚧 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ZONE-VETO: price is INSIDE opposing ' + (_zvIn.kind || 'OB') + ' ' + (_zvIn.tf || '') + ' $' + _zvIn.lo.toFixed(2) + '-$' + _zvIn.hi.toFixed(2) + (_zvInAge !== null ? ' · zone age ' + _zvInAge + 'min [' + (_zvInAge < 240 ? 'ZAGE-FRESH' : _zvInAge <= 720 ? 'ZAGE-MID' : 'ZAGE-OLD') + ']' : '') + ' — inside-zone rule holds even on latched trend days (2026-08-28, 8/27 23:46 case).' + grindReclaimTag(s, sig.type, price, _zvIn, atrVal);
+          const _zvInMsg = '🚧 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ZONE-VETO: price is INSIDE opposing ' + (_zvIn.kind || 'OB') + ' ' + (_zvIn.tf || '') + ' $' + _zvIn.lo.toFixed(2) + '-$' + _zvIn.hi.toFixed(2) + (_zvInAge !== null ? ' · zone age ' + _zvInAge + 'min [' + (_zvInAge < 240 ? 'ZAGE-FRESH' : _zvInAge <= 720 ? 'ZAGE-MID' : 'ZAGE-OLD') + ']' : '') + ' — inside-zone rule holds even on latched trend days (2026-08-28, 8/27 23:46 case).' + grindReclaimTag(s, sig.type, price, _zvIn, atrVal) + _zvTok;
           log(sym, _zvInMsg); trackBlockedOutcome(sym, _zvInMsg, true);
           return false;
         }
@@ -7716,7 +7738,7 @@ function processPrice(sym, price, hi, lo) {
           // If ZAGE-OLD saves degrade, tighten the 1500-min zone cap with evidence.
           const _zvAge = _zv.ts ? Math.round((Date.now() - _zv.ts) / 60000) : null;
           const _zvAgeTag = _zvAge !== null ? ' · zone age ' + _zvAge + 'min [' + (_zvAge < 240 ? 'ZAGE-FRESH' : _zvAge <= 720 ? 'ZAGE-MID' : 'ZAGE-OLD') + ']' : '';
-          const _zvMsg = '🚧 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ZONE-VETO: opposing ' + (_zv.kind || 'OB') + ' ' + (_zv.tf || '') + ' $' + _zv.lo.toFixed(2) + '-$' + _zv.hi.toFixed(2) + ' sits ' + (_zvC ? (_zv.lo - price) : (price - _zv.hi)).toFixed(2) + ' ahead (<1.2×ATR)' + _zvAgeTag + ' — path runs into mapped ' + (_zvC ? 'supply' : 'demand') + ' (Layer 3, 2026-08-13).' + grindReclaimTag(s, sig.type, price, _zv, atrVal);
+          const _zvMsg = '🚧 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ZONE-VETO: opposing ' + (_zv.kind || 'OB') + ' ' + (_zv.tf || '') + ' $' + _zv.lo.toFixed(2) + '-$' + _zv.hi.toFixed(2) + ' sits ' + (_zvC ? (_zv.lo - price) : (price - _zv.hi)).toFixed(2) + ' ahead (<1.2×ATR)' + _zvAgeTag + ' — path runs into mapped ' + (_zvC ? 'supply' : 'demand') + ' (Layer 3, 2026-08-13).' + grindReclaimTag(s, sig.type, price, _zv, atrVal) + _zvTok;
           log(sym, _zvMsg); trackBlockedOutcome(sym, _zvMsg, true);
           return false;
         }
@@ -15971,6 +15993,26 @@ function computeAVWAP(s, dir) {
 // pivot-AVWAP), each required to sit at least 0.05×ATR on the pullback side of price.
 // Nearer = fills more often while still improving on market; the deep OTE stays the
 // limit when the AVWAP is invalid, deeper, or already crossed. Returns {limit, via}.
+// ===== LEG MODE (2026-10-02, Jean: "check CT-VETO and ZONE-VETO — they also blocked a lot of
+// winners") ===== The with-trend waivers for ZONE-VETO and CT-VETO were tied to BIG-LEG's FULL
+// tier, i.e. to the 3-hour regime classifier saying TREND. On the 10/01 night ($48 drop, $63
+// recovery) and the 10/02 morning the classifier said MIXED/RANGE throughout, so the waivers
+// never engaged while the legs themselves were 2-10×ATR. Leg size is the faster regime signal:
+// LEG MODE is on for a direction when BIG-LEG is armed that way AND the leg from its pivot is
+// ≥ LEG_MODE_ATR (1.5) × ATR — any classifier label. The 9/28 lesson that motivated the FULL-tier
+// restriction (exhaustion fires at the staircase lows) is now handled by the extreme-pullback
+// hold (7.05), which is why this can be relaxed. Bench rule: BIG-LEG's (net-negative first 6
+// LEG-MODE fires → back to FULL tier). LEG_MODE=0 kills.
+function legModeActive(s, sym, dir, atr) {
+  try {
+    if (process.env.LEG_MODE === '0' || !s || s._bigLeg !== dir || process.env.BIGLEG_DISABLED === '1') return false;
+    if (s._bigLegTier === 'FULL') return true; // classifier TREND — already the old behaviour
+    const a = (atr > 0) ? atr : (s._atr || 0); // the gate's own ATR (same one BIG-LEG bands and zones use); s._atr only as fallback
+    if (!(a > 0) || !s._legPivot || !(s._legPivot.ext > 0) || !(s.lastPrice > 0)) return false;
+    const leg = dir === 'put' ? (s._legPivot.ext - s.lastPrice) : (s.lastPrice - s._legPivot.ext);
+    return leg >= (parseFloat(process.env.LEG_MODE_ATR) || 1.5) * a;
+  } catch (e) { return false; }
+}
 // ===== EXTREME-PULLBACK HOLD (2026-10-01, Jean, the 04:24 XAU put stopped in 2 min) =====
 // "The idea of the put was not bad, the timing was. Within 1 max ATR of the session extreme:
 // block the market fire, wait 2–3 minutes for a pullback, fire if price pulls back, don't
@@ -18451,7 +18493,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.09-20261002-macd-defer-loosened', // bump on each deploy — lets /state verify what's live
+    build: '7.10-20261002-leg-mode', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const _since = (fundedEpoch && fundedEpoch.since) || ''; const _base = (fundedEpoch && fundedEpoch.base) || {}; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; if (d >= _since) wk += pnlLedger[d][sym].pnl - ((_base[d] && typeof _base[d][sym] === 'number') ? _base[d][sym] : 0); } } out.weekTotal = +wk.toFixed(2); out.account = (fundedEpoch && fundedEpoch.label) || null; return out; } catch (e) { return {}; } })(), // weekTotal counts the current funded-account epoch only (2026-10-01) // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
