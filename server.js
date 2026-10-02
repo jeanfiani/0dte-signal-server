@@ -4357,7 +4357,8 @@ function processPrice(sym, price, hi, lo) {
                            // pullback limit (the fill point), not at the absolute level from the exhausted fire price —
                            // otherwise the bounce we are waiting for would cancel the very trade it should fill.
                            slPrice: (typeof _uvT.slPrice === 'number' && _uvT.slPrice > 0) ? (_uvAtExt ? +(_uvDir === 'put' ? _uvPick.limit + Math.abs(_uvT.ep - _uvT.slPrice) : _uvPick.limit - Math.abs(_uvT.ep - _uvT.slPrice)).toFixed(2) : _uvT.slPrice) : null,
-                           runaway: (parseFloat(process.env.OTE_RUNAWAY_MULT) || 0.3) * (_uvT.atr || 0),
+                           // extreme-pullback 'signal left' leash = 0.75×ATR (EXT_PB_RUNAWAY_MULT), not the 0.3×ATR auction leash — the resolver runs every tick since 7.12, so a $1-2 wiggle must not cancel the hold
+                           runaway: (_uvAtExt ? (parseFloat(process.env.EXT_PB_RUNAWAY_MULT) || 0.75) : (parseFloat(process.env.OTE_RUNAWAY_MULT) || 0.3)) * Math.max(_uvT.atr || 0, _uvAtExt ? (s._atr || 0) : 0),
                            extPb: _uvAtExt, extDist: _uvPB.dist, extZone: _uvPB.zone,
                            armTs: Date.now(), expiry: Date.now() + (_uvAtExt ? (parseInt(process.env.EXT_PB_HOLD_SEC, 10) || 180) * 1000 : 240000) };
             s.trade = { active: false }; // NEVER null (2026-09-07 crash lesson)
@@ -10960,6 +10961,815 @@ function processPrice(sym, price, hi, lo) {
   // in Jun 4–11 fired set and 3W/38L+S blocked — TRv2 already covers NAS comprehensively.
   // Set env DISABLE_NAS_FADES=1 to suppress all four NAS fade paths for an A/B period.
   const nasFadesOff = isNAS && process.env.DISABLE_NAS_FADES === '1';
+  // ===== UNGATED (2026-10-02, health check after the 7.11 deploy) =====
+  // This whole section — M5 aggregation, zone map, BIG-LEG arms, breakout time-stop, early-
+  // protect, dormant lanes, and the OTE-HOLD / MACD-HOLD / INV-HOLD RESOLVERS — used to live
+  // INSIDE the local-fade detector block, i.e. behind `hasLocalCandles && cool && RSI 10-90`.
+  // Consequences, all observed: (1) for 30 min after every deploy and every daily reset
+  // (6 ATR candles) nothing here ran — no M5 bars, no zones, no regime score, no holds;
+  // (2) for 3 minutes after EVERY fire (COOLDOWN_MS) the hold resolvers were blind — every
+  // OTE-HOLD fill on record waited exactly ~169-170 s and "released on runaway" at whatever
+  // price the first post-cooldown tick found, which on 10/01 21:06 and 10/02 06:21 was the
+  // session low. The auction was never slow; it was switched off. Moved here, in front of
+  // the fade block, unconditional for MT5 symbols (atrVal > 0).
+  // ===== ZONE-OB v2 — TRUE OHLC FVG + ORDER BLOCKS, M5/M10/M15 (DORMANT, 2026-08-11) =====
+  // Upgrade from close-snapshot approximation to real candle logic, ported from the MIT
+  // reference implementation (joshyattridge/smart-money-concepts):
+  //   FVG:  bullish when candle[i-2].high < candle[i].low (gap left by displacement);
+  //         bearish mirrored. Zone = the gap itself.
+  //   OB:   last opposing candle before a displacement that closes beyond its extreme
+  //         with body >= 0.8xATR. Zone = that candle's full range.
+  // Candles are aggregated incrementally per tick into M5 (72 kept = 6h); M10/M15 are
+  // derived from M5. Zones die when a candle CLOSES through the far side. Touch of an
+  // unmitigated zone >=15min old with conv >=5 -> dormant stamp, one per zone. All
+  // symbols (shadow). Same ZONE-OB cohort; messages now carry type+TF for sub-analysis.
+  try {
+    if (isMT5 && atrVal > 0) {
+      const _zNow = Date.now();
+      // restore moved to the UNGATED early section 2026-09-16 (Jean: "FVG/OB frozen on
+      // xau.html") — living here behind atrVal>0 meant every deploy blanked the map,
+      // msTrend and the big-leg state for ~45min while M5 candles rebuilt, even though
+      // the persisted map was on disk. See the ungated restore near the watchdogs.
+      // --- incremental M5 candle aggregation from live ticks ---
+      const _zBkt = Math.floor(_zNow / 300000);
+      if (!s._m5cur || s._m5cur.b !== _zBkt) {
+        if (s._m5cur && s._m5cur.n > 0) {
+          s._m5 = s._m5 || [];
+          s._m5.push({ o: s._m5cur.o, h: s._m5cur.h, l: s._m5cur.l, c: s._m5cur.c, ts: s._m5cur.b * 300000 });
+          if (s._m5.length > 72) s._m5.shift();
+          // LONG M5 HISTORY (2026-09-20, Jean "go" on Lorentzian prep): a separate
+          // 2,016-bar ring (one week) so the kNN classifier has neighbors to compare
+          // against. Kept apart from s._m5 on purpose — the zone engine's FVG/OB
+          // detection and mitigation semantics are built around the 6h window.
+          s._m5hist = s._m5hist || [];
+          s._m5hist.push({ o: s._m5cur.o, h: s._m5cur.h, l: s._m5cur.l, c: s._m5cur.c, n: s._m5cur.n, ts: s._m5cur.b * 300000 });
+          if (s._m5hist.length > 2016) s._m5hist.shift();
+        }
+        s._m5cur = { b: _zBkt, o: price, h: price, l: price, c: price, n: 0 };
+      }
+      s._m5cur.h = Math.max(s._m5cur.h, price); s._m5cur.l = Math.min(s._m5cur.l, price);
+      s._m5cur.c = price; s._m5cur.n++;
+      // --- rebuild zone map once per minute from closed candles ---
+      if ((!s._zoneObLastBuild || _zNow - s._zoneObLastBuild > 60000) && (s._m5 || []).length >= 9) {
+        s._zoneObLastBuild = _zNow;
+        const _agg = (cs, f) => { const out = []; for (let i = 0; i + f <= cs.length; i += f) { const seg = cs.slice(i, i + f); out.push({ o: seg[0].o, h: Math.max(...seg.map(x => x.h)), l: Math.min(...seg.map(x => x.l)), c: seg[seg.length - 1].c, ts: seg[0].ts }); } return out; };
+        const _zones = [];
+        for (const [tf, cs] of [['M5', s._m5], ['M10', _agg(s._m5, 2)], ['M15', _agg(s._m5, 3)]]) {
+          for (let i = 2; i < cs.length; i++) {
+            const a = cs[i - 2], b = cs[i - 1], c = cs[i];
+            // FVG (3-candle gap with displacement middle candle)
+            if (a.h < c.l && (c.l - a.h) >= 0.3 * atrVal && Math.abs(b.c - b.o) >= 0.8 * atrVal) _zones.push({ hi: c.l, lo: a.h, dir: 'call', ts: c.ts, kind: 'FVG', tf });
+            if (a.l > c.h && (a.l - c.h) >= 0.3 * atrVal && Math.abs(b.c - b.o) >= 0.8 * atrVal) _zones.push({ hi: a.l, lo: c.h, dir: 'put', ts: c.ts, kind: 'FVG', tf });
+            // OB (opposing candle before displacement closing beyond its extreme)
+            if (b.c < b.o && c.c > b.h && (c.c - c.o) >= 0.8 * atrVal) _zones.push({ hi: b.h, lo: b.l, dir: 'call', ts: c.ts, kind: 'OB', tf });
+            if (b.c > b.o && c.c < b.l && (c.o - c.c) >= 0.8 * atrVal) _zones.push({ hi: b.h, lo: b.l, dir: 'put', ts: c.ts, kind: 'OB', tf });
+          }
+        }
+        // mitigation: a later M5 CLOSE through the far side kills the zone
+        const _prevZ = s._zoneObs || []; // capture BEFORE reassignment (merge source)
+        s._zoneObs = _zones.filter(z => {
+          for (const cd of s._m5) { if (cd.ts > z.ts && (z.dir === 'call' ? cd.c < z.lo - 0.2 * atrVal : cd.c > z.hi + 0.2 * atrVal)) return false; }
+          return true;
+        });
+        // MERGE survivors (2026-08-12): zones older than the 6h _m5 window can no longer
+        // be re-derived — keep prior unmitigated zones not already in the fresh set.
+        const _lastC = s._m5[s._m5.length - 1];
+        const _prevKeep = _prevZ.filter(z => z && !_zones.some(n2z => n2z.ts === z.ts && n2z.kind === z.kind && n2z.tf === z.tf) &&
+          (_lastC ? (z.dir === 'call' ? _lastC.c > z.lo - 0.2 * atrVal : _lastC.c < z.hi + 0.2 * atrVal) : true));
+        s._zoneObs = s._zoneObs.concat(_prevKeep);
+        // TEST PHASE 2026-08-11: keep ALL unmitigated zones (was slice(-10) — evicted
+        // the 4396-4405 supply shelf before the 12:00 retest at Jean's ideal 4397 entry).
+        // Mitigation filter above already prunes dead zones; hard safety cap 60.
+        // MAX AGE 1500min (2026-08-19, Jean): M5-M15 zones are intraday structures —
+        // after a full session cycle the level has been re-auctioned and the zone is
+        // spent. Stale zones were still ACTIVE inputs (ZONE-VETO, ZONE-PERM, EG-RETEST-Z,
+        // SE-RETEST anchors, NAS live lane, EXT-FLIP confluence), so this is risk
+        // pruning, not display cleanup.
+        s._zoneObs = s._zoneObs.filter(z => z && (_zNow - z.ts) < 1500 * 60000);
+        if (s._zoneObs.length > 60) s._zoneObs = s._zoneObs.slice(-60);
+        // ===== FVG-RT — RETIRED (2026-09-18, Jean: "ok to retire rt2") =====
+        // The mapped-FVG retest lane (2026-09-12, born from Jean's 9/9 +$3,113 hand
+        // trade) failed in BOTH grading geometries: v1 symmetric ±cap 8W/41L (16%),
+        // v2 zone-anchored SL + 1.5R target 1W/17L (6%). The thesis is dead as an
+        // auto-fire: price re-entering a same-direction FVG with msTrend agreeing is
+        // NOT sufficient — the 9/9 winner's real edge was the leg context, which the
+        // BIG-LEG pivot machine (6.61) now owns. Cohorts FVG-RT / FVG-RT2 frozen in
+        // the tally as the permanent record; cohortFor mappings retained so any
+        // in-flight entries resolve into the right buckets.
+      }
+      // ===== BREAKOUT TIME-STOP (2026-08-19, Jean) =====
+      // 8/19 16:57 TREND CALL @4523.40: fired through the live-break window (fresh
+      // session-high break — the sanctioned door), then went NOWHERE: +$0.4 peak,
+      // flat 30min, full SL −$256. Jean: "it was not a bad move [to fire] — protect
+      // the trade earlier." A +$3 BE-protect would NOT have saved it (never reached
+      // +$3); what diagnoses it is TIME: a breakout that shows no progress has lost
+      // its premise. Rule: a live-break-tagged trade that hasn't moved ≥0.5×ATR
+      // favorable within 15min and hasn't hit TP1 → server issues the EA close
+      // command (~flat exit instead of full stop). Scoped to live-break entries ONLY.
+      try {
+        const _tb = s.trade;
+        if (_tb && _tb.active) {
+          if (_tb._lbEntry === undefined) {
+            _tb._lbEntry = !!(s._lbWaiverTs && _tb.ts && (_tb.ts - s._lbWaiverTs) >= 0 && (_tb.ts - s._lbWaiverTs) < 10000);
+            if (_tb._lbEntry) log(sym, '🏷️ Trade tagged BREAKOUT (live-break entry) — 15min progress check armed (2026-08-19).');
+            // Liquidity stamp at fire (2026-08-19, Jean): tick-rate now vs session avg.
+            try {
+              _tb._tickRateAtFire = Math.round(s._tickRate || 0);
+              _tb._tickRateSessAvg = Math.round(s._tickRateSess || 0);
+              const _tkRatio = (s._tickRateSess > 0) ? (s._tickRate / s._tickRateSess) : null;
+              _tb._tickRatio = _tkRatio != null ? +_tkRatio.toFixed(2) : null;
+              if (s.lastHistEntry && s.lastHistEntry.symbol === sym) {
+                s.lastHistEntry.tickRateAtFire = _tb._tickRateAtFire;
+                s.lastHistEntry.tickRatio = _tb._tickRatio;
+              }
+              log(sym, '📶 Liquidity at fire — ' + _tb._tickRateAtFire + ' ticks/min vs session avg ' + _tb._tickRateSessAvg + (_tkRatio != null ? ' (×' + _tkRatio.toFixed(2) + ')' : '') + (_tb._lbEntry ? ' [BREAKOUT entry]' : '') + '.');
+            } catch (eTS) {}
+          }
+          if (_tb._lbEntry && !_tb.t1 && !_tb._lbStop && _tb.ep > 0 && atrVal > 0 &&
+              (_zNow - _tb.ts) > 900000 &&
+              !(s.closeRequest && s.closeRequest.active)) {
+            const _tbFav = _tb.type === 'call' ? price - _tb.ep : _tb.ep - price;
+            if (_tbFav < 0.5 * atrVal) {
+              _tb._lbStop = true;
+              // ===== BENCHED 2026-09-21 (Jean: "why did the EA close the first NAS call
+              // which was going directly to TP3") ===== Record: 8/19 save (flat 30min →
+              // full SL) vs 9/21 09:53 NAS call flattened at +10pts at the 15-min tick,
+              // TP1 4min later, TP3 15min after that (MFE +107). Same shape as EARLY-PROT
+              // (benched 3W/0L). Default = WOULD-CLOSE stamp; the trade runs on and its
+              // real outcome grades LB-TIMESTOP-HELD: re-arm (LB_TIMESTOP=1) only if held
+              // trades from this state LOSE ≥60% over ≥10. Live path also fixed: it now
+              // closes the SERVER trade too — before, the ledger kept booking TP1/TP3 on a
+              // position the EA had already flattened (today's +$2,583 NAS ledger vs ~+$450 real).
+              if (process.env.LB_TIMESTOP === '1') {
+                const _tbId = 'lbstop-' + Date.now();
+                s.closeRequest = { active: true, id: _tbId, ts: Date.now(), type: _tb.type || '', ep: _tb.ep || 0, source: 'breakout-time-stop' };
+                const _tbMsg = '⏱️ BREAKOUT TIME-STOP — ' + String(_tb.type || '').toUpperCase() + ' @ $' + (+_tb.ep).toFixed(2) + ' showed ' + _tbFav.toFixed(2) + ' (<0.5×ATR $' + (0.5 * atrVal).toFixed(2) + ') after 15min; live-break premise dead, EA close requested (~flat exit vs full SL) [id ' + _tbId + '].';
+                log(sym, _tbMsg);
+                sendPush('⏱️ ' + sym + ' breakout time-stop', 'Closing stalled ' + String(_tb.type || '').toUpperCase() + ' @ $' + price.toFixed(2) + ' (entry $' + (+_tb.ep).toFixed(2) + ')', 'signal');
+                // Server-side close to match the EA (2026-09-21): book the flat exit, end the trade.
+                try {
+                  const _tbE = s.lastHistEntry;
+                  if (_tbE && _tbE.symbol === sym) { _tbE.outcomes = _tbE.outcomes || {}; _tbE.outcomes.timeStopExit = +price.toFixed(2); _tbE.outcomes.closePrice = +price.toFixed(2); }
+                  bookPnl(sym, _tbFav * pnlMultFor(sym, _tb), 'close');
+                  s.trade = { active: false };
+                } catch (eTBc) {}
+              } else {
+                _tb._lbStopWouldClose = { ts: Date.now(), price: price, fav: +_tbFav.toFixed(2) };
+                log(sym, '⏱️ BREAKOUT TIME-STOP WOULD-CLOSE (benched 2026-09-21) — ' + String(_tb.type || '').toUpperCase() + ' @ $' + (+_tb.ep).toFixed(2) + ' shows ' + _tbFav.toFixed(2) + ' (<0.5×ATR $' + (0.5 * atrVal).toFixed(2) + ') after 15min; holding — real outcome grades LB-TIMESTOP-HELD. LB_TIMESTOP=1 re-arms.');
+              }
+            }
+          }
+        }
+      } catch (eTB) { /* time-stop must never crash the tick */ }
+      // ===== EARLY PROTECT — JEAN'S +$3 RULE (2026-08-19) =====
+      // 8/19 16:57 CALL @4523.40 corrected by Jean: it ran +$4.00 to the Asian high
+      // 4527.40 ($1 short of TP1), reversed, and took the FULL −$5.12 stop. The
+      // priceSnaps hid the spike (point samples, not the path — same trap as the
+      // 8/17 'trade:null' lesson). Rule: once a trade has shown ≥60% of its TP1
+      // distance in favorable movement (XAU: +$3 of the $5 TP1), it may no longer
+      // round-trip to a loss — if favorable movement decays back to ≤10% of TP1
+      // distance, the server issues the EA close (~breakeven exit). Peak tracked
+      // tick-by-tick server-side, so between-snapshot spikes are never missed again.
+      try {
+        const _ept = s.trade;
+        if (_ept && _ept.active && _ept.ep > 0) {
+          const _epFav = _ept.type === 'call' ? price - _ept.ep : _ept.ep - price;
+          if (_epFav > (_ept._pkFav || 0)) _ept._pkFav = _epFav;
+          const _epT1d = (typeof _ept.tp1Price === 'number' && _ept.tp1Price > 0) ? Math.abs(_ept.tp1Price - _ept.ep) : 0;
+          // ===== TIGHT-STOP EXEMPTION (2026-09-10, Jean: "loosen a bit the early
+          // protect") ===== 9/10 00:45 EXT-FLIP CALL: OTE-improved fill 4408.85 with
+          // a $2.21 stop (0.67× the $3.31 TP1). Protect fired on the decay, EA
+          // flattened near BE — then price bottomed $0.08 ABOVE the SL and ran +$11.14
+          // to TP3. When SL risk ≤ 0.7×TP1 the stop is already tighter than the
+          // target: protect can save at most ~the stop but costs the whole runner —
+          // the round-trip asymmetry this rule fixes (8/19: peak +$4 → full −$5.12)
+          // doesn't exist. Skip protect there; the tight stop IS the protection.
+          // Every skip AND every protect close stamps EARLY-PROT so both sides grade.
+          const _epRisk = (typeof _ept.slPrice === 'number' && _ept.slPrice > 0) ? Math.abs(_ept.ep - _ept.slPrice) : 0;
+          const _epTight = _epT1d > 0 && _epRisk > 0 && _epRisk <= 0.7 * _epT1d;
+          if (!_ept.t1 && !_ept._epStop && _epT1d > 0 &&
+              (_ept._pkFav || 0) >= 0.6 * _epT1d && _epFav <= 0.1 * _epT1d &&
+              !(s.closeRequest && s.closeRequest.active)) {
+            if (_epTight) {
+              if (!_ept._epTightLogged) {
+                _ept._epTightLogged = true;
+                const _etMsg = '🛡️ EARLY-PROT SKIPPED (tight-stop exemption, 2026-09-10) — ' + String(_ept.type || '').toUpperCase() + ' @ $' + (+_ept.ep).toFixed(2) + ' peaked +$' + (_ept._pkFav || 0).toFixed(2) + ' then decayed, but SL risk $' + _epRisk.toFixed(2) + ' ≤ 0.7× TP1 $' + _epT1d.toFixed(2) + ' — the tight stop is the protection; holding.';
+                log(sym, _etMsg); trackBlockedOutcome(sym, _etMsg, true);
+              }
+            } else if (process.env.EARLY_PROTECT === '1') {
+            _ept._epStop = true;
+            const _epId = 'protect-' + Date.now();
+            s.closeRequest = { active: true, id: _epId, ts: Date.now(), type: _ept.type || '', ep: _ept.ep || 0, source: 'early-protect' };
+            log(sym, '🛡️ EARLY PROTECT — ' + String(_ept.type || '').toUpperCase() + ' @ $' + (+_ept.ep).toFixed(2) + ' peaked +$' + (_ept._pkFav || 0).toFixed(2) + ' (≥60% of TP1 $' + _epT1d.toFixed(2) + ') then decayed to +$' + _epFav.toFixed(2) + '; EA close requested — a trade that nearly reached TP1 may not round-trip to a stop (Jean 2026-08-19) [id ' + _epId + '].');
+            sendPush('🛡️ ' + sym + ' early protect', 'Closing ' + String(_ept.type || '').toUpperCase() + ' near BE @ $' + price.toFixed(2) + ' (peaked +$' + (_ept._pkFav || 0).toFixed(2) + ')', 'signal');
+            try { trackBlockedOutcome(sym, '🛡️ EARLY-PROT CLOSED ' + String(_ept.type || '').toUpperCase() + ' @ $' + price.toFixed(2) + ' (entry $' + (+_ept.ep).toFixed(2) + ', peaked +$' + (_ept._pkFav || 0).toFixed(2) + ') — bracket grades what holding would have done.', true); } catch (eEPT) {}
+            } else {
+            // ===== EARLY PROTECT BENCHED (2026-09-16, Jean: "maybe we should remove
+            // early protect?") ===== Since grading began (9/10) the rule's closed-trade
+            // brackets are 3W/0L/3S — every position it flattened would have WON by
+            // holding, and its signature act was closing Jean's 4-lot TRv2 call at
+            // 23:08:29, four minutes before a 13-second TP1→TP3 sweep (~$3,400 at his
+            // size). The 8/19 motivating case has not recurred. Benched to stamp-only;
+            // EARLY_PROTECT=1 in Railway env re-arms without a deploy. Re-arm bar:
+            // WOULD-CLOSE brackets showing holding LOSES ≥60% over ≥15 resolved.
+            _ept._epStop = true; // one stamp per trade, same as the live rule
+            const _ebMsg = '🛡️ EARLY-PROT WOULD-CLOSE (benched 2026-09-16) — ' + String(_ept.type || '').toUpperCase() + ' @ $' + price.toFixed(2) + ' (entry $' + (+_ept.ep).toFixed(2) + ', peaked +$' + (_ept._pkFav || 0).toFixed(2) + ' then decayed to +$' + _epFav.toFixed(2) + '); holding — bracket grades what the close would have saved.';
+            log(sym, _ebMsg); try { trackBlockedOutcome(sym, _ebMsg, true); } catch (eEB) {}
+            }
+          }
+        }
+      } catch (eEP) { /* early-protect must never crash the tick */ }
+      // ===== REJECT-FLOW (DORMANT, 2026-08-21 — Jean's design) =====
+      // 8/21 07:38-08:16: detectors kept emitting CALLs at the 4604 top and the gates
+      // correctly refused five in a row while price rolled over — then the PUT that
+      // agreed with the gates died at its own floors. Jean: "5 calls rightly blocked —
+      // maybe we should ease the put when we have the situation." The one-sided
+      // rejection stream IS a signal: lagging detectors vs leading gates disagreeing
+      // repeatedly in one direction marks the turn. Rule: blocked candidates of ONE
+      // direction span ≥4 distinct minutes in 15min, ≤1 opposite block, and price has
+      // moved ≥0.75×ATR against the rejected direction → stamp an opposite-direction
+      // would-fire (REJECT-FLOW cohort). Dormant: counting only; promotion by cohort.
+      try {
+        if (Array.isArray(s.blockedAttempts) && s.blockedAttempts.length && Array.isArray(s._m5) && s._m5.length >= 5 && atrVal > 0) {
+          s._rejFlowTs = s._rejFlowTs || {};
+          const _rfWin = s.blockedAttempts.filter(b => b && _zNow - b.ts < 900000);
+          const _rfMinC = new Set(_rfWin.filter(b => /\bCALL\b/.test(b.msg)).map(b => Math.floor(b.ts / 60000))).size;
+          const _rfMinP = new Set(_rfWin.filter(b => /\bPUT\b/.test(b.msg)).map(b => Math.floor(b.ts / 60000))).size;
+          const _rfRef = s._m5[s._m5.length - 4]; // ~15-20min back
+          for (const _rf of [{ dir: 'put', rej: _rfMinC, opp: _rfMinP, rejName: 'CALL' }, { dir: 'call', rej: _rfMinP, opp: _rfMinC, rejName: 'PUT' }]) {
+            const _rfMove = _rf.dir === 'put' ? (_rfRef.c - price) : (price - _rfRef.c);
+            if (_rf.rej >= 4 && _rf.opp <= 1 && _rfMove >= 0.75 * atrVal &&
+                _zNow - (s._rejFlowTs[_rf.dir] || 0) >= 600000) {
+              s._rejFlowTs[_rf.dir] = _zNow;
+              const _rfT1 = sym === 'XAU' ? 5 : sym === 'BTC' ? 50 : sym === 'NAS100' ? 30 : 0.3;
+              s.blockedOutcomes = s.blockedOutcomes || [];
+              s.blockedOutcomes.push({
+                ts: _zNow, time: ts(), symbol: sym, detector: 'REJECT-FLOW', type: _rf.dir,
+                price: +price.toFixed(2),
+                virtualTp1: +(_rf.dir === 'call' ? price + _rfT1 : price - _rfT1).toFixed(2),
+                virtualSl: +(_rf.dir === 'call' ? price - _rfT1 : price + _rfT1).toFixed(2),
+                blockReason: '🔃 REJECT-FLOW ' + _rf.dir.toUpperCase() + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — gates refused ' + _rf.rej + ' ' + _rf.rejName + ' candidates in 15min (opposite blocks: ' + _rf.opp + ') while price moved ' + _rfMove.toFixed(2) + ' (' + (_rfMove / atrVal).toFixed(1) + '×ATR) against them; the one-sided rejection stream marks the turn (Jean 2026-08-21, 4604-top case).',
+                snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+                tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null,
+                closed: false, closedTs: null, outcome: null
+              });
+              log(sym, '🔃 REJECT-FLOW ' + _rf.dir.toUpperCase() + ' armed dormant @ $' + price.toFixed(2) + ' (' + _rf.rej + ' rejected ' + _rf.rejName + ' minutes, move ' + _rfMove.toFixed(2) + ').');
+            }
+          }
+        }
+      } catch (eRF) { /* reject-flow must never crash the tick */ }
+      // ===== TP3==TP2 EQUALITY GUARD (2026-08-25, Jean's MT5 report) =====
+      // Capital mode set tp3 EXACTLY equal to tp2 at every ladder site. If the EA
+      // allocates a portion per level, two identical prices is an edge case: the TP2
+      // portion closes, the TP3 portion's same-price order can fail to trigger, and
+      // the rump rides the reversal to the STOP while the server books a full TP3 win.
+      // Guard: whenever an active trade carries tp3 === tp2, nudge tp3 a hair INSIDE
+      // (0.1 XAU / 2 NAS / 10 BTC) so the final portion always exits just BEFORE tp2.
+      // Central per-tick guard — catches all 12 ladder sites at once.
+      try {
+        const _eqT = s.trade;
+        if (CAPITAL_MODE && _eqT && _eqT.active && typeof _eqT.tp2Price === 'number' && _eqT.tp2Price > 0 &&
+            _eqT.tp3Price === _eqT.tp2Price) {
+          const _eqEps = sym === 'XAU' ? 0.1 : sym === 'NAS100' ? 2 : sym === 'BTC' ? 10 : 0.05;
+          _eqT.tp3Price = +(_eqT.type === 'call' ? _eqT.tp2Price - _eqEps : _eqT.tp2Price + _eqEps).toFixed(2);
+          log(sym, '🔧 TP3==TP2 equality guard — tp3 nudged to $' + _eqT.tp3Price.toFixed(2) + ' (inside tp2 $' + _eqT.tp2Price.toFixed(2) + ') so the final portion always closes before tp2 (2026-08-25, MT5 rump-position bug).');
+        }
+      } catch (eEQ) {}
+      // ===== RANGE-FADE (DORMANT, 2026-08-26 — Jean: "sell at 4634, buy at 4599") =====
+      // Range-day mean-reversion lane: on an ESTABLISHED range, stand at the edges and
+      // trade back toward the middle — the exact inverse of the week's losing pattern
+      // (continuation entries mid-range in a NEUTRAL drift). Conditions: session range
+      // ≥3×ATR, each side touched ≥2× (10-min-spaced touches), NO trend-day latch armed
+      // (fading edges on a trend day is the 8/18 bottom-tick disease), and the extreme
+      // STALE >90s at fill (a fresh break belongs to the live-break lane, not a fade).
+      // Virtual fill on touch within 0.1×ATR of the extreme; SL 0.5×ATR beyond it
+      // (range thesis dead = out cheap); TP1 $5. One stamp per side per 90min.
+      // DORMANT: RANGE-FADE cohort only. Promote at ≥60% over ≥15 fills (agreed bar).
+      try {
+        if (sym === 'XAU' && atrVal > 0 && s.sessionHigh > 0 && s.sessionLow < Infinity && isFinite(s.sessionHigh) && isFinite(s.sessionLow)) {
+          const _rfR = s.sessionHigh - s.sessionLow;
+          if (!s._rf || s._rf.day !== todayDateET()) s._rf = { day: todayDateET(), hiN: 0, loN: 0, hiTs: 0, loTs: 0, lastStamp: { put: 0, call: 0 } };
+          const _rfNear = 0.2 * atrVal;
+          if (s.sessionHigh - price <= _rfNear && _zNow - s._rf.hiTs > 600000) { s._rf.hiN++; s._rf.hiTs = _zNow; }
+          if (price - s.sessionLow <= _rfNear && _zNow - s._rf.loTs > 600000) { s._rf.loN++; s._rf.loTs = _zNow; }
+          const _rfLatch = tdLatchEase(s, 'call') || tdLatchEase(s, 'put');
+          if (_rfR >= 3 * atrVal && !_rfLatch) {
+            const _rfHiStale = (s.sessionHighUpdateTs || 0) > 0 && (_zNow - s.sessionHighUpdateTs) > 90000;
+            if (s.sessionHigh - price <= 0.1 * atrVal && _rfHiStale && s._rf.hiN >= 2 && _zNow - s._rf.lastStamp.put >= 5400000) {
+              s._rf.lastStamp.put = _zNow;
+              const _rfSl = +(s.sessionHigh + 0.5 * atrVal).toFixed(2);
+              s.blockedOutcomes = s.blockedOutcomes || [];
+              s.blockedOutcomes.push({ ts: _zNow, time: ts(), symbol: sym, detector: 'RANGE-FADE', type: 'put',
+                price: +price.toFixed(2), virtualTp1: +(price - 5).toFixed(2), virtualSl: _rfSl,
+                blockReason: '🏓 RANGE-FADE PUT DORMANT-WOULD-FILL @ $' + price.toFixed(2) + ' — selling the range high $' + s.sessionHigh.toFixed(2) + ' (touch #' + s._rf.hiN + ', range $' + _rfR.toFixed(2) + ' = ' + (_rfR / atrVal).toFixed(1) + '×ATR, high stale ' + Math.round((_zNow - s.sessionHighUpdateTs) / 60000) + 'min) · SL $' + _rfSl.toFixed(2) + ' (0.5×ATR beyond) — Jean 2026-08-26: sell the edge, buy the edge.',
+                snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+                tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+              log(sym, '🏓 RANGE-FADE PUT stamped @ $' + price.toFixed(2) + ' — range high $' + s.sessionHigh.toFixed(2) + ' (dormant).');
+            }
+            const _rfLoStale = (s.sessionLowUpdateTs || 0) > 0 && (_zNow - s.sessionLowUpdateTs) > 90000;
+            if (price - s.sessionLow <= 0.1 * atrVal && _rfLoStale && s._rf.loN >= 2 && _zNow - s._rf.lastStamp.call >= 5400000) {
+              s._rf.lastStamp.call = _zNow;
+              const _rfSl2 = +(s.sessionLow - 0.5 * atrVal).toFixed(2);
+              s.blockedOutcomes = s.blockedOutcomes || [];
+              s.blockedOutcomes.push({ ts: _zNow, time: ts(), symbol: sym, detector: 'RANGE-FADE', type: 'call',
+                price: +price.toFixed(2), virtualTp1: +(price + 5).toFixed(2), virtualSl: _rfSl2,
+                blockReason: '🏓 RANGE-FADE CALL DORMANT-WOULD-FILL @ $' + price.toFixed(2) + ' — buying the range low $' + s.sessionLow.toFixed(2) + ' (touch #' + s._rf.loN + ', range $' + _rfR.toFixed(2) + ' = ' + (_rfR / atrVal).toFixed(1) + '×ATR, low stale ' + Math.round((_zNow - s.sessionLowUpdateTs) / 60000) + 'min) · SL $' + _rfSl2.toFixed(2) + ' (0.5×ATR beyond) — Jean 2026-08-26: sell the edge, buy the edge.',
+                snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+                tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+              log(sym, '🏓 RANGE-FADE CALL stamped @ $' + price.toFixed(2) + ' — range low $' + s.sessionLow.toFixed(2) + ' (dormant).');
+            }
+          }
+        }
+      } catch (eRF) { /* dormant lane must never crash the tick */ }
+      // ===== NAS DORMANT LANES — ORB / VWAP-FADE / GAP-FILL (2026-08-30, Jean: "ship the 3 as dormant") =====
+      // GitHub/paper ports, all measurement-only:
+      //  · NAS-ORB — Zarattini-style opening range: 09:30-09:45 ET range, first breakout
+      //    after 09:45 (until 11:30), stop = far side of range, target = 1R. One/day.
+      //    Replication warns edge is marginal after costs — that's what the cohort tests.
+      //  · NAS-GAP — overnight gap vs prior RTH close (captured 15:55-16:00 ET), stamped
+      //    at 09:30-09:36 toward the fill (NQ gaps fill ~60% per public stats), stop 0.5×gap.
+      //  · NAS-VWAP — session-VWAP stretch fade: |price − vwap| ≥ max(2×ATR, 0.20%) in RTH
+      //    → fade toward VWAP (target = VWAP, stop 1×ATR beyond). 30-min/side throttle.
+      // Promotion bar for each: ≥60% over ≥15 resolved, else they stay stamps forever.
+      try {
+        if (sym === 'NAS100' && price > 0) {
+          const _nlEt = new Date().toLocaleTimeString('en-GB', { timeZone: 'America/New_York' });
+          const _nlHM = (+_nlEt.slice(0, 2)) * 60 + (+_nlEt.slice(3, 5));
+          const _nlDay = todayDateET();
+          if (!s._nl || s._nl.date !== _nlDay) s._nl = { date: _nlDay, orbHi: -Infinity, orbLo: Infinity, orbFired: false, gapDone: false, vwapTs: { call: 0, put: 0 } };
+          // prior-RTH-close capture for tomorrow's gap (15:55-16:00 ET, last tick wins)
+          if (_nlHM >= 955 && _nlHM < 960) { s._rthClose = price; s._rthCloseDate = _nlDay; }
+          // --- NAS-ORB: build the 09:30-09:45 range, stamp the first breakout 09:45-11:30 ---
+          if (_nlHM >= 570 && _nlHM < 585) {
+            if (price > s._nl.orbHi) s._nl.orbHi = price;
+            if (price < s._nl.orbLo) s._nl.orbLo = price;
+          } else if (!s._nl.orbFired && _nlHM >= 585 && _nlHM < 690 && isFinite(s._nl.orbHi) && isFinite(s._nl.orbLo) && s._nl.orbHi > s._nl.orbLo) {
+            const _orbR = s._nl.orbHi - s._nl.orbLo;
+            const _orbDir = price > s._nl.orbHi ? 'call' : (price < s._nl.orbLo ? 'put' : null);
+            if (_orbDir && _orbR >= 5) {
+              s._nl.orbFired = true;
+              s.blockedOutcomes = s.blockedOutcomes || [];
+              s.blockedOutcomes.push({
+                ts: _zNow, time: ts(), symbol: sym, detector: 'NAS-ORB', type: _orbDir,
+                price: +price.toFixed(2),
+                virtualTp1: +(_orbDir === 'call' ? price + _orbR : price - _orbR).toFixed(2),
+                virtualSl: +(_orbDir === 'call' ? s._nl.orbLo : s._nl.orbHi).toFixed(2),
+                blockReason: '🕘 NAS-ORB ' + _orbDir.toUpperCase() + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — first breakout of the 09:30-09:45 opening range $' + s._nl.orbLo.toFixed(2) + '-$' + s._nl.orbHi.toFixed(2) + ' ($' + _orbR.toFixed(2) + '); stop = far side, target = 1R (Zarattini ORB port, dormant 2026-08-30).',
+                snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+                tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null
+              });
+              log(sym, '🕘 NAS-ORB ' + _orbDir.toUpperCase() + ' stamped @ $' + price.toFixed(2) + ' (range $' + _orbR.toFixed(2) + ', dormant).');
+            }
+          }
+          // --- NAS-GAP: overnight gap toward the fill, once, 09:30-09:36 ---
+          if (!s._nl.gapDone && _nlHM >= 570 && _nlHM < 576 && s._rthClose > 0 && s._rthCloseDate && s._rthCloseDate !== _nlDay) {
+            s._nl.gapDone = true;
+            const _gap = price - s._rthClose;
+            if (Math.abs(_gap) >= Math.max(20, price * 0.0007)) {
+              const _gDir = _gap > 0 ? 'put' : 'call';
+              s.blockedOutcomes = s.blockedOutcomes || [];
+              s.blockedOutcomes.push({
+                ts: _zNow, time: ts(), symbol: sym, detector: 'NAS-GAP', type: _gDir,
+                price: +price.toFixed(2),
+                virtualTp1: +s._rthClose.toFixed(2),
+                virtualSl: +(_gap > 0 ? price + Math.abs(_gap) * 0.5 : price - Math.abs(_gap) * 0.5).toFixed(2),
+                blockReason: '🕳 NAS-GAP ' + _gDir.toUpperCase() + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — overnight gap ' + (_gap > 0 ? '+' : '') + '$' + _gap.toFixed(2) + ' vs prior RTH close $' + s._rthClose.toFixed(2) + ' (' + s._rthCloseDate + '); trade toward the fill, stop 0.5×gap (NQ gaps fill ~60%, dormant 2026-08-30).',
+                snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+                tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null
+              });
+              log(sym, '🕳 NAS-GAP ' + _gDir.toUpperCase() + ' stamped @ $' + price.toFixed(2) + ' (gap $' + _gap.toFixed(2) + ', dormant).');
+            }
+          }
+          // --- NAS-VWAP: session-VWAP stretch fade, RTH 09:45-15:55 ---
+          if (_nlHM >= 585 && _nlHM < 955 && s.vwapCount > 30 && atrVal > 0) {
+            const _vw = s.vwapSum / s.vwapCount;
+            const _vwD = price - _vw;
+            const _vwStretch = Math.max(2 * atrVal, price * 0.002);
+            const _vwDir = _vwD >= _vwStretch ? 'put' : (_vwD <= -_vwStretch ? 'call' : null);
+            if (_vwDir && _zNow - (s._nl.vwapTs[_vwDir] || 0) >= 1800000) {
+              s._nl.vwapTs[_vwDir] = _zNow;
+              s.blockedOutcomes = s.blockedOutcomes || [];
+              s.blockedOutcomes.push({
+                ts: _zNow, time: ts(), symbol: sym, detector: 'NAS-VWAP', type: _vwDir,
+                price: +price.toFixed(2),
+                virtualTp1: +_vw.toFixed(2),
+                virtualSl: +(_vwDir === 'put' ? price + atrVal : price - atrVal).toFixed(2),
+                blockReason: '📏 NAS-VWAP ' + _vwDir.toUpperCase() + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — stretched $' + Math.abs(_vwD).toFixed(2) + ' ' + (_vwD > 0 ? 'above' : 'below') + ' session VWAP $' + _vw.toFixed(2) + ' (≥max(2×ATR $' + (2 * atrVal).toFixed(2) + ', 0.20%)); fade toward VWAP, stop 1×ATR beyond (NQ VWAP-reversion port, dormant 2026-08-30).',
+                snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+                tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null
+              });
+              log(sym, '📏 NAS-VWAP ' + _vwDir.toUpperCase() + ' stamped @ $' + price.toFixed(2) + ' (vwap $' + _vw.toFixed(2) + ', dormant).');
+            }
+          }
+        }
+      } catch (eNL) { /* dormant lanes must never crash the tick */ }
+      // ===== OTE-HOLD — ENTRY AUCTION FOR ALL XAU SIGNALS (2026-08-26, Jean) =====
+      // "Bot detects a signal → it looks where the OTE is → takes 3 to 5 minutes to
+      // get as close as possible to it → fires." Never skips a signal (the July
+      // limit-offset backtest died on missed runners): fires on OTE touch, on ≥0.5×ATR
+      // runaway (retrace isn't coming — don't chase late), or at 4-min expiry at
+      // market. Price crossing the SL level while waiting = invalidation, zero-loss
+      // save. Fresh XAU trades are born _oteVetted:false (hidden from EA feeds) and
+      // vetted here on the next tick, custom SL/TP geometry intact. Exempt: INVERSAL
+      // band fires, INV-HOLD fills, V-REC/elite scalps, same-dir continuations.
+      try {
+        // OTE kill switch (2026-09-07, Jean's WR concern): set OTE_DISABLED=1 in
+        // Railway env to release every fire at market instantly — no code push needed.
+        if (process.env.OTE_DISABLED === '1' && s.trade && s.trade._oteVetted === false) s.trade._oteVetted = true;
+        if ((sym === 'XAU' || sym === 'NAS100') && s.trade && s.trade.active && s.trade._oteVetted === false && !s._invHold && !s._oteHold) { // NAS added 2026-09-09 (Jean: "we need to work on NAS")
+          const _ohT = s.trade;
+          const _ohDir = _ohT.type;
+          const _ohOte = computeOTE(s, sym, _ohDir);
+          // EXTREME-PULLBACK zone (2026-10-01): inside 1×max(ATR) of the session extreme every
+          // release path (no impulse / at-or-beyond OTE / fast-lane) is off — hold for the pullback.
+          const _ohPB = extPullbackZone(s, sym, _ohDir, price, atrVal > 0 ? atrVal : (_ohT.atr || 0));
+          if (!_ohPB.at && (!_ohOte || (_ohDir === 'call' ? price <= _ohOte.limit : price >= _ohOte.limit))) {
+            _ohT._oteVetted = true; // no valid impulse, or already at/beyond OTE → release to market now
+            delete _ohT.oteLimit; delete _ohT.oteExpiry; delete _ohT.oteImpulseHi; delete _ohT.oteImpulseLo; // XAU: server-side hold supersedes the legacy EA-side limit — never send both
+            if (_ohOte) log(sym, '🎯 OTE-HOLD skipped — $' + price.toFixed(2) + ' already at/beyond OTE $' + _ohOte.limit.toFixed(2) + '; released at market.');
+            // ===== VISIBILITY STAMP (2026-09-10, Jean's 01:20 case) ===== Instant
+            // releases were invisible: no oteHold field on the row, indistinguishable
+            // from "no auction ran". Both known specimens (9/9 03:46 RSI-91.6 put,
+            // 9/10 01:20 put) were market releases into a still-running rally that
+            // SL'd. Stamp them so the class self-grades; if at-or-beyond releases
+            // keep losing, the fix is holding fades for a stall instead of releasing.
+            try {
+              const _ohSk = s.signals.length ? s.signals[s.signals.length - 1] : null;
+              const _ohSkH = { fill: +price.toFixed(2), sigPrice: _ohT.ep, improve: 0, waitedSec: 0, via: _ohOte ? 'at-or-beyond OTE' : 'no valid impulse' };
+              if (_ohSk && _ohSk.type === _ohDir && !_ohSk.oteHold) _ohSk.oteHold = _ohSkH;
+              if (s.lastHistEntry && s.lastHistEntry.type === _ohDir && !s.lastHistEntry.oteHold) s.lastHistEntry.oteHold = _ohSkH;
+            } catch (eOSk) {}
+          } else if (!_ohPB.at && ((_ohDir === 'call' ? roc3 >= 0.10 : roc3 <= -0.10) ||
+                     (isFinite(macdL) && (_ohDir === 'call' ? (macdL >= (parseFloat(process.env.OTE_FAST_MACD) || 0.20) && roc3 >= (parseFloat(process.env.OTE_FAST_ROC2) || 0.07)) : (macdL <= -(parseFloat(process.env.OTE_FAST_MACD) || 0.20) && roc3 <= -(parseFloat(process.env.OTE_FAST_ROC2) || 0.07)))))) { // MACD-aware fast-lane 2026-09-23; no fast-lane inside the extreme-pullback zone (0.3×ATR 2026-09-28 → 1×max ATR 2026-10-01)
+            // ===== MOMENTUM FAST-LANE (2026-09-12, Jean: "go ahead with all") =====
+            // Week-of-9/8 fill audit: every OTE-touch fill improved (+0.37…+3.45) and
+            // every runaway fill chased (−1.56…−3.04, avg −2.15) — runaways happen when
+            // the tape is already running, i.e. the retracement premise was dead at the
+            // vet. When fire-direction ROC is already ≥0.10% (the 9/10 06:33 MFLIP
+            // waterfall: −0.201%, auctioned 1min, filled $4 worse), release at market
+            // NOW instead of auctioning for a pullback that isn't coming.
+            _ohT._oteVetted = true;
+            delete _ohT.oteLimit; delete _ohT.oteExpiry; delete _ohT.oteImpulseHi; delete _ohT.oteImpulseLo;
+            log(sym, '🎯 OTE-HOLD skipped — momentum fast-lane: ROC ' + (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '% already accelerating in fire direction; released at market @ $' + price.toFixed(2) + ' (2026-09-12).');
+            try {
+              const _ohFl = s.signals.length ? s.signals[s.signals.length - 1] : null;
+              const _ohFlH = { fill: +price.toFixed(2), sigPrice: _ohT.ep, improve: 0, waitedSec: 0, via: 'momentum fast-lane' };
+              if (_ohFl && _ohFl.type === _ohDir && !_ohFl.oteHold) _ohFl.oteHold = _ohFlH;
+              if (s.lastHistEntry && s.lastHistEntry.type === _ohDir && !s.lastHistEntry.oteHold) s.lastHistEntry.oteHold = _ohFlH;
+            } catch (eOFl) {}
+          } else {
+            const _ohSig = s.signals.length ? s.signals[s.signals.length - 1] : null;
+            if (_ohSig && _ohSig.type === _ohDir) _ohSig.pendingEntry = true;
+            if (s.lastHistEntry && s.lastHistEntry.type === _ohDir) s.lastHistEntry.pendingEntry = true;
+            const _ohA = Math.max(s._atr || 0, atrVal || 0, _ohT.atr || 0);
+            let _ohPick = _ohOte ? pickAuctionLimit(s, _ohDir, price, _ohOte.limit, atrVal > 0 ? atrVal : (_ohT.atr || 0)) : null; // pivot-AVWAP vs OTE (2026-09-20)
+            if (_ohPB.at) { // extreme-pullback: the limit must be a real pullback (≥0.25×ATR), else 0.5×ATR back from the fire price
+              const _fb = +(_ohDir === 'put' ? price + 0.5 * _ohA : price - 0.5 * _ohA).toFixed(2);
+              const _ok = _ohPick && (_ohDir === 'put' ? _ohPick.limit - price : price - _ohPick.limit) >= 0.25 * _ohA;
+              if (!_ok) _ohPick = { limit: _fb, via: 'PULLBACK 0.5×ATR', avwap: _ohPick ? _ohPick.avwap : null, basis: '', n: 0, ageMin: 0 };
+            }
+            s._oteHold = { dir: _ohDir, trade: _ohT,
+                           sigRef: (_ohSig && _ohSig.type === _ohDir) ? _ohSig : null,
+                           histRef: (s.lastHistEntry && s.lastHistEntry.type === _ohDir) ? s.lastHistEntry : null,
+                           sigPrice: _ohT.ep, ote: _ohPick.limit, limVia: _ohPick.via, oteFib: _ohOte ? _ohOte.limit : null, avwap: _ohPick.avwap,
+                           extPb: _ohPB.at, extDist: _ohPB.dist, extZone: _ohPB.zone,
+                           slPrice: (typeof _ohT.slPrice === 'number' && _ohT.slPrice > 0) ? (_ohPB.at ? +(_ohDir === 'put' ? _ohPick.limit + Math.abs(_ohT.ep - _ohT.slPrice) : _ohPick.limit - Math.abs(_ohT.ep - _ohT.slPrice)).toFixed(2) : _ohT.slPrice) : null, // extreme-pullback: invalidation stop = original SL distance beyond the pullback limit (2026-10-01)
+                           // Runaway leash 0.5→0.3×ATR (2026-09-12, Jean): runaway fills averaged −$2.15
+                           // vs signal this week; releasing ~$1.3 earlier halves the chase. OTE_RUNAWAY_MULT
+                           // env overrides without a deploy.
+                           runaway: (_ohPB.at ? (parseFloat(process.env.EXT_PB_RUNAWAY_MULT) || 0.75) : (parseFloat(process.env.OTE_RUNAWAY_MULT) || 0.3)) * (atrVal > 0 ? atrVal : (_ohT.atr || 0)), // extreme-pullback leash 0.75×ATR (2026-10-02; resolver live every tick since 7.12)
+                           armTs: _zNow, expiry: _zNow + (_ohPB.at ? (parseInt(process.env.EXT_PB_HOLD_SEC, 10) || 180) * 1000 : 240000) };
+            s.trade = { active: false }; // NEVER null (2026-09-07 crash: /prices//status/checkExit read .active unguarded — the 18:48 MFLIP auction nulled this and crash-looped the server)
+            if (_ohPB.at) log(sym, '⏸️ EXTREME-PULLBACK HOLD ' + _ohDir.toUpperCase() + ' @ $' + price.toFixed(2) + ' — $' + (_ohPB.dist || 0).toFixed(2) + ' from the session ' + (_ohDir === 'put' ? 'low' : 'high') + ' (zone $' + _ohPB.zone.toFixed(2) + ' = 1×ATR); no market fire. Fires only if price pulls back to ' + _ohPick.via + ' $' + _ohPick.limit.toFixed(2) + ' within ' + Math.round((s._oteHold.expiry - _zNow) / 1000) + 's; runaway = signal left → no trade (Jean 2026-10-01).');
+            else log(sym, '⏳ OTE-HOLD ' + _ohDir.toUpperCase() + ' armed @ $' + price.toFixed(2) + ' — auctioning toward ' + _ohPick.via + ' $' + _ohPick.limit.toFixed(2) + (_ohPick.via === 'AVWAP' ? ' (pivot-anchored VWAP, ' + _ohPick.basis + ' n=' + _ohPick.n + ', leg ' + _ohPick.ageMin + 'min; OTE fib was $' + _ohOte.limit.toFixed(2) + ')' : ' (70.5% of impulse $' + _ohOte.impulseLo.toFixed(2) + '-$' + _ohOte.impulseHi.toFixed(2) + (_ohPick.avwap ? '; AVWAP $' + _ohPick.avwap.toFixed(2) + ' not eligible' : '') + ')') + ' ≤4min; early fire on touch or ≥0.5×ATR runaway; invalidates at SL' + (s._oteHold.slPrice ? ' $' + s._oteHold.slPrice.toFixed(2) : '') + ' (Jean 2026-08-26; AVWAP candidate 2026-09-20).');
+            sendPush('⏳ ' + sym + ' OTE-HOLD ' + _ohDir.toUpperCase(), 'waiting for ' + _ohPick.via + ' $' + _ohPick.limit.toFixed(2) + ' (now $' + price.toFixed(2) + ') · ≤4min', 'signal');
+          }
+        }
+      } catch (eOV) { if (s.trade && s.trade._oteVetted === false) s.trade._oteVetted = true; /* never strand a trade unvetted */ }
+      // ===== MACD-HOLD RESOLVER (2026-10-02, Jean) ===== A continuation candidate deferred
+      // for a wrong-sense MACD line is parked in s._macdHold. Every tick: the line turned
+      // (crossed to the trade's side, or moved toward it for ≥60s / with aligned acceleration)
+      // → re-vet the parked candidate through enrichSig (all downstream gates, current price)
+      // and fire it via buildCfdTrade (XAU/NAS born unvetted → the auction / extreme hold
+      // still applies). Window = MACD_DEFER_WIN_SEC (5 min) from the FIRST sighting; expiry
+      // drops it (the DEFER shadow already measures what the market did).
+      try {
+        const _mh = s._macdHold;
+        if (_mh && isMT5 && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold) {
+          const _mhWin = (parseInt(process.env.MACD_DEFER_WIN_SEC, 10) || 300) * 1000;
+          const _mhAge = _zNow - _mh.ts0;
+          if (_mhAge > _mhWin) {
+            s._macdHold = null;
+            log(sym, '⏱️ MACD-HOLD ' + _mh.dir.toUpperCase() + ' (' + _mh.tag + ' @ $' + (+_mh.sigPrice).toFixed(2) + ') EXPIRED — line ' + (_mh.macd0 >= 0 ? '+' : '') + (+_mh.macd0).toFixed(3) + ' → ' + (macdL >= 0 ? '+' : '') + macdL.toFixed(3) + ' never turned within ' + Math.round(_mhWin / 60000) + 'min; no trade (2026-10-02).');
+          } else if (_mhAge >= 30000) {
+            const _mhC = _mh.dir === 'call';
+            const _aligned = _mhC ? macdL >= 0 : macdL <= 0;
+            const _impr = Math.abs(macdL) < Math.abs(_mh.macd0);
+            const _turn = _mhC ? macdAccel > 0 : macdAccel < 0;
+            if (_aligned || (_impr && (_mhAge >= 60000 || _turn))) {
+              s._macdHold = null; s._macdDefer = null;
+              const _sig2 = Object.assign({}, _mh.sig, { time: ts(), price: price.toFixed(2), macd: macdL.toFixed(3) });
+              _sig2._macdRelease = { waitedSec: Math.round(_mhAge / 1000), from: +(+_mh.macd0).toFixed(3), to: +macdL.toFixed(3), accel: +macdAccel.toFixed(3), hold: true, sigPrice: +(+_mh.sigPrice).toFixed(2) };
+              log(sym, '⏱️ MACD-HOLD ' + _mh.dir.toUpperCase() + ' (' + _mh.tag + ') RELEASED — waited ' + Math.round(_mhAge / 1000) + 's, MACD line ' + (_mh.macd0 >= 0 ? '+' : '') + (+_mh.macd0).toFixed(3) + ' → ' + (macdL >= 0 ? '+' : '') + macdL.toFixed(3) + (_aligned ? ' (crossed to the ' + _mh.dir + ' side)' : ' (reversing, accel ' + macdAccel.toFixed(3) + ')') + '; parked @ $' + (+_mh.sigPrice).toFixed(2) + ', now $' + price.toFixed(2) + ' — re-vetting through the remaining gates (2026-10-02).');
+              if (enrichSig(_sig2)) {
+                s.dailySignalCount++; _sig2.num = s.dailySignalCount;
+                s.lastSignalDir = _sig2.type; s.lastSignalTs = _zNow; s.lastNTs = _zNow; s.lastAT = _sig2.type;
+                if (_sig2.type === 'call') s.nC++; else s.nP++;
+                s.signals.push(_sig2); logSignal(sym, _sig2);
+                s.trade = buildCfdTrade(_sig2.type, price, atrVal, sym);
+                log(sym, '🚀 ' + (_sig2.score || _mh.tag) + ' ' + _sig2.type.toUpperCase() + ' FIRED on MACD turn @ $' + price.toFixed(2) + ' (parked $' + (+_mh.sigPrice).toFixed(2) + ', ' + Math.round(_mhAge / 1000) + 's) · SL $' + (+s.trade.slPrice || 0).toFixed(2) + ' · TP1 $' + (+s.trade.tp1Price || 0).toFixed(2) + ' · TP2 $' + (+s.trade.tp2Price || 0).toFixed(2) + ' · TP3 $' + (+s.trade.tp3Price || 0).toFixed(2) + ' [#' + s.dailySignalCount + ', MACD-RELEASED]');
+                sendPush('⏱️ ' + sym + ' ' + _sig2.type.toUpperCase() + ' on MACD turn #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · SL $' + (+s.trade.slPrice || 0).toFixed(2) + ' · TP1 $' + (+s.trade.tp1Price || 0).toFixed(2) + ' · waited ' + Math.round(_mhAge / 1000) + 's', 'signal');
+              } else {
+                log(sym, '⏱️ MACD-HOLD ' + _mh.dir.toUpperCase() + ' released but a downstream gate refused it at $' + price.toFixed(2) + ' (see the block above) — no trade; hold cleared.');
+              }
+            }
+          }
+        }
+      } catch (eMHR) { /* macd-hold must never crash the tick */ }
+      // ===== OTE-HOLD RESOLVER (2026-08-26, Jean) =====
+      try {
+        const _oh = s._oteHold;
+        if (_oh && (sym === 'XAU' || sym === 'NAS100')) {
+          const _ohC = _oh.dir === 'call';
+          const _ohSlX = _oh.slPrice !== null && (_ohC ? price <= _oh.slPrice : price >= _oh.slPrice);
+          const _ohTouch = _ohC ? price <= _oh.ote : price >= _oh.ote;
+          const _ohRun = _oh.runaway > 0 && (_ohC ? (price - _oh.sigPrice) >= _oh.runaway : (_oh.sigPrice - price) >= _oh.runaway);
+          const _ohExp = _zNow >= _oh.expiry;
+          if (_ohSlX) {
+            s._oteHold = null;
+            const _ohM = '⏳ OTE-HOLD ' + _oh.dir.toUpperCase() + ' INVALIDATED — price crossed the SL level $' + _oh.slPrice.toFixed(2) + ' while auctioning; the market entry @ $' + _oh.sigPrice.toFixed(2) + ' would have been a full loss. Zero-loss save (Jean 2026-08-26).';
+            log(sym, _ohM); trackBlockedOutcome(sym, _ohM, true);
+            if (_oh.sigRef) { _oh.sigRef.oteHold = 'invalidated-save'; }
+            if (_oh.histRef) { _oh.histRef.oteHold = 'invalidated-save'; _oh.histRef.pendingEntry = false; }
+          } else if (_oh.extPb && !_ohTouch && (_ohRun || _ohExp)) {
+            // EXTREME-PULLBACK: no pullback came — the signal left (runaway) or the window
+            // closed. NO trade. Shadow the skipped market entry so the rule grades itself:
+            // EXT-PB-LEFT / EXT-PB-EXPIRED win = we were wrong to wait, loss = the rule paid.
+            s._oteHold = null;
+            const _pbWhy = _ohRun ? 'LEFT' : 'EXPIRED';
+            const _pbM = '⏭️ EXTREME-PULLBACK ' + _oh.dir.toUpperCase() + ' CANCELLED — ' + (_ohRun ? 'signal left: price ran $' + Math.abs(price - _oh.sigPrice).toFixed(2) + ' away without pulling back' : 'no pullback to $' + _oh.ote.toFixed(2) + ' within the window') + ' (fire $' + _oh.sigPrice.toFixed(2) + ', $' + (_oh.extDist || 0).toFixed(2) + ' from the extreme, now $' + price.toFixed(2) + '). No trade taken (Jean 2026-10-01). EXT-PB-' + _pbWhy;
+            log(sym, _pbM); trackBlockedOutcome(sym, _pbM, true);
+            if (_oh.sigRef) { _oh.sigRef.oteHold = 'extreme-pullback-' + _pbWhy.toLowerCase(); } // pendingEntry stays true — never shown to the EA
+            if (_oh.histRef) { _oh.histRef.oteHold = 'extreme-pullback-' + _pbWhy.toLowerCase(); _oh.histRef.pendingEntry = false; }
+            sendPush('⏭️ ' + sym + ' ' + _oh.dir.toUpperCase() + ' not taken', (_ohRun ? 'signal left without a pullback' : 'no pullback in ' + Math.round((_zNow - _oh.armTs) / 60000) + 'min') + ' · fire was $' + _oh.sigPrice.toFixed(2), 'signal');
+          } else if ((_ohTouch || _ohRun || _ohExp) && !(s.trade && s.trade.active)) {
+            s._oteHold = null;
+            const _t = _oh.trade;
+            const _ohImp = _ohC ? _oh.sigPrice - price : price - _oh.sigPrice; // + = better entry
+            if (_ohImp >= 0) {
+              // better/equal entry: keep absolute SL (risk shrinks) + TP2/TP3 (structure
+              // targets); TP1 keeps its original DISTANCE from the new entry ($5 cap /
+              // OB-anchored dist preserved) so the profit-secure leg behaves as designed.
+              const _t1d = Math.abs(_t.ep - _t.tp1Price);
+              const _slD0 = (typeof _t.slPrice === 'number' && _t.slPrice > 0) ? Math.abs(_t.ep - _t.slPrice) : 0;
+              _t.ep = price;
+              _t.tp1Price = +(_ohC ? price + _t1d : price - _t1d).toFixed(2);
+              // EXTREME-PULLBACK fill (2026-10-01, Jean: "SL should be approx $5 to have room for
+              // TP1"): the stop keeps its ORIGINAL distance from the pullback fill (4162 fill →
+              // SL 4167), not the absolute level from the exhausted fire price.
+              if (_oh.extPb && _slD0 > 0) _t.slPrice = +(_ohC ? price - _slD0 : price + _slD0).toFixed(2);
+              // MIN-RISK FLOOR (2026-09-08, the 23:22 case): a deeply improved fill kept
+              // the absolute SL FIVE CENTS from the fill (4431.94 vs 4431.89) — the trade
+              // died in seconds for −$2.50 on a winning entry. Keep the absolute SL, but
+              // never closer than 0.5×TP1cap from the fill.
+              try {
+                const _mr = (sym === 'XAU' ? 5 : sym === 'BTC' ? 100 : sym === 'NAS100' ? 50 : 5) * 0.5;
+                if (typeof _t.slPrice === 'number' && _t.slPrice > 0) {
+                  if (_ohC) { if (price - _t.slPrice < _mr) _t.slPrice = +(price - _mr).toFixed(2); }
+                  else { if (_t.slPrice - price < _mr) _t.slPrice = +(price + _mr).toFixed(2); }
+                }
+              } catch (eMR) {}
+            } else {
+              // worse entry (runaway/expiry): shift every level by the slip — all
+              // original distances preserved, risk unchanged.
+              const _ohD = price - _t.ep;
+              _t.ep = price;
+              if (typeof _t.slPrice === 'number') _t.slPrice = +(_t.slPrice + _ohD).toFixed(2);
+              if (typeof _t.tp1Price === 'number') _t.tp1Price = +(_t.tp1Price + _ohD).toFixed(2);
+              if (typeof _t.tp2Price === 'number') _t.tp2Price = +(_t.tp2Price + _ohD).toFixed(2);
+              if (typeof _t.tp3Price === 'number') _t.tp3Price = +(_t.tp3Price + _ohD).toFixed(2);
+            }
+            _t.bestPrice = price; _t.worstPrice = price; _t.ts = _zNow;
+            delete _t.oteLimit; delete _t.oteExpiry; delete _t.oteImpulseHi; delete _t.oteImpulseLo; // server-side hold supersedes the legacy EA-side OTE limit on XAU
+            _t._oteVetted = true;
+            s.trade = _t;
+            const _ohWhy = _ohTouch ? (_oh.extPb ? 'extreme pullback ' + (_oh.limVia === 'AVWAP' ? 'AVWAP' : _oh.limVia === 'PULLBACK 0.5×ATR' ? '0.5×ATR' : 'OTE') + ' touch' : (_oh.limVia === 'AVWAP' ? 'AVWAP touch' : 'OTE touch')) : _ohRun ? 'runaway ≥0.5×ATR' : 'window expiry'; // 'AVWAP touch' = pivot-anchored VWAP limit filled (2026-09-20) — grades as its own via class; 'extreme pullback …' = the 1×ATR extreme hold filled (2026-10-01)
+            const _ohInfo = { fill: +price.toFixed(2), sigPrice: +_oh.sigPrice.toFixed(2), improve: +_ohImp.toFixed(2), waitedSec: Math.round((_zNow - _oh.armTs) / 1000), via: _ohWhy, extPb: _oh.extPb === true || undefined };
+            if (_oh.extPb) _t._extPb = true;
+            if (_oh.sigRef) { _oh.sigRef.pendingEntry = false; _oh.sigRef.entryActual = _ohInfo.fill; _oh.sigRef.oteHold = _ohInfo; _oh.sigRef.price = price.toFixed(2); /* 2026-09-08: the EA anchors its chase-guard (and its dedupe key) on sig.price — a fill un-hiding a minutes-old row must present the FILL, not the stale signal price */ if (typeof _t.slPrice === 'number') { _oh.sigRef.sl = _t.slPrice.toFixed(2); _oh.sigRef.tp1 = _t.tp1Price.toFixed(2); _oh.sigRef.tp2 = _t.tp2Price.toFixed(2); _oh.sigRef.tp3 = _t.tp3Price.toFixed(2); } }
+            if (_oh.histRef) { _oh.histRef.pendingEntry = false; _oh.histRef.oteHold = _ohInfo; if (typeof _t.slPrice === 'number') { _oh.histRef.sl = _t.slPrice; _oh.histRef.tp1 = _t.tp1Price; _oh.histRef.tp2 = _t.tp2Price; _oh.histRef.tp3 = _t.tp3Price; } }
+            log(sym, '▶️ OTE-HOLD ' + _oh.dir.toUpperCase() + ' FILLED @ $' + price.toFixed(2) + ' via ' + _ohWhy + ' — signal $' + _oh.sigPrice.toFixed(2) + ', entry ' + (_ohImp >= 0 ? 'improved $' + _ohImp.toFixed(2) : 'slipped $' + (-_ohImp).toFixed(2)) + ', waited ' + _ohInfo.waitedSec + 's (Jean 2026-08-26).');
+            sendPush('▶️ XAU OTE ' + _oh.dir.toUpperCase() + ' filled', '$' + price.toFixed(2) + ' (' + (_ohImp >= 0 ? '+' : '-') + '$' + Math.abs(_ohImp).toFixed(2) + ' vs signal) · ' + _ohWhy, 'signal');
+          }
+        }
+      } catch (eOR) { /* ote-hold must never crash the tick */ }
+      // ===== INV-HOLD RESOLVER (2026-08-24, Jean) =====
+      try {
+        const _ih = s._invHold;
+        if (_ih) {
+          const _ihDist = _ih.dir === 'call' ? price - _ih.slPrice : _ih.slPrice - price;
+          const _ihCap = sym === 'XAU' ? 5 : sym === 'BTC' ? 100 : sym === 'NAS100' ? 50 : 0.5;
+          if (_ihDist <= 0) {
+            // price reached the SL level before entry — setup invalidated, no trade, no loss
+            s._invHold = null;
+            const _ihM = '⏸ ' + (_ih.tag || 'INVERSAL') + '-HOLD ' + _ih.dir.toUpperCase() + ' INVALIDATED — price hit the SL level $' + _ih.slPrice.toFixed(2) + ' before entry; the wide-SL fire would have been a FULL -$' + _ih.initialDist.toFixed(2) + ' loss. INV-HOLD saved it (Jean 2026-08-24).';
+            log(sym, _ihM); trackBlockedOutcome(sym, _ihM, true);
+          } else if (_ihDist <= _ih.targetDist && !(s.trade && s.trade.active)) {
+            // FIRE at the improved entry — same stop, normal geometry
+            s._invHold = null;
+            const _ihT1 = Math.min(_ihDist * 1.5, _ihCap);
+            const _ihT2d = Math.max(_ihDist * 2.5, _ihT1 * 1.6);
+            s.trade = buildCfdTrade(_ih.dir, price, atrVal, sym);
+            s.trade._oteVetted = true; // already auctioned via INV-HOLD — no OTE re-hold
+            s.trade.slPrice = _ih.slPrice;
+            s.trade.tp1Price = +(_ih.dir === 'call' ? price + _ihT1 : price - _ihT1).toFixed(2);
+            s.trade.tp2Price = +(_ih.dir === 'call' ? price + _ihT2d : price - _ihT2d).toFixed(2);
+            s.trade.tp3Price = CAPITAL_MODE ? s.trade.tp2Price : +(_ih.dir === 'call' ? price + Math.max(_ihDist * 4, _ihT1 * 2.5) : price - Math.max(_ihDist * 4, _ihT1 * 2.5)).toFixed(2);
+            if (_ih.sigRef) { _ih.sigRef.sl = _ih.slPrice.toFixed(2); _ih.sigRef.tp1 = s.trade.tp1Price.toFixed(2); _ih.sigRef.tp2 = s.trade.tp2Price.toFixed(2); _ih.sigRef.tp3 = s.trade.tp3Price.toFixed(2); _ih.sigRef.entryActual = +price.toFixed(2); _ih.sigRef.pendingEntry = false; }
+            log(sym, '▶️ ' + (_ih.tag || 'INVERSAL') + '-HOLD ' + _ih.dir.toUpperCase() + ' FILLED @ $' + price.toFixed(2) + ' — signal was $' + _ih.sigPrice.toFixed(2) + ', risk cut $' + _ih.initialDist.toFixed(2) + ' → $' + _ihDist.toFixed(2) + ' (same stop $' + _ih.slPrice.toFixed(2) + ') [Jean 2026-08-24].');
+            sendPush('▶️ ' + sym + ' ' + (_ih.tag || 'INVERSAL') + ' ' + _ih.dir.toUpperCase() + ' filled', '$' + price.toFixed(2) + ' · risk $' + _ihDist.toFixed(2) + ' (was $' + _ih.initialDist.toFixed(2) + ') · SL $' + _ih.slPrice.toFixed(2), 'signal');
+          } else if (_zNow >= _ih.expiry) {
+            s._invHold = null;
+            if (_ihDist < _ih.initialDist && !(s.trade && s.trade.active)) {
+              // in the band at expiry — authorized to fire even with wide-ish SL (Jean's rule)
+              const _ihT1 = Math.min(_ihDist * 1.5, _ihCap);
+              const _ihT2d = Math.max(_ihDist * 2.5, _ihT1 * 1.6);
+              s.trade = buildCfdTrade(_ih.dir, price, atrVal, sym);
+              s.trade._oteVetted = true; // already auctioned via INV-HOLD — no OTE re-hold
+              s.trade.slPrice = _ih.slPrice;
+              s.trade.tp1Price = +(_ih.dir === 'call' ? price + _ihT1 : price - _ihT1).toFixed(2);
+              s.trade.tp2Price = +(_ih.dir === 'call' ? price + _ihT2d : price - _ihT2d).toFixed(2);
+              s.trade.tp3Price = CAPITAL_MODE ? s.trade.tp2Price : +(_ih.dir === 'call' ? price + Math.max(_ihDist * 4, _ihT1 * 2.5) : price - Math.max(_ihDist * 4, _ihT1 * 2.5)).toFixed(2);
+              if (_ih.sigRef) { _ih.sigRef.sl = _ih.slPrice.toFixed(2); _ih.sigRef.tp1 = s.trade.tp1Price.toFixed(2); _ih.sigRef.tp2 = s.trade.tp2Price.toFixed(2); _ih.sigRef.tp3 = s.trade.tp3Price.toFixed(2); _ih.sigRef.entryActual = +price.toFixed(2); _ih.sigRef.pendingEntry = false; }
+              log(sym, '▶️ ' + (_ih.tag || 'INVERSAL') + '-HOLD ' + _ih.dir.toUpperCase() + ' BAND-FILL at expiry @ $' + price.toFixed(2) + ' — dist $' + _ihDist.toFixed(2) + ' (band ' + _ih.targetDist.toFixed(2) + '-' + _ih.initialDist.toFixed(2) + '); authorized wide fire (Jean 2026-08-24).');
+              sendPush('▶️ ' + sym + ' ' + (_ih.tag || 'INVERSAL') + ' ' + _ih.dir.toUpperCase() + ' band-fill', '$' + price.toFixed(2) + ' · risk $' + _ihDist.toFixed(2) + ' · SL $' + _ih.slPrice.toFixed(2), 'signal');
+            } else {
+              const _ihM = '⏸ ' + (_ih.tag || 'INVERSAL') + '-HOLD ' + _ih.dir.toUpperCase() + ' MISSED — price ran away (dist $' + _ihDist.toFixed(2) + ' ≥ initial $' + _ih.initialDist.toFixed(2) + ') within 3min; per design: too bad for us (Jean 2026-08-24). Virtual track from signal price $' + _ih.sigPrice.toFixed(2) + ' measures the cost.';
+              log(sym, _ihM);
+              s.blockedOutcomes = s.blockedOutcomes || [];
+              s.blockedOutcomes.push({
+                ts: _zNow, time: ts(), symbol: sym, detector: 'INV-HOLD-MISS', type: _ih.dir,
+                price: +_ih.sigPrice.toFixed(2),
+                virtualTp1: +(_ih.dir === 'call' ? _ih.sigPrice + _ihCap : _ih.sigPrice - _ihCap).toFixed(2),
+                virtualSl: _ih.slPrice,
+                blockReason: _ihM,
+                snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
+                tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null,
+                closed: false, closedTs: null, outcome: null
+              });
+            }
+          }
+        }
+      } catch (eIH) { /* inv-hold must never crash the tick */ }
+      // --- touch detection (unchanged contract: one dormant stamp per zone) ---
+      s._zoneTouched = s._zoneTouched || {};
+      for (const z of (s._zoneObs || [])) {
+        const _zk = z.kind + z.tf + z.ts;
+        // RE-TOUCH ENABLED (2026-08-19, Jean): was one-stamp-per-zone forever — the
+        // 8/18 20:17 bounce died at the 4344-48 breakdown-origin supply and the engine
+        // couldn't say so because that shelf had already spent its single stamp hours
+        // earlier. A zone that matters at noon still matters at 20:00. Re-touches
+        // stamp after a 90-min per-zone cool-off into their own ZONE-OB-RT cohort
+        // (dormant everywhere; the NAS live lane keeps firing on FIRST touch only
+        // until ZONE-OB-RT earns promotion).
+        if ((_zNow - z.ts) < 15 * 60000) continue;
+        const _ltRaw = s._zoneTouched[_zk];
+        const _lt = _ltRaw === true ? _zNow : (_ltRaw || 0);
+        if (_ltRaw === true) s._zoneTouched[_zk] = _zNow; // migrate legacy boolean
+        if (_lt > 0 && (_zNow - _lt) < 90 * 60000) continue;
+        const _isReTouch = _lt > 0;
+        if (price <= z.hi && price >= z.lo && convictionFor(z.dir).score >= 5) {
+          s._zoneTouched[_zk] = _zNow;
+          const _zSl = z.dir === 'call' ? z.lo - 0.15 * atrVal : z.hi + 0.15 * atrVal;
+          // ===== ZONE-OB NAS PUT PROMOTED TO LIVE (2026-08-18, Jean) =====
+          // "same for nas — 0 puts today on a huge, obvious drawdown." Two straight
+          // trend-down days the QQQ-supervised lanes fired nothing (QQQ itself mute)
+          // while ZONE-OB supply-retest put stamps kept winning: 8/17 4W/1S, 8/18
+          // 04:33+04:55 wins — NAS's best cohort. NOT the XAU fade promotion: NAS
+          // trends through extremes (FADE-EASE 0W/1L/6S, scoped out 8/4); this is
+          // WITH-TREND continuation at a supply retest, EXT-FLIP-style specialized
+          // lane. Own gates: conv≥5 (touch contract), 1h-down or trend-day-latch-put,
+          // no news blackout, no active trade, 20min lane cooldown, 30s global dedupe,
+          // tight SL = min(zone anchor, 0.8×ATR floor $15). CALL side + XAU/BTC stay
+          // DORMANT. Bench rule: 0W/3L live and it reverts to a stamp.
+          // ===== REVERTED TO DORMANT (2026-08-30, Jean: "ok go") =====
+          // W-35 live record: 3W/4L (Mon-Fri 2W/4L = 33.3%), every NAS fire of the
+          // week came from this lane, at ×30/×20 sizing, while NAS's supporting
+          // instruments are degraded (QQQ store frozen 44d, GEX feed dead, validator
+          // components unpopulated — digest O-3/O-38/O-37). The 8/18 promotion rode a
+          // hot 2-day sample; the weekly review's 33.33% NAS WR is this lane alone.
+          // ZONE_OB_NAS_LIVE=true re-enables without a code change. Stamps continue —
+          // re-promotion at ≥60% over ≥15 fresh dormant samples, per the standard bar.
+          const ZONE_OB_NAS_LIVE = process.env.ZONE_OB_NAS_LIVE === 'true';
+          let _zFired = false;
+          try {
+            if (ZONE_OB_NAS_LIVE) {
+            // Session-extreme chase rule applies here too (2026-08-19, Jean: "every
+            // signal, no exception"): no put fire within 0.05% of an unbroken session
+            // low; a break within the last 90s (live breakdown) is the only way through.
+            const _zSeLo = (s.sessionLow > 0 && s.sessionLow < Infinity) ? ((price - s.sessionLow) / price) * 100 : 999;
+            const _zSeFresh = (s.sessionLowUpdateTs || 0) > 0 && (_zNow - s.sessionLowUpdateTs) < 90000;
+            if (sym === 'NAS100' && z.dir === 'put' && !_isReTouch &&
+                !(_zSeLo < 0.05 && !_zSeFresh) &&
+                (s.htf1h_dir === 'down' || tdLatchEase(s, 'put')) &&
+                !(s.newsBlackout && s.newsBlackout.active) &&
+                !(s.trade && s.trade.active) &&
+                (_zNow - (s._zobLastFireTs || 0)) >= 1200000 &&
+                (_zNow - (s.lastNTs || 0)) >= 30000) {
+              // SL width fix (2026-08-20): day-1 went 1W/3L because the live lane wore a
+              // 0.8×ATR cap while the dormant cohort that earned promotion was graded with
+              // ZONE-ANCHORED stops — on NAS (ATR $20-30) the cap halved the stop and all
+              // three SLs were bounce-wicks the anchor survives (13:47: wicked -$13, then
+              // price fell $90). Now: zone anchor, capped 1.5×ATR, floor $15.
+              const _zSlDist = Math.min(_zSl - price, Math.max(1.5 * atrVal, 15));
+              if (_zSlDist > 0) {
+                s._zobLastFireTs = _zNow;
+                s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
+                if (s.lastSignalDir === 'call') s.lastReversalTs = _zNow;
+                s.lastSignalDir = 'put'; s.lastSignalTs = _zNow; s.lastNTs = _zNow;
+                const sigZ = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇ZONE-OB', rsi: (typeof rsiV === 'number' ? rsiV.toFixed(1) : '0'), macd: (typeof macdL === 'number' ? macdL.toFixed(3) : '0'), roc: '0.000%', num: s.dailySignalCount };
+                try { const _zc = convictionFor('put'); sigZ.conv = { score: _zc.score, label: _zc.score >= 5 ? 'HIGH' : 'MOD', factors: _zc.factors }; } catch (eZC) {}
+                s.signals.push(sigZ); logSignal(sym, sigZ);
+                // ===== ZONE-OB ENTRY AUCTION (2026-08-24, Jean) =====
+                // 8/23 20:40 case: 46.6-pt zone-anchored stop bought at full market price
+                // → straight SL −$932 at ×20, one loss erasing 80% of a win. Same rule
+                // as INV-HOLD: when the stop is wider than the ×20 sizing line
+                // (NAS_WIDE_SL $25), hold ≤3min for price to come deeper into the zone
+                // until risk ≤$20; band-fill at expiry; runaway = miss, measured.
+                if (_zSlDist > NAS_WIDE_SL) {
+                  sigZ.pendingEntry = true;
+                  s._invHold = { tag: 'ZONE-OB', dir: 'put', slPrice: +(price + _zSlDist).toFixed(2), targetDist: 20,
+                                 initialDist: _zSlDist, sigPrice: price, expiry: _zNow + 180000, sigRef: sigZ };
+                  log(sym, '⏸ ZONE-OB-HOLD PUT armed — zone-anchored SL $' + (price + _zSlDist).toFixed(2) + ' is $' + _zSlDist.toFixed(2) + ' wide (>' + NAS_WIDE_SL + '); entry auction ≤3min for $20-from-SL (Jean 2026-08-24).');
+                  sendPush('⏸ NAS100 ZONE-OB PUT holding', 'SL $' + _zSlDist.toFixed(2) + ' wide — entry auction 3min', 'signal');
+                } else {
+                const _zT1 = Math.max(Math.min(_zSlDist * 1.5, 50), 30);
+                const _zT2 = Math.max(_zSlDist * 2.5, _zT1 * 1.6);
+                const _zT3 = CAPITAL_MODE ? _zT2 : Math.max(_zSlDist * 4.0, _zT1 * 2.5);
+                s.trade = buildCfdTrade('put', price, atrVal, sym);
+                s.trade.slPrice = +(price + _zSlDist).toFixed(2);
+                s.trade.tp1Price = +(price - _zT1).toFixed(2);
+                s.trade.tp2Price = +(price - _zT2).toFixed(2);
+                s.trade.tp3Price = +(price - _zT3).toFixed(2);
+                sigZ.sl = s.trade.slPrice.toFixed(2); sigZ.tp1 = s.trade.tp1Price.toFixed(2); sigZ.tp2 = s.trade.tp2Price.toFixed(2); sigZ.tp3 = s.trade.tp3Price.toFixed(2);
+                _zFired = true;
+                const _zFm = '🗺️ ZONE-OB PUT LIVE-FIRING @ $' + price.toFixed(2) + ' — ' + z.kind + ' ' + z.tf + ' supply $' + z.lo.toFixed(2) + '-$' + z.hi.toFixed(2) + ' retest, with-trend (1h ' + s.htf1h_dir + ') · tight SL $' + s.trade.slPrice.toFixed(2) + ' · TP1 $' + s.trade.tp1Price.toFixed(2) + ' (promoted 2026-08-18) [#' + s.dailySignalCount + '].';
+                log(sym, _zFm); trackBlockedOutcome(sym, _zFm, true);
+                sendPush('🗺️ NAS100 ZONE-OB PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · supply retest with-trend · SL $' + s.trade.slPrice.toFixed(2) + ' · TP1 $' + s.trade.tp1Price.toFixed(2), 'signal');
+                }
+              }
+            }
+            } // end ZONE_OB_NAS_LIVE (reverted to dormant 2026-08-30)
+          } catch (eZF) { /* zone promotion must never crash the tick */ }
+          if (!_zFired) {
+            const _zMsg = '🗺️ ZONE-OB' + (_isReTouch ? '-RT' : '') + ' ' + (z.dir === 'call' ? 'CALL' : 'PUT') + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — ' + z.kind + ' ' + z.tf + ' ' + (z.dir === 'call' ? 'demand' : 'supply') + ' $' + z.lo.toFixed(2) + '-$' + z.hi.toFixed(2) + ' (formed ' + Math.round((_zNow - z.ts) / 60000) + 'min ago) · SL would anchor $' + _zSl.toFixed(2) + '.';
+            log(sym, _zMsg); trackBlockedOutcome(sym, _zMsg, true);
+          }
+        }
+      }
+    }
+      // ===== LIQUIDITY POOLS + CHOCH v2 (DORMANT, 2026-08-11, ported from smart-money-concepts) =====
+      // liquidity(): fractal swing highs/lows on M5; >=2 swings within 0.15xATR = an
+      // equal-highs/lows pool (stop cluster). A SWEEP (price pierces pool >0.1xATR)
+      // followed by an M5 close back through it = the reclaim -> dormant fade stamp.
+      // bos_choch(): a close beyond the last opposing swing = structure shift stamp.
+      try {
+        if ((s._m5 || []).length >= 7) {
+          const _cs = s._m5, _sw = { hi: [], lo: [] };
+          for (let i2 = 2; i2 < _cs.length - 2; i2++) {
+            if (_cs[i2].h > _cs[i2-1].h && _cs[i2].h > _cs[i2-2].h && _cs[i2].h > _cs[i2+1].h && _cs[i2].h > _cs[i2+2].h) _sw.hi.push(_cs[i2]);
+            if (_cs[i2].l < _cs[i2-1].l && _cs[i2].l < _cs[i2-2].l && _cs[i2].l < _cs[i2+1].l && _cs[i2].l < _cs[i2+2].l) _sw.lo.push(_cs[i2]);
+          }
+          s._liqTouched = s._liqTouched || {};
+          const _last = _cs[_cs.length - 1];
+          for (const [arr, side] of [[_sw.hi, 'hi'], [_sw.lo, 'lo']]) {
+            for (let a2 = 0; a2 < arr.length - 1; a2++) {
+              const lv = side === 'hi' ? arr[a2].h : arr[a2].l;
+              const eq = arr.filter(x => Math.abs((side === 'hi' ? x.h : x.l) - lv) <= 0.15 * atrVal);
+              if (eq.length >= 2) {
+                const key = side + Math.round(lv * 10);
+                const swept = side === 'hi' ? (_last.h > lv + 0.1 * atrVal && _last.c < lv) : (_last.l < lv - 0.1 * atrVal && _last.c > lv);
+                if (swept && !s._liqTouched[key]) {
+                  s._liqTouched[key] = true;
+                  const _lm = '💧 LIQ-POOL ' + (side === 'hi' ? 'PUT' : 'CALL') + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — equal-' + (side === 'hi' ? 'highs' : 'lows') + ' pool $' + lv.toFixed(2) + ' (' + eq.length + ' swings) swept and reclaimed.' + nightTag();
+                  log(sym, _lm); trackBlockedOutcome(sym, _lm, true);
+                }
+              }
+            }
+          }
+          const _lh = _sw.hi[_sw.hi.length - 1], _ll = _sw.lo[_sw.lo.length - 1];
+          if (_lh && _ll) {
+            if (_last.c > _lh.h && s._msTrend !== 'up') { s._msTrend = 'up';
+              const _cm = '🔀 CHOCH-V2 CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — M5 close above last swing high $' + _lh.h.toFixed(2) + ' (structure shift up).';
+              log(sym, _cm); trackBlockedOutcome(sym, _cm, true); }
+            if (_last.c < _ll.l && s._msTrend !== 'down') { s._msTrend = 'down';
+              const _cm2 = '🔀 CHOCH-V2 PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — M5 close below last swing low $' + _ll.l.toFixed(2) + ' (structure shift down).';
+              log(sym, _cm2); trackBlockedOutcome(sym, _cm2, true); }
+          }
+        }
+      } catch (eLQ) {}
+  } catch (eZO) { try { if (!s._zoneErrTs || Date.now() - s._zoneErrTs > 600000) { s._zoneErrTs = Date.now(); console.error('[' + ts() + '] ' + sym + ' zone/hold block error (logged 1/10min, 2026-10-02): ' + (eZO && eZO.message) + ' · ' + String(eZO && eZO.stack || '').split('\n').slice(1, 3).join(' | ').trim()); } } catch (e2) {} /* zone map must never crash the tick — but never fail silently either */ }
+
   if (hasLocalCandles && cool && !nasFadesOff && (rsiV >= 10 && rsiV <= 90)) {
     const last6 = s.atrCandles.slice(-6); // 6 × 5-min candles = 30 min lookback
     let localHi6 = -Infinity, localHi6Idx = -1;
@@ -11546,803 +12356,6 @@ function processPrice(sym, price, hi, lo) {
       }
     } catch (eRT) { /* retest detector must never crash the tick */ }
 
-    // ===== ZONE-OB v2 — TRUE OHLC FVG + ORDER BLOCKS, M5/M10/M15 (DORMANT, 2026-08-11) =====
-    // Upgrade from close-snapshot approximation to real candle logic, ported from the MIT
-    // reference implementation (joshyattridge/smart-money-concepts):
-    //   FVG:  bullish when candle[i-2].high < candle[i].low (gap left by displacement);
-    //         bearish mirrored. Zone = the gap itself.
-    //   OB:   last opposing candle before a displacement that closes beyond its extreme
-    //         with body >= 0.8xATR. Zone = that candle's full range.
-    // Candles are aggregated incrementally per tick into M5 (72 kept = 6h); M10/M15 are
-    // derived from M5. Zones die when a candle CLOSES through the far side. Touch of an
-    // unmitigated zone >=15min old with conv >=5 -> dormant stamp, one per zone. All
-    // symbols (shadow). Same ZONE-OB cohort; messages now carry type+TF for sub-analysis.
-    try {
-      if (isMT5 && atrVal > 0) {
-        const _zNow = Date.now();
-        // restore moved to the UNGATED early section 2026-09-16 (Jean: "FVG/OB frozen on
-        // xau.html") — living here behind atrVal>0 meant every deploy blanked the map,
-        // msTrend and the big-leg state for ~45min while M5 candles rebuilt, even though
-        // the persisted map was on disk. See the ungated restore near the watchdogs.
-        // --- incremental M5 candle aggregation from live ticks ---
-        const _zBkt = Math.floor(_zNow / 300000);
-        if (!s._m5cur || s._m5cur.b !== _zBkt) {
-          if (s._m5cur && s._m5cur.n > 0) {
-            s._m5 = s._m5 || [];
-            s._m5.push({ o: s._m5cur.o, h: s._m5cur.h, l: s._m5cur.l, c: s._m5cur.c, ts: s._m5cur.b * 300000 });
-            if (s._m5.length > 72) s._m5.shift();
-            // LONG M5 HISTORY (2026-09-20, Jean "go" on Lorentzian prep): a separate
-            // 2,016-bar ring (one week) so the kNN classifier has neighbors to compare
-            // against. Kept apart from s._m5 on purpose — the zone engine's FVG/OB
-            // detection and mitigation semantics are built around the 6h window.
-            s._m5hist = s._m5hist || [];
-            s._m5hist.push({ o: s._m5cur.o, h: s._m5cur.h, l: s._m5cur.l, c: s._m5cur.c, n: s._m5cur.n, ts: s._m5cur.b * 300000 });
-            if (s._m5hist.length > 2016) s._m5hist.shift();
-          }
-          s._m5cur = { b: _zBkt, o: price, h: price, l: price, c: price, n: 0 };
-        }
-        s._m5cur.h = Math.max(s._m5cur.h, price); s._m5cur.l = Math.min(s._m5cur.l, price);
-        s._m5cur.c = price; s._m5cur.n++;
-        // --- rebuild zone map once per minute from closed candles ---
-        if ((!s._zoneObLastBuild || _zNow - s._zoneObLastBuild > 60000) && (s._m5 || []).length >= 9) {
-          s._zoneObLastBuild = _zNow;
-          const _agg = (cs, f) => { const out = []; for (let i = 0; i + f <= cs.length; i += f) { const seg = cs.slice(i, i + f); out.push({ o: seg[0].o, h: Math.max(...seg.map(x => x.h)), l: Math.min(...seg.map(x => x.l)), c: seg[seg.length - 1].c, ts: seg[0].ts }); } return out; };
-          const _zones = [];
-          for (const [tf, cs] of [['M5', s._m5], ['M10', _agg(s._m5, 2)], ['M15', _agg(s._m5, 3)]]) {
-            for (let i = 2; i < cs.length; i++) {
-              const a = cs[i - 2], b = cs[i - 1], c = cs[i];
-              // FVG (3-candle gap with displacement middle candle)
-              if (a.h < c.l && (c.l - a.h) >= 0.3 * atrVal && Math.abs(b.c - b.o) >= 0.8 * atrVal) _zones.push({ hi: c.l, lo: a.h, dir: 'call', ts: c.ts, kind: 'FVG', tf });
-              if (a.l > c.h && (a.l - c.h) >= 0.3 * atrVal && Math.abs(b.c - b.o) >= 0.8 * atrVal) _zones.push({ hi: a.l, lo: c.h, dir: 'put', ts: c.ts, kind: 'FVG', tf });
-              // OB (opposing candle before displacement closing beyond its extreme)
-              if (b.c < b.o && c.c > b.h && (c.c - c.o) >= 0.8 * atrVal) _zones.push({ hi: b.h, lo: b.l, dir: 'call', ts: c.ts, kind: 'OB', tf });
-              if (b.c > b.o && c.c < b.l && (c.o - c.c) >= 0.8 * atrVal) _zones.push({ hi: b.h, lo: b.l, dir: 'put', ts: c.ts, kind: 'OB', tf });
-            }
-          }
-          // mitigation: a later M5 CLOSE through the far side kills the zone
-          const _prevZ = s._zoneObs || []; // capture BEFORE reassignment (merge source)
-          s._zoneObs = _zones.filter(z => {
-            for (const cd of s._m5) { if (cd.ts > z.ts && (z.dir === 'call' ? cd.c < z.lo - 0.2 * atrVal : cd.c > z.hi + 0.2 * atrVal)) return false; }
-            return true;
-          });
-          // MERGE survivors (2026-08-12): zones older than the 6h _m5 window can no longer
-          // be re-derived — keep prior unmitigated zones not already in the fresh set.
-          const _lastC = s._m5[s._m5.length - 1];
-          const _prevKeep = _prevZ.filter(z => z && !_zones.some(n2z => n2z.ts === z.ts && n2z.kind === z.kind && n2z.tf === z.tf) &&
-            (_lastC ? (z.dir === 'call' ? _lastC.c > z.lo - 0.2 * atrVal : _lastC.c < z.hi + 0.2 * atrVal) : true));
-          s._zoneObs = s._zoneObs.concat(_prevKeep);
-          // TEST PHASE 2026-08-11: keep ALL unmitigated zones (was slice(-10) — evicted
-          // the 4396-4405 supply shelf before the 12:00 retest at Jean's ideal 4397 entry).
-          // Mitigation filter above already prunes dead zones; hard safety cap 60.
-          // MAX AGE 1500min (2026-08-19, Jean): M5-M15 zones are intraday structures —
-          // after a full session cycle the level has been re-auctioned and the zone is
-          // spent. Stale zones were still ACTIVE inputs (ZONE-VETO, ZONE-PERM, EG-RETEST-Z,
-          // SE-RETEST anchors, NAS live lane, EXT-FLIP confluence), so this is risk
-          // pruning, not display cleanup.
-          s._zoneObs = s._zoneObs.filter(z => z && (_zNow - z.ts) < 1500 * 60000);
-          if (s._zoneObs.length > 60) s._zoneObs = s._zoneObs.slice(-60);
-          // ===== FVG-RT — RETIRED (2026-09-18, Jean: "ok to retire rt2") =====
-          // The mapped-FVG retest lane (2026-09-12, born from Jean's 9/9 +$3,113 hand
-          // trade) failed in BOTH grading geometries: v1 symmetric ±cap 8W/41L (16%),
-          // v2 zone-anchored SL + 1.5R target 1W/17L (6%). The thesis is dead as an
-          // auto-fire: price re-entering a same-direction FVG with msTrend agreeing is
-          // NOT sufficient — the 9/9 winner's real edge was the leg context, which the
-          // BIG-LEG pivot machine (6.61) now owns. Cohorts FVG-RT / FVG-RT2 frozen in
-          // the tally as the permanent record; cohortFor mappings retained so any
-          // in-flight entries resolve into the right buckets.
-        }
-        // ===== BREAKOUT TIME-STOP (2026-08-19, Jean) =====
-        // 8/19 16:57 TREND CALL @4523.40: fired through the live-break window (fresh
-        // session-high break — the sanctioned door), then went NOWHERE: +$0.4 peak,
-        // flat 30min, full SL −$256. Jean: "it was not a bad move [to fire] — protect
-        // the trade earlier." A +$3 BE-protect would NOT have saved it (never reached
-        // +$3); what diagnoses it is TIME: a breakout that shows no progress has lost
-        // its premise. Rule: a live-break-tagged trade that hasn't moved ≥0.5×ATR
-        // favorable within 15min and hasn't hit TP1 → server issues the EA close
-        // command (~flat exit instead of full stop). Scoped to live-break entries ONLY.
-        try {
-          const _tb = s.trade;
-          if (_tb && _tb.active) {
-            if (_tb._lbEntry === undefined) {
-              _tb._lbEntry = !!(s._lbWaiverTs && _tb.ts && (_tb.ts - s._lbWaiverTs) >= 0 && (_tb.ts - s._lbWaiverTs) < 10000);
-              if (_tb._lbEntry) log(sym, '🏷️ Trade tagged BREAKOUT (live-break entry) — 15min progress check armed (2026-08-19).');
-              // Liquidity stamp at fire (2026-08-19, Jean): tick-rate now vs session avg.
-              try {
-                _tb._tickRateAtFire = Math.round(s._tickRate || 0);
-                _tb._tickRateSessAvg = Math.round(s._tickRateSess || 0);
-                const _tkRatio = (s._tickRateSess > 0) ? (s._tickRate / s._tickRateSess) : null;
-                _tb._tickRatio = _tkRatio != null ? +_tkRatio.toFixed(2) : null;
-                if (s.lastHistEntry && s.lastHistEntry.symbol === sym) {
-                  s.lastHistEntry.tickRateAtFire = _tb._tickRateAtFire;
-                  s.lastHistEntry.tickRatio = _tb._tickRatio;
-                }
-                log(sym, '📶 Liquidity at fire — ' + _tb._tickRateAtFire + ' ticks/min vs session avg ' + _tb._tickRateSessAvg + (_tkRatio != null ? ' (×' + _tkRatio.toFixed(2) + ')' : '') + (_tb._lbEntry ? ' [BREAKOUT entry]' : '') + '.');
-              } catch (eTS) {}
-            }
-            if (_tb._lbEntry && !_tb.t1 && !_tb._lbStop && _tb.ep > 0 && atrVal > 0 &&
-                (_zNow - _tb.ts) > 900000 &&
-                !(s.closeRequest && s.closeRequest.active)) {
-              const _tbFav = _tb.type === 'call' ? price - _tb.ep : _tb.ep - price;
-              if (_tbFav < 0.5 * atrVal) {
-                _tb._lbStop = true;
-                // ===== BENCHED 2026-09-21 (Jean: "why did the EA close the first NAS call
-                // which was going directly to TP3") ===== Record: 8/19 save (flat 30min →
-                // full SL) vs 9/21 09:53 NAS call flattened at +10pts at the 15-min tick,
-                // TP1 4min later, TP3 15min after that (MFE +107). Same shape as EARLY-PROT
-                // (benched 3W/0L). Default = WOULD-CLOSE stamp; the trade runs on and its
-                // real outcome grades LB-TIMESTOP-HELD: re-arm (LB_TIMESTOP=1) only if held
-                // trades from this state LOSE ≥60% over ≥10. Live path also fixed: it now
-                // closes the SERVER trade too — before, the ledger kept booking TP1/TP3 on a
-                // position the EA had already flattened (today's +$2,583 NAS ledger vs ~+$450 real).
-                if (process.env.LB_TIMESTOP === '1') {
-                  const _tbId = 'lbstop-' + Date.now();
-                  s.closeRequest = { active: true, id: _tbId, ts: Date.now(), type: _tb.type || '', ep: _tb.ep || 0, source: 'breakout-time-stop' };
-                  const _tbMsg = '⏱️ BREAKOUT TIME-STOP — ' + String(_tb.type || '').toUpperCase() + ' @ $' + (+_tb.ep).toFixed(2) + ' showed ' + _tbFav.toFixed(2) + ' (<0.5×ATR $' + (0.5 * atrVal).toFixed(2) + ') after 15min; live-break premise dead, EA close requested (~flat exit vs full SL) [id ' + _tbId + '].';
-                  log(sym, _tbMsg);
-                  sendPush('⏱️ ' + sym + ' breakout time-stop', 'Closing stalled ' + String(_tb.type || '').toUpperCase() + ' @ $' + price.toFixed(2) + ' (entry $' + (+_tb.ep).toFixed(2) + ')', 'signal');
-                  // Server-side close to match the EA (2026-09-21): book the flat exit, end the trade.
-                  try {
-                    const _tbE = s.lastHistEntry;
-                    if (_tbE && _tbE.symbol === sym) { _tbE.outcomes = _tbE.outcomes || {}; _tbE.outcomes.timeStopExit = +price.toFixed(2); _tbE.outcomes.closePrice = +price.toFixed(2); }
-                    bookPnl(sym, _tbFav * pnlMultFor(sym, _tb), 'close');
-                    s.trade = { active: false };
-                  } catch (eTBc) {}
-                } else {
-                  _tb._lbStopWouldClose = { ts: Date.now(), price: price, fav: +_tbFav.toFixed(2) };
-                  log(sym, '⏱️ BREAKOUT TIME-STOP WOULD-CLOSE (benched 2026-09-21) — ' + String(_tb.type || '').toUpperCase() + ' @ $' + (+_tb.ep).toFixed(2) + ' shows ' + _tbFav.toFixed(2) + ' (<0.5×ATR $' + (0.5 * atrVal).toFixed(2) + ') after 15min; holding — real outcome grades LB-TIMESTOP-HELD. LB_TIMESTOP=1 re-arms.');
-                }
-              }
-            }
-          }
-        } catch (eTB) { /* time-stop must never crash the tick */ }
-        // ===== EARLY PROTECT — JEAN'S +$3 RULE (2026-08-19) =====
-        // 8/19 16:57 CALL @4523.40 corrected by Jean: it ran +$4.00 to the Asian high
-        // 4527.40 ($1 short of TP1), reversed, and took the FULL −$5.12 stop. The
-        // priceSnaps hid the spike (point samples, not the path — same trap as the
-        // 8/17 'trade:null' lesson). Rule: once a trade has shown ≥60% of its TP1
-        // distance in favorable movement (XAU: +$3 of the $5 TP1), it may no longer
-        // round-trip to a loss — if favorable movement decays back to ≤10% of TP1
-        // distance, the server issues the EA close (~breakeven exit). Peak tracked
-        // tick-by-tick server-side, so between-snapshot spikes are never missed again.
-        try {
-          const _ept = s.trade;
-          if (_ept && _ept.active && _ept.ep > 0) {
-            const _epFav = _ept.type === 'call' ? price - _ept.ep : _ept.ep - price;
-            if (_epFav > (_ept._pkFav || 0)) _ept._pkFav = _epFav;
-            const _epT1d = (typeof _ept.tp1Price === 'number' && _ept.tp1Price > 0) ? Math.abs(_ept.tp1Price - _ept.ep) : 0;
-            // ===== TIGHT-STOP EXEMPTION (2026-09-10, Jean: "loosen a bit the early
-            // protect") ===== 9/10 00:45 EXT-FLIP CALL: OTE-improved fill 4408.85 with
-            // a $2.21 stop (0.67× the $3.31 TP1). Protect fired on the decay, EA
-            // flattened near BE — then price bottomed $0.08 ABOVE the SL and ran +$11.14
-            // to TP3. When SL risk ≤ 0.7×TP1 the stop is already tighter than the
-            // target: protect can save at most ~the stop but costs the whole runner —
-            // the round-trip asymmetry this rule fixes (8/19: peak +$4 → full −$5.12)
-            // doesn't exist. Skip protect there; the tight stop IS the protection.
-            // Every skip AND every protect close stamps EARLY-PROT so both sides grade.
-            const _epRisk = (typeof _ept.slPrice === 'number' && _ept.slPrice > 0) ? Math.abs(_ept.ep - _ept.slPrice) : 0;
-            const _epTight = _epT1d > 0 && _epRisk > 0 && _epRisk <= 0.7 * _epT1d;
-            if (!_ept.t1 && !_ept._epStop && _epT1d > 0 &&
-                (_ept._pkFav || 0) >= 0.6 * _epT1d && _epFav <= 0.1 * _epT1d &&
-                !(s.closeRequest && s.closeRequest.active)) {
-              if (_epTight) {
-                if (!_ept._epTightLogged) {
-                  _ept._epTightLogged = true;
-                  const _etMsg = '🛡️ EARLY-PROT SKIPPED (tight-stop exemption, 2026-09-10) — ' + String(_ept.type || '').toUpperCase() + ' @ $' + (+_ept.ep).toFixed(2) + ' peaked +$' + (_ept._pkFav || 0).toFixed(2) + ' then decayed, but SL risk $' + _epRisk.toFixed(2) + ' ≤ 0.7× TP1 $' + _epT1d.toFixed(2) + ' — the tight stop is the protection; holding.';
-                  log(sym, _etMsg); trackBlockedOutcome(sym, _etMsg, true);
-                }
-              } else if (process.env.EARLY_PROTECT === '1') {
-              _ept._epStop = true;
-              const _epId = 'protect-' + Date.now();
-              s.closeRequest = { active: true, id: _epId, ts: Date.now(), type: _ept.type || '', ep: _ept.ep || 0, source: 'early-protect' };
-              log(sym, '🛡️ EARLY PROTECT — ' + String(_ept.type || '').toUpperCase() + ' @ $' + (+_ept.ep).toFixed(2) + ' peaked +$' + (_ept._pkFav || 0).toFixed(2) + ' (≥60% of TP1 $' + _epT1d.toFixed(2) + ') then decayed to +$' + _epFav.toFixed(2) + '; EA close requested — a trade that nearly reached TP1 may not round-trip to a stop (Jean 2026-08-19) [id ' + _epId + '].');
-              sendPush('🛡️ ' + sym + ' early protect', 'Closing ' + String(_ept.type || '').toUpperCase() + ' near BE @ $' + price.toFixed(2) + ' (peaked +$' + (_ept._pkFav || 0).toFixed(2) + ')', 'signal');
-              try { trackBlockedOutcome(sym, '🛡️ EARLY-PROT CLOSED ' + String(_ept.type || '').toUpperCase() + ' @ $' + price.toFixed(2) + ' (entry $' + (+_ept.ep).toFixed(2) + ', peaked +$' + (_ept._pkFav || 0).toFixed(2) + ') — bracket grades what holding would have done.', true); } catch (eEPT) {}
-              } else {
-              // ===== EARLY PROTECT BENCHED (2026-09-16, Jean: "maybe we should remove
-              // early protect?") ===== Since grading began (9/10) the rule's closed-trade
-              // brackets are 3W/0L/3S — every position it flattened would have WON by
-              // holding, and its signature act was closing Jean's 4-lot TRv2 call at
-              // 23:08:29, four minutes before a 13-second TP1→TP3 sweep (~$3,400 at his
-              // size). The 8/19 motivating case has not recurred. Benched to stamp-only;
-              // EARLY_PROTECT=1 in Railway env re-arms without a deploy. Re-arm bar:
-              // WOULD-CLOSE brackets showing holding LOSES ≥60% over ≥15 resolved.
-              _ept._epStop = true; // one stamp per trade, same as the live rule
-              const _ebMsg = '🛡️ EARLY-PROT WOULD-CLOSE (benched 2026-09-16) — ' + String(_ept.type || '').toUpperCase() + ' @ $' + price.toFixed(2) + ' (entry $' + (+_ept.ep).toFixed(2) + ', peaked +$' + (_ept._pkFav || 0).toFixed(2) + ' then decayed to +$' + _epFav.toFixed(2) + '); holding — bracket grades what the close would have saved.';
-              log(sym, _ebMsg); try { trackBlockedOutcome(sym, _ebMsg, true); } catch (eEB) {}
-              }
-            }
-          }
-        } catch (eEP) { /* early-protect must never crash the tick */ }
-        // ===== REJECT-FLOW (DORMANT, 2026-08-21 — Jean's design) =====
-        // 8/21 07:38-08:16: detectors kept emitting CALLs at the 4604 top and the gates
-        // correctly refused five in a row while price rolled over — then the PUT that
-        // agreed with the gates died at its own floors. Jean: "5 calls rightly blocked —
-        // maybe we should ease the put when we have the situation." The one-sided
-        // rejection stream IS a signal: lagging detectors vs leading gates disagreeing
-        // repeatedly in one direction marks the turn. Rule: blocked candidates of ONE
-        // direction span ≥4 distinct minutes in 15min, ≤1 opposite block, and price has
-        // moved ≥0.75×ATR against the rejected direction → stamp an opposite-direction
-        // would-fire (REJECT-FLOW cohort). Dormant: counting only; promotion by cohort.
-        try {
-          if (Array.isArray(s.blockedAttempts) && s.blockedAttempts.length && Array.isArray(s._m5) && s._m5.length >= 5 && atrVal > 0) {
-            s._rejFlowTs = s._rejFlowTs || {};
-            const _rfWin = s.blockedAttempts.filter(b => b && _zNow - b.ts < 900000);
-            const _rfMinC = new Set(_rfWin.filter(b => /\bCALL\b/.test(b.msg)).map(b => Math.floor(b.ts / 60000))).size;
-            const _rfMinP = new Set(_rfWin.filter(b => /\bPUT\b/.test(b.msg)).map(b => Math.floor(b.ts / 60000))).size;
-            const _rfRef = s._m5[s._m5.length - 4]; // ~15-20min back
-            for (const _rf of [{ dir: 'put', rej: _rfMinC, opp: _rfMinP, rejName: 'CALL' }, { dir: 'call', rej: _rfMinP, opp: _rfMinC, rejName: 'PUT' }]) {
-              const _rfMove = _rf.dir === 'put' ? (_rfRef.c - price) : (price - _rfRef.c);
-              if (_rf.rej >= 4 && _rf.opp <= 1 && _rfMove >= 0.75 * atrVal &&
-                  _zNow - (s._rejFlowTs[_rf.dir] || 0) >= 600000) {
-                s._rejFlowTs[_rf.dir] = _zNow;
-                const _rfT1 = sym === 'XAU' ? 5 : sym === 'BTC' ? 50 : sym === 'NAS100' ? 30 : 0.3;
-                s.blockedOutcomes = s.blockedOutcomes || [];
-                s.blockedOutcomes.push({
-                  ts: _zNow, time: ts(), symbol: sym, detector: 'REJECT-FLOW', type: _rf.dir,
-                  price: +price.toFixed(2),
-                  virtualTp1: +(_rf.dir === 'call' ? price + _rfT1 : price - _rfT1).toFixed(2),
-                  virtualSl: +(_rf.dir === 'call' ? price - _rfT1 : price + _rfT1).toFixed(2),
-                  blockReason: '🔃 REJECT-FLOW ' + _rf.dir.toUpperCase() + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — gates refused ' + _rf.rej + ' ' + _rf.rejName + ' candidates in 15min (opposite blocks: ' + _rf.opp + ') while price moved ' + _rfMove.toFixed(2) + ' (' + (_rfMove / atrVal).toFixed(1) + '×ATR) against them; the one-sided rejection stream marks the turn (Jean 2026-08-21, 4604-top case).',
-                  snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
-                  tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null,
-                  closed: false, closedTs: null, outcome: null
-                });
-                log(sym, '🔃 REJECT-FLOW ' + _rf.dir.toUpperCase() + ' armed dormant @ $' + price.toFixed(2) + ' (' + _rf.rej + ' rejected ' + _rf.rejName + ' minutes, move ' + _rfMove.toFixed(2) + ').');
-              }
-            }
-          }
-        } catch (eRF) { /* reject-flow must never crash the tick */ }
-        // ===== TP3==TP2 EQUALITY GUARD (2026-08-25, Jean's MT5 report) =====
-        // Capital mode set tp3 EXACTLY equal to tp2 at every ladder site. If the EA
-        // allocates a portion per level, two identical prices is an edge case: the TP2
-        // portion closes, the TP3 portion's same-price order can fail to trigger, and
-        // the rump rides the reversal to the STOP while the server books a full TP3 win.
-        // Guard: whenever an active trade carries tp3 === tp2, nudge tp3 a hair INSIDE
-        // (0.1 XAU / 2 NAS / 10 BTC) so the final portion always exits just BEFORE tp2.
-        // Central per-tick guard — catches all 12 ladder sites at once.
-        try {
-          const _eqT = s.trade;
-          if (CAPITAL_MODE && _eqT && _eqT.active && typeof _eqT.tp2Price === 'number' && _eqT.tp2Price > 0 &&
-              _eqT.tp3Price === _eqT.tp2Price) {
-            const _eqEps = sym === 'XAU' ? 0.1 : sym === 'NAS100' ? 2 : sym === 'BTC' ? 10 : 0.05;
-            _eqT.tp3Price = +(_eqT.type === 'call' ? _eqT.tp2Price - _eqEps : _eqT.tp2Price + _eqEps).toFixed(2);
-            log(sym, '🔧 TP3==TP2 equality guard — tp3 nudged to $' + _eqT.tp3Price.toFixed(2) + ' (inside tp2 $' + _eqT.tp2Price.toFixed(2) + ') so the final portion always closes before tp2 (2026-08-25, MT5 rump-position bug).');
-          }
-        } catch (eEQ) {}
-        // ===== RANGE-FADE (DORMANT, 2026-08-26 — Jean: "sell at 4634, buy at 4599") =====
-        // Range-day mean-reversion lane: on an ESTABLISHED range, stand at the edges and
-        // trade back toward the middle — the exact inverse of the week's losing pattern
-        // (continuation entries mid-range in a NEUTRAL drift). Conditions: session range
-        // ≥3×ATR, each side touched ≥2× (10-min-spaced touches), NO trend-day latch armed
-        // (fading edges on a trend day is the 8/18 bottom-tick disease), and the extreme
-        // STALE >90s at fill (a fresh break belongs to the live-break lane, not a fade).
-        // Virtual fill on touch within 0.1×ATR of the extreme; SL 0.5×ATR beyond it
-        // (range thesis dead = out cheap); TP1 $5. One stamp per side per 90min.
-        // DORMANT: RANGE-FADE cohort only. Promote at ≥60% over ≥15 fills (agreed bar).
-        try {
-          if (sym === 'XAU' && atrVal > 0 && s.sessionHigh > 0 && s.sessionLow < Infinity && isFinite(s.sessionHigh) && isFinite(s.sessionLow)) {
-            const _rfR = s.sessionHigh - s.sessionLow;
-            if (!s._rf || s._rf.day !== todayDateET()) s._rf = { day: todayDateET(), hiN: 0, loN: 0, hiTs: 0, loTs: 0, lastStamp: { put: 0, call: 0 } };
-            const _rfNear = 0.2 * atrVal;
-            if (s.sessionHigh - price <= _rfNear && _zNow - s._rf.hiTs > 600000) { s._rf.hiN++; s._rf.hiTs = _zNow; }
-            if (price - s.sessionLow <= _rfNear && _zNow - s._rf.loTs > 600000) { s._rf.loN++; s._rf.loTs = _zNow; }
-            const _rfLatch = tdLatchEase(s, 'call') || tdLatchEase(s, 'put');
-            if (_rfR >= 3 * atrVal && !_rfLatch) {
-              const _rfHiStale = (s.sessionHighUpdateTs || 0) > 0 && (_zNow - s.sessionHighUpdateTs) > 90000;
-              if (s.sessionHigh - price <= 0.1 * atrVal && _rfHiStale && s._rf.hiN >= 2 && _zNow - s._rf.lastStamp.put >= 5400000) {
-                s._rf.lastStamp.put = _zNow;
-                const _rfSl = +(s.sessionHigh + 0.5 * atrVal).toFixed(2);
-                s.blockedOutcomes = s.blockedOutcomes || [];
-                s.blockedOutcomes.push({ ts: _zNow, time: ts(), symbol: sym, detector: 'RANGE-FADE', type: 'put',
-                  price: +price.toFixed(2), virtualTp1: +(price - 5).toFixed(2), virtualSl: _rfSl,
-                  blockReason: '🏓 RANGE-FADE PUT DORMANT-WOULD-FILL @ $' + price.toFixed(2) + ' — selling the range high $' + s.sessionHigh.toFixed(2) + ' (touch #' + s._rf.hiN + ', range $' + _rfR.toFixed(2) + ' = ' + (_rfR / atrVal).toFixed(1) + '×ATR, high stale ' + Math.round((_zNow - s.sessionHighUpdateTs) / 60000) + 'min) · SL $' + _rfSl.toFixed(2) + ' (0.5×ATR beyond) — Jean 2026-08-26: sell the edge, buy the edge.',
-                  snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
-                  tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
-                log(sym, '🏓 RANGE-FADE PUT stamped @ $' + price.toFixed(2) + ' — range high $' + s.sessionHigh.toFixed(2) + ' (dormant).');
-              }
-              const _rfLoStale = (s.sessionLowUpdateTs || 0) > 0 && (_zNow - s.sessionLowUpdateTs) > 90000;
-              if (price - s.sessionLow <= 0.1 * atrVal && _rfLoStale && s._rf.loN >= 2 && _zNow - s._rf.lastStamp.call >= 5400000) {
-                s._rf.lastStamp.call = _zNow;
-                const _rfSl2 = +(s.sessionLow - 0.5 * atrVal).toFixed(2);
-                s.blockedOutcomes = s.blockedOutcomes || [];
-                s.blockedOutcomes.push({ ts: _zNow, time: ts(), symbol: sym, detector: 'RANGE-FADE', type: 'call',
-                  price: +price.toFixed(2), virtualTp1: +(price + 5).toFixed(2), virtualSl: _rfSl2,
-                  blockReason: '🏓 RANGE-FADE CALL DORMANT-WOULD-FILL @ $' + price.toFixed(2) + ' — buying the range low $' + s.sessionLow.toFixed(2) + ' (touch #' + s._rf.loN + ', range $' + _rfR.toFixed(2) + ' = ' + (_rfR / atrVal).toFixed(1) + '×ATR, low stale ' + Math.round((_zNow - s.sessionLowUpdateTs) / 60000) + 'min) · SL $' + _rfSl2.toFixed(2) + ' (0.5×ATR beyond) — Jean 2026-08-26: sell the edge, buy the edge.',
-                  snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
-                  tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
-                log(sym, '🏓 RANGE-FADE CALL stamped @ $' + price.toFixed(2) + ' — range low $' + s.sessionLow.toFixed(2) + ' (dormant).');
-              }
-            }
-          }
-        } catch (eRF) { /* dormant lane must never crash the tick */ }
-        // ===== NAS DORMANT LANES — ORB / VWAP-FADE / GAP-FILL (2026-08-30, Jean: "ship the 3 as dormant") =====
-        // GitHub/paper ports, all measurement-only:
-        //  · NAS-ORB — Zarattini-style opening range: 09:30-09:45 ET range, first breakout
-        //    after 09:45 (until 11:30), stop = far side of range, target = 1R. One/day.
-        //    Replication warns edge is marginal after costs — that's what the cohort tests.
-        //  · NAS-GAP — overnight gap vs prior RTH close (captured 15:55-16:00 ET), stamped
-        //    at 09:30-09:36 toward the fill (NQ gaps fill ~60% per public stats), stop 0.5×gap.
-        //  · NAS-VWAP — session-VWAP stretch fade: |price − vwap| ≥ max(2×ATR, 0.20%) in RTH
-        //    → fade toward VWAP (target = VWAP, stop 1×ATR beyond). 30-min/side throttle.
-        // Promotion bar for each: ≥60% over ≥15 resolved, else they stay stamps forever.
-        try {
-          if (sym === 'NAS100' && price > 0) {
-            const _nlEt = new Date().toLocaleTimeString('en-GB', { timeZone: 'America/New_York' });
-            const _nlHM = (+_nlEt.slice(0, 2)) * 60 + (+_nlEt.slice(3, 5));
-            const _nlDay = todayDateET();
-            if (!s._nl || s._nl.date !== _nlDay) s._nl = { date: _nlDay, orbHi: -Infinity, orbLo: Infinity, orbFired: false, gapDone: false, vwapTs: { call: 0, put: 0 } };
-            // prior-RTH-close capture for tomorrow's gap (15:55-16:00 ET, last tick wins)
-            if (_nlHM >= 955 && _nlHM < 960) { s._rthClose = price; s._rthCloseDate = _nlDay; }
-            // --- NAS-ORB: build the 09:30-09:45 range, stamp the first breakout 09:45-11:30 ---
-            if (_nlHM >= 570 && _nlHM < 585) {
-              if (price > s._nl.orbHi) s._nl.orbHi = price;
-              if (price < s._nl.orbLo) s._nl.orbLo = price;
-            } else if (!s._nl.orbFired && _nlHM >= 585 && _nlHM < 690 && isFinite(s._nl.orbHi) && isFinite(s._nl.orbLo) && s._nl.orbHi > s._nl.orbLo) {
-              const _orbR = s._nl.orbHi - s._nl.orbLo;
-              const _orbDir = price > s._nl.orbHi ? 'call' : (price < s._nl.orbLo ? 'put' : null);
-              if (_orbDir && _orbR >= 5) {
-                s._nl.orbFired = true;
-                s.blockedOutcomes = s.blockedOutcomes || [];
-                s.blockedOutcomes.push({
-                  ts: _zNow, time: ts(), symbol: sym, detector: 'NAS-ORB', type: _orbDir,
-                  price: +price.toFixed(2),
-                  virtualTp1: +(_orbDir === 'call' ? price + _orbR : price - _orbR).toFixed(2),
-                  virtualSl: +(_orbDir === 'call' ? s._nl.orbLo : s._nl.orbHi).toFixed(2),
-                  blockReason: '🕘 NAS-ORB ' + _orbDir.toUpperCase() + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — first breakout of the 09:30-09:45 opening range $' + s._nl.orbLo.toFixed(2) + '-$' + s._nl.orbHi.toFixed(2) + ' ($' + _orbR.toFixed(2) + '); stop = far side, target = 1R (Zarattini ORB port, dormant 2026-08-30).',
-                  snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
-                  tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null
-                });
-                log(sym, '🕘 NAS-ORB ' + _orbDir.toUpperCase() + ' stamped @ $' + price.toFixed(2) + ' (range $' + _orbR.toFixed(2) + ', dormant).');
-              }
-            }
-            // --- NAS-GAP: overnight gap toward the fill, once, 09:30-09:36 ---
-            if (!s._nl.gapDone && _nlHM >= 570 && _nlHM < 576 && s._rthClose > 0 && s._rthCloseDate && s._rthCloseDate !== _nlDay) {
-              s._nl.gapDone = true;
-              const _gap = price - s._rthClose;
-              if (Math.abs(_gap) >= Math.max(20, price * 0.0007)) {
-                const _gDir = _gap > 0 ? 'put' : 'call';
-                s.blockedOutcomes = s.blockedOutcomes || [];
-                s.blockedOutcomes.push({
-                  ts: _zNow, time: ts(), symbol: sym, detector: 'NAS-GAP', type: _gDir,
-                  price: +price.toFixed(2),
-                  virtualTp1: +s._rthClose.toFixed(2),
-                  virtualSl: +(_gap > 0 ? price + Math.abs(_gap) * 0.5 : price - Math.abs(_gap) * 0.5).toFixed(2),
-                  blockReason: '🕳 NAS-GAP ' + _gDir.toUpperCase() + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — overnight gap ' + (_gap > 0 ? '+' : '') + '$' + _gap.toFixed(2) + ' vs prior RTH close $' + s._rthClose.toFixed(2) + ' (' + s._rthCloseDate + '); trade toward the fill, stop 0.5×gap (NQ gaps fill ~60%, dormant 2026-08-30).',
-                  snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
-                  tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null
-                });
-                log(sym, '🕳 NAS-GAP ' + _gDir.toUpperCase() + ' stamped @ $' + price.toFixed(2) + ' (gap $' + _gap.toFixed(2) + ', dormant).');
-              }
-            }
-            // --- NAS-VWAP: session-VWAP stretch fade, RTH 09:45-15:55 ---
-            if (_nlHM >= 585 && _nlHM < 955 && s.vwapCount > 30 && atrVal > 0) {
-              const _vw = s.vwapSum / s.vwapCount;
-              const _vwD = price - _vw;
-              const _vwStretch = Math.max(2 * atrVal, price * 0.002);
-              const _vwDir = _vwD >= _vwStretch ? 'put' : (_vwD <= -_vwStretch ? 'call' : null);
-              if (_vwDir && _zNow - (s._nl.vwapTs[_vwDir] || 0) >= 1800000) {
-                s._nl.vwapTs[_vwDir] = _zNow;
-                s.blockedOutcomes = s.blockedOutcomes || [];
-                s.blockedOutcomes.push({
-                  ts: _zNow, time: ts(), symbol: sym, detector: 'NAS-VWAP', type: _vwDir,
-                  price: +price.toFixed(2),
-                  virtualTp1: +_vw.toFixed(2),
-                  virtualSl: +(_vwDir === 'put' ? price + atrVal : price - atrVal).toFixed(2),
-                  blockReason: '📏 NAS-VWAP ' + _vwDir.toUpperCase() + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — stretched $' + Math.abs(_vwD).toFixed(2) + ' ' + (_vwD > 0 ? 'above' : 'below') + ' session VWAP $' + _vw.toFixed(2) + ' (≥max(2×ATR $' + (2 * atrVal).toFixed(2) + ', 0.20%)); fade toward VWAP, stop 1×ATR beyond (NQ VWAP-reversion port, dormant 2026-08-30).',
-                  snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
-                  tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null
-                });
-                log(sym, '📏 NAS-VWAP ' + _vwDir.toUpperCase() + ' stamped @ $' + price.toFixed(2) + ' (vwap $' + _vw.toFixed(2) + ', dormant).');
-              }
-            }
-          }
-        } catch (eNL) { /* dormant lanes must never crash the tick */ }
-        // ===== OTE-HOLD — ENTRY AUCTION FOR ALL XAU SIGNALS (2026-08-26, Jean) =====
-        // "Bot detects a signal → it looks where the OTE is → takes 3 to 5 minutes to
-        // get as close as possible to it → fires." Never skips a signal (the July
-        // limit-offset backtest died on missed runners): fires on OTE touch, on ≥0.5×ATR
-        // runaway (retrace isn't coming — don't chase late), or at 4-min expiry at
-        // market. Price crossing the SL level while waiting = invalidation, zero-loss
-        // save. Fresh XAU trades are born _oteVetted:false (hidden from EA feeds) and
-        // vetted here on the next tick, custom SL/TP geometry intact. Exempt: INVERSAL
-        // band fires, INV-HOLD fills, V-REC/elite scalps, same-dir continuations.
-        try {
-          // OTE kill switch (2026-09-07, Jean's WR concern): set OTE_DISABLED=1 in
-          // Railway env to release every fire at market instantly — no code push needed.
-          if (process.env.OTE_DISABLED === '1' && s.trade && s.trade._oteVetted === false) s.trade._oteVetted = true;
-          if ((sym === 'XAU' || sym === 'NAS100') && s.trade && s.trade.active && s.trade._oteVetted === false && !s._invHold && !s._oteHold) { // NAS added 2026-09-09 (Jean: "we need to work on NAS")
-            const _ohT = s.trade;
-            const _ohDir = _ohT.type;
-            const _ohOte = computeOTE(s, sym, _ohDir);
-            // EXTREME-PULLBACK zone (2026-10-01): inside 1×max(ATR) of the session extreme every
-            // release path (no impulse / at-or-beyond OTE / fast-lane) is off — hold for the pullback.
-            const _ohPB = extPullbackZone(s, sym, _ohDir, price, atrVal > 0 ? atrVal : (_ohT.atr || 0));
-            if (!_ohPB.at && (!_ohOte || (_ohDir === 'call' ? price <= _ohOte.limit : price >= _ohOte.limit))) {
-              _ohT._oteVetted = true; // no valid impulse, or already at/beyond OTE → release to market now
-              delete _ohT.oteLimit; delete _ohT.oteExpiry; delete _ohT.oteImpulseHi; delete _ohT.oteImpulseLo; // XAU: server-side hold supersedes the legacy EA-side limit — never send both
-              if (_ohOte) log(sym, '🎯 OTE-HOLD skipped — $' + price.toFixed(2) + ' already at/beyond OTE $' + _ohOte.limit.toFixed(2) + '; released at market.');
-              // ===== VISIBILITY STAMP (2026-09-10, Jean's 01:20 case) ===== Instant
-              // releases were invisible: no oteHold field on the row, indistinguishable
-              // from "no auction ran". Both known specimens (9/9 03:46 RSI-91.6 put,
-              // 9/10 01:20 put) were market releases into a still-running rally that
-              // SL'd. Stamp them so the class self-grades; if at-or-beyond releases
-              // keep losing, the fix is holding fades for a stall instead of releasing.
-              try {
-                const _ohSk = s.signals.length ? s.signals[s.signals.length - 1] : null;
-                const _ohSkH = { fill: +price.toFixed(2), sigPrice: _ohT.ep, improve: 0, waitedSec: 0, via: _ohOte ? 'at-or-beyond OTE' : 'no valid impulse' };
-                if (_ohSk && _ohSk.type === _ohDir && !_ohSk.oteHold) _ohSk.oteHold = _ohSkH;
-                if (s.lastHistEntry && s.lastHistEntry.type === _ohDir && !s.lastHistEntry.oteHold) s.lastHistEntry.oteHold = _ohSkH;
-              } catch (eOSk) {}
-            } else if (!_ohPB.at && ((_ohDir === 'call' ? roc3 >= 0.10 : roc3 <= -0.10) ||
-                       (isFinite(macdL) && (_ohDir === 'call' ? (macdL >= (parseFloat(process.env.OTE_FAST_MACD) || 0.20) && roc3 >= (parseFloat(process.env.OTE_FAST_ROC2) || 0.07)) : (macdL <= -(parseFloat(process.env.OTE_FAST_MACD) || 0.20) && roc3 <= -(parseFloat(process.env.OTE_FAST_ROC2) || 0.07)))))) { // MACD-aware fast-lane 2026-09-23; no fast-lane inside the extreme-pullback zone (0.3×ATR 2026-09-28 → 1×max ATR 2026-10-01)
-              // ===== MOMENTUM FAST-LANE (2026-09-12, Jean: "go ahead with all") =====
-              // Week-of-9/8 fill audit: every OTE-touch fill improved (+0.37…+3.45) and
-              // every runaway fill chased (−1.56…−3.04, avg −2.15) — runaways happen when
-              // the tape is already running, i.e. the retracement premise was dead at the
-              // vet. When fire-direction ROC is already ≥0.10% (the 9/10 06:33 MFLIP
-              // waterfall: −0.201%, auctioned 1min, filled $4 worse), release at market
-              // NOW instead of auctioning for a pullback that isn't coming.
-              _ohT._oteVetted = true;
-              delete _ohT.oteLimit; delete _ohT.oteExpiry; delete _ohT.oteImpulseHi; delete _ohT.oteImpulseLo;
-              log(sym, '🎯 OTE-HOLD skipped — momentum fast-lane: ROC ' + (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '% already accelerating in fire direction; released at market @ $' + price.toFixed(2) + ' (2026-09-12).');
-              try {
-                const _ohFl = s.signals.length ? s.signals[s.signals.length - 1] : null;
-                const _ohFlH = { fill: +price.toFixed(2), sigPrice: _ohT.ep, improve: 0, waitedSec: 0, via: 'momentum fast-lane' };
-                if (_ohFl && _ohFl.type === _ohDir && !_ohFl.oteHold) _ohFl.oteHold = _ohFlH;
-                if (s.lastHistEntry && s.lastHistEntry.type === _ohDir && !s.lastHistEntry.oteHold) s.lastHistEntry.oteHold = _ohFlH;
-              } catch (eOFl) {}
-            } else {
-              const _ohSig = s.signals.length ? s.signals[s.signals.length - 1] : null;
-              if (_ohSig && _ohSig.type === _ohDir) _ohSig.pendingEntry = true;
-              if (s.lastHistEntry && s.lastHistEntry.type === _ohDir) s.lastHistEntry.pendingEntry = true;
-              const _ohA = Math.max(s._atr || 0, atrVal || 0, _ohT.atr || 0);
-              let _ohPick = _ohOte ? pickAuctionLimit(s, _ohDir, price, _ohOte.limit, atrVal > 0 ? atrVal : (_ohT.atr || 0)) : null; // pivot-AVWAP vs OTE (2026-09-20)
-              if (_ohPB.at) { // extreme-pullback: the limit must be a real pullback (≥0.25×ATR), else 0.5×ATR back from the fire price
-                const _fb = +(_ohDir === 'put' ? price + 0.5 * _ohA : price - 0.5 * _ohA).toFixed(2);
-                const _ok = _ohPick && (_ohDir === 'put' ? _ohPick.limit - price : price - _ohPick.limit) >= 0.25 * _ohA;
-                if (!_ok) _ohPick = { limit: _fb, via: 'PULLBACK 0.5×ATR', avwap: _ohPick ? _ohPick.avwap : null, basis: '', n: 0, ageMin: 0 };
-              }
-              s._oteHold = { dir: _ohDir, trade: _ohT,
-                             sigRef: (_ohSig && _ohSig.type === _ohDir) ? _ohSig : null,
-                             histRef: (s.lastHistEntry && s.lastHistEntry.type === _ohDir) ? s.lastHistEntry : null,
-                             sigPrice: _ohT.ep, ote: _ohPick.limit, limVia: _ohPick.via, oteFib: _ohOte ? _ohOte.limit : null, avwap: _ohPick.avwap,
-                             extPb: _ohPB.at, extDist: _ohPB.dist, extZone: _ohPB.zone,
-                             slPrice: (typeof _ohT.slPrice === 'number' && _ohT.slPrice > 0) ? (_ohPB.at ? +(_ohDir === 'put' ? _ohPick.limit + Math.abs(_ohT.ep - _ohT.slPrice) : _ohPick.limit - Math.abs(_ohT.ep - _ohT.slPrice)).toFixed(2) : _ohT.slPrice) : null, // extreme-pullback: invalidation stop = original SL distance beyond the pullback limit (2026-10-01)
-                             // Runaway leash 0.5→0.3×ATR (2026-09-12, Jean): runaway fills averaged −$2.15
-                             // vs signal this week; releasing ~$1.3 earlier halves the chase. OTE_RUNAWAY_MULT
-                             // env overrides without a deploy.
-                             runaway: (parseFloat(process.env.OTE_RUNAWAY_MULT) || 0.3) * (atrVal > 0 ? atrVal : (_ohT.atr || 0)),
-                             armTs: _zNow, expiry: _zNow + (_ohPB.at ? (parseInt(process.env.EXT_PB_HOLD_SEC, 10) || 180) * 1000 : 240000) };
-              s.trade = { active: false }; // NEVER null (2026-09-07 crash: /prices//status/checkExit read .active unguarded — the 18:48 MFLIP auction nulled this and crash-looped the server)
-              if (_ohPB.at) log(sym, '⏸️ EXTREME-PULLBACK HOLD ' + _ohDir.toUpperCase() + ' @ $' + price.toFixed(2) + ' — $' + (_ohPB.dist || 0).toFixed(2) + ' from the session ' + (_ohDir === 'put' ? 'low' : 'high') + ' (zone $' + _ohPB.zone.toFixed(2) + ' = 1×ATR); no market fire. Fires only if price pulls back to ' + _ohPick.via + ' $' + _ohPick.limit.toFixed(2) + ' within ' + Math.round((s._oteHold.expiry - _zNow) / 1000) + 's; runaway = signal left → no trade (Jean 2026-10-01).');
-              else log(sym, '⏳ OTE-HOLD ' + _ohDir.toUpperCase() + ' armed @ $' + price.toFixed(2) + ' — auctioning toward ' + _ohPick.via + ' $' + _ohPick.limit.toFixed(2) + (_ohPick.via === 'AVWAP' ? ' (pivot-anchored VWAP, ' + _ohPick.basis + ' n=' + _ohPick.n + ', leg ' + _ohPick.ageMin + 'min; OTE fib was $' + _ohOte.limit.toFixed(2) + ')' : ' (70.5% of impulse $' + _ohOte.impulseLo.toFixed(2) + '-$' + _ohOte.impulseHi.toFixed(2) + (_ohPick.avwap ? '; AVWAP $' + _ohPick.avwap.toFixed(2) + ' not eligible' : '') + ')') + ' ≤4min; early fire on touch or ≥0.5×ATR runaway; invalidates at SL' + (s._oteHold.slPrice ? ' $' + s._oteHold.slPrice.toFixed(2) : '') + ' (Jean 2026-08-26; AVWAP candidate 2026-09-20).');
-              sendPush('⏳ ' + sym + ' OTE-HOLD ' + _ohDir.toUpperCase(), 'waiting for ' + _ohPick.via + ' $' + _ohPick.limit.toFixed(2) + ' (now $' + price.toFixed(2) + ') · ≤4min', 'signal');
-            }
-          }
-        } catch (eOV) { if (s.trade && s.trade._oteVetted === false) s.trade._oteVetted = true; /* never strand a trade unvetted */ }
-        // ===== MACD-HOLD RESOLVER (2026-10-02, Jean) ===== A continuation candidate deferred
-        // for a wrong-sense MACD line is parked in s._macdHold. Every tick: the line turned
-        // (crossed to the trade's side, or moved toward it for ≥60s / with aligned acceleration)
-        // → re-vet the parked candidate through enrichSig (all downstream gates, current price)
-        // and fire it via buildCfdTrade (XAU/NAS born unvetted → the auction / extreme hold
-        // still applies). Window = MACD_DEFER_WIN_SEC (5 min) from the FIRST sighting; expiry
-        // drops it (the DEFER shadow already measures what the market did).
-        try {
-          const _mh = s._macdHold;
-          if (_mh && isMT5 && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold) {
-            const _mhWin = (parseInt(process.env.MACD_DEFER_WIN_SEC, 10) || 300) * 1000;
-            const _mhAge = _zNow - _mh.ts0;
-            if (_mhAge > _mhWin) {
-              s._macdHold = null;
-              log(sym, '⏱️ MACD-HOLD ' + _mh.dir.toUpperCase() + ' (' + _mh.tag + ' @ $' + (+_mh.sigPrice).toFixed(2) + ') EXPIRED — line ' + (_mh.macd0 >= 0 ? '+' : '') + (+_mh.macd0).toFixed(3) + ' → ' + (macdL >= 0 ? '+' : '') + macdL.toFixed(3) + ' never turned within ' + Math.round(_mhWin / 60000) + 'min; no trade (2026-10-02).');
-            } else if (_mhAge >= 30000) {
-              const _mhC = _mh.dir === 'call';
-              const _aligned = _mhC ? macdL >= 0 : macdL <= 0;
-              const _impr = Math.abs(macdL) < Math.abs(_mh.macd0);
-              const _turn = _mhC ? macdAccel > 0 : macdAccel < 0;
-              if (_aligned || (_impr && (_mhAge >= 60000 || _turn))) {
-                s._macdHold = null; s._macdDefer = null;
-                const _sig2 = Object.assign({}, _mh.sig, { time: ts(), price: price.toFixed(2), macd: macdL.toFixed(3) });
-                _sig2._macdRelease = { waitedSec: Math.round(_mhAge / 1000), from: +(+_mh.macd0).toFixed(3), to: +macdL.toFixed(3), accel: +macdAccel.toFixed(3), hold: true, sigPrice: +(+_mh.sigPrice).toFixed(2) };
-                log(sym, '⏱️ MACD-HOLD ' + _mh.dir.toUpperCase() + ' (' + _mh.tag + ') RELEASED — waited ' + Math.round(_mhAge / 1000) + 's, MACD line ' + (_mh.macd0 >= 0 ? '+' : '') + (+_mh.macd0).toFixed(3) + ' → ' + (macdL >= 0 ? '+' : '') + macdL.toFixed(3) + (_aligned ? ' (crossed to the ' + _mh.dir + ' side)' : ' (reversing, accel ' + macdAccel.toFixed(3) + ')') + '; parked @ $' + (+_mh.sigPrice).toFixed(2) + ', now $' + price.toFixed(2) + ' — re-vetting through the remaining gates (2026-10-02).');
-                if (enrichSig(_sig2)) {
-                  s.dailySignalCount++; _sig2.num = s.dailySignalCount;
-                  s.lastSignalDir = _sig2.type; s.lastSignalTs = _zNow; s.lastNTs = _zNow; s.lastAT = _sig2.type;
-                  if (_sig2.type === 'call') s.nC++; else s.nP++;
-                  s.signals.push(_sig2); logSignal(sym, _sig2);
-                  s.trade = buildCfdTrade(_sig2.type, price, atrVal, sym);
-                  log(sym, '🚀 ' + (_sig2.score || _mh.tag) + ' ' + _sig2.type.toUpperCase() + ' FIRED on MACD turn @ $' + price.toFixed(2) + ' (parked $' + (+_mh.sigPrice).toFixed(2) + ', ' + Math.round(_mhAge / 1000) + 's) · SL $' + (+s.trade.slPrice || 0).toFixed(2) + ' · TP1 $' + (+s.trade.tp1Price || 0).toFixed(2) + ' · TP2 $' + (+s.trade.tp2Price || 0).toFixed(2) + ' · TP3 $' + (+s.trade.tp3Price || 0).toFixed(2) + ' [#' + s.dailySignalCount + ', MACD-RELEASED]');
-                  sendPush('⏱️ ' + sym + ' ' + _sig2.type.toUpperCase() + ' on MACD turn #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · SL $' + (+s.trade.slPrice || 0).toFixed(2) + ' · TP1 $' + (+s.trade.tp1Price || 0).toFixed(2) + ' · waited ' + Math.round(_mhAge / 1000) + 's', 'signal');
-                } else {
-                  log(sym, '⏱️ MACD-HOLD ' + _mh.dir.toUpperCase() + ' released but a downstream gate refused it at $' + price.toFixed(2) + ' (see the block above) — no trade; hold cleared.');
-                }
-              }
-            }
-          }
-        } catch (eMHR) { /* macd-hold must never crash the tick */ }
-        // ===== OTE-HOLD RESOLVER (2026-08-26, Jean) =====
-        try {
-          const _oh = s._oteHold;
-          if (_oh && (sym === 'XAU' || sym === 'NAS100')) {
-            const _ohC = _oh.dir === 'call';
-            const _ohSlX = _oh.slPrice !== null && (_ohC ? price <= _oh.slPrice : price >= _oh.slPrice);
-            const _ohTouch = _ohC ? price <= _oh.ote : price >= _oh.ote;
-            const _ohRun = _oh.runaway > 0 && (_ohC ? (price - _oh.sigPrice) >= _oh.runaway : (_oh.sigPrice - price) >= _oh.runaway);
-            const _ohExp = _zNow >= _oh.expiry;
-            if (_ohSlX) {
-              s._oteHold = null;
-              const _ohM = '⏳ OTE-HOLD ' + _oh.dir.toUpperCase() + ' INVALIDATED — price crossed the SL level $' + _oh.slPrice.toFixed(2) + ' while auctioning; the market entry @ $' + _oh.sigPrice.toFixed(2) + ' would have been a full loss. Zero-loss save (Jean 2026-08-26).';
-              log(sym, _ohM); trackBlockedOutcome(sym, _ohM, true);
-              if (_oh.sigRef) { _oh.sigRef.oteHold = 'invalidated-save'; }
-              if (_oh.histRef) { _oh.histRef.oteHold = 'invalidated-save'; _oh.histRef.pendingEntry = false; }
-            } else if (_oh.extPb && !_ohTouch && (_ohRun || _ohExp)) {
-              // EXTREME-PULLBACK: no pullback came — the signal left (runaway) or the window
-              // closed. NO trade. Shadow the skipped market entry so the rule grades itself:
-              // EXT-PB-LEFT / EXT-PB-EXPIRED win = we were wrong to wait, loss = the rule paid.
-              s._oteHold = null;
-              const _pbWhy = _ohRun ? 'LEFT' : 'EXPIRED';
-              const _pbM = '⏭️ EXTREME-PULLBACK ' + _oh.dir.toUpperCase() + ' CANCELLED — ' + (_ohRun ? 'signal left: price ran $' + Math.abs(price - _oh.sigPrice).toFixed(2) + ' away without pulling back' : 'no pullback to $' + _oh.ote.toFixed(2) + ' within the window') + ' (fire $' + _oh.sigPrice.toFixed(2) + ', $' + (_oh.extDist || 0).toFixed(2) + ' from the extreme, now $' + price.toFixed(2) + '). No trade taken (Jean 2026-10-01). EXT-PB-' + _pbWhy;
-              log(sym, _pbM); trackBlockedOutcome(sym, _pbM, true);
-              if (_oh.sigRef) { _oh.sigRef.oteHold = 'extreme-pullback-' + _pbWhy.toLowerCase(); } // pendingEntry stays true — never shown to the EA
-              if (_oh.histRef) { _oh.histRef.oteHold = 'extreme-pullback-' + _pbWhy.toLowerCase(); _oh.histRef.pendingEntry = false; }
-              sendPush('⏭️ ' + sym + ' ' + _oh.dir.toUpperCase() + ' not taken', (_ohRun ? 'signal left without a pullback' : 'no pullback in ' + Math.round((_zNow - _oh.armTs) / 60000) + 'min') + ' · fire was $' + _oh.sigPrice.toFixed(2), 'signal');
-            } else if ((_ohTouch || _ohRun || _ohExp) && !(s.trade && s.trade.active)) {
-              s._oteHold = null;
-              const _t = _oh.trade;
-              const _ohImp = _ohC ? _oh.sigPrice - price : price - _oh.sigPrice; // + = better entry
-              if (_ohImp >= 0) {
-                // better/equal entry: keep absolute SL (risk shrinks) + TP2/TP3 (structure
-                // targets); TP1 keeps its original DISTANCE from the new entry ($5 cap /
-                // OB-anchored dist preserved) so the profit-secure leg behaves as designed.
-                const _t1d = Math.abs(_t.ep - _t.tp1Price);
-                const _slD0 = (typeof _t.slPrice === 'number' && _t.slPrice > 0) ? Math.abs(_t.ep - _t.slPrice) : 0;
-                _t.ep = price;
-                _t.tp1Price = +(_ohC ? price + _t1d : price - _t1d).toFixed(2);
-                // EXTREME-PULLBACK fill (2026-10-01, Jean: "SL should be approx $5 to have room for
-                // TP1"): the stop keeps its ORIGINAL distance from the pullback fill (4162 fill →
-                // SL 4167), not the absolute level from the exhausted fire price.
-                if (_oh.extPb && _slD0 > 0) _t.slPrice = +(_ohC ? price - _slD0 : price + _slD0).toFixed(2);
-                // MIN-RISK FLOOR (2026-09-08, the 23:22 case): a deeply improved fill kept
-                // the absolute SL FIVE CENTS from the fill (4431.94 vs 4431.89) — the trade
-                // died in seconds for −$2.50 on a winning entry. Keep the absolute SL, but
-                // never closer than 0.5×TP1cap from the fill.
-                try {
-                  const _mr = (sym === 'XAU' ? 5 : sym === 'BTC' ? 100 : sym === 'NAS100' ? 50 : 5) * 0.5;
-                  if (typeof _t.slPrice === 'number' && _t.slPrice > 0) {
-                    if (_ohC) { if (price - _t.slPrice < _mr) _t.slPrice = +(price - _mr).toFixed(2); }
-                    else { if (_t.slPrice - price < _mr) _t.slPrice = +(price + _mr).toFixed(2); }
-                  }
-                } catch (eMR) {}
-              } else {
-                // worse entry (runaway/expiry): shift every level by the slip — all
-                // original distances preserved, risk unchanged.
-                const _ohD = price - _t.ep;
-                _t.ep = price;
-                if (typeof _t.slPrice === 'number') _t.slPrice = +(_t.slPrice + _ohD).toFixed(2);
-                if (typeof _t.tp1Price === 'number') _t.tp1Price = +(_t.tp1Price + _ohD).toFixed(2);
-                if (typeof _t.tp2Price === 'number') _t.tp2Price = +(_t.tp2Price + _ohD).toFixed(2);
-                if (typeof _t.tp3Price === 'number') _t.tp3Price = +(_t.tp3Price + _ohD).toFixed(2);
-              }
-              _t.bestPrice = price; _t.worstPrice = price; _t.ts = _zNow;
-              delete _t.oteLimit; delete _t.oteExpiry; delete _t.oteImpulseHi; delete _t.oteImpulseLo; // server-side hold supersedes the legacy EA-side OTE limit on XAU
-              _t._oteVetted = true;
-              s.trade = _t;
-              const _ohWhy = _ohTouch ? (_oh.extPb ? 'extreme pullback ' + (_oh.limVia === 'AVWAP' ? 'AVWAP' : _oh.limVia === 'PULLBACK 0.5×ATR' ? '0.5×ATR' : 'OTE') + ' touch' : (_oh.limVia === 'AVWAP' ? 'AVWAP touch' : 'OTE touch')) : _ohRun ? 'runaway ≥0.5×ATR' : 'window expiry'; // 'AVWAP touch' = pivot-anchored VWAP limit filled (2026-09-20) — grades as its own via class; 'extreme pullback …' = the 1×ATR extreme hold filled (2026-10-01)
-              const _ohInfo = { fill: +price.toFixed(2), sigPrice: +_oh.sigPrice.toFixed(2), improve: +_ohImp.toFixed(2), waitedSec: Math.round((_zNow - _oh.armTs) / 1000), via: _ohWhy, extPb: _oh.extPb === true || undefined };
-              if (_oh.extPb) _t._extPb = true;
-              if (_oh.sigRef) { _oh.sigRef.pendingEntry = false; _oh.sigRef.entryActual = _ohInfo.fill; _oh.sigRef.oteHold = _ohInfo; _oh.sigRef.price = price.toFixed(2); /* 2026-09-08: the EA anchors its chase-guard (and its dedupe key) on sig.price — a fill un-hiding a minutes-old row must present the FILL, not the stale signal price */ if (typeof _t.slPrice === 'number') { _oh.sigRef.sl = _t.slPrice.toFixed(2); _oh.sigRef.tp1 = _t.tp1Price.toFixed(2); _oh.sigRef.tp2 = _t.tp2Price.toFixed(2); _oh.sigRef.tp3 = _t.tp3Price.toFixed(2); } }
-              if (_oh.histRef) { _oh.histRef.pendingEntry = false; _oh.histRef.oteHold = _ohInfo; if (typeof _t.slPrice === 'number') { _oh.histRef.sl = _t.slPrice; _oh.histRef.tp1 = _t.tp1Price; _oh.histRef.tp2 = _t.tp2Price; _oh.histRef.tp3 = _t.tp3Price; } }
-              log(sym, '▶️ OTE-HOLD ' + _oh.dir.toUpperCase() + ' FILLED @ $' + price.toFixed(2) + ' via ' + _ohWhy + ' — signal $' + _oh.sigPrice.toFixed(2) + ', entry ' + (_ohImp >= 0 ? 'improved $' + _ohImp.toFixed(2) : 'slipped $' + (-_ohImp).toFixed(2)) + ', waited ' + _ohInfo.waitedSec + 's (Jean 2026-08-26).');
-              sendPush('▶️ XAU OTE ' + _oh.dir.toUpperCase() + ' filled', '$' + price.toFixed(2) + ' (' + (_ohImp >= 0 ? '+' : '-') + '$' + Math.abs(_ohImp).toFixed(2) + ' vs signal) · ' + _ohWhy, 'signal');
-            }
-          }
-        } catch (eOR) { /* ote-hold must never crash the tick */ }
-        // ===== INV-HOLD RESOLVER (2026-08-24, Jean) =====
-        try {
-          const _ih = s._invHold;
-          if (_ih) {
-            const _ihDist = _ih.dir === 'call' ? price - _ih.slPrice : _ih.slPrice - price;
-            const _ihCap = sym === 'XAU' ? 5 : sym === 'BTC' ? 100 : sym === 'NAS100' ? 50 : 0.5;
-            if (_ihDist <= 0) {
-              // price reached the SL level before entry — setup invalidated, no trade, no loss
-              s._invHold = null;
-              const _ihM = '⏸ ' + (_ih.tag || 'INVERSAL') + '-HOLD ' + _ih.dir.toUpperCase() + ' INVALIDATED — price hit the SL level $' + _ih.slPrice.toFixed(2) + ' before entry; the wide-SL fire would have been a FULL -$' + _ih.initialDist.toFixed(2) + ' loss. INV-HOLD saved it (Jean 2026-08-24).';
-              log(sym, _ihM); trackBlockedOutcome(sym, _ihM, true);
-            } else if (_ihDist <= _ih.targetDist && !(s.trade && s.trade.active)) {
-              // FIRE at the improved entry — same stop, normal geometry
-              s._invHold = null;
-              const _ihT1 = Math.min(_ihDist * 1.5, _ihCap);
-              const _ihT2d = Math.max(_ihDist * 2.5, _ihT1 * 1.6);
-              s.trade = buildCfdTrade(_ih.dir, price, atrVal, sym);
-              s.trade._oteVetted = true; // already auctioned via INV-HOLD — no OTE re-hold
-              s.trade.slPrice = _ih.slPrice;
-              s.trade.tp1Price = +(_ih.dir === 'call' ? price + _ihT1 : price - _ihT1).toFixed(2);
-              s.trade.tp2Price = +(_ih.dir === 'call' ? price + _ihT2d : price - _ihT2d).toFixed(2);
-              s.trade.tp3Price = CAPITAL_MODE ? s.trade.tp2Price : +(_ih.dir === 'call' ? price + Math.max(_ihDist * 4, _ihT1 * 2.5) : price - Math.max(_ihDist * 4, _ihT1 * 2.5)).toFixed(2);
-              if (_ih.sigRef) { _ih.sigRef.sl = _ih.slPrice.toFixed(2); _ih.sigRef.tp1 = s.trade.tp1Price.toFixed(2); _ih.sigRef.tp2 = s.trade.tp2Price.toFixed(2); _ih.sigRef.tp3 = s.trade.tp3Price.toFixed(2); _ih.sigRef.entryActual = +price.toFixed(2); _ih.sigRef.pendingEntry = false; }
-              log(sym, '▶️ ' + (_ih.tag || 'INVERSAL') + '-HOLD ' + _ih.dir.toUpperCase() + ' FILLED @ $' + price.toFixed(2) + ' — signal was $' + _ih.sigPrice.toFixed(2) + ', risk cut $' + _ih.initialDist.toFixed(2) + ' → $' + _ihDist.toFixed(2) + ' (same stop $' + _ih.slPrice.toFixed(2) + ') [Jean 2026-08-24].');
-              sendPush('▶️ ' + sym + ' ' + (_ih.tag || 'INVERSAL') + ' ' + _ih.dir.toUpperCase() + ' filled', '$' + price.toFixed(2) + ' · risk $' + _ihDist.toFixed(2) + ' (was $' + _ih.initialDist.toFixed(2) + ') · SL $' + _ih.slPrice.toFixed(2), 'signal');
-            } else if (_zNow >= _ih.expiry) {
-              s._invHold = null;
-              if (_ihDist < _ih.initialDist && !(s.trade && s.trade.active)) {
-                // in the band at expiry — authorized to fire even with wide-ish SL (Jean's rule)
-                const _ihT1 = Math.min(_ihDist * 1.5, _ihCap);
-                const _ihT2d = Math.max(_ihDist * 2.5, _ihT1 * 1.6);
-                s.trade = buildCfdTrade(_ih.dir, price, atrVal, sym);
-                s.trade._oteVetted = true; // already auctioned via INV-HOLD — no OTE re-hold
-                s.trade.slPrice = _ih.slPrice;
-                s.trade.tp1Price = +(_ih.dir === 'call' ? price + _ihT1 : price - _ihT1).toFixed(2);
-                s.trade.tp2Price = +(_ih.dir === 'call' ? price + _ihT2d : price - _ihT2d).toFixed(2);
-                s.trade.tp3Price = CAPITAL_MODE ? s.trade.tp2Price : +(_ih.dir === 'call' ? price + Math.max(_ihDist * 4, _ihT1 * 2.5) : price - Math.max(_ihDist * 4, _ihT1 * 2.5)).toFixed(2);
-                if (_ih.sigRef) { _ih.sigRef.sl = _ih.slPrice.toFixed(2); _ih.sigRef.tp1 = s.trade.tp1Price.toFixed(2); _ih.sigRef.tp2 = s.trade.tp2Price.toFixed(2); _ih.sigRef.tp3 = s.trade.tp3Price.toFixed(2); _ih.sigRef.entryActual = +price.toFixed(2); _ih.sigRef.pendingEntry = false; }
-                log(sym, '▶️ ' + (_ih.tag || 'INVERSAL') + '-HOLD ' + _ih.dir.toUpperCase() + ' BAND-FILL at expiry @ $' + price.toFixed(2) + ' — dist $' + _ihDist.toFixed(2) + ' (band ' + _ih.targetDist.toFixed(2) + '-' + _ih.initialDist.toFixed(2) + '); authorized wide fire (Jean 2026-08-24).');
-                sendPush('▶️ ' + sym + ' ' + (_ih.tag || 'INVERSAL') + ' ' + _ih.dir.toUpperCase() + ' band-fill', '$' + price.toFixed(2) + ' · risk $' + _ihDist.toFixed(2) + ' · SL $' + _ih.slPrice.toFixed(2), 'signal');
-              } else {
-                const _ihM = '⏸ ' + (_ih.tag || 'INVERSAL') + '-HOLD ' + _ih.dir.toUpperCase() + ' MISSED — price ran away (dist $' + _ihDist.toFixed(2) + ' ≥ initial $' + _ih.initialDist.toFixed(2) + ') within 3min; per design: too bad for us (Jean 2026-08-24). Virtual track from signal price $' + _ih.sigPrice.toFixed(2) + ' measures the cost.';
-                log(sym, _ihM);
-                s.blockedOutcomes = s.blockedOutcomes || [];
-                s.blockedOutcomes.push({
-                  ts: _zNow, time: ts(), symbol: sym, detector: 'INV-HOLD-MISS', type: _ih.dir,
-                  price: +_ih.sigPrice.toFixed(2),
-                  virtualTp1: +(_ih.dir === 'call' ? _ih.sigPrice + _ihCap : _ih.sigPrice - _ihCap).toFixed(2),
-                  virtualSl: _ih.slPrice,
-                  blockReason: _ihM,
-                  snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
-                  tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null,
-                  closed: false, closedTs: null, outcome: null
-                });
-              }
-            }
-          }
-        } catch (eIH) { /* inv-hold must never crash the tick */ }
-        // --- touch detection (unchanged contract: one dormant stamp per zone) ---
-        s._zoneTouched = s._zoneTouched || {};
-        for (const z of (s._zoneObs || [])) {
-          const _zk = z.kind + z.tf + z.ts;
-          // RE-TOUCH ENABLED (2026-08-19, Jean): was one-stamp-per-zone forever — the
-          // 8/18 20:17 bounce died at the 4344-48 breakdown-origin supply and the engine
-          // couldn't say so because that shelf had already spent its single stamp hours
-          // earlier. A zone that matters at noon still matters at 20:00. Re-touches
-          // stamp after a 90-min per-zone cool-off into their own ZONE-OB-RT cohort
-          // (dormant everywhere; the NAS live lane keeps firing on FIRST touch only
-          // until ZONE-OB-RT earns promotion).
-          if ((_zNow - z.ts) < 15 * 60000) continue;
-          const _ltRaw = s._zoneTouched[_zk];
-          const _lt = _ltRaw === true ? _zNow : (_ltRaw || 0);
-          if (_ltRaw === true) s._zoneTouched[_zk] = _zNow; // migrate legacy boolean
-          if (_lt > 0 && (_zNow - _lt) < 90 * 60000) continue;
-          const _isReTouch = _lt > 0;
-          if (price <= z.hi && price >= z.lo && convictionFor(z.dir).score >= 5) {
-            s._zoneTouched[_zk] = _zNow;
-            const _zSl = z.dir === 'call' ? z.lo - 0.15 * atrVal : z.hi + 0.15 * atrVal;
-            // ===== ZONE-OB NAS PUT PROMOTED TO LIVE (2026-08-18, Jean) =====
-            // "same for nas — 0 puts today on a huge, obvious drawdown." Two straight
-            // trend-down days the QQQ-supervised lanes fired nothing (QQQ itself mute)
-            // while ZONE-OB supply-retest put stamps kept winning: 8/17 4W/1S, 8/18
-            // 04:33+04:55 wins — NAS's best cohort. NOT the XAU fade promotion: NAS
-            // trends through extremes (FADE-EASE 0W/1L/6S, scoped out 8/4); this is
-            // WITH-TREND continuation at a supply retest, EXT-FLIP-style specialized
-            // lane. Own gates: conv≥5 (touch contract), 1h-down or trend-day-latch-put,
-            // no news blackout, no active trade, 20min lane cooldown, 30s global dedupe,
-            // tight SL = min(zone anchor, 0.8×ATR floor $15). CALL side + XAU/BTC stay
-            // DORMANT. Bench rule: 0W/3L live and it reverts to a stamp.
-            // ===== REVERTED TO DORMANT (2026-08-30, Jean: "ok go") =====
-            // W-35 live record: 3W/4L (Mon-Fri 2W/4L = 33.3%), every NAS fire of the
-            // week came from this lane, at ×30/×20 sizing, while NAS's supporting
-            // instruments are degraded (QQQ store frozen 44d, GEX feed dead, validator
-            // components unpopulated — digest O-3/O-38/O-37). The 8/18 promotion rode a
-            // hot 2-day sample; the weekly review's 33.33% NAS WR is this lane alone.
-            // ZONE_OB_NAS_LIVE=true re-enables without a code change. Stamps continue —
-            // re-promotion at ≥60% over ≥15 fresh dormant samples, per the standard bar.
-            const ZONE_OB_NAS_LIVE = process.env.ZONE_OB_NAS_LIVE === 'true';
-            let _zFired = false;
-            try {
-              if (ZONE_OB_NAS_LIVE) {
-              // Session-extreme chase rule applies here too (2026-08-19, Jean: "every
-              // signal, no exception"): no put fire within 0.05% of an unbroken session
-              // low; a break within the last 90s (live breakdown) is the only way through.
-              const _zSeLo = (s.sessionLow > 0 && s.sessionLow < Infinity) ? ((price - s.sessionLow) / price) * 100 : 999;
-              const _zSeFresh = (s.sessionLowUpdateTs || 0) > 0 && (_zNow - s.sessionLowUpdateTs) < 90000;
-              if (sym === 'NAS100' && z.dir === 'put' && !_isReTouch &&
-                  !(_zSeLo < 0.05 && !_zSeFresh) &&
-                  (s.htf1h_dir === 'down' || tdLatchEase(s, 'put')) &&
-                  !(s.newsBlackout && s.newsBlackout.active) &&
-                  !(s.trade && s.trade.active) &&
-                  (_zNow - (s._zobLastFireTs || 0)) >= 1200000 &&
-                  (_zNow - (s.lastNTs || 0)) >= 30000) {
-                // SL width fix (2026-08-20): day-1 went 1W/3L because the live lane wore a
-                // 0.8×ATR cap while the dormant cohort that earned promotion was graded with
-                // ZONE-ANCHORED stops — on NAS (ATR $20-30) the cap halved the stop and all
-                // three SLs were bounce-wicks the anchor survives (13:47: wicked -$13, then
-                // price fell $90). Now: zone anchor, capped 1.5×ATR, floor $15.
-                const _zSlDist = Math.min(_zSl - price, Math.max(1.5 * atrVal, 15));
-                if (_zSlDist > 0) {
-                  s._zobLastFireTs = _zNow;
-                  s.lastAT = 'put'; s.nP++; s.dailySignalCount++;
-                  if (s.lastSignalDir === 'call') s.lastReversalTs = _zNow;
-                  s.lastSignalDir = 'put'; s.lastSignalTs = _zNow; s.lastNTs = _zNow;
-                  const sigZ = { type: 'put', time: ts(), price: price.toFixed(2), score: '⬇ZONE-OB', rsi: (typeof rsiV === 'number' ? rsiV.toFixed(1) : '0'), macd: (typeof macdL === 'number' ? macdL.toFixed(3) : '0'), roc: '0.000%', num: s.dailySignalCount };
-                  try { const _zc = convictionFor('put'); sigZ.conv = { score: _zc.score, label: _zc.score >= 5 ? 'HIGH' : 'MOD', factors: _zc.factors }; } catch (eZC) {}
-                  s.signals.push(sigZ); logSignal(sym, sigZ);
-                  // ===== ZONE-OB ENTRY AUCTION (2026-08-24, Jean) =====
-                  // 8/23 20:40 case: 46.6-pt zone-anchored stop bought at full market price
-                  // → straight SL −$932 at ×20, one loss erasing 80% of a win. Same rule
-                  // as INV-HOLD: when the stop is wider than the ×20 sizing line
-                  // (NAS_WIDE_SL $25), hold ≤3min for price to come deeper into the zone
-                  // until risk ≤$20; band-fill at expiry; runaway = miss, measured.
-                  if (_zSlDist > NAS_WIDE_SL) {
-                    sigZ.pendingEntry = true;
-                    s._invHold = { tag: 'ZONE-OB', dir: 'put', slPrice: +(price + _zSlDist).toFixed(2), targetDist: 20,
-                                   initialDist: _zSlDist, sigPrice: price, expiry: _zNow + 180000, sigRef: sigZ };
-                    log(sym, '⏸ ZONE-OB-HOLD PUT armed — zone-anchored SL $' + (price + _zSlDist).toFixed(2) + ' is $' + _zSlDist.toFixed(2) + ' wide (>' + NAS_WIDE_SL + '); entry auction ≤3min for $20-from-SL (Jean 2026-08-24).');
-                    sendPush('⏸ NAS100 ZONE-OB PUT holding', 'SL $' + _zSlDist.toFixed(2) + ' wide — entry auction 3min', 'signal');
-                  } else {
-                  const _zT1 = Math.max(Math.min(_zSlDist * 1.5, 50), 30);
-                  const _zT2 = Math.max(_zSlDist * 2.5, _zT1 * 1.6);
-                  const _zT3 = CAPITAL_MODE ? _zT2 : Math.max(_zSlDist * 4.0, _zT1 * 2.5);
-                  s.trade = buildCfdTrade('put', price, atrVal, sym);
-                  s.trade.slPrice = +(price + _zSlDist).toFixed(2);
-                  s.trade.tp1Price = +(price - _zT1).toFixed(2);
-                  s.trade.tp2Price = +(price - _zT2).toFixed(2);
-                  s.trade.tp3Price = +(price - _zT3).toFixed(2);
-                  sigZ.sl = s.trade.slPrice.toFixed(2); sigZ.tp1 = s.trade.tp1Price.toFixed(2); sigZ.tp2 = s.trade.tp2Price.toFixed(2); sigZ.tp3 = s.trade.tp3Price.toFixed(2);
-                  _zFired = true;
-                  const _zFm = '🗺️ ZONE-OB PUT LIVE-FIRING @ $' + price.toFixed(2) + ' — ' + z.kind + ' ' + z.tf + ' supply $' + z.lo.toFixed(2) + '-$' + z.hi.toFixed(2) + ' retest, with-trend (1h ' + s.htf1h_dir + ') · tight SL $' + s.trade.slPrice.toFixed(2) + ' · TP1 $' + s.trade.tp1Price.toFixed(2) + ' (promoted 2026-08-18) [#' + s.dailySignalCount + '].';
-                  log(sym, _zFm); trackBlockedOutcome(sym, _zFm, true);
-                  sendPush('🗺️ NAS100 ZONE-OB PUT #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · supply retest with-trend · SL $' + s.trade.slPrice.toFixed(2) + ' · TP1 $' + s.trade.tp1Price.toFixed(2), 'signal');
-                  }
-                }
-              }
-              } // end ZONE_OB_NAS_LIVE (reverted to dormant 2026-08-30)
-            } catch (eZF) { /* zone promotion must never crash the tick */ }
-            if (!_zFired) {
-              const _zMsg = '🗺️ ZONE-OB' + (_isReTouch ? '-RT' : '') + ' ' + (z.dir === 'call' ? 'CALL' : 'PUT') + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — ' + z.kind + ' ' + z.tf + ' ' + (z.dir === 'call' ? 'demand' : 'supply') + ' $' + z.lo.toFixed(2) + '-$' + z.hi.toFixed(2) + ' (formed ' + Math.round((_zNow - z.ts) / 60000) + 'min ago) · SL would anchor $' + _zSl.toFixed(2) + '.';
-              log(sym, _zMsg); trackBlockedOutcome(sym, _zMsg, true);
-            }
-          }
-        }
-      }
-        // ===== LIQUIDITY POOLS + CHOCH v2 (DORMANT, 2026-08-11, ported from smart-money-concepts) =====
-        // liquidity(): fractal swing highs/lows on M5; >=2 swings within 0.15xATR = an
-        // equal-highs/lows pool (stop cluster). A SWEEP (price pierces pool >0.1xATR)
-        // followed by an M5 close back through it = the reclaim -> dormant fade stamp.
-        // bos_choch(): a close beyond the last opposing swing = structure shift stamp.
-        try {
-          if ((s._m5 || []).length >= 7) {
-            const _cs = s._m5, _sw = { hi: [], lo: [] };
-            for (let i2 = 2; i2 < _cs.length - 2; i2++) {
-              if (_cs[i2].h > _cs[i2-1].h && _cs[i2].h > _cs[i2-2].h && _cs[i2].h > _cs[i2+1].h && _cs[i2].h > _cs[i2+2].h) _sw.hi.push(_cs[i2]);
-              if (_cs[i2].l < _cs[i2-1].l && _cs[i2].l < _cs[i2-2].l && _cs[i2].l < _cs[i2+1].l && _cs[i2].l < _cs[i2+2].l) _sw.lo.push(_cs[i2]);
-            }
-            s._liqTouched = s._liqTouched || {};
-            const _last = _cs[_cs.length - 1];
-            for (const [arr, side] of [[_sw.hi, 'hi'], [_sw.lo, 'lo']]) {
-              for (let a2 = 0; a2 < arr.length - 1; a2++) {
-                const lv = side === 'hi' ? arr[a2].h : arr[a2].l;
-                const eq = arr.filter(x => Math.abs((side === 'hi' ? x.h : x.l) - lv) <= 0.15 * atrVal);
-                if (eq.length >= 2) {
-                  const key = side + Math.round(lv * 10);
-                  const swept = side === 'hi' ? (_last.h > lv + 0.1 * atrVal && _last.c < lv) : (_last.l < lv - 0.1 * atrVal && _last.c > lv);
-                  if (swept && !s._liqTouched[key]) {
-                    s._liqTouched[key] = true;
-                    const _lm = '💧 LIQ-POOL ' + (side === 'hi' ? 'PUT' : 'CALL') + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — equal-' + (side === 'hi' ? 'highs' : 'lows') + ' pool $' + lv.toFixed(2) + ' (' + eq.length + ' swings) swept and reclaimed.' + nightTag();
-                    log(sym, _lm); trackBlockedOutcome(sym, _lm, true);
-                  }
-                }
-              }
-            }
-            const _lh = _sw.hi[_sw.hi.length - 1], _ll = _sw.lo[_sw.lo.length - 1];
-            if (_lh && _ll) {
-              if (_last.c > _lh.h && s._msTrend !== 'up') { s._msTrend = 'up';
-                const _cm = '🔀 CHOCH-V2 CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — M5 close above last swing high $' + _lh.h.toFixed(2) + ' (structure shift up).';
-                log(sym, _cm); trackBlockedOutcome(sym, _cm, true); }
-              if (_last.c < _ll.l && s._msTrend !== 'down') { s._msTrend = 'down';
-                const _cm2 = '🔀 CHOCH-V2 PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — M5 close below last swing low $' + _ll.l.toFixed(2) + ' (structure shift down).';
-                log(sym, _cm2); trackBlockedOutcome(sym, _cm2, true); }
-            }
-          }
-        } catch (eLQ) {}
-    } catch (eZO) { /* zone map must never crash the tick */ }
 
     // ===== LHF/LLF PERSISTENCE DETECTOR (added 2026-05-28) =====
     // When LHF/LLF has been blocked 80+ times in last 10 min (macro-only blocks — meaning
@@ -18544,7 +18557,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.11-20261002-macd-hold', // bump on each deploy — lets /state verify what's live
+    build: '7.12-20261002-ungated-holds', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const _since = (fundedEpoch && fundedEpoch.since) || ''; const _base = (fundedEpoch && fundedEpoch.base) || {}; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; if (d >= _since) wk += pnlLedger[d][sym].pnl - ((_base[d] && typeof _base[d][sym] === 'number') ? _base[d][sym] : 0); } } out.weekTotal = +wk.toFixed(2); out.account = (fundedEpoch && fundedEpoch.label) || null; return out; } catch (e) { return {}; } })(), // weekTotal counts the current funded-account epoch only (2026-10-01) // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
