@@ -1321,8 +1321,50 @@ const NEWS_BLACKOUT_AFTER_MIN  = 30;   // block entries this many min AFTER even
 const NEWS_OVERRIDE_LOCKOUT_MIN = parseInt(process.env.NEWS_OVERRIDE_LOCKOUT_MIN, 10) || 120;
 let lastHighImpactEvent = { ts: 0, name: null, impact: null };
 let _econCalCache = { events: [], lastFetchTs: 0 };
+// ===== CALENDAR SOURCE FIX (2026-10-04, Jean: "make the bot clever about announcements") =====
+// Finnhub's calendar endpoint denies the free tier, so since July the cache has been empty:
+// the news blackout (8/13), the post-news override lockout (7/29) and lastHighImpactEvent were
+// all silently inactive — on 10/02 NFP the bot had no idea an event existed. ForexFactory's
+// weekly JSON is free and carries title / country / time (with offset) / impact / forecast /
+// previous. It is now the primary source; Finnhub stays as a fallback when a key is set.
+const FF_CAL_URL = process.env.FF_CAL_URL || 'https://nfs.faireconomy.media/ff_calendar_thisweek.json';
+const NEWS_KEYWORDS = ['nfp', 'non-farm', 'cpi', 'fomc', 'fed funds', 'federal funds', 'interest rate', 'powell', 'ppi', 'gdp', 'unemployment', 'retail sales', 'pce', 'ism', 'jolts', 'claims', 'consumer confidence', 'michigan', 'adp'];
+async function pollForexFactoryCalendar() {
+  const r = await fetch(FF_CAL_URL, { headers: { 'User-Agent': 'Mozilla/5.0 (signal-server)' } });
+  if (!r.ok) throw new Error('FF calendar HTTP ' + r.status);
+  const arr = await r.json();
+  if (!Array.isArray(arr)) throw new Error('FF calendar: unexpected payload');
+  const now = Date.now();
+  const evs = arr.filter(e => e && e.country === 'USD' && e.date)
+    .map(e => {
+      const t = Date.parse(e.date); // ISO with offset, e.g. 2026-10-02T08:30:00-04:00
+      const name = String(e.title || '').trim();
+      const imp = String(e.impact || '').toLowerCase();
+      // Keep HIGH releases, plus MEDIUM core data (CPI/PCE/GDP/PPI/ISM/JOLTS/claims/retail…).
+      // Speeches are excluded unless it is the Fed Chair — otherwise eight "FOMC Member X
+      // Speaks" a day would each trigger a 60-min blackout and the bot would never trade.
+      const core = /cpi|non-farm|nfp|pce|gdp|ppi|retail sales|ism |jolts|unemployment claims|fomc statement|federal funds|fed chair|powell|consumer confidence|michigan|adp/i.test(name);
+      const speaks = /speaks|testif|press conference/i.test(name) && !/powell|fed chair/i.test(name);
+      const kw = core && !speaks;
+      return { event: name, time: e.date, impact: imp === 'high' ? 'high' : imp === 'medium' ? 'medium' : imp, ts: isNaN(t) ? 0 : t, forecast: e.forecast || '', previous: e.previous || '', high: imp === 'high' && !speaks, kw, speaks };
+    })
+    .filter(e => e.ts > 0 && !e.speaks && (e.high || (e.impact === 'medium' && e.kw)) && e.ts > now - 240 * 60000 && e.ts < now + 8 * 86400000)
+    .sort((a, b) => a.ts - b.ts);
+  // collapse same-timestamp high-impact releases into one "event" label for the desk (NFP + UR + AHE)
+  return evs;
+}
 async function pollEconomicCalendar() {
   try {
+    const ff = await pollForexFactoryCalendar();
+    _econCalCache = { events: ff, lastFetchTs: Date.now(), source: 'forexfactory' };
+    const nxt = ff.find(e => e.ts > Date.now());
+    console.log('[' + ts() + '] Economic calendar (ForexFactory): ' + ff.length + ' USD events tracked' + (nxt ? ' · next: ' + nxt.event + ' in ' + Math.round((nxt.ts - Date.now()) / 60000) + 'min (' + nxt.impact + ', fcst ' + (nxt.forecast || '—') + ' / prev ' + (nxt.previous || '—') + ')' : '') + '.');
+    return;
+  } catch (eFF) {
+    console.log('[' + ts() + '] Economic calendar: ForexFactory failed (' + eFF.message + ') — trying Finnhub fallback.');
+  }
+  try {
+    if (!API) return;
     const today    = new Date().toISOString().slice(0, 10);
     const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
     const url = 'https://finnhub.io/api/v1/calendar/economic?from=' + today + '&to=' + tomorrow + '&token=' + API;
@@ -1371,6 +1413,7 @@ function applyEconomicCalendarBlackout() {
   // Find the most relevant event: nearest one within blackout window, or the next future event
   let active = false, eventName = null, minutesUntil = null, impact = null, eventTs = 0;
   for (const e of events) {
+    if (e.high === false) continue; // blackout = HIGH impact only (2026-10-04); medium core data stays on the desk, not in the gate
     const minsUntil = (e.ts - now) / 60000;
     if (minsUntil >= -NEWS_BLACKOUT_AFTER_MIN && minsUntil <= NEWS_BLACKOUT_BEFORE_MIN) {
       active = true; eventName = e.event; minutesUntil = Math.round(minsUntil); impact = e.impact; eventTs = e.ts;
@@ -1403,6 +1446,191 @@ function applyEconomicCalendarBlackout() {
     s.newsBlackout = { active, eventName, minutesUntil, impact, eventTs };
   });
 }
+// ===== NEWS DESK (2026-10-04, Jean: "analyze economic announcements and give advice on the
+// direction, with a button to launch the signal when I think it is the right moment") =====
+// Honest scope: the desk does NOT forecast the number's direction. It knows an event is
+// coming (T-10 brief), reads the first 10 minutes of price (T+10 read: spike size/direction,
+// retrace, the lower-high / higher-low to watch), then runs a SHADOW lane on the two things
+// that are actually tradable after a release — NEWS-FADE (spike into an extreme that fails:
+// ≥38% retrace + an M5 close through the prior bar) and NEWS-CONT (the extreme breaks after
+// T+15 with structure agreeing). Geometry is the event's own: stop beyond the spike extreme,
+// target the release price. Promotion bar ≥60% over ≥10 events. The EA posts the ACTUAL
+// value from MT5's calendar (POST /news/actual) so the read can say "51K vs 89K".
+// Symbols: XAU (primary), NAS100, BTC. Window: T-15 → T+180 min. State in global._newsDesk.
+const NEWS_DESK_SYMS = ['XAU', 'NAS100', 'BTC'];
+global._newsDesk = global._newsDesk || {}; // key = event ts (ms) → desk record
+function newsDeskLabel(evs) { // group same-timestamp high-impact releases: "NFP + Unemployment + AHE"
+  const names = evs.map(e => String(e.event).replace(/Non-Farm Employment Change/i, 'NFP').replace(/Average Hourly Earnings m\/m/i, 'AHE').replace(/Unemployment Rate/i, 'Unemployment').replace(/Core PCE Price Index m\/m/i, 'Core PCE').replace(/Federal Funds Rate/i, 'Fed Funds'));
+  return names.slice(0, 3).join(' + ') + (names.length > 3 ? ' +' + (names.length - 3) : '');
+}
+// TEXTBOOK READ (2026-10-04, Jean: "would it have analysed that the sentiment is negative and
+// proposed to sell XAU?") — honest answer: no, and on purpose. The desk gives the textbook
+// implication of the SURPRISE (actual vs forecast) as context, then lets PRICE have the last
+// word. 10/02 is the proof: NFP 89K forecast — a weak print is textbook BULLISH gold (rate
+// cuts, weaker dollar), the spike went up to 4225 exactly as the textbook says, and then the
+// market sold it $100. A model trading the textbook would have bought the top. So the line
+// reads: "textbook: gold ↑ (weak jobs) · price: spike failed → FADE bias" — the two together
+// are the advice; when they disagree, price wins.
+function parseNum(v) { const m = String(v == null ? '' : v).replace(/,/g, '').match(/-?\d+(\.\d+)?/); return m ? parseFloat(m[0]) : null; }
+function textbookRead(eventName, actual, forecast) {
+  const a = parseNum(actual), f = parseNum(forecast); if (a === null || f === null) return null;
+  const n = String(eventName).toLowerCase(); const beat = a > f, miss = a < f; if (!beat && !miss) return { gold: 'flat', nas: 'flat', why: 'in line with forecast' };
+  // growth / jobs data: beat = strong economy → fewer cuts → gold ↓, NAS ↑ (growth) but higher yields… call it mixed
+  if (/non-farm|nfp|adp|retail sales|gdp|ism|consumer confidence|michigan|jolts/.test(n)) return beat ? { gold: 'down', nas: 'mixed', why: 'stronger than forecast → fewer cuts, firmer USD' } : { gold: 'up', nas: 'mixed', why: 'weaker than forecast → more cuts, softer USD' };
+  // labour slack: higher unemployment / claims = weak → gold ↑
+  if (/unemployment|claims/.test(n)) return beat ? { gold: 'up', nas: 'down', why: 'labour weaker than forecast → more cuts' } : { gold: 'down', nas: 'up', why: 'labour firmer than forecast → fewer cuts' };
+  // inflation: hot = gold ↓ (real yields up), NAS ↓
+  if (/cpi|ppi|pce|hourly earnings|ahe|price index/.test(n)) return beat ? { gold: 'down', nas: 'down', why: 'hotter than forecast → higher-for-longer' } : { gold: 'up', nas: 'up', why: 'cooler than forecast → cuts back on the table' };
+  // policy rate
+  if (/federal funds|fed funds|interest rate/.test(n)) return beat ? { gold: 'down', nas: 'down', why: 'tighter than expected' } : { gold: 'up', nas: 'up', why: 'easier than expected' };
+  return null;
+}
+function newsDeskTick() {
+  try {
+    const now = Date.now();
+    const evs = (_econCalCache.events || []).filter(e => e.high);
+    // bucket by timestamp
+    const byTs = {}; evs.forEach(e => { (byTs[e.ts] = byTs[e.ts] || []).push(e); });
+    for (const k of Object.keys(byTs)) {
+      const t0 = +k; const dt = (now - t0) / 60000; // minutes since release (negative = before)
+      if (dt < -15 || dt > 180) continue;
+      const grp = byTs[k];
+      let d = global._newsDesk[k];
+      if (!d) {
+        d = global._newsDesk[k] = { ts: t0, label: newsDeskLabel(grp), events: grp.map(e => ({ event: e.event, forecast: e.forecast, previous: e.previous, actual: null })), brief: false, p0: {}, hi: {}, lo: {}, hiTs: {}, loTs: {}, read: null, readSent: false, armed: {}, actualSent: false };
+      }
+      // T-10 brief (once, between T-12 and T-3)
+      if (!d.brief && dt >= -12 && dt <= -3) {
+        d.brief = true;
+        const lines = d.events.map(e => e.event + (e.forecast ? ' fcst ' + e.forecast : '') + (e.previous ? ' / prev ' + e.previous : ''));
+        const msg = '📰 ' + d.label + ' in ' + Math.round(-dt) + 'min (' + new Date(t0).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'America/New_York' }) + ' ET) — ' + lines.join(' · ') + '. Spike protocol armed: blackout to T+30, read at T+10, FADE/CONT shadow from T+15.';
+        console.log('[' + ts() + '] ' + msg);
+        try { sendPush('📰 ' + d.label + ' in ' + Math.round(-dt) + 'min', lines.join(' · ').slice(0, 140), 'alert'); } catch (e) {}
+      }
+      // T0: snapshot release price per symbol; then track extremes
+      if (dt >= -0.5) {
+        NEWS_DESK_SYMS.forEach(sym => {
+          const s = S[sym]; if (!s || !(s.lastPrice > 0)) return;
+          if (!(d.p0[sym] > 0) && dt <= 2) { d.p0[sym] = s.lastPrice; d.hi[sym] = s.lastPrice; d.lo[sym] = s.lastPrice; d.hiTs[sym] = now; d.loTs[sym] = now; }
+          if (d.p0[sym] > 0) {
+            if (s.lastPrice > d.hi[sym]) { d.hi[sym] = s.lastPrice; d.hiTs[sym] = now; }
+            if (s.lastPrice < d.lo[sym]) { d.lo[sym] = s.lastPrice; d.loTs[sym] = now; }
+          }
+        });
+      }
+      // T+10 read (once)
+      if (!d.readSent && dt >= 10) {
+        d.readSent = true;
+        const reads = [];
+        NEWS_DESK_SYMS.forEach(sym => {
+          const s = S[sym]; const p0 = d.p0[sym]; if (!s || !(p0 > 0)) return;
+          const up = d.hi[sym] - p0, dn = p0 - d.lo[sym];
+          const dir = up >= dn ? 'up' : 'down'; const size = Math.max(up, dn); const ext = dir === 'up' ? d.hi[sym] : d.lo[sym];
+          const atr = s._atr || 0; const px = s.lastPrice;
+          const retr = size > 0 ? (dir === 'up' ? (ext - px) / size : (px - ext) / size) : 0;
+          const fadeLvl = dir === 'up' ? ext - 0.382 * size : ext + 0.382 * size;
+          const rec = { sym, dir, size: +size.toFixed(2), ext: +ext.toFixed(2), p0: +p0.toFixed(2), now: +px.toFixed(2), retrace: +(100 * retr).toFixed(0), atrMult: atr > 0 ? +(size / atr).toFixed(1) : null, fadeLvl: +fadeLvl.toFixed(2) };
+          d.read = d.read || {}; d.read[sym] = rec;
+          const dec = sym === 'XAU' ? 2 : 0;
+          reads.push(sym + ': ' + (dir === 'up' ? '+' : '−') + '$' + size.toFixed(dec) + ' spike to ' + ext.toFixed(dec) + (rec.atrMult ? ' (' + rec.atrMult + '×ATR)' : '') + ', now ' + px.toFixed(dec) + ' (' + rec.retrace + '% retraced) → ' + (dir === 'up' ? 'FADE watch below ' + fadeLvl.toFixed(dec) + ' / CONT if > ' + ext.toFixed(dec) : 'FADE watch above ' + fadeLvl.toFixed(dec) + ' / CONT if < ' + ext.toFixed(dec)));
+        });
+        const act = d.events.filter(e => e.actual != null).map(e => e.event.replace(/Non-Farm Employment Change/i, 'NFP') + ' ' + e.actual + (e.forecast ? ' vs ' + e.forecast : '')).join(' · ');
+        // textbook line (needs an actual) + verdict vs the XAU spike
+        let tb = null;
+        try {
+          const tbs = d.events.map(e => e.actual != null ? textbookRead(e.event, e.actual, e.forecast) : null).filter(Boolean);
+          if (tbs.length) {
+            const g = tbs.map(t => t.gold).filter(x => x !== 'flat'); const gold = g.every(x => x === 'up') ? 'up' : g.every(x => x === 'down') ? 'down' : g.length ? 'mixed' : 'flat';
+            const rx = d.read && d.read.XAU; let verdict = '';
+            if (rx && gold !== 'mixed' && gold !== 'flat') {
+              const agree = rx.dir === gold;
+              verdict = agree ? (rx.retrace >= 38 ? ' · price AGREED then FAILED (retraced ' + rx.retrace + '%) → FADE bias' : ' · price agrees → CONT bias while ' + rx.ext.toFixed(2) + ' holds') : ' · price DISAGREES with the textbook (spike ' + rx.dir + ') → trust price, FADE bias on a failed extreme';
+            }
+            tb = 'textbook: gold ' + (gold === 'up' ? '↑' : gold === 'down' ? '↓' : gold) + ' (' + tbs[0].why + ')' + verdict;
+            d.textbook = tb;
+          }
+        } catch (eTB) {}
+        const msg = '📰 ' + d.label + ' T+10 read' + (act ? ' — ' + act : '') + (tb ? ' — ' + tb : '') + ' — ' + (reads.join(' | ') || 'no price data');
+        console.log('[' + ts() + '] ' + msg);
+        try { sendPush('📰 ' + d.label + ' — T+10 read', (act ? act + ' · ' : '') + (tb ? tb + ' · ' : '') + (reads[0] || ''), 'alert'); } catch (e) {}
+      }
+      // T+15 → T+180: shadow arms (one FADE + one CONT per symbol per event)
+      if (dt >= 15 && d.read) {
+        NEWS_DESK_SYMS.forEach(sym => {
+          const s = S[sym]; const r = d.read[sym]; if (!s || !r || !(s.lastPrice > 0)) return;
+          const atr = s._atr || 0; if (!(atr > 0) || r.size < 0.8 * atr) return; // no spike worth trading
+          const px = s.lastPrice; const m5 = Array.isArray(s._m5) ? s._m5 : [];
+          const last = m5[m5.length - 1], prev = m5[m5.length - 2];
+          d.armed[sym] = d.armed[sym] || {};
+          // live extreme since release (keeps tracking)
+          const ext = r.dir === 'up' ? d.hi[sym] : d.lo[sym];
+          const retr = r.dir === 'up' ? (ext - px) / r.size : (px - ext) / r.size;
+          const brokeStruct = last && prev && (r.dir === 'up' ? last.c < prev.l : last.c > prev.h);
+          if (!d.armed[sym].fade && retr >= 0.382 && brokeStruct) {
+            d.armed[sym].fade = now;
+            const type = r.dir === 'up' ? 'put' : 'call';
+            const sl = r.dir === 'up' ? ext + 0.15 * r.size : ext - 0.15 * r.size;
+            const tpDist = Math.max(Math.abs(px - r.p0), 1.0 * atr);
+            const tp1 = type === 'put' ? px - tpDist : px + tpDist;
+            const m = '📰 ' + sym + ' NEWS-FADE ' + type.toUpperCase() + ' @ $' + px.toFixed(2) + ' — ' + d.label + ' spike ' + (r.dir === 'up' ? '+' : '−') + '$' + r.size.toFixed(2) + ' to ' + ext.toFixed(2) + ' has retraced ' + Math.round(100 * retr) + '% and the last M5 closed through the prior bar; SL $' + sl.toFixed(2) + ' (beyond the extreme), TP1 $' + tp1.toFixed(2) + ' (release price / ≥1×ATR). Shadow lane, promotion ≥60% over ≥10 events (2026-10-04). NEWS-FADE';
+            s.blockedOutcomes = s.blockedOutcomes || [];
+            s.blockedOutcomes.push({ ts: now, time: ts(), symbol: sym, detector: 'NEWS-FADE', type, price: px, virtualTp1: +tp1.toFixed(2), virtualSl: +sl.toFixed(2), maxMin: 180, blockReason: m, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+            log(sym, m);
+            try { sendPush('📰 ' + sym + ' NEWS-FADE ' + type.toUpperCase() + ' (shadow)', '$' + px.toFixed(2) + ' · SL ' + sl.toFixed(2) + ' · TP1 ' + tp1.toFixed(2) + ' — launch if you agree', 'signal'); } catch (e) {}
+          }
+          const brokeExt = r.dir === 'up' ? px > r.ext + 0.1 * r.size : px < r.ext - 0.1 * r.size;
+          const msOk = r.dir === 'up' ? s._msTrend === 'up' : s._msTrend === 'down';
+          if (!d.armed[sym].cont && brokeExt && msOk) {
+            d.armed[sym].cont = now;
+            const type = r.dir === 'up' ? 'call' : 'put';
+            const sl = r.dir === 'up' ? px - Math.max(0.5 * r.size, 1.0 * atr) : px + Math.max(0.5 * r.size, 1.0 * atr);
+            const tp1 = type === 'call' ? px + Math.max(0.5 * r.size, 1.0 * atr) : px - Math.max(0.5 * r.size, 1.0 * atr);
+            const m = '📰 ' + sym + ' NEWS-CONT ' + type.toUpperCase() + ' @ $' + px.toFixed(2) + ' — ' + d.label + ' spike extreme ' + r.ext.toFixed(2) + ' broken after T+' + Math.round(dt) + 'min with msTrend ' + s._msTrend + '; SL $' + sl.toFixed(2) + ', TP1 $' + tp1.toFixed(2) + '. Shadow lane (2026-10-04). NEWS-CONT';
+            s.blockedOutcomes = s.blockedOutcomes || [];
+            s.blockedOutcomes.push({ ts: now, time: ts(), symbol: sym, detector: 'NEWS-CONT', type, price: px, virtualTp1: +tp1.toFixed(2), virtualSl: +sl.toFixed(2), maxMin: 180, blockReason: m, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+            log(sym, m);
+            try { sendPush('📰 ' + sym + ' NEWS-CONT ' + type.toUpperCase() + ' (shadow)', '$' + px.toFixed(2) + ' · SL ' + sl.toFixed(2) + ' · TP1 ' + tp1.toFixed(2) + ' — launch if you agree', 'signal'); } catch (e) {}
+          }
+        });
+      }
+    }
+    // prune desk records older than 2 days
+    for (const k of Object.keys(global._newsDesk)) if (now - (+k) > 2 * 86400000) delete global._newsDesk[k];
+  } catch (e) { console.log('[' + ts() + '] newsDesk error: ' + e.message); }
+}
+setInterval(newsDeskTick, 2000).unref();
+// EA-posted actuals (MQL5 calendar) → match by time (±45min) + title words; re-brief if the read already went out
+app.post('/news/actual', (req, res) => {
+  try {
+    const b = req.body || {};
+    const title = String(b.title || ''), actual = b.actual != null ? String(b.actual) : null, tsv = +b.ts || 0;
+    if (!title || actual == null) return res.status(400).json({ ok: false, error: 'title + actual required' });
+    const words = title.toLowerCase().split(/[^a-z]+/).filter(w => w.length > 2);
+    let hit = null, best = 0;
+    for (const k of Object.keys(global._newsDesk)) {
+      const d = global._newsDesk[k]; if (tsv && Math.abs(d.ts - tsv) > 45 * 60000) continue;
+      for (const e of d.events) { const ew = e.event.toLowerCase(); const sc = words.filter(w => ew.includes(w)).length; if (sc > best) { best = sc; hit = { d, e }; } }
+    }
+    if (!hit || best === 0) return res.json({ ok: true, matched: false });
+    hit.e.actual = actual; if (b.forecast != null && !hit.e.forecast) hit.e.forecast = String(b.forecast); if (b.previous != null && !hit.e.previous) hit.e.previous = String(b.previous);
+    console.log('[' + ts() + '] 📰 actual received — ' + hit.e.event + ': ' + actual + (hit.e.forecast ? ' vs fcst ' + hit.e.forecast : '') + (b.acct ? ' [acct ' + b.acct + ']' : ''));
+    if (hit.d.readSent && !hit.d.actualSent) {
+      hit.d.actualSent = true;
+      let tbl = ''; try { const t = textbookRead(hit.e.event, actual, hit.e.forecast); if (t) { const rx = hit.d.read && hit.d.read.XAU; tbl = ' · textbook gold ' + (t.gold === 'up' ? '↑' : t.gold === 'down' ? '↓' : t.gold) + (rx && t.gold !== 'flat' && t.gold !== 'mixed' ? (rx.dir === t.gold ? (rx.retrace >= 38 ? ' — price agreed then failed → FADE bias' : ' — price agrees → CONT bias') : ' — price disagrees → trust price') : ''); hit.d.textbook = tbl.slice(3); } } catch (e) {}
+      try { sendPush('📰 ' + hit.d.label + ' — actual', hit.e.event + ' ' + actual + (hit.e.forecast ? ' vs ' + hit.e.forecast + ' forecast' : '') + tbl, 'alert'); } catch (e) {}
+    }
+    res.json({ ok: true, matched: true, event: hit.e.event });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+// Dashboard feed: upcoming high-impact USD events, desk records, blackout state
+app.get('/news', (req, res) => {
+  try {
+    const now = Date.now();
+    const up = (_econCalCache.events || []).filter(e => e.ts > now - 180 * 60000 && e.ts < now + 3 * 86400000).map(e => ({ event: e.event, ts: e.ts, impact: e.impact, forecast: e.forecast, previous: e.previous, inMin: Math.round((e.ts - now) / 60000) }));
+    const desk = Object.values(global._newsDesk).sort((a, b) => b.ts - a.ts).slice(0, 4).map(d => ({ ts: d.ts, label: d.label, events: d.events, read: d.read, armed: d.armed, textbook: d.textbook || null, minutesSince: Math.round((now - d.ts) / 60000), p0: d.p0, hi: d.hi, lo: d.lo }));
+    res.json({ ts: now, source: _econCalCache.source || null, lastFetchTs: _econCalCache.lastFetchTs || 0, events: up, desk, blackout: (S.XAU && S.XAU.newsBlackout) || null, lastHighImpactEvent, cohorts: { NEWS_FADE: Object.fromEntries(['XAU', 'NAS100', 'BTC'].map(sy => [sy, (cohortTally[sy] || {})['NEWS-FADE'] || null])), NEWS_CONT: Object.fromEntries(['XAU', 'NAS100', 'BTC'].map(sy => [sy, (cohortTally[sy] || {})['NEWS-CONT'] || null])) } });
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
 // Initial fetch and recurring schedule
 setTimeout(pollEconomicCalendar, 5000);                  // first fetch 5s after startup
 setInterval(pollEconomicCalendar, 10 * 60 * 1000);       // refresh full calendar every 10 min
@@ -1705,7 +1933,7 @@ function trackBlockedOutcome(sym, msg, force) {
   // Only actual blocks/deferrals qualify; validator/dormant lines are excluded explicitly.
   try {
     const _isBlockMsg = /BLOCKED|DEFERRED|REFUSED|SKIPPED|conv \d+ < \d+|below (the )?floor|too (low|weak)/i.test(msg)
-      && !/DORMANT|WOULD-FIRE|TREND-CONT-WF|TREND-REGIME|TREND-WT|TREND-CT|EXT-PB-|EXTREME-PULLBACK|ARMED \(dormant|CONF-SCORE|dormant validator|no firing effect|LC-AGREE|LC-DISAGREE|ML-DIR|EOD-CONT-WF|BIGLEG-CT-WF|FAST-PRE|LADDER-|BE-HELD|ZONE-MICRO-WF|LEVEL-PROX/i.test(msg);
+      && !/DORMANT|WOULD-FIRE|TREND-CONT-WF|TREND-REGIME|TREND-WT|TREND-CT|EXT-PB-|EXTREME-PULLBACK|NEWS-FADE|NEWS-CONT|ARMED \(dormant|CONF-SCORE|dormant validator|no firing effect|LC-AGREE|LC-DISAGREE|ML-DIR|EOD-CONT-WF|BIGLEG-CT-WF|FAST-PRE|LADDER-|BE-HELD|ZONE-MICRO-WF|LEVEL-PROX/i.test(msg);
     if (_isBlockMsg) {
       s._lastBlock = s._lastBlock || {}; s._lastBlock[type] = { msg: msg.slice(0, 200), ts: now };
       const _gj = s._gateJournal = s._gateJournal || [];
@@ -1975,6 +2203,7 @@ function nasRthBlocked(sym) {
 function cohortFor(reason) {
   { const _tw = reason.match(/\bTREND-(WT|CT)\b/); if (_tw) return 'TREND-' + _tw[1]; }
   { const _pb = reason.match(/\bEXT-PB-(LEFT|EXPIRED)\b/); if (_pb) return 'EXT-PB-' + _pb[1]; }
+  { const _nw = reason.match(/\bNEWS-(FADE|CONT)\b/); if (_nw) return 'NEWS-' + _nw[1]; } // news desk shadow lane (2026-10-04)
   { const _zt = reason.match(/\bZONE-VETO-(WT|CT)\b/); if (_zt) return 'ZONE-VETO-' + _zt[1]; } // live-direction split of the zone veto (2026-10-02)
   { const _ct = reason.match(/\bCT-VETO-S([12])([WC])\b/); if (_ct) return 'CT-VETO-S' + _ct[1] + _ct[2]; } // strength × live-direction split of the counter-trend veto (2026-10-02) // extreme-pullback hold cancellations (2026-10-01): win = waiting cost a winner, loss = the rule paid // trend-regime tracker (2026-10-01) — first: the row names its detector AND its gate, either would hijack it
   if (/GRIND-RECLAIM-V/.test(reason)) return 'GRIND-RECLAIM-V'; // V-recovery arm, no latch (2026-09-07, 9/7 RIDE-call 8W/2L specimen) — must precede the plain match
@@ -3532,6 +3761,7 @@ function logSignal(sym, sig) {
     // because regime=TREND and with-trend. Bench rule reads these rows (nasNightTrendOk).
     nightTrend: sig._nightTrend === true || undefined,
     macdRelease: sig._macdRelease || undefined,
+    manual: sig.manual || undefined, // MANUAL launch (2026-10-04): {note, mode, regime, msTrend}
     ctWaived: sig._ctWaived || undefined, // CT-VETO waived under LEG MODE (2026-10-02)
     legMode: sig._legMode === true || undefined, // ZONE-VETO waived under LEG MODE (2026-10-02) // fired after a MACD-DEFER release (2026-10-02): {waitedSec, from, to, accel} — grades as its own class
     // ML-DIR learned-scorer probability (dormant, 2026-08-29) — grade fired rows by
@@ -18278,6 +18508,51 @@ app.post('/trade/close', (req, res) => {
   res.json({ ok: true, sym, id, closeRequest: s.closeRequest });
 });
 
+// ===== MANUAL LAUNCH (2026-10-04, Jean: "a button that I can hit to launch the signal when I
+// think it is the right momentum") ===== POST /manual/fire { sym, type: 'call'|'put',
+// mode: 'market'|'hold', note } → a REAL server trade built with the regime-adaptive ladder,
+// served to the EA through /prices like any fire. Every gate is bypassed by design — that is
+// what the button is for — except the hard lines: an active trade on the symbol (one at a
+// time), the funded guard (day/total), and a per-account stand-down (the EA-side filter still
+// applies). 'hold' parks the fire in the normal auction (OTE/AVWAP, extreme-pullback hold);
+// 'market' fires at the next tick. Rows carry score ⬆MANUAL/⬇MANUAL + manual:{note,mode} and
+// grade as their own class (MANUAL) so discretion is measured like every lane.
+// Token: CLOSE_TOKEN (same as the manual close) when set.
+app.post('/manual/fire', (req, res) => {
+  try {
+    const b = req.body || {};
+    const sym = resolveSymbol(b.sym);
+    const token = (req.headers['x-close-token'] || b.token || '');
+    if (CLOSE_TOKEN && token !== CLOSE_TOKEN) return res.status(403).json({ error: 'bad token' });
+    const s = S[sym];
+    if (!s || (sym !== 'XAU' && sym !== 'BTC' && sym !== 'NAS100')) return res.status(400).json({ error: 'sym must be XAU, BTC or NAS100' });
+    const type = String(b.type || '').toLowerCase();
+    if (type !== 'call' && type !== 'put') return res.status(400).json({ error: 'type must be call or put' });
+    const mode = String(b.mode || 'market').toLowerCase() === 'hold' ? 'hold' : 'market';
+    const price = s.lastPrice;
+    if (!(price > 0)) return res.status(409).json({ error: 'no live price for ' + sym });
+    if (s.trade && s.trade.active) return res.status(409).json({ error: 'a trade is already active on ' + sym + ' (' + String(s.trade.type).toUpperCase() + ' @ $' + (+s.trade.ep).toFixed(2) + ') — close it first' });
+    if (s._oteHold || s._invHold || s._macdHold) return res.status(409).json({ error: 'an auction/hold is already running on ' + sym });
+    const fg = global._fundedGuard || {};
+    if ((fg.dayLimit && fg.day <= -fg.dayLimit) || (fg.totalLimit && fg.total <= -fg.totalLimit)) return res.status(409).json({ error: 'FUNDED-GUARD active (day $' + fg.day + ' / total $' + fg.total + ') — no manual fires' });
+    const atr = s._atr || 0;
+    s.dailySignalCount++;
+    const sig = { type, time: ts(), price: price.toFixed(2), score: (type === 'call' ? '⬆' : '⬇') + 'MANUAL', rsi: '', macd: (typeof s._macdL === 'number') ? s._macdL.toFixed(3) : '', roc: (typeof s._roc3 === 'number') ? ((s._roc3 >= 0 ? '+' : '') + s._roc3.toFixed(3) + '%') : '', num: s.dailySignalCount, manual: { note: String(b.note || '').slice(0, 80), mode, regime: (s._dayRegime && s._dayRegime.label) || null, msTrend: s._msTrend || null } };
+    s.signals.push(sig); logSignal(sym, sig);
+    s.trade = buildCfdTrade(type, price, atr, sym);
+    s.trade._manual = true;
+    if (mode === 'market') { s.trade._oteVetted = true; delete s.trade.oteLimit; delete s.trade.oteExpiry; }
+    else if (sym === 'BTC') { s.trade._oteVetted = true; } // BTC has no server-side auction — market
+    // row carries the ladder for the dashboards
+    try { const h = s.lastHistEntry; if (h && h.symbol === sym) { h.sl = s.trade.slPrice; h.tp1 = s.trade.tp1Price; h.tp2 = s.trade.tp2Price; h.tp3 = s.trade.tp3Price; h.ladder = s.trade._ladder || null; sig.sl = (+s.trade.slPrice).toFixed(2); sig.tp1 = (+s.trade.tp1Price).toFixed(2); sig.tp2 = (+s.trade.tp2Price).toFixed(2); sig.tp3 = (+s.trade.tp3Price).toFixed(2); } } catch (eH) {}
+    s.lastSignalDir = type; s.lastSignalTs = Date.now(); s.lastNTs = Date.now(); s.lastAT = type; if (type === 'call') s.nC++; else s.nP++;
+    const m = '🖐️ ' + sym + ' MANUAL ' + type.toUpperCase() + ' LAUNCHED @ $' + price.toFixed(2) + ' (' + mode + (sig.manual.note ? ', "' + sig.manual.note + '"' : '') + ') — SL $' + (+s.trade.slPrice).toFixed(2) + ' · TP1 $' + (+s.trade.tp1Price).toFixed(2) + ' · TP2 $' + (+s.trade.tp2Price).toFixed(2) + ' · TP3 $' + (+s.trade.tp3Price).toFixed(2) + ' · ladder ' + (s.trade._ladder || '—') + ' · regime ' + (sig.manual.regime || '?') + ' · msTrend ' + (sig.manual.msTrend || '?') + ' [#' + s.dailySignalCount + ', MANUAL cohort] (2026-10-04).';
+    log(sym, m);
+    try { sendPush('🖐️ ' + sym + ' MANUAL ' + type.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · SL $' + (+s.trade.slPrice).toFixed(2) + ' · TP1 $' + (+s.trade.tp1Price).toFixed(2) + (mode === 'hold' ? ' · auctioning' : ' · at market'), 'signal'); } catch (e) {}
+    res.json({ ok: true, sym, type, mode, price: +price.toFixed(2), trade: { sl: s.trade.slPrice, tp1: s.trade.tp1Price, tp2: s.trade.tp2Price, tp3: s.trade.tp3Price, ladder: s.trade._ladder || null, vetted: s.trade._oteVetted !== false }, num: s.dailySignalCount });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
 // EA acknowledges it has flattened the position → clear the flag (idempotent by id).
 // ===== EA EVENT REPORTER (2026-09-21, the 00:00 RANGE5 put the EA never took) =====
 // The EA POSTs its own execution failures/skips here — ORDER_FAILED, SKIPPED, INIT_SKIP,
@@ -18557,12 +18832,13 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.12-20261002-ungated-holds', // bump on each deploy — lets /state verify what's live
+    build: '7.21-20261004-news-textbook', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const _since = (fundedEpoch && fundedEpoch.since) || ''; const _base = (fundedEpoch && fundedEpoch.base) || {}; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; if (d >= _since) wk += pnlLedger[d][sym].pnl - ((_base[d] && typeof _base[d][sym] === 'number') ? _base[d][sym] : 0); } } out.weekTotal = +wk.toFixed(2); out.account = (fundedEpoch && fundedEpoch.label) || null; return out; } catch (e) { return {}; } })(), // weekTotal counts the current funded-account epoch only (2026-10-01) // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     fundedGuard: (function () { try { const g = Object.assign({}, global._fundedGuard || {}); g.accounts = acctIds().map(acctTotals); return g; } catch (e) { return global._fundedGuard || null; } })(), // Neura guard readout (2026-09-20) + per-account day/total/limits/stand-down (2026-10-01)
     regimeScore: s._dayRegime || null, // KER+CHOP+Hurst composite classifier (2026-09-20): {label TREND|RANGE|MIXED, ker, chop, hurst, n, ts}
+    newsDesk: (function () { try { const now = Date.now(); const nxt = (_econCalCache.events || []).find(e => e.ts > now && e.high); const d = Object.values(global._newsDesk || {}).sort((a, b) => b.ts - a.ts)[0] || null; return { source: _econCalCache.source || null, next: nxt ? { event: nxt.event, inMin: Math.round((nxt.ts - now) / 60000), forecast: nxt.forecast, previous: nxt.previous } : null, last: d ? { label: d.label, minutesSince: Math.round((now - d.ts) / 60000), read: d.read && d.read[sym] || null, armed: d.armed && d.armed[sym] || null } : null }; } catch (e) { return null; } })(), // news desk summary (2026-10-04)
     gateJournal: (s._gateJournal || []).slice(-150), // 24h ring of real blocks {t, d, det, g(ate cohort), rg(regime), p} — 1/min per gate+dir (2026-09-30)
     trendTracker: (function () { try { return trendTrackerFor(sym); } catch (e) { return null; } })(), // blocked-signal win rate in TREND regime, with- vs counter-trend, by detector/gate (2026-10-01)
     volumeProfile: s._vp ? { poc: s._vp.poc, vah: s._vp.vah, val: s._vp.val, ticks: s._vp.ticks, session: s._vp.key } : null, // session tick-profile POC / value area (2026-09-20)
@@ -18732,6 +19008,18 @@ app.post('/feed/batch', (req, res) => {
 // just stopped and priceSnaps stayed blank. This watchdog makes feed death loud:
 // one log line + one push per outage (not per check), plus a recovery notice above.
 const FEED_STALE_MS = 90 * 1000; // 90s without a tick = stale (EA posts every 1s)
+function cfdMarketOpenET(nowMs) { // XAU / NAS100 CFD hours: Sun 18:00 ET → Fri 17:00 ET (daily break ignored)
+  try {
+    const d = new Date(nowMs);
+    const wd = d.toLocaleDateString('en-US', { weekday: 'short', timeZone: 'America/New_York' });
+    const et = d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'America/New_York' });
+    const m = (+et.slice(0, 2)) * 60 + (+et.slice(3, 5));
+    if (wd === 'Sat') return false;
+    if (wd === 'Sun' && m < 1080) return false;
+    if (wd === 'Fri' && m >= 1020) return false;
+    return true;
+  } catch (e) { return true; }
+}
 const FEED_WATCHDOG_BOOT_TS = Date.now(); // so "dead since boot" is also detected
 setInterval(() => {
   try {
@@ -18747,6 +19035,28 @@ setInterval(() => {
         console.log('[' + ts() + '] [FEED] 🚨 ' + sym + ' feed STALE — no ticks for ' + Math.round(age / 1000) + 's (last $' + s.lastPrice + '). Check MT5 EA / VPS connection.');
         try { sendPush('🚨 ' + sym + ' FEED DEAD', 'No ticks for ' + Math.round(age / 1000) + 's — check MT5/VPS', 'exit'); } catch (e) {}
       }
+      // THIN-FEED WATCHDOG (2026-10-03, the 10/01 13:05-13:30 ET NAS case): +$260 in 25 min
+      // and the server saw ~10 ticks — M5 bars with ONE print each (13:20 30482/30482/30482/
+      // 30482). Never "stale" (a tick every few minutes), so nothing fired and nothing warned;
+      // ROC/FAST/EXT-GUARD all judged the move from a handful of prints. Rule: during the
+      // symbol's market hours, <6 ticks in the last 60s while the feed is nominally alive →
+      // one log + one push per episode (re-arm after 15 min healthy). Tick-rate from the
+      // liquidity meter (s._tkWin, 2026-08-19).
+      try {
+        const _tk = Array.isArray(s._tkWin) ? s._tkWin.filter(w => now - w.ts <= 60000).reduce((a, b) => a + b.n, 0) : null;
+        const _mkt = sym === 'BTC' ? !btcWeekendClosed() : cfdMarketOpenET(now); // XAU/NAS: closed Fri 17:00 → Sun 18:00 ET
+        if (_tk !== null && _mkt && age <= FEED_STALE_MS && _tk < 6 && (s._tkWin.length >= 3)) {
+          s._thinSince = s._thinSince || now;
+          if (now - s._thinSince >= 120000 && !s._feedThin) {
+            s._feedThin = true;
+            console.log('[' + ts() + '] [FEED] ⚠️ ' + sym + ' feed THIN — ' + _tk + ' ticks in the last 60s during market hours (normal ≈60). Detectors are judging the move from a few prints; check the bridge terminal (2026-10-03).');
+            try { sendPush('⚠️ ' + sym + ' FEED THIN', _tk + ' ticks/min during market hours — bridge terminal?', 'alert'); } catch (e) {}
+          }
+        } else {
+          if (s._feedThin && _tk !== null && _tk >= 20) { s._feedThin = false; console.log('[' + ts() + '] [FEED] ✅ ' + sym + ' feed rate recovered — ' + _tk + ' ticks/min.'); }
+          if (_tk === null || _tk >= 6) s._thinSince = 0;
+        }
+      } catch (eTh) {}
     });
   } catch (e) { /* watchdog must never crash the server */ }
 }, 30 * 1000);
