@@ -4576,8 +4576,10 @@ function processPrice(sym, price, hi, lo) {
             let _uvPick = _uvOte ? pickAuctionLimit(s, _uvDir, price, _uvOte.limit, _uvT.atr || 0) : null; // pivot-AVWAP vs OTE (2026-09-20)
             if (_uvAtExt) {
               const _fb = +(_uvDir === 'put' ? price + 0.5 * _uvA : price - 0.5 * _uvA).toFixed(2);
-              const _ok = _uvPick && (_uvDir === 'put' ? _uvPick.limit - price : price - _uvPick.limit) >= 0.25 * _uvA;
-              if (!_ok) _uvPick = { limit: _fb, via: 'PULLBACK 0.5×ATR', avwap: _uvPick ? _uvPick.avwap : null, basis: '', n: 0, ageMin: 0 };
+              const _maxD = (parseFloat(process.env.EXT_PB_MAX_ATR) || 0.75) * _uvA; // cap (2026-10-05): a limit 1.5×ATR away is a wish, not an entry
+              const _dist = _uvPick ? (_uvDir === 'put' ? _uvPick.limit - price : price - _uvPick.limit) : -1;
+              if (!(_dist >= 0.25 * _uvA)) _uvPick = { limit: _fb, via: 'PULLBACK 0.5×ATR', avwap: _uvPick ? _uvPick.avwap : null, basis: '', n: 0, ageMin: 0 };
+              else if (_dist > _maxD) _uvPick = { limit: +(_uvDir === 'put' ? price + _maxD : price - _maxD).toFixed(2), via: 'PULLBACK cap 0.75×ATR (' + _uvPick.via + ' $' + _uvPick.limit.toFixed(2) + ' too far)', avwap: _uvPick.avwap, basis: '', n: 0, ageMin: 0 };
             }
             s._oteHold = { dir: _uvDir, trade: _uvT,
                            sigRef: (_uvSig && _uvSig.type === _uvDir) ? _uvSig : null,
@@ -4589,7 +4591,7 @@ function processPrice(sym, price, hi, lo) {
                            slPrice: (typeof _uvT.slPrice === 'number' && _uvT.slPrice > 0) ? (_uvAtExt ? +(_uvDir === 'put' ? _uvPick.limit + Math.abs(_uvT.ep - _uvT.slPrice) : _uvPick.limit - Math.abs(_uvT.ep - _uvT.slPrice)).toFixed(2) : _uvT.slPrice) : null,
                            // extreme-pullback 'signal left' leash = 0.75×ATR (EXT_PB_RUNAWAY_MULT), not the 0.3×ATR auction leash — the resolver runs every tick since 7.12, so a $1-2 wiggle must not cancel the hold
                            runaway: (_uvAtExt ? (parseFloat(process.env.EXT_PB_RUNAWAY_MULT) || 0.75) : (parseFloat(process.env.OTE_RUNAWAY_MULT) || 0.3)) * Math.max(_uvT.atr || 0, _uvAtExt ? (s._atr || 0) : 0),
-                           extPb: _uvAtExt, extDist: _uvPB.dist, extZone: _uvPB.zone,
+                           extPb: _uvAtExt, extDist: _uvPB.dist, extZone: _uvPB.zone, atrAtArm: _uvA,
                            armTs: Date.now(), expiry: Date.now() + (_uvAtExt ? (parseInt(process.env.EXT_PB_HOLD_SEC, 10) || 180) * 1000 : 240000) };
             s.trade = { active: false }; // NEVER null (2026-09-07 crash lesson)
             if (_uvAtExt) log(sym, '⏸️ EXTREME-PULLBACK HOLD ' + _uvDir.toUpperCase() + ' @ $' + price.toFixed(2) + ' — $' + (_uvPB.dist || 0).toFixed(2) + ' from the session ' + (_uvDir === 'put' ? 'low' : 'high') + ' (zone $' + _uvPB.zone.toFixed(2) + '); no market fire. Fires only if price pulls back to ' + _uvPick.via + ' $' + _uvPick.limit.toFixed(2) + ' within ' + Math.round((s._oteHold.expiry - Date.now()) / 1000) + 's; runaway = signal left → no trade (Jean 2026-10-01).');
@@ -11653,16 +11655,18 @@ function processPrice(sym, price, hi, lo) {
             if (s.lastHistEntry && s.lastHistEntry.type === _ohDir) s.lastHistEntry.pendingEntry = true;
             const _ohA = Math.max(s._atr || 0, atrVal || 0, _ohT.atr || 0);
             let _ohPick = _ohOte ? pickAuctionLimit(s, _ohDir, price, _ohOte.limit, atrVal > 0 ? atrVal : (_ohT.atr || 0)) : null; // pivot-AVWAP vs OTE (2026-09-20)
-            if (_ohPB.at) { // extreme-pullback: the limit must be a real pullback (≥0.25×ATR), else 0.5×ATR back from the fire price
+            if (_ohPB.at) { // extreme-pullback: the limit must be a real pullback (≥0.25×ATR) and not a wish (≤0.75×ATR, 2026-10-05); else 0.5×ATR back from the fire price
               const _fb = +(_ohDir === 'put' ? price + 0.5 * _ohA : price - 0.5 * _ohA).toFixed(2);
-              const _ok = _ohPick && (_ohDir === 'put' ? _ohPick.limit - price : price - _ohPick.limit) >= 0.25 * _ohA;
-              if (!_ok) _ohPick = { limit: _fb, via: 'PULLBACK 0.5×ATR', avwap: _ohPick ? _ohPick.avwap : null, basis: '', n: 0, ageMin: 0 };
+              const _maxD = (parseFloat(process.env.EXT_PB_MAX_ATR) || 0.75) * _ohA;
+              const _dist = _ohPick ? (_ohDir === 'put' ? _ohPick.limit - price : price - _ohPick.limit) : -1;
+              if (!(_dist >= 0.25 * _ohA)) _ohPick = { limit: _fb, via: 'PULLBACK 0.5×ATR', avwap: _ohPick ? _ohPick.avwap : null, basis: '', n: 0, ageMin: 0 };
+              else if (_dist > _maxD) _ohPick = { limit: +(_ohDir === 'put' ? price + _maxD : price - _maxD).toFixed(2), via: 'PULLBACK cap 0.75×ATR (' + _ohPick.via + ' $' + _ohPick.limit.toFixed(2) + ' too far)', avwap: _ohPick.avwap, basis: '', n: 0, ageMin: 0 };
             }
             s._oteHold = { dir: _ohDir, trade: _ohT,
                            sigRef: (_ohSig && _ohSig.type === _ohDir) ? _ohSig : null,
                            histRef: (s.lastHistEntry && s.lastHistEntry.type === _ohDir) ? s.lastHistEntry : null,
                            sigPrice: _ohT.ep, ote: _ohPick.limit, limVia: _ohPick.via, oteFib: _ohOte ? _ohOte.limit : null, avwap: _ohPick.avwap,
-                           extPb: _ohPB.at, extDist: _ohPB.dist, extZone: _ohPB.zone,
+                           extPb: _ohPB.at, extDist: _ohPB.dist, extZone: _ohPB.zone, atrAtArm: _ohA,
                            slPrice: (typeof _ohT.slPrice === 'number' && _ohT.slPrice > 0) ? (_ohPB.at ? +(_ohDir === 'put' ? _ohPick.limit + Math.abs(_ohT.ep - _ohT.slPrice) : _ohPick.limit - Math.abs(_ohT.ep - _ohT.slPrice)).toFixed(2) : _ohT.slPrice) : null, // extreme-pullback: invalidation stop = original SL distance beyond the pullback limit (2026-10-01)
                            // Runaway leash 0.5→0.3×ATR (2026-09-12, Jean): runaway fills averaged −$2.15
                            // vs signal this week; releasing ~$1.3 earlier halves the chase. OTE_RUNAWAY_MULT
@@ -11722,7 +11726,27 @@ function processPrice(sym, price, hi, lo) {
         if (_oh && (sym === 'XAU' || sym === 'NAS100')) {
           const _ohC = _oh.dir === 'call';
           const _ohSlX = _oh.slPrice !== null && (_ohC ? price <= _oh.slPrice : price >= _oh.slPrice);
-          const _ohTouch = _ohC ? price <= _oh.ote : price >= _oh.ote;
+          let _ohTouch = _ohC ? price <= _oh.ote : price >= _oh.ote;
+          // EXTREME-PULLBACK RESUMPTION (2026-10-05, the 02:17 XAU call: hold at 4153.94 waiting for AVWAP
+          // 4145, price pulled back to 4146.9 — a 1.2×ATR pullback — never printed 4145, the 3-min window
+          // expired and Jean had to buy 4148.5 by hand; TP1 in minutes). Two fixes: (1) the pullback
+          // target is capped at EXT_PB_MAX_ATR (0.75×ATR) from the fire price — a limit 1.5×ATR away is a
+          // wish, not an entry; (2) a pullback that has gone ≥EXT_PB_MIN_ATR (0.5×ATR) and then RESUMES by
+          // ≥0.2×ATR toward the fire direction fills at market — that resumption IS the entry. Once the
+          // minimum pullback is in, the window gets one EXT_PB_GRACE_SEC (120 s) extension.
+          let _ohResume = false;
+          if (_oh.extPb) {
+            try {
+              const _a = Math.max(_oh.atrAtArm || 0, atrVal || 0, s._atr || 0);
+              _oh.pbBest = (_oh.pbBest === undefined || _oh.pbBest === null) ? price : (_ohC ? Math.min(_oh.pbBest, price) : Math.max(_oh.pbBest, price));
+              const _pbDepth = _ohC ? (_oh.sigPrice - _oh.pbBest) : (_oh.pbBest - _oh.sigPrice);
+              const _pbMin = (parseFloat(process.env.EXT_PB_MIN_ATR) || 0.5) * _a;
+              const _bounce = _ohC ? (price - _oh.pbBest) : (_oh.pbBest - price);
+              if (_pbDepth >= _pbMin && !_oh.graced) { _oh.graced = true; const _gs = (parseInt(process.env.EXT_PB_GRACE_SEC, 10) || 120); _oh.expiry = Math.max(_oh.expiry, _zNow + _gs * 1000); log(sym, '⏸️ EXTREME-PULLBACK ' + _oh.dir.toUpperCase() + ' — pullback underway ($' + _pbDepth.toFixed(2) + ' ≥ 0.5×ATR); window extended ' + _gs + 's for the resumption (2026-10-05).'); }
+              if (_pbDepth >= _pbMin && _bounce >= 0.2 * _a) _ohResume = true;
+            } catch (eRS) {}
+          }
+          if (_ohResume) _ohTouch = true;
           const _ohRun = _oh.runaway > 0 && (_ohC ? (price - _oh.sigPrice) >= _oh.runaway : (_oh.sigPrice - price) >= _oh.runaway);
           const _ohExp = _zNow >= _oh.expiry;
           if (_ohSlX) {
@@ -11783,7 +11807,7 @@ function processPrice(sym, price, hi, lo) {
             delete _t.oteLimit; delete _t.oteExpiry; delete _t.oteImpulseHi; delete _t.oteImpulseLo; // server-side hold supersedes the legacy EA-side OTE limit on XAU
             _t._oteVetted = true;
             s.trade = _t;
-            const _ohWhy = _ohTouch ? (_oh.extPb ? 'extreme pullback ' + (_oh.limVia === 'AVWAP' ? 'AVWAP' : _oh.limVia === 'PULLBACK 0.5×ATR' ? '0.5×ATR' : 'OTE') + ' touch' : (_oh.limVia === 'AVWAP' ? 'AVWAP touch' : 'OTE touch')) : _ohRun ? 'runaway ≥0.5×ATR' : 'window expiry'; // 'AVWAP touch' = pivot-anchored VWAP limit filled (2026-09-20) — grades as its own via class; 'extreme pullback …' = the 1×ATR extreme hold filled (2026-10-01)
+            const _ohWhy = _ohTouch ? (_oh.extPb ? (_ohResume ? 'extreme pullback resumption' : 'extreme pullback ' + (_oh.limVia === 'AVWAP' ? 'AVWAP' : /PULLBACK/.test(_oh.limVia || '') ? 'capped-limit' : 'OTE') + ' touch') : (_oh.limVia === 'AVWAP' ? 'AVWAP touch' : 'OTE touch')) : _ohRun ? 'runaway ≥0.5×ATR' : 'window expiry'; // resumption / capped-limit added 2026-10-05
             const _ohInfo = { fill: +price.toFixed(2), sigPrice: +_oh.sigPrice.toFixed(2), improve: +_ohImp.toFixed(2), waitedSec: Math.round((_zNow - _oh.armTs) / 1000), via: _ohWhy, extPb: _oh.extPb === true || undefined };
             if (_oh.extPb) _t._extPb = true;
             if (_oh.sigRef) { _oh.sigRef.pendingEntry = false; _oh.sigRef.entryActual = _ohInfo.fill; _oh.sigRef.oteHold = _ohInfo; _oh.sigRef.price = price.toFixed(2); /* 2026-09-08: the EA anchors its chase-guard (and its dedupe key) on sig.price — a fill un-hiding a minutes-old row must present the FILL, not the stale signal price */ if (typeof _t.slPrice === 'number') { _oh.sigRef.sl = _t.slPrice.toFixed(2); _oh.sigRef.tp1 = _t.tp1Price.toFixed(2); _oh.sigRef.tp2 = _t.tp2Price.toFixed(2); _oh.sigRef.tp3 = _t.tp3Price.toFixed(2); } }
@@ -18832,7 +18856,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.21-20261004-news-textbook', // bump on each deploy — lets /state verify what's live
+    build: '7.22-20261005-pullback-resumption', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const _since = (fundedEpoch && fundedEpoch.since) || ''; const _base = (fundedEpoch && fundedEpoch.base) || {}; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; if (d >= _since) wk += pnlLedger[d][sym].pnl - ((_base[d] && typeof _base[d][sym] === 'number') ? _base[d][sym] : 0); } } out.weekTotal = +wk.toFixed(2); out.account = (fundedEpoch && fundedEpoch.label) || null; return out; } catch (e) { return {}; } })(), // weekTotal counts the current funded-account epoch only (2026-10-01) // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
