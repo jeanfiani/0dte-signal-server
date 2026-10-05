@@ -2276,6 +2276,10 @@ function cohortFor(reason) {
   if (/EOD-CONT-WF/.test(reason)) return 'EOD-CONT-WF'; // with-trend blocks in the last 90min of RTH (2026-09-28, Jean's end-of-session drift hypothesis) — must precede TREND-CONT-WF
   if (/LADDER-77/.test(reason)) return 'LADDER-77'; // proportional 7/7 ladder sim on live XAU fires (2026-09-28)
   if (/LADDER-510/.test(reason)) return 'LADDER-510'; // current 5/10 ladder, same fires, same sequence rule
+  if (/XAU-SESS-REJ-MULTI/.test(reason)) return 'XAU-SESS-REJ-MULTI'; // XAU session-extreme rejection, extreme tested ≥2× (2026-10-05, the 4125 triple bottom)
+  if (/XAU-SESS-REJ-CRASH/.test(reason)) return 'XAU-SESS-REJ-CRASH';
+  if (/XAU-SESS-REJ/.test(reason)) return 'XAU-SESS-REJ';
+  if (/BTC-SESS-REJ-MULTI/.test(reason)) return 'BTC-SESS-REJ-MULTI';
   if (/BTC-SESS-REJ-CRASH/.test(reason)) return 'BTC-SESS-REJ-CRASH'; // V-REC v2: ≥2×ATR flush + rejection close, any regime (2026-09-24) — must precede the plain match
   if (/BTC-SESS-REJ/.test(reason)) return 'BTC-SESS-REJ'; // confirmed session-extreme rejection in RANGE regime (2026-09-22, the 86,670 case) — must precede SESS-EXTREME
   if (/support-proximity|resistance-proximity/.test(reason)) return 'LEVEL-PROX'; // Asian-low/high proximity blocks (2026-09-22) — was 'unmatched'; the 9/21 night put-killer, 2W/2L/1S on its first look
@@ -4209,7 +4213,15 @@ function processPrice(sym, price, hi, lo) {
       // CALL the low came after the high). No `held` requirement — that flag is what kept
       // V-REC live at ZERO fires for four days while twelve bounce candidates won. Cohorts
       // BTC-SESS-REJ (RNG, continuity) and BTC-SESS-REJ-CRASH; promote at ≥60%/≥15.
-      if (isMT5 && sym === 'BTC' && !btcWeekendClosed() && isFinite(s.sessionHigh) && isFinite(s.sessionLow) && Array.isArray(s._m5) && s._m5.length >= 12) {
+      // XAU ADDED AS SHADOW (2026-10-05, Jean: "the session low was hit 3 times at 4125 and the
+      // bot never took the call"). XAU has no live session-extreme-rejection lane: the dormant
+      // bounce lanes (ZONE-OB-RT 30%, LIQ-POOL 32%, VA-FADE 33%) buy blind at lows and lose
+      // 2 in 3; this lane waits for the M5 close back inside. Lanes are symbol-prefixed
+      // (XAU-SESS-REJ / -CRASH) and a MULTI sub-cohort counts extremes tested ≥2 times (the
+      // double/triple-bottom case). Live fire stays BTC-only until XAU earns its own bar.
+      const _srSym = sym === 'BTC' || sym === 'XAU';
+      const _srOpen = sym === 'BTC' ? !btcWeekendClosed() : cfdMarketOpenET(Date.now());
+      if (isMT5 && _srSym && _srOpen && isFinite(s.sessionHigh) && isFinite(s.sessionLow) && Array.isArray(s._m5) && s._m5.length >= 12) {
         const _srDl = Array.isArray(s.dailyLevels) ? s.dailyLevels : [];
         const _srAdr = _srDl.length >= 3 ? _srDl.reduce((a, d0) => a + (d0.high - d0.low), 0) / _srDl.length : 0;
         const _srRng = !!(s._dayRegime && s._dayRegime.label === 'RANGE');
@@ -4223,9 +4235,10 @@ function processPrice(sym, price, hi, lo) {
           const _vp = s._vp || null;
           const _hiIn = _vp ? _vp.vah : s.sessionHigh - 0.05 * _srAdr; // "back inside" line for the high
           const _loIn = _vp ? _vp.val : s.sessionLow + 0.05 * _srAdr;  // and for the low
-          s._sr = s._sr || { hiTag: 0, loTag: 0, hiTs: 0, loTs: 0, m5Ts: 0 };
-          if (price >= s.sessionHigh - 0.02 * _srAdr && (!_vp || price > _vp.vah)) s._sr.hiTag = Date.now();
-          if (price <= s.sessionLow + 0.02 * _srAdr && (!_vp || price < _vp.val)) s._sr.loTag = Date.now();
+          s._sr = s._sr || { hiTag: 0, loTag: 0, hiTs: 0, loTs: 0, m5Ts: 0, hiN: 0, loN: 0, hiLvl: 0, loLvl: 0 };
+          // test counting (2026-10-05): a tag ≥20 min after the previous one at the same extreme (±0.05×ADR) is another TEST of it
+          if (price >= s.sessionHigh - 0.02 * _srAdr && (!_vp || price > _vp.vah)) { if (Date.now() - s._sr.hiTag > 1200000) { s._sr.hiN = (Math.abs(s.sessionHigh - (s._sr.hiLvl || 0)) <= 0.05 * _srAdr ? (s._sr.hiN || 0) : 0) + 1; s._sr.hiLvl = s.sessionHigh; } s._sr.hiTag = Date.now(); }
+          if (price <= s.sessionLow + 0.02 * _srAdr && (!_vp || price < _vp.val)) { if (Date.now() - s._sr.loTag > 1200000) { s._sr.loN = (Math.abs(s.sessionLow - (s._sr.loLvl || 0)) <= 0.05 * _srAdr ? (s._sr.loN || 0) : 0) + 1; s._sr.loLvl = s.sessionLow; } s._sr.loTag = Date.now(); }
           const _lc = (Array.isArray(s._m5) && s._m5.length) ? s._m5[s._m5.length - 1] : null;
           if (_lc && _lc.ts !== s._sr.m5Ts) {
             s._sr.m5Ts = _lc.ts;
@@ -4241,7 +4254,7 @@ function processPrice(sym, price, hi, lo) {
             // (BTC_SESSREJ_LIVE=0 kills by hand). Rows: score ⬆/⬇SESSREJ-RT, _sessLive on the trade.
             const _srLiveFire = (dir, sl, tp, lane) => {
               try {
-                if (lane !== 'BTC-SESS-REJ' || process.env.BTC_SESSREJ_LIVE === '0') return false;
+                if (!/^BTC-SESS-REJ(-MULTI)?$/.test(lane) || process.env.BTC_SESSREJ_LIVE === '0') return false; // RNG arm (single or multi-test); CRASH stays shadow; XAU lanes never live here
                 if ((s.trade && s.trade.active) || s._oteHold || s._invHold || s._macdHold) return false;
                 // bench check (cached 10 min)
                 const _nowB = Date.now();
@@ -4271,13 +4284,13 @@ function processPrice(sym, price, hi, lo) {
             };
             // PUT side: needs RANGE regime or an up-spike flush (CRASH arm)
             if (_fresh(s._sr.hiTag) && _lc.c < _hiIn && Date.now() - s._sr.hiTs > 7200000 && (_srRng || _crashUp)) {
-              s._sr.hiTs = Date.now(); const _lane = _srRng ? 'BTC-SESS-REJ' : 'BTC-SESS-REJ-CRASH'; const _sl = +(s.sessionHigh + 0.1 * _srAdr).toFixed(2), _tp = +((_vp && _vp.poc < price) ? _vp.poc : price - 0.3 * _srAdr).toFixed(2);
-              if (_tp < price) { _push(_lane, 'put', _sl, _tp, '🎯 ' + _lane + ' PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session high $' + s.sessionHigh.toFixed(0) + ' tagged, M5 closed back inside (' + (_vp ? 'VAH $' + _vp.vah.toFixed(0) : 'extreme −0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm: ' + _srSwing.toFixed(1) + '×ATR spike in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp ? ' (POC)' : ' (0.3×ADR)') + ' (2026-09-22; two arms 2026-09-24).'); _srLiveFire('put', _sl, _tp, _lane); }
+              s._sr.hiTs = Date.now(); const _lane = (_srRng ? sym + '-SESS-REJ' : sym + '-SESS-REJ-CRASH') + ((s._sr.hiN || 1) >= 2 && _srRng ? '-MULTI' : ''); const _sl = +(s.sessionHigh + 0.1 * _srAdr).toFixed(2), _tp = +((_vp && _vp.poc < price) ? _vp.poc : price - 0.3 * _srAdr).toFixed(2);
+              if (_tp < price) { _push(_lane, 'put', _sl, _tp, '🎯 ' + _lane + ' PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session high $' + s.sessionHigh.toFixed(0) + ' tagged (test #' + (s._sr.hiN || 1) + '), M5 closed back inside (' + (_vp ? 'VAH $' + _vp.vah.toFixed(0) : 'extreme −0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm: ' + _srSwing.toFixed(1) + '×ATR spike in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp ? ' (POC)' : ' (0.3×ADR)') + ' (2026-09-22; two arms 2026-09-24).'); _srLiveFire('put', _sl, _tp, _lane); }
             }
             // CALL side: needs RANGE regime or a down-flush (CRASH arm = V-REC v2)
             if (_fresh(s._sr.loTag) && _lc.c > _loIn && Date.now() - s._sr.loTs > 7200000 && (_srRng || _crashDn)) {
-              s._sr.loTs = Date.now(); const _lane = _srRng ? 'BTC-SESS-REJ' : 'BTC-SESS-REJ-CRASH'; const _sl = +(s.sessionLow - 0.1 * _srAdr).toFixed(2), _tp = +((_vp && _vp.poc > price) ? _vp.poc : price + 0.3 * _srAdr).toFixed(2);
-              if (_tp > price) { _push(_lane, 'call', _sl, _tp, '🎯 ' + _lane + ' CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session low $' + s.sessionLow.toFixed(0) + ' tagged, M5 closed back inside (' + (_vp ? 'VAL $' + _vp.val.toFixed(0) : 'extreme +0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm (V-REC v2): ' + _srSwing.toFixed(1) + '×ATR flush in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp ? ' (POC)' : ' (0.3×ADR)') + ' (the 82,879 ATL case, 2026-09-24).'); _srLiveFire('call', _sl, _tp, _lane); }
+              s._sr.loTs = Date.now(); const _lane = (_srRng ? sym + '-SESS-REJ' : sym + '-SESS-REJ-CRASH') + ((s._sr.loN || 1) >= 2 && _srRng ? '-MULTI' : ''); const _sl = +(s.sessionLow - 0.1 * _srAdr).toFixed(2), _tp = +((_vp && _vp.poc > price) ? _vp.poc : price + 0.3 * _srAdr).toFixed(2);
+              if (_tp > price) { _push(_lane, 'call', _sl, _tp, '🎯 ' + _lane + ' CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session low $' + s.sessionLow.toFixed(0) + ' tagged (test #' + (s._sr.loN || 1) + '), M5 closed back inside (' + (_vp ? 'VAL $' + _vp.val.toFixed(0) : 'extreme +0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm (V-REC v2): ' + _srSwing.toFixed(1) + '×ATR flush in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp ? ' (POC)' : ' (0.3×ADR)') + ' (the 82,879 ATL case, 2026-09-24).'); _srLiveFire('call', _sl, _tp, _lane); }
             }
           }
         }
@@ -18910,7 +18923,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.24-20261005-sessrej-live', // bump on each deploy — lets /state verify what's live
+    build: '7.25-20261005-xau-sessrej-shadow', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const _since = (fundedEpoch && fundedEpoch.since) || ''; const _base = (fundedEpoch && fundedEpoch.base) || {}; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; if (d >= _since) wk += pnlLedger[d][sym].pnl - ((_base[d] && typeof _base[d][sym] === 'number') ? _base[d][sym] : 0); } } out.weekTotal = +wk.toFixed(2); out.account = (fundedEpoch && fundedEpoch.label) || null; return out; } catch (e) { return {}; } })(), // weekTotal counts the current funded-account epoch only (2026-10-01) // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
