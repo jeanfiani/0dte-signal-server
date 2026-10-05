@@ -2411,7 +2411,7 @@ function pnlMultFor(sym, t) {
     if (sym === 'NAS100' && t && t.ep > 0 && t.slPrice > 0 && Math.abs(t.ep - t.slPrice) > NAS_WIDE_SL) return 20;
     // RANGE5 live fires trade at HALF the symbol lot in the EA (2026-09-20 half-lot rule) —
     // book them at half the multiplier so the ledger and the funded guard see real dollars.
-    if (sym === 'BTC' && t && (t._r5Live || t._legLive)) return (PNL_MULT[sym] || 1) * 0.5; // BIGLEG live rows also trade at half lot (EA matches "BIGLEG", 2026-09-21)
+    if (sym === 'BTC' && t && (t._r5Live || t._legLive || t._sessLive)) return (PNL_MULT[sym] || 1) * 0.5; // BIGLEG live rows also trade at half lot (EA matches "BIGLEG", 2026-09-21)
   } catch (e) {}
   return PNL_MULT[sym] || 1;
 }
@@ -4231,15 +4231,53 @@ function processPrice(sym, price, hi, lo) {
             s._sr.m5Ts = _lc.ts;
             const _fresh = (t0) => t0 > 0 && Date.now() - t0 < 5400000; // tag within the last 90min
             const _push = (lane, dir, sl, tp, m) => { s.blockedOutcomes = s.blockedOutcomes || []; s.blockedOutcomes.push({ ts: Date.now(), time: ts(), symbol: sym, detector: lane, type: dir, price: price, virtualTp1: tp, virtualSl: sl, maxMin: 480, blockReason: m, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null }); log(sym, m); };
+            // ===== SESS-REJ GOES LIVE (2026-10-05, Jean: "it should have earned its go-live from now") =====
+            // Cohort BTC-SESS-REJ 9W/3L/5S = 75% W/(W+L) over 17 resolved — past the bar set on
+            // 2026-09-22 (≥60% over ≥15). RNG arm only; the CRASH arm (2W/1L) stays shadow until it
+            // earns its own. Geometry = the shadow's: SL beyond the session extreme by 0.1×ADR,
+            // TP1 0.25×ADR (secure), TP2 = the shadow target (POC / 0.3×ADR), TP3 0.5×ADR. Half
+            // lot like RANGE5 (EA matches "SESSREJ"), cap-exempt, weekdays only. Bench rule
+            // ENFORCED: net-negative over the first 6 live fires → back to shadow
+            // (BTC_SESSREJ_LIVE=0 kills by hand). Rows: score ⬆/⬇SESSREJ-RT, _sessLive on the trade.
+            const _srLiveFire = (dir, sl, tp, lane) => {
+              try {
+                if (lane !== 'BTC-SESS-REJ' || process.env.BTC_SESSREJ_LIVE === '0') return false;
+                if ((s.trade && s.trade.active) || s._oteHold || s._invHold || s._macdHold) return false;
+                // bench check (cached 10 min)
+                const _nowB = Date.now();
+                if (!global._srBenchTs || _nowB - global._srBenchTs > 600000) {
+                  global._srBenchTs = _nowB; let w = 0, l = 0;
+                  for (const h of signalHistory) { if (h.symbol !== 'BTC' || !/SESSREJ-RT/.test(h.score || '') || !h.outcomes) continue; if (h.outcomes.tp1Hit) w++; else if (h.outcomes.slHit) l++; }
+                  const benched = (w + l >= 6) && (w < l);
+                  if (benched && !global._srBenched) log(sym, '🛏️ BTC SESS-REJ live lane BENCHED — ' + w + 'W/' + l + 'L over the first ' + (w + l) + ' live fires is net-negative (pre-registered bench rule, 2026-10-05). Shadow continues; re-earn at ≥60% over ≥15.');
+                  global._srBenched = benched; global._srRec = { w, l };
+                }
+                if (global._srBenched) return false;
+                const isL = dir === 'call';
+                const _tp1 = isL ? price + 0.25 * _srAdr : price - 0.25 * _srAdr;
+                const _tp3 = isL ? price + 0.5 * _srAdr : price - 0.5 * _srAdr;
+                const _tp2 = isL ? Math.max(tp, _tp1 + 0.01) : Math.min(tp, _tp1 - 0.01);
+                if (isL ? (sl >= price || _tp1 <= price) : (sl <= price || _tp1 >= price)) return false;
+                s.dailySignalCount++;
+                const _sig = { type: dir, time: ts(), price: price.toFixed(2), score: (isL ? '⬆' : '⬇') + 'SESSREJ-RT', rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: sl.toFixed(2), tp1: _tp1.toFixed(2), tp2: _tp2.toFixed(2), tp3: _tp3.toFixed(2), regime: (s._dayRegime && s._dayRegime.label) || null, oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: 'sess-rej rejection close' } };
+                s.signals.push(_sig); logSignal(sym, _sig);
+                s.trade = buildCfdTrade(dir, price, (s._atr || _srAdr / 20), sym);
+                s.trade._oteVetted = true; s.trade._sessLive = true;
+                s.trade.slPrice = +sl.toFixed(2); s.trade.tp1Price = +_tp1.toFixed(2); s.trade.tp2Price = +_tp2.toFixed(2); s.trade.tp3Price = +_tp3.toFixed(2);
+                log(sym, '🎯 BTC SESS-REJ ' + dir.toUpperCase() + ' LIVE FIRE @ $' + price.toFixed(0) + ' — session ' + (isL ? 'low' : 'high') + ' rejected (M5 closed back inside, regime RANGE) · SL $' + sl.toFixed(0) + ' (beyond the extreme) · TP1 $' + _tp1.toFixed(0) + ' · TP2 $' + _tp2.toFixed(0) + ' · TP3 $' + _tp3.toFixed(0) + ' · live record ' + ((global._srRec && global._srRec.w) || 0) + 'W/' + ((global._srRec && global._srRec.l) || 0) + 'L [promoted 2026-10-05 on 9W/3L/5S].');
+                sendPush('🎯 BTC SESS-REJ ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(0) + ' · SL $' + sl.toFixed(0) + ' · TP1 $' + _tp1.toFixed(0) + ' · session-extreme rejection', 'signal');
+                return true;
+              } catch (eSRL) { return false; }
+            };
             // PUT side: needs RANGE regime or an up-spike flush (CRASH arm)
             if (_fresh(s._sr.hiTag) && _lc.c < _hiIn && Date.now() - s._sr.hiTs > 7200000 && (_srRng || _crashUp)) {
               s._sr.hiTs = Date.now(); const _lane = _srRng ? 'BTC-SESS-REJ' : 'BTC-SESS-REJ-CRASH'; const _sl = +(s.sessionHigh + 0.1 * _srAdr).toFixed(2), _tp = +((_vp && _vp.poc < price) ? _vp.poc : price - 0.3 * _srAdr).toFixed(2);
-              if (_tp < price) _push(_lane, 'put', _sl, _tp, '🎯 ' + _lane + ' PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session high $' + s.sessionHigh.toFixed(0) + ' tagged, M5 closed back inside (' + (_vp ? 'VAH $' + _vp.vah.toFixed(0) : 'extreme −0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm: ' + _srSwing.toFixed(1) + '×ATR spike in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp ? ' (POC)' : ' (0.3×ADR)') + ' (2026-09-22; two arms 2026-09-24).');
+              if (_tp < price) { _push(_lane, 'put', _sl, _tp, '🎯 ' + _lane + ' PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session high $' + s.sessionHigh.toFixed(0) + ' tagged, M5 closed back inside (' + (_vp ? 'VAH $' + _vp.vah.toFixed(0) : 'extreme −0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm: ' + _srSwing.toFixed(1) + '×ATR spike in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp ? ' (POC)' : ' (0.3×ADR)') + ' (2026-09-22; two arms 2026-09-24).'); _srLiveFire('put', _sl, _tp, _lane); }
             }
             // CALL side: needs RANGE regime or a down-flush (CRASH arm = V-REC v2)
             if (_fresh(s._sr.loTag) && _lc.c > _loIn && Date.now() - s._sr.loTs > 7200000 && (_srRng || _crashDn)) {
               s._sr.loTs = Date.now(); const _lane = _srRng ? 'BTC-SESS-REJ' : 'BTC-SESS-REJ-CRASH'; const _sl = +(s.sessionLow - 0.1 * _srAdr).toFixed(2), _tp = +((_vp && _vp.poc > price) ? _vp.poc : price + 0.3 * _srAdr).toFixed(2);
-              if (_tp > price) _push(_lane, 'call', _sl, _tp, '🎯 ' + _lane + ' CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session low $' + s.sessionLow.toFixed(0) + ' tagged, M5 closed back inside (' + (_vp ? 'VAL $' + _vp.val.toFixed(0) : 'extreme +0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm (V-REC v2): ' + _srSwing.toFixed(1) + '×ATR flush in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp ? ' (POC)' : ' (0.3×ADR)') + ' (the 82,879 ATL case, 2026-09-24).');
+              if (_tp > price) { _push(_lane, 'call', _sl, _tp, '🎯 ' + _lane + ' CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session low $' + s.sessionLow.toFixed(0) + ' tagged, M5 closed back inside (' + (_vp ? 'VAL $' + _vp.val.toFixed(0) : 'extreme +0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm (V-REC v2): ' + _srSwing.toFixed(1) + '×ATR flush in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp ? ' (POC)' : ' (0.3×ADR)') + ' (the 82,879 ATL case, 2026-09-24).'); _srLiveFire('call', _sl, _tp, _lane); }
             }
           }
         }
@@ -17018,7 +17056,7 @@ function checkExit(sym, price) {
       // the thesis IS high SL + very wide TP (structural 0.75×ADR stop, 5-day-mid
       // target) — clamping it to the scalp caps would gut the design. _r5Live trades
       // keep their thesis geometry; every other path stays capped.
-      if (_capT > 0 && !t._r5Live && !t._legLive) { // _legLive (BTC-BIGLEG live lane, 2026-09-21) keeps its ADR-scale geometry too
+      if (_capT > 0 && !t._r5Live && !t._legLive && !t._sessLive) { // _sessLive (SESS-REJ live, 2026-10-05) keeps its extreme-anchored geometry // _legLive (BTC-BIGLEG live lane, 2026-09-21) keeps its ADR-scale geometry too
         if (typeof t.tp1Price === 'number' && Math.abs(t.ep - t.tp1Price) > _capT + 0.01) {
           const _oldT1 = t.tp1Price;
           t.tp1Price = +(iC ? t.ep + _capT : t.ep - _capT).toFixed(2);
@@ -18872,8 +18910,8 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.23-20261005-scalp-full-exit', // bump on each deploy — lets /state verify what's live
-    btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
+    build: '7.24-20261005-sessrej-live', // bump on each deploy — lets /state verify what's live
+    btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const _since = (fundedEpoch && fundedEpoch.since) || ''; const _base = (fundedEpoch && fundedEpoch.base) || {}; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; if (d >= _since) wk += pnlLedger[d][sym].pnl - ((_base[d] && typeof _base[d][sym] === 'number') ? _base[d][sym] : 0); } } out.weekTotal = +wk.toFixed(2); out.account = (fundedEpoch && fundedEpoch.label) || null; return out; } catch (e) { return {}; } })(), // weekTotal counts the current funded-account epoch only (2026-10-01) // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     fundedGuard: (function () { try { const g = Object.assign({}, global._fundedGuard || {}); g.accounts = acctIds().map(acctTotals); return g; } catch (e) { return global._fundedGuard || null; } })(), // Neura guard readout (2026-09-20) + per-account day/total/limits/stand-down (2026-10-01)
