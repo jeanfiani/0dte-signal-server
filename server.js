@@ -17109,6 +17109,22 @@ function checkExit(sym, price) {
         log(sym, '🎯 SCALP TP1 — FULL EXIT — $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2) + ' (TP1-only scalp, Phase 3.94 — no TP2/TP3).');
         sendPush('🎯 ' + sym + ' SCALP TP1 — FULL EXIT', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · close entire position', 'signal');
         updateSignalOutcome(sym, price); // capture outcome BEFORE clearing trade
+        // SCALP = ONE TP, 100% OUT (2026-10-05, Jean: the 10:29 TREND put scalp "closed only 50% at
+        // TP1 and SL'd the rest"). The server exited in full here, but the EA only knows the
+        // standard 50%-at-TP1 playbook and then saw "trade cleared" with half a position still
+        // open — which rode down to the stop. Three fixes: (1) a closeRequest so the EA flattens
+        // the remainder at market NOW (the TP3 channel, id-deduped); (2) the trade block carries
+        // scalp:true so the EA closes 100% at TP1 itself even before the poll; (3) the row is
+        // stamped scalpExit instead of slHit — a full exit at TP1 is a WIN, not a stop.
+        try {
+          const _e = s.lastHistEntry;
+          if (_e && _e.symbol === sym) { _e.outcomes = _e.outcomes || {}; delete _e.outcomes.slHit; delete _e.outcomes.slHitTs; _e.outcomes.scalpExit = +price.toFixed(2); _e.outcomes.closePrice = +price.toFixed(2); }
+          if (!(s.closeRequest && s.closeRequest.active)) {
+            s.closeRequest = { active: true, id: 'scalp-' + Date.now(), ts: Date.now(), type: t.type || '', ep: t.ep || 0, source: 'scalp-tp1-full-exit' };
+            log(sym, '🚪 SCALP CLOSE REQUEST → EA — TP1 reached @ $' + price.toFixed(2) + '; flatten 100% at market (one target, no runner — 2026-10-05).');
+          }
+          // P&L: updateSignalOutcome above already booked the t1 half AND the 'close' half at the TP1 price (t.t1 + t.sl set together) = full size at TP1. Nothing more to book.
+        } catch (eSC) {}
         s.trade = { active: false };
         return;
       }
@@ -18675,7 +18691,7 @@ app.get('/ea/:sym', (req, res) => {
   res.json({
     n: 1, id: t.ts, type: t.type || '', ep: +t.ep || 0,
     sl: +t.slPrice || 0, tp1: +t.tp1Price || 0, tp2: +t.tp2Price || 0, tp3: +t.tp3Price || 0,
-    age: Math.round((Date.now() - t.ts) / 1000), ts: Date.now(), close: cr,
+    age: Math.round((Date.now() - t.ts) / 1000), ts: Date.now(), close: cr, scalp: !!t.scalp,
     // FAST BE-DELAY (2026-08-28, Jean: "it's the EA that banks TP"): the EA moves the
     // broker SL to BE at TP1 autonomously, so it must be told when a trade carries the
     // 5-min delay. beDelaySec > 0 → EA banks the TP1 half as usual but leaves the
@@ -18856,7 +18872,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.22-20261005-pullback-resumption', // bump on each deploy — lets /state verify what's live
+    build: '7.23-20261005-scalp-full-exit', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const _since = (fundedEpoch && fundedEpoch.since) || ''; const _base = (fundedEpoch && fundedEpoch.base) || {}; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; if (d >= _since) wk += pnlLedger[d][sym].pnl - ((_base[d] && typeof _base[d][sym] === 'number') ? _base[d][sym] : 0); } } out.weekTotal = +wk.toFixed(2); out.account = (fundedEpoch && fundedEpoch.label) || null; return out; } catch (e) { return {}; } })(), // weekTotal counts the current funded-account epoch only (2026-10-01) // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
@@ -19262,6 +19278,7 @@ app.get('/prices', (req, res) => {
         tp2Price: s.trade.tp2Price || null,
         tp3Price: s.trade.tp3Price || null,
         trailSl: s.trade.trailSl || null,
+        scalp: !!s.trade.scalp, // TP1-only scalp (2026-10-05): EA closes 100% at TP1, no runner
         atr: s.trade.atr || null,
         bestPrice: s.trade.bestPrice || null,
         worstPrice: s.trade.worstPrice || null,
