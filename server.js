@@ -2632,6 +2632,9 @@ function bookPnl(sym, amount, kind) {
     if (!isFinite(amount)) return;
     const d = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
     const t = S[sym] && S[sym].trade;
+    // EA-CLOSE RECONCILIATION (2026-10-05): once the EA has reported the real close of this trade,
+    // the server's virtual exits must not book on top of it (kind 'ea-reconcile' is the correction).
+    if (t && t._eaClosed && kind !== 'ea-reconcile') { log(sym, '💰 P&L NOT booked (' + (amount >= 0 ? '+' : '') + '$' + amount.toFixed(2) + ' ' + kind + ') — EA already reported the real close ($' + (+t._eaClosed.total).toFixed(2) + ').'); return; }
     // PER-ACCOUNT LEDGER (2026-10-01): each registered account books amount × scale, unless
     // ITS terminal reported ORDER_FAILED for this trade and never a fill (ORDER_OK). A trade
     // nobody filled books nothing anywhere.
@@ -2656,6 +2659,8 @@ function bookPnl(sym, amount, kind) {
     row.pnl = +(row.pnl + amount).toFixed(2);
     if (kind === 't1') row.t1Legs++; else row.closes++;
     _plDirty = true;
+    // what the server has booked for THIS trade so far (base terms) — the EA's CLOSED report reconciles against it
+    try { if (t) t._booked = +((t._booked || 0) + amount).toFixed(2); const _h = S[sym].lastHistEntry; if (_h && _h.symbol === sym) _h.booked = +((_h.booked || 0) + amount).toFixed(2); } catch (eBk) {}
     log(sym, '💰 P&L booked: ' + (amount >= 0 ? '+' : '') + '$' + amount.toFixed(2) + ' (' + kind + ', base sizing) — day total $' + row.pnl.toFixed(2) + (acctIds().length ? ' · accounts: ' + acctIds().map(acct => { const tt = acctTotals(acct); return tt ? tt.label + ' $' + tt.day.toFixed(0) : acct; }).join(', ') : ''));
     acctGuardSweep();
   } catch (e) {}
@@ -16393,7 +16398,12 @@ function extPullbackZone(s, sym, dir, price, atrHint) {
   try {
     if (!s || (sym !== 'XAU' && sym !== 'NAS100') || process.env.EXT_PB_HOLD === '0') return { at: false, zone: 0, dist: null };
     const a = Math.max(s._atr || 0, atrHint || 0); if (!(a > 0)) return { at: false, zone: 0, dist: null };
-    const zone = (parseFloat(process.env.EXT_PB_ATR_MULT) || 1.0) * a;
+    // ZONE FLOOR (2026-10-06, the 22:36 XAU put: a $35 overnight flush to 4109, ATR compressed to ~$3,
+    // the put fired fast-lane at 4113.84 — $4.5 above the low, outside a $3 zone — and lost $7 in
+    // minutes). The zone is now at least 20% of the session range (EXT_PB_RANGE_FRAC), so a big
+    // flush widens the no-market-fire band even when the tick ATR has collapsed.
+    const rng = (isFinite(s.sessionHigh) && isFinite(s.sessionLow)) ? (s.sessionHigh - s.sessionLow) : 0;
+    const zone = Math.max((parseFloat(process.env.EXT_PB_ATR_MULT) || 1.0) * a, (parseFloat(process.env.EXT_PB_RANGE_FRAC) || 0.2) * rng);
     const dist = dir === 'put' ? (isFinite(s.sessionLow) ? price - s.sessionLow : null) : (isFinite(s.sessionHigh) ? s.sessionHigh - price : null);
     return { at: dist !== null && dist <= zone, zone, dist };
   } catch (e) { return { at: false, zone: 0, dist: null }; }
@@ -18679,6 +18689,28 @@ app.post('/ea/event', (req, res) => {
       }
       if (/ORDER_OK|FILLED/i.test(kind)) return res.json({ ok: true }); // fills are not pushed as alerts
     } catch (eOK) {}
+    // CLOSED → reconcile the ledger to the account's REAL result (2026-10-05, Jean: "the BTC loss
+    // trade got protected by the EA and closed on EP" — the server had booked a full stop, −$1,723,
+    // for a trade the EA had taken out flat). detail = "<reason> @ <price> | total <pnl> | vol <v> | ticket <n>".
+    try {
+      if (/^CLOSED$/i.test(kind) && S[sym]) {
+        const _tot = parseFloat((detail.match(/total (-?[\d.]+)/) || [])[1]);
+        const _px = parseFloat((detail.match(/@ (-?[\d.]+)/) || [])[1]);
+        if (isFinite(_tot)) {
+          const _s = S[sym]; const _t = _s.trade && _s.trade.active ? _s.trade : null;
+          // the row: the live trade's row, else the most recent filled row of the last 12h without a close
+          let _row = (_s.lastHistEntry && _s.lastHistEntry.symbol === sym) ? _s.lastHistEntry : null;
+          if (!_t) { for (let i = signalHistory.length - 1; i >= 0; i--) { const h = signalHistory[i]; if (h.symbol === sym && h.outcomes && (h.outcomes.eaFill || h.outcomes.eaFailedThenFilled) && !h.outcomes.eaClose && Date.now() - h.ts < 12 * 3600000) { _row = h; break; } } }
+          const _booked = _t ? (_t._booked || 0) : (_row ? (_row.booked || 0) : 0);
+          const _diff = +(_tot - _booked).toFixed(2);
+          if (_t) _t._eaClosed = { total: _tot, price: _px, ts: Date.now() };
+          if (_row) { _row.outcomes = _row.outcomes || {}; _row.outcomes.eaClose = { total: +_tot.toFixed(2), price: isFinite(_px) ? _px : null, reason: detail.split(' @ ')[0].slice(0, 40), booked: _booked, reconcile: _diff }; }
+          if (Math.abs(_diff) >= 1) bookPnl(sym, _diff, 'ea-reconcile');
+          log(sym, '🧾 EA CLOSE reconciled — account result $' + _tot.toFixed(2) + ' vs server-booked $' + _booked.toFixed(2) + ' → ' + (_diff >= 0 ? '+' : '') + '$' + _diff.toFixed(2) + ' correction booked' + (_t ? ' (server trade still active: its later exits will not book)' : '') + '.');
+        }
+        return res.json({ ok: true });
+      }
+    } catch (eCL) {}
     // ORDER_FAILED → mark the live trade as unfilled (2026-09-30, the 13:48 XAU put refused
     // with 10027 "Autotrading disabled by client"): the row is stamped eaFailed for the
     // nightly report and bookPnl() skips it, so the funded ledger only counts real fills.
@@ -18923,7 +18955,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.25-20261005-xau-sessrej-shadow', // bump on each deploy — lets /state verify what's live
+    build: '7.27-20261006-init-take-young-signal', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const _since = (fundedEpoch && fundedEpoch.since) || ''; const _base = (fundedEpoch && fundedEpoch.base) || {}; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; if (d >= _since) wk += pnlLedger[d][sym].pnl - ((_base[d] && typeof _base[d][sym] === 'number') ? _base[d][sym] : 0); } } out.weekTotal = +wk.toFixed(2); out.account = (fundedEpoch && fundedEpoch.label) || null; return out; } catch (e) { return {}; } })(), // weekTotal counts the current funded-account epoch only (2026-10-01) // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
