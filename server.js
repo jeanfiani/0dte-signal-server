@@ -4514,7 +4514,14 @@ function processPrice(sym, price, hi, lo) {
           // 83,210 within $300 of the session low after a $2,000 drop, all lost — the XAU/NAS
           // rule from 9/28, now on BTC too): a leg does not begin within 0.1×ADR of the
           // session extreme in its own direction.
-          const _bAtExt = _bDir === 'put' ? (isFinite(s.sessionLow) && price - s.sessionLow <= 0.1 * _bAdr) : (isFinite(s.sessionHigh) && s.sessionHigh - price <= 0.1 * _bAdr);
+          // EXTREME BAND WIDENED (2026-10-07, the 22:07 put @83,848 — $290 above the low of a $2,000
+          // two-hour crash, band was 0.1×ADR ≈ $230, so it armed and sold the bottom; +$420 against
+          // within 4h). The band is now max(0.1×ADR, 0.2×session range): after a big leg the
+          // no-arm zone scales with the leg, and the lane re-arms naturally on the first pullback
+          // out of the zone — the XAU extreme-hold rule, expressed in BIGLEG's own terms.
+          const _bRange = (isFinite(s.sessionHigh) && isFinite(s.sessionLow)) ? (s.sessionHigh - s.sessionLow) : 0;
+          const _bExtBand = Math.max(0.1 * _bAdr, (parseFloat(process.env.BIGLEG_EXT_RANGE_FRAC) || 0.3) * _bRange); // 30% of the session range (Jean, 2026-10-07): BTC legs overshoot; the first third of the retrace is not an entry
+          const _bAtExt = _bDir === 'put' ? (isFinite(s.sessionLow) && price - s.sessionLow <= _bExtBand) : (isFinite(s.sessionHigh) && s.sessionHigh - price <= _bExtBand);
           if (_bAtExt && _bLeg >= 0.15 * _bAdr && Date.now() - (s._bblExtTs || 0) > 300000) { s._bblExtTs = Date.now(); log(sym, '🦵 BTC-BIGLEG ' + _bDir.toUpperCase() + ' NOT ARMED — within 0.1×ADR of the session extreme (2026-09-29).'); }
           if (!_bAtExt && _bLeg >= 0.15 * _bAdr && _bLeg < 0.6 * _bAdr && Date.now() - (s._bblTs[_bDir] || 0) >= 1800000) {
             s._bblTs[_bDir] = Date.now();
@@ -18955,7 +18962,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.27-20261006-init-take-young-signal', // bump on each deploy — lets /state verify what's live
+    build: '7.28-20261007-bigleg-ext-band30', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const _since = (fundedEpoch && fundedEpoch.since) || ''; const _base = (fundedEpoch && fundedEpoch.base) || {}; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; if (d >= _since) wk += pnlLedger[d][sym].pnl - ((_base[d] && typeof _base[d][sym] === 'number') ? _base[d][sym] : 0); } } out.weekTotal = +wk.toFixed(2); out.account = (fundedEpoch && fundedEpoch.label) || null; return out; } catch (e) { return {}; } })(), // weekTotal counts the current funded-account epoch only (2026-10-01) // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
