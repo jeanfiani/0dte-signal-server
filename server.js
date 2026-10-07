@@ -2636,11 +2636,12 @@ function bookPnl(sym, amount, kind) {
     const t = S[sym] && S[sym].trade;
     // EA-CLOSE RECONCILIATION (2026-10-05): once the EA has reported the real close of this trade,
     // the server's virtual exits must not book on top of it (kind 'ea-reconcile' is the correction).
-    if (t && t._eaClosed && kind !== 'ea-reconcile') { log(sym, '💰 P&L NOT booked (' + (amount >= 0 ? '+' : '') + '$' + amount.toFixed(2) + ' ' + kind + ') — EA already reported the real close ($' + (+t._eaClosed.total).toFixed(2) + ').'); return; }
+    if (t && t._eaClosed && !/^ea-reconcile/.test(kind)) { log(sym, '💰 P&L NOT booked (' + (amount >= 0 ? '+' : '') + '$' + amount.toFixed(2) + ' ' + kind + ') — EA already reported the real close ($' + (+t._eaClosed.total).toFixed(2) + ').'); return; }
     // PER-ACCOUNT LEDGER (2026-10-01): each registered account books amount × scale, unless
     // ITS terminal reported ORDER_FAILED for this trade and never a fill (ORDER_OK). A trade
     // nobody filled books nothing anywhere.
-    const _fills = (t && t._fills) || {}, _failed = (t && t._failed) || {};
+    // 'ea-reconcile-prior': an earlier position's REAL close reported by the EA while a new trade is live — the live trade's fill/failure map says nothing about it (2026-10-07)
+    const _fills = (t && t._fills && kind !== 'ea-reconcile-prior') ? t._fills : {}, _failed = (t && t._failed && kind !== 'ea-reconcile-prior') ? t._failed : {};
     let _anyBooked = false;
     for (const acct of acctIds()) {
       const a = eaAccounts[acct];
@@ -2654,7 +2655,7 @@ function bookPnl(sym, amount, kind) {
     // NO-FILL LEDGER GUARD (2026-09-30) — base ledger: with no registry the old rule applies
     // (any ORDER_FAILED without a later ORDER_OK → nothing booked); with a registry the base
     // ledger books whenever at least one account filled (or no account reported at all).
-    const _legacyNoFill = !acctIds().length ? !!(t && t._eaFailed) : (Object.keys(_failed).length > 0 && !Object.keys(_fills).length && !_anyBooked);
+    const _legacyNoFill = kind === 'ea-reconcile-prior' ? false : (!acctIds().length ? !!(t && t._eaFailed) : (Object.keys(_failed).length > 0 && !Object.keys(_fills).length && !_anyBooked));
     if (_legacyNoFill) { log(sym, '💰 P&L NOT booked (' + (amount >= 0 ? '+' : '') + '$' + amount.toFixed(2) + ' ' + kind + ') — EA reported ORDER_FAILED for this trade and no terminal filled it (2026-09-30).'); return; }
     pnlLedger[d] = pnlLedger[d] || {};
     const row = pnlLedger[d][sym] = pnlLedger[d][sym] || { pnl: 0, t1Legs: 0, closes: 0 };
@@ -2662,7 +2663,8 @@ function bookPnl(sym, amount, kind) {
     if (kind === 't1') row.t1Legs++; else row.closes++;
     _plDirty = true;
     // what the server has booked for THIS trade so far (base terms) — the EA's CLOSED report reconciles against it
-    try { if (t) t._booked = +((t._booked || 0) + amount).toFixed(2); const _h = S[sym].lastHistEntry; if (_h && _h.symbol === sym) _h.booked = +((_h.booked || 0) + amount).toFixed(2); } catch (eBk) {}
+    // 'ea-reconcile-prior' (2026-10-07): the EA's close report for an EARLIER position while a new trade is live — books to the day/accounts but never to the live trade's own tally
+    try { if (kind !== 'ea-reconcile-prior') { if (t) t._booked = +((t._booked || 0) + amount).toFixed(2); const _h = S[sym].lastHistEntry; if (_h && _h.symbol === sym) _h.booked = +((_h.booked || 0) + amount).toFixed(2); } } catch (eBk) {}
     log(sym, '💰 P&L booked: ' + (amount >= 0 ? '+' : '') + '$' + amount.toFixed(2) + ' (' + kind + ', base sizing) — day total $' + row.pnl.toFixed(2) + (acctIds().length ? ' · accounts: ' + acctIds().map(acct => { const tt = acctTotals(acct); return tt ? tt.label + ' $' + tt.day.toFixed(0) : acct; }).join(', ') : ''));
     acctGuardSweep();
   } catch (e) {}
@@ -18810,6 +18812,73 @@ app.post('/manual/fire', (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
 
+// ===== MANUAL-TRADE ADOPTION (2026-10-07, Jean: "tell the EA to take also the manual trades
+// that I take through MT5") ===== POST /manual/adopt { sym, type, price (position open),
+// lots, ticket, acct, sl, tp, ageSec }. The EA finds a hand-placed position (magic 0) on one
+// of its symbols, younger than its AdoptMaxAgeSec, and asks the server to put a trade behind
+// it. The server builds the regime-adaptive ladder FROM THE REAL OPEN PRICE (not the current
+// tick), marks the trade filled on that account and born vetted, pushes a ⬆/⬇MANUAL-MT5 row with
+// manual.mode='mt5-adopted' (graded as its own class, next to the LAUNCH button's MANUAL), and answers
+// with the levels + the row key so the EA records the row as "already in the market" instead
+// of entering it a second time. From then on the EA manages the position exactly like its own
+// (TP1 half-close, breakeven, server trail/exits, close reports → ledger reconcile).
+// Hard lines: an active server trade on the symbol (unless it IS this ticket — idempotent) →
+// 409; a running auction/hold is CANCELLED (Jean's hand beats a candidate); the funded guard
+// is NOT a hard line here (the position already exists — refusing would leave it unmanaged).
+app.post('/manual/adopt', (req, res) => {
+  try {
+    const b = req.body || {};
+    const sym = resolveSymbol(b.sym);
+    const token = (req.headers['x-close-token'] || b.token || '');
+    if (CLOSE_TOKEN && token !== CLOSE_TOKEN) return res.status(403).json({ error: 'bad token' });
+    const s = S[sym];
+    if (!s || (sym !== 'XAU' && sym !== 'BTC' && sym !== 'NAS100')) return res.status(400).json({ error: 'sym must be XAU, BTC or NAS100' });
+    const type = String(b.type || '').toLowerCase();
+    if (type !== 'call' && type !== 'put') return res.status(400).json({ error: 'type must be call or put' });
+    const ep = +b.price;
+    if (!(ep > 0)) return res.status(400).json({ error: 'price (position open) required' });
+    const ticket = String(b.ticket || '').slice(0, 24);
+    if (!ticket) return res.status(400).json({ error: 'ticket required' });
+    const acct = b.acct ? String(b.acct).slice(0, 20) : null;
+    const lots = +b.lots || 0, ageSec = Math.max(0, +b.ageSec || 0);
+    if (s.trade && s.trade.active) {
+      if (s.trade._adopted && s.trade._adopted.ticket === ticket) { // idempotent re-ask (EA restart)
+        const t = s.trade; const row = (s.lastHistEntry && s.lastHistEntry.symbol === sym && s.lastHistEntry.manual && s.lastHistEntry.manual.ticket === ticket) ? s.lastHistEntry : null;
+        return res.json({ ok: true, already: true, sym, type: t.type, sl: t.slPrice, tp1: t.tp1Price, tp2: t.tp2Price, tp3: t.tp3Price, scalp: !!t.scalp, key: row ? (row.time + '|' + row.type + '|' + row.price) : '' });
+      }
+      return res.status(409).json({ ok: false, error: 'a trade is already active on ' + sym + ' (' + String(s.trade.type).toUpperCase() + ' @ $' + (+s.trade.ep).toFixed(2) + ') — manual position #' + ticket + ' left unmanaged' });
+    }
+    // reattachOnly (EA restart, hand position older than its adoption window): only a ticket the server
+    // already manages may come back — an aged hand position is never adopted fresh.
+    if (b.reattachOnly) return res.status(409).json({ ok: false, error: 'reattach-only: #' + ticket + ' is not a known adoption (older than the EA adoption window) — left alone' });
+    // Jean's hand beats a candidate: cancel any running auction/hold so it cannot fire a second position behind his.
+    const _cancelled = [];
+    try {
+      if (s._oteHold) { const h = s._oteHold; s._oteHold = null; if (h.sigRef) h.sigRef.oteHold = 'cancelled-manual-adopt'; if (h.histRef) { h.histRef.oteHold = 'cancelled-manual-adopt'; h.histRef.pendingEntry = false; } _cancelled.push('OTE-HOLD ' + String(h.dir || '').toUpperCase()); }
+      if (s._invHold) { const h = s._invHold; s._invHold = null; if (h.sigRef) h.sigRef.oteHold = 'cancelled-manual-adopt'; if (h.histRef) { h.histRef.oteHold = 'cancelled-manual-adopt'; h.histRef.pendingEntry = false; } _cancelled.push('INV-HOLD ' + String(h.dir || '').toUpperCase()); }
+      if (s._macdHold) { const h = s._macdHold; s._macdHold = null; s._macdDefer = null; _cancelled.push('MACD-HOLD ' + String(h.dir || h.type || '').toUpperCase()); }
+    } catch (eHC) {}
+    const atr = s._atr || 0;
+    const price = s.lastPrice > 0 ? s.lastPrice : ep;
+    s.dailySignalCount++;
+    const sig = { type, time: ts(), price: ep.toFixed(2), score: (type === 'call' ? '⬆' : '⬇') + 'MANUAL-MT5', rsi: '', macd: (typeof s._macdL === 'number') ? s._macdL.toFixed(3) : '', roc: (typeof s._roc3 === 'number') ? ((s._roc3 >= 0 ? '+' : '') + s._roc3.toFixed(3) + '%') : '', num: s.dailySignalCount, manual: { note: 'taken by hand in MT5', mode: 'mt5-adopted', ticket, lots, acct, ageSec, regime: (s._dayRegime && s._dayRegime.label) || null, msTrend: s._msTrend || null } };
+    s.signals.push(sig); logSignal(sym, sig);
+    s.trade = buildCfdTrade(type, ep, atr, sym);
+    s.trade._manual = true; s.trade._oteVetted = true; delete s.trade.oteLimit; delete s.trade.oteExpiry;
+    s.trade._adopted = { ticket, acct, lots, ts: Date.now() };
+    if (ageSec > 0) s.trade.ts = Date.now() - ageSec * 1000; // the real entry time — age-based rules see the true hold
+    if (acct) { s.trade._fills = s.trade._fills || {}; s.trade._fills[acct] = 'adopted manual #' + ticket + ' (' + lots.toFixed(2) + ' lots)'; } // filled by definition — never a no-fill
+    s.trade._tickets = { [ticket]: acct || '?' }; // CLOSED reports are matched by ticket (2026-10-07)
+    if (price !== ep) { s.trade.bestPrice = type === 'call' ? Math.max(ep, price) : Math.min(ep, price); s.trade.worstPrice = type === 'call' ? Math.min(ep, price) : Math.max(ep, price); }
+    try { const h = s.lastHistEntry; if (h && h.symbol === sym) { h.sl = s.trade.slPrice; h.tp1 = s.trade.tp1Price; h.tp2 = s.trade.tp2Price; h.tp3 = s.trade.tp3Price; h.ladder = s.trade._ladder || null; h.outcomes = h.outcomes || {}; h.outcomes.eaFill = 'adopted manual #' + ticket + ' (' + lots.toFixed(2) + ' lots)' + (acct ? ' [acct ' + acct + ']' : ''); h.outcomes.eaTickets = [ticket]; sig.sl = (+s.trade.slPrice).toFixed(2); sig.tp1 = (+s.trade.tp1Price).toFixed(2); sig.tp2 = (+s.trade.tp2Price).toFixed(2); sig.tp3 = (+s.trade.tp3Price).toFixed(2); } } catch (eH) {}
+    s.lastSignalDir = type; s.lastSignalTs = Date.now(); s.lastNTs = Date.now(); s.lastAT = type; if (type === 'call') s.nC++; else s.nP++;
+    const own = (b.sl > 0 ? ' · your SL $' + (+b.sl).toFixed(2) : ' · no SL on the position') + (b.tp > 0 ? ' · your TP $' + (+b.tp).toFixed(2) : '');
+    log(sym, '🖐️ ' + sym + ' MANUAL ' + type.toUpperCase() + ' ADOPTED from MT5 — ticket #' + ticket + ' · ' + lots.toFixed(2) + ' lots @ $' + ep.toFixed(2) + ' (opened ' + Math.round(ageSec) + 's ago' + (acct ? ', acct ' + acct : '') + ')' + own + ' → EA now manages it with SL $' + (+s.trade.slPrice).toFixed(2) + ' · TP1 $' + (+s.trade.tp1Price).toFixed(2) + ' · TP2 $' + (+s.trade.tp2Price).toFixed(2) + ' · TP3 $' + (+s.trade.tp3Price).toFixed(2) + ' · ladder ' + (s.trade._ladder || '—') + ' · regime ' + (sig.manual.regime || '?') + (_cancelled.length ? ' · cancelled ' + _cancelled.join(', ') : '') + ' [#' + s.dailySignalCount + ', MANUAL-MT5 class] (2026-10-07).');
+    try { sendPush('🖐️ ' + sym + ' MANUAL ' + type.toUpperCase() + ' adopted', '#' + ticket + ' · ' + lots.toFixed(2) + ' lots @ $' + ep.toFixed(2) + ' · SL $' + (+s.trade.slPrice).toFixed(2) + ' · TP1 $' + (+s.trade.tp1Price).toFixed(2), 'signal'); } catch (e) {}
+    res.json({ ok: true, sym, type, price: +ep.toFixed(2), sl: s.trade.slPrice, tp1: s.trade.tp1Price, tp2: s.trade.tp2Price, tp3: s.trade.tp3Price, scalp: !!s.trade.scalp, ladder: s.trade._ladder || null, key: sig.time + '|' + type + '|' + sig.price, num: s.dailySignalCount, cancelled: _cancelled });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+
 // EA acknowledges it has flattened the position → clear the flag (idempotent by id).
 // ===== EA EVENT REPORTER (2026-09-21, the 00:00 RANGE5 put the EA never took) =====
 // The EA POSTs its own execution failures/skips here — ORDER_FAILED, SKIPPED, INIT_SKIP,
@@ -18841,6 +18910,9 @@ app.post('/ea/event', (req, res) => {
         delete S[sym].trade._eaFailed;
         const _h = S[sym].lastHistEntry;
         if (_h && _h.symbol === sym) { _h.outcomes = _h.outcomes || {}; if (_h.outcomes.eaFailed) { _h.outcomes.eaFailedThenFilled = _h.outcomes.eaFailed; delete _h.outcomes.eaFailed; } _h.outcomes.eaFill = detail.slice(0, 120); }
+        // broker ticket (2026-10-07): "ticket #N" in the fill report → remembered on the trade and the row, so a
+        // later CLOSED report is matched to the trade it belongs to (an old position's close must never end a new trade).
+        try { const _tk = (detail.match(/ticket #?(\d+)/) || [])[1]; if (_tk) { const _tt = S[sym].trade; _tt._tickets = _tt._tickets || {}; _tt._tickets[_tk] = _acct || '?'; if (_h && _h.symbol === sym) { _h.outcomes.eaTickets = _h.outcomes.eaTickets || []; if (_h.outcomes.eaTickets.indexOf(_tk) < 0) _h.outcomes.eaTickets.push(_tk); } } } catch (eTk) {}
         if (_was) log(sym, '🧾 no-fill mark CLEARED — EA reports a fill after the earlier failure; P&L booking resumes for this trade.');
       }
       if (/ORDER_OK|FILLED/i.test(kind)) return res.json({ ok: true }); // fills are not pushed as alerts
@@ -18853,15 +18925,35 @@ app.post('/ea/event', (req, res) => {
         const _tot = parseFloat((detail.match(/total (-?[\d.]+)/) || [])[1]);
         const _px = parseFloat((detail.match(/@ (-?[\d.]+)/) || [])[1]);
         if (isFinite(_tot)) {
-          const _s = S[sym]; const _t = _s.trade && _s.trade.active ? _s.trade : null;
-          // the row: the live trade's row, else the most recent filled row of the last 12h without a close
+          const _s = S[sym]; let _t = _s.trade && _s.trade.active ? _s.trade : null;
+          // TICKET MATCH (2026-10-07): since the EA now reports EVERY close (its own exits included), a CLOSED
+          // for an OLD position can arrive while a NEW server trade is already live (opposite-direction flip,
+          // adoption after a flat). If the live trade knows its tickets and this one is not among them, the
+          // close belongs to an earlier trade: reconcile against THAT row and leave the live trade alone.
+          const _tkC = (detail.match(/ticket #?(\d+)/) || [])[1] || null;
           let _row = (_s.lastHistEntry && _s.lastHistEntry.symbol === sym) ? _s.lastHistEntry : null;
-          if (!_t) { for (let i = signalHistory.length - 1; i >= 0; i--) { const h = signalHistory[i]; if (h.symbol === sym && h.outcomes && (h.outcomes.eaFill || h.outcomes.eaFailedThenFilled) && !h.outcomes.eaClose && Date.now() - h.ts < 12 * 3600000) { _row = h; break; } } }
+          let _rowByTicket = null;
+          if (_tkC) { for (let i = signalHistory.length - 1; i >= 0 && Date.now() - signalHistory[i].ts < 5 * 86400000; i--) { const h = signalHistory[i]; if (h.symbol === sym && h.outcomes && Array.isArray(h.outcomes.eaTickets) && h.outcomes.eaTickets.indexOf(_tkC) >= 0) { _rowByTicket = h; break; } } }
+          if (_t && _tkC && _t._tickets && Object.keys(_t._tickets).length && !_t._tickets[_tkC]) {
+            log(sym, '🧾 EA CLOSE for ticket #' + _tkC + ' is NOT the live trade (' + Object.keys(_t._tickets).map(k => '#' + k).join(',') + ') — reconciling the earlier trade only; live trade untouched.');
+            _t = null; if (_rowByTicket) _row = _rowByTicket;
+          } else if (_rowByTicket) _row = _rowByTicket;
+          // the row: the live trade's row, else the most recent filled row of the last 12h without a close
+          if (!_t && !_rowByTicket) {
+            // fallback (no ticket match): the most recent filled row of the last 12h without a close — never the
+            // LIVE trade's row, and never a row whose known tickets exclude this one.
+            const _liveRow = (_s.trade && _s.trade.active && _s.lastHistEntry && _s.lastHistEntry.symbol === sym) ? _s.lastHistEntry : null;
+            _row = null;
+            for (let i = signalHistory.length - 1; i >= 0; i--) { const h = signalHistory[i]; if (h.symbol === sym && h !== _liveRow && h.outcomes && (h.outcomes.eaFill || h.outcomes.eaFailedThenFilled) && !h.outcomes.eaClose && !(_tkC && Array.isArray(h.outcomes.eaTickets) && h.outcomes.eaTickets.length && h.outcomes.eaTickets.indexOf(_tkC) < 0) && Date.now() - h.ts < 12 * 3600000) { _row = h; break; } }
+            if (!_row) log(sym, '🧾 EA CLOSE' + (_tkC ? ' for ticket #' + _tkC : '') + ' matches no known row — booking the account result as a stand-alone correction.');
+          }
+          if (_row && _row.outcomes && _row.outcomes.eaClose && _tkC && _row.outcomes.eaClose.ticket === _tkC) { log(sym, '🧾 EA CLOSE for ticket #' + _tkC + ' already reconciled — ignored (duplicate report).'); return res.json({ ok: true, dup: true }); }
           const _booked = _t ? (_t._booked || 0) : (_row ? (_row.booked || 0) : 0);
           const _diff = +(_tot - _booked).toFixed(2);
           if (_t) _t._eaClosed = { total: _tot, price: _px, ts: Date.now() };
-          if (_row) { _row.outcomes = _row.outcomes || {}; _row.outcomes.eaClose = { total: +_tot.toFixed(2), price: isFinite(_px) ? _px : null, reason: detail.split(' @ ')[0].slice(0, 40), booked: _booked, reconcile: _diff }; }
-          if (Math.abs(_diff) >= 1) bookPnl(sym, _diff, 'ea-reconcile');
+          if (_row) { _row.outcomes = _row.outcomes || {}; _row.outcomes.eaClose = { total: +_tot.toFixed(2), price: isFinite(_px) ? _px : null, reason: detail.split(' @ ')[0].slice(0, 40), booked: _booked, reconcile: _diff, ticket: _tkC }; }
+          const _prior = !_t && !!(_s.trade && _s.trade.active); // a NEW trade is live — this close is an earlier position's
+          if (Math.abs(_diff) >= 1) { bookPnl(sym, _diff, _prior ? 'ea-reconcile-prior' : 'ea-reconcile'); if (_prior && _row) _row.booked = +((_row.booked || 0) + _diff).toFixed(2); }
           log(sym, '🧾 EA CLOSE reconciled — account result $' + _tot.toFixed(2) + ' vs server-booked $' + _booked.toFixed(2) + ' → ' + (_diff >= 0 ? '+' : '') + '$' + _diff.toFixed(2) + ' correction booked.');
           // THE EA'S CLOSE ENDS THE SERVER TRADE (2026-10-07, Jean: "when the EA stops the trade it
           // should also stop in the server"). The position is gone at the broker; a server trade
@@ -18871,8 +18963,8 @@ app.post('/ea/event', (req, res) => {
           if (_t) {
             if (_row) { _row.outcomes.closePrice = isFinite(_px) ? _px : _row.outcomes.closePrice; _row.outcomes.endedByEa = true; }
             log(sym, '🚪 server trade ENDED by the EA close — ' + String(_t.type || '').toUpperCase() + ' @ $' + (+_t.ep || 0).toFixed(2) + ' closed at the broker (' + detail.split(' | ')[0].slice(0, 40) + '); slot released, no further server exits for this trade.');
-            s.trade = { active: false };
-            if (s.closeRequest && s.closeRequest.active) s.closeRequest = null;
+            _s.trade = { active: false };
+            if (_s.closeRequest && _s.closeRequest.active) _s.closeRequest = null;
           }
         }
         return res.json({ ok: true });
@@ -18941,7 +19033,7 @@ app.get('/ea/:sym', (req, res) => {
   res.json({
     n: 1, id: t.ts, type: t.type || '', ep: +t.ep || 0,
     sl: +t.slPrice || 0, tp1: +t.tp1Price || 0, tp2: +t.tp2Price || 0, tp3: +t.tp3Price || 0,
-    age: Math.round((Date.now() - t.ts) / 1000), ts: Date.now(), close: cr, scalp: !!t.scalp,
+    age: Math.round((Date.now() - t.ts) / 1000), ts: Date.now(), close: cr, scalp: !!t.scalp, adopted: (t._adopted && t._adopted.ticket) || null,
     // FAST BE-DELAY (2026-08-28, Jean: "it's the EA that banks TP"): the EA moves the
     // broker SL to BE at TP1 autonomously, so it must be told when a trade carries the
     // 5-min delay. beDelaySec > 0 → EA banks the TP1 half as usual but leaves the
@@ -19122,7 +19214,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.33-20261007-ea-close-ends-trade', // bump on each deploy — lets /state verify what's live
+    build: '7.34-20261007-mt5-manual-adopt', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const _since = (fundedEpoch && fundedEpoch.since) || ''; const _base = (fundedEpoch && fundedEpoch.base) || {}; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; if (d >= _since) wk += pnlLedger[d][sym].pnl - ((_base[d] && typeof _base[d][sym] === 'number') ? _base[d][sym] : 0); } } out.weekTotal = +wk.toFixed(2); out.account = (fundedEpoch && fundedEpoch.label) || null; return out; } catch (e) { return {}; } })(), // weekTotal counts the current funded-account epoch only (2026-10-01) // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
@@ -19529,6 +19621,7 @@ app.get('/prices', (req, res) => {
         tp3Price: s.trade.tp3Price || null,
         trailSl: s.trade.trailSl || null,
         scalp: !!s.trade.scalp, // TP1-only scalp (2026-10-05): EA closes 100% at TP1, no runner
+        adopted: (s.trade._adopted && s.trade._adopted.ticket) || null, // MANUAL position adopted from MT5 (2026-10-07): the EA's own ticket, managed like a bot fire
         atr: s.trade.atr || null,
         bestPrice: s.trade.bestPrice || null,
         worstPrice: s.trade.worstPrice || null,
