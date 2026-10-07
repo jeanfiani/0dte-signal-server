@@ -4295,8 +4295,15 @@ function processPrice(sym, price, hi, lo) {
                 }
                 if (global._srBenched) return false;
                 const isL = dir === 'call';
-                const _tp1 = isL ? price + 0.25 * _srAdr : price - 0.25 * _srAdr;
-                const _tp3 = isL ? price + 0.5 * _srAdr : price - 0.5 * _srAdr;
+                // GEOMETRY GUARD (2026-10-07, the 07:50 BTC call: entry 86,290, stop 84,564 = $1,726 risk
+                // against a $716 TP1 — R:R 0.4 on a live lane; XAU's two CRASH calls had the same shape).
+                // The stop is structural (beyond the extreme), so the entry must still be AT the extreme:
+                // fire only when the stop distance ≤ SESSREJ_MAX_R_ADR (0.35×ADR); TP1 is at least 1R.
+                const _R = Math.abs(price - sl);
+                if (_R > (parseFloat(process.env.SESSREJ_MAX_R_ADR) || 0.35) * _srAdr) { log(sym, '🎯 BTC SESS-REJ ' + dir.toUpperCase() + ' NOT fired live — entry $' + price.toFixed(0) + ' sits $' + _R.toFixed(0) + ' from the structural stop $' + sl.toFixed(0) + ' (> 0.35×ADR $' + (0.35 * _srAdr).toFixed(0) + '): too far from the extreme for the lane\'s geometry (2026-10-07). Shadow row stands.'); return false; }
+                const _t1d = Math.max(0.25 * _srAdr, _R);
+                const _tp1 = isL ? price + _t1d : price - _t1d;
+                const _tp3 = isL ? price + Math.max(0.5 * _srAdr, 2 * _R) : price - Math.max(0.5 * _srAdr, 2 * _R);
                 const _tp2 = isL ? Math.max(tp, _tp1 + 0.01) : Math.min(tp, _tp1 - 0.01);
                 if (isL ? (sl >= price || _tp1 <= price) : (sl <= price || _tp1 >= price)) return false;
                 s.dailySignalCount++;
@@ -18855,7 +18862,18 @@ app.post('/ea/event', (req, res) => {
           if (_t) _t._eaClosed = { total: _tot, price: _px, ts: Date.now() };
           if (_row) { _row.outcomes = _row.outcomes || {}; _row.outcomes.eaClose = { total: +_tot.toFixed(2), price: isFinite(_px) ? _px : null, reason: detail.split(' @ ')[0].slice(0, 40), booked: _booked, reconcile: _diff }; }
           if (Math.abs(_diff) >= 1) bookPnl(sym, _diff, 'ea-reconcile');
-          log(sym, '🧾 EA CLOSE reconciled — account result $' + _tot.toFixed(2) + ' vs server-booked $' + _booked.toFixed(2) + ' → ' + (_diff >= 0 ? '+' : '') + '$' + _diff.toFixed(2) + ' correction booked' + (_t ? ' (server trade still active: its later exits will not book)' : '') + '.');
+          log(sym, '🧾 EA CLOSE reconciled — account result $' + _tot.toFixed(2) + ' vs server-booked $' + _booked.toFixed(2) + ' → ' + (_diff >= 0 ? '+' : '') + '$' + _diff.toFixed(2) + ' correction booked.');
+          // THE EA'S CLOSE ENDS THE SERVER TRADE (2026-10-07, Jean: "when the EA stops the trade it
+          // should also stop in the server"). The position is gone at the broker; a server trade
+          // that keeps running stamps TP1s nobody banked, pushes exits nobody can act on, and holds
+          // the one-trade-at-a-time slot. Row keeps eaClose + closePrice; virtual grading of the
+          // signal continues through the per-fire tracks, not through s.trade.
+          if (_t) {
+            if (_row) { _row.outcomes.closePrice = isFinite(_px) ? _px : _row.outcomes.closePrice; _row.outcomes.endedByEa = true; }
+            log(sym, '🚪 server trade ENDED by the EA close — ' + String(_t.type || '').toUpperCase() + ' @ $' + (+_t.ep || 0).toFixed(2) + ' closed at the broker (' + detail.split(' | ')[0].slice(0, 40) + '); slot released, no further server exits for this trade.');
+            s.trade = { active: false };
+            if (s.closeRequest && s.closeRequest.active) s.closeRequest = null;
+          }
         }
         return res.json({ ok: true });
       }
@@ -19104,7 +19122,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.31-20261007-path-sampler', // bump on each deploy — lets /state verify what's live
+    build: '7.33-20261007-ea-close-ends-trade', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const _since = (fundedEpoch && fundedEpoch.since) || ''; const _base = (fundedEpoch && fundedEpoch.base) || {}; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; if (d >= _since) wk += pnlLedger[d][sym].pnl - ((_base[d] && typeof _base[d][sym] === 'number') ? _base[d][sym] : 0); } } out.weekTotal = +wk.toFixed(2); out.account = (fundedEpoch && fundedEpoch.label) || null; return out; } catch (e) { return {}; } })(), // weekTotal counts the current funded-account epoch only (2026-10-01) // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
