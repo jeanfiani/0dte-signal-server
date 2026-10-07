@@ -1933,7 +1933,7 @@ function trackBlockedOutcome(sym, msg, force) {
   // Only actual blocks/deferrals qualify; validator/dormant lines are excluded explicitly.
   try {
     const _isBlockMsg = /BLOCKED|DEFERRED|REFUSED|SKIPPED|conv \d+ < \d+|below (the )?floor|too (low|weak)/i.test(msg)
-      && !/DORMANT|WOULD-FIRE|TREND-CONT-WF|TREND-REGIME|TREND-WT|TREND-CT|EXT-PB-|EXTREME-PULLBACK|NEWS-FADE|NEWS-CONT|ZONE-REACT|ARMED \(dormant|CONF-SCORE|dormant validator|no firing effect|LC-AGREE|LC-DISAGREE|ML-DIR|EOD-CONT-WF|BIGLEG-CT-WF|FAST-PRE|LADDER-|BE-HELD|ZONE-MICRO-WF|LEVEL-PROX/i.test(msg);
+      && !/DORMANT|WOULD-FIRE|TREND-CONT-WF|TREND-REGIME|TREND-WT|TREND-CT|EXT-PB-|EXTREME-PULLBACK|NEWS-FADE|NEWS-CONT|ZONE-REACT|PATH-CLEAR|PATH-ZONED|ARMED \(dormant|CONF-SCORE|dormant validator|no firing effect|LC-AGREE|LC-DISAGREE|ML-DIR|EOD-CONT-WF|BIGLEG-CT-WF|FAST-PRE|LADDER-|BE-HELD|ZONE-MICRO-WF|LEVEL-PROX/i.test(msg);
     if (_isBlockMsg) {
       s._lastBlock = s._lastBlock || {}; s._lastBlock[type] = { msg: msg.slice(0, 200), ts: now };
       const _gj = s._gateJournal = s._gateJournal || [];
@@ -2203,6 +2203,7 @@ function nasRthBlocked(sym) {
 function cohortFor(reason) {
   { const _tw = reason.match(/\bTREND-(WT|CT)\b/); if (_tw) return 'TREND-' + _tw[1]; }
   { const _pb = reason.match(/\bEXT-PB-(LEFT|EXPIRED)\b/); if (_pb) return 'EXT-PB-' + _pb[1]; }
+  { const _pt = reason.match(/\bPATH-(CLEAR|ZONED)-([TRM])\b/); if (_pt) return 'PATH-' + _pt[1] + '-' + _pt[2]; } // path sampler (2026-10-07)
   { const _zr = reason.match(/\bZONE-REACT(-MULTI)?\b/); if (_zr) return 'ZONE-REACT' + (_zr[1] || ''); } // zone reaction at the session extreme (2026-10-07)
   { const _nw = reason.match(/\bNEWS-(FADE|CONT)\b/); if (_nw) return 'NEWS-' + _nw[1]; } // news desk shadow lane (2026-10-04)
   { const _zt = reason.match(/\bZONE-VETO-(WT|CT)\b/); if (_zt) return 'ZONE-VETO-' + _zt[1]; } // live-direction split of the zone veto (2026-10-02)
@@ -2785,7 +2786,8 @@ app.get('/zones/:sym', (req, res) => {
     const L = s._zoneLedger || {}; const arr = Object.values(L);
     res.json({ symbol: sym, ts: Date.now(), ledgerN: arr.length, live: arr.filter(z => !z.fate).length, byBucket: zoneStats(sym),
       recent: arr.sort((a, b) => b.ts - a.ts).slice(0, 40).map(z => ({ id: z.id, kind: z.kind, tf: z.tf, dir: z.dir, lo: z.lo, hi: z.hi, hAtr: z.hAtr, body: z.body, nearExt: z.nearExt, withTrend: z.withTrend, regime: z.regime, touches: z.touches, holds: z.holds, maxReact: z.maxReact, fate: z.fate, lifeMin: z.lifeMin || null })),
-      zoneReact: { all: (cohortTally[sym] || {})['ZONE-REACT'] || null, multi: (cohortTally[sym] || {})['ZONE-REACT-MULTI'] || null } });
+      zoneReact: { all: (cohortTally[sym] || {})['ZONE-REACT'] || null, multi: (cohortTally[sym] || {})['ZONE-REACT-MULTI'] || null },
+      path: (function () { const ct = cohortTally[sym] || {}; const o = {}; ['CLEAR', 'ZONED'].forEach(k => ['T', 'R', 'M'].forEach(r => { const c = ct['PATH-' + k + '-' + r]; if (c) o[k + '-' + r] = { win: c.win, loss: c.loss, scratch: c.scratch, winRate: (c.win + c.loss) ? +(100 * c.win / (c.win + c.loss)).toFixed(0) : null }; })); return o; })() });
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 function trendTrackerFor(sym) {
@@ -11459,6 +11461,39 @@ function processPrice(sym, price, hi, lo) {
           }
         }
       } catch (eZR2) {}
+      // ===== PATH SAMPLER (2026-10-07, Jean: "when price is going down and all OB/FVG has no more
+      // support, check in how many situations a put would have been a winner — same on the other
+      // side") ===== Detector-independent measurement. Every 5 min per symbol, in the msTrend
+      // direction: if NO opposing zone sits within 2×ATR ahead (and price is not inside one) →
+      // virtual trade PATH-CLEAR-<regime>; if an opposing zone sits within 1.2×ATR ahead (the
+      // ZONE-VETO condition) → PATH-ZONED-<regime>. Symmetric 1×ATR bracket, 60-min window.
+      // The pair answers the question directly: does a clear path pay, and does a zone ahead
+      // actually stop the move. Regime letter T/R/M so the answer is per regime.
+      try {
+        if (atrVal > 0 && (s._msTrend === 'up' || s._msTrend === 'down') && Array.isArray(s._zoneObs)) {
+          const _nowP = Date.now();
+          s._pathTs = s._pathTs || 0;
+          if (_nowP - s._pathTs >= 300000) {
+            const dir = s._msTrend === 'down' ? 'put' : 'call';
+            const opp = s._zoneObs.filter(z => z && z.dir !== dir); // zones that would oppose the move
+            const ahead2 = opp.filter(z => dir === 'put' ? (z.hi <= price && z.hi >= price - 2.0 * atrVal) : (z.lo >= price && z.lo <= price + 2.0 * atrVal));
+            const ahead12 = opp.filter(z => dir === 'put' ? (z.hi <= price && z.hi >= price - 1.2 * atrVal) : (z.lo >= price && z.lo <= price + 1.2 * atrVal));
+            const insideOpp = opp.some(z => price >= z.lo && price <= z.hi);
+            const rg = (s._dayRegime && s._dayRegime.label) ? s._dayRegime.label.charAt(0) : 'M';
+            let lane = null, note = '';
+            if (!insideOpp && ahead2.length === 0) { lane = 'PATH-CLEAR-' + rg; note = 'no opposing zone within 2×ATR'; }
+            else if (ahead12.length > 0 || insideOpp) { lane = 'PATH-ZONED-' + rg; const z0 = insideOpp ? opp.find(z => price >= z.lo && price <= z.hi) : ahead12[0]; note = (insideOpp ? 'inside ' : 'zone ahead ') + z0.kind + ' ' + z0.tf + ' $' + z0.lo.toFixed(2) + '-$' + z0.hi.toFixed(2); }
+            if (lane) {
+              s._pathTs = _nowP;
+              const tp1 = dir === 'put' ? price - 1.0 * atrVal : price + 1.0 * atrVal;
+              const sl = dir === 'put' ? price + 1.0 * atrVal : price - 1.0 * atrVal;
+              const m = '🛣️ ' + sym + ' ' + lane + ' ' + dir.toUpperCase() + ' sample @ $' + price.toFixed(2) + ' — msTrend ' + s._msTrend + ', ' + note + '; symmetric 1×ATR bracket (sampler 2026-10-07). ' + lane;
+              s.blockedOutcomes = s.blockedOutcomes || [];
+              s.blockedOutcomes.push({ ts: _nowP, time: ts(), symbol: sym, detector: lane.slice(0, 10), type: dir, price, virtualTp1: +tp1.toFixed(2), virtualSl: +sl.toFixed(2), maxMin: 60, blockReason: m, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+            }
+          }
+        }
+      } catch (ePS) {}
       // ===== BREAKOUT TIME-STOP (2026-08-19, Jean) =====
       // 8/19 16:57 TREND CALL @4523.40: fired through the live-break window (fresh
       // session-high break — the sanctioned door), then went NOWHERE: +$0.4 peak,
@@ -19069,7 +19104,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.30-20261007-zone-ledger', // bump on each deploy — lets /state verify what's live
+    build: '7.31-20261007-path-sampler', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const _since = (fundedEpoch && fundedEpoch.since) || ''; const _base = (fundedEpoch && fundedEpoch.base) || {}; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; if (d >= _since) wk += pnlLedger[d][sym].pnl - ((_base[d] && typeof _base[d][sym] === 'number') ? _base[d][sym] : 0); } } out.weekTotal = +wk.toFixed(2); out.account = (fundedEpoch && fundedEpoch.label) || null; return out; } catch (e) { return {}; } })(), // weekTotal counts the current funded-account epoch only (2026-10-01) // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
