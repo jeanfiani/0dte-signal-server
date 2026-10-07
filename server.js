@@ -1933,7 +1933,7 @@ function trackBlockedOutcome(sym, msg, force) {
   // Only actual blocks/deferrals qualify; validator/dormant lines are excluded explicitly.
   try {
     const _isBlockMsg = /BLOCKED|DEFERRED|REFUSED|SKIPPED|conv \d+ < \d+|below (the )?floor|too (low|weak)/i.test(msg)
-      && !/DORMANT|WOULD-FIRE|TREND-CONT-WF|TREND-REGIME|TREND-WT|TREND-CT|EXT-PB-|EXTREME-PULLBACK|NEWS-FADE|NEWS-CONT|ARMED \(dormant|CONF-SCORE|dormant validator|no firing effect|LC-AGREE|LC-DISAGREE|ML-DIR|EOD-CONT-WF|BIGLEG-CT-WF|FAST-PRE|LADDER-|BE-HELD|ZONE-MICRO-WF|LEVEL-PROX/i.test(msg);
+      && !/DORMANT|WOULD-FIRE|TREND-CONT-WF|TREND-REGIME|TREND-WT|TREND-CT|EXT-PB-|EXTREME-PULLBACK|NEWS-FADE|NEWS-CONT|ZONE-REACT|ARMED \(dormant|CONF-SCORE|dormant validator|no firing effect|LC-AGREE|LC-DISAGREE|ML-DIR|EOD-CONT-WF|BIGLEG-CT-WF|FAST-PRE|LADDER-|BE-HELD|ZONE-MICRO-WF|LEVEL-PROX/i.test(msg);
     if (_isBlockMsg) {
       s._lastBlock = s._lastBlock || {}; s._lastBlock[type] = { msg: msg.slice(0, 200), ts: now };
       const _gj = s._gateJournal = s._gateJournal || [];
@@ -2203,6 +2203,7 @@ function nasRthBlocked(sym) {
 function cohortFor(reason) {
   { const _tw = reason.match(/\bTREND-(WT|CT)\b/); if (_tw) return 'TREND-' + _tw[1]; }
   { const _pb = reason.match(/\bEXT-PB-(LEFT|EXPIRED)\b/); if (_pb) return 'EXT-PB-' + _pb[1]; }
+  { const _zr = reason.match(/\bZONE-REACT(-MULTI)?\b/); if (_zr) return 'ZONE-REACT' + (_zr[1] || ''); } // zone reaction at the session extreme (2026-10-07)
   { const _nw = reason.match(/\bNEWS-(FADE|CONT)\b/); if (_nw) return 'NEWS-' + _nw[1]; } // news desk shadow lane (2026-10-04)
   { const _zt = reason.match(/\bZONE-VETO-(WT|CT)\b/); if (_zt) return 'ZONE-VETO-' + _zt[1]; } // live-direction split of the zone veto (2026-10-02)
   { const _ct = reason.match(/\bCT-VETO-S([12])([WC])\b/); if (_ct) return 'CT-VETO-S' + _ct[1] + _ct[2]; } // strength × live-direction split of the counter-trend veto (2026-10-02) // extreme-pullback hold cancellations (2026-10-01): win = waiting cost a winner, loss = the rule paid // trend-regime tracker (2026-10-01) — first: the row names its detector AND its gate, either would hijack it
@@ -2393,7 +2394,7 @@ setInterval(() => {
     const out = {};
     for (const sy of ['XAU', 'BTC', 'NAS100']) {
       const st = S[sy]; if (!st) continue;
-      out[sy] = { zones: st._zoneObs || [], touched: st._zoneTouched || {}, m5: (st._m5 || []).slice(-72), m5h: (st._m5hist || []).slice(-2016), msTrend: st._msTrend || null }; // m5h: week-long M5 ring for the Lorentzian prep (2026-09-20)
+      out[sy] = { zones: st._zoneObs || [], touched: st._zoneTouched || {}, m5: (st._m5 || []).slice(-72), m5h: (st._m5hist || []).slice(-2016), msTrend: st._msTrend || null, zl: st._zoneLedger || {} }; // m5h: week-long M5 ring for the Lorentzian prep (2026-09-20)
     }
     fs.writeFileSync(ZONE_MAP_FILE, JSON.stringify(out));
   } catch (e) {}
@@ -2674,7 +2675,7 @@ function _flushPersist() {
     const out = {};
     for (const sy of ['XAU', 'BTC', 'NAS100']) {
       const st = S[sy]; if (!st) continue;
-      out[sy] = { zones: st._zoneObs || [], touched: st._zoneTouched || {}, m5: (st._m5 || []).slice(-72), m5h: (st._m5hist || []).slice(-2016), msTrend: st._msTrend || null };
+      out[sy] = { zones: st._zoneObs || [], touched: st._zoneTouched || {}, m5: (st._m5 || []).slice(-72), m5h: (st._m5hist || []).slice(-2016), msTrend: st._msTrend || null, zl: st._zoneLedger || {} };
     }
     fs.writeFileSync(ZONE_MAP_FILE, JSON.stringify(out));
     fs.writeFileSync(COHORT_TALLY_FILE, JSON.stringify(cohortTally));
@@ -2768,6 +2769,25 @@ const TREND_WR_FILE = path.join(DATA_DIR, 'trend_wr.json');
 let trendWr = {}; let _twDirty = false;
 try { trendWr = JSON.parse(fs.readFileSync(TREND_WR_FILE, 'utf8')) || {}; } catch (e) { trendWr = {}; }
 setInterval(() => { if (!_twDirty) return; _twDirty = false; try { fs.writeFileSync(TREND_WR_FILE, JSON.stringify(trendWr)); } catch (e) {} }, 60000).unref();
+// ===== ZONE GRADE (2026-10-07) ===== bucket hold-rate from the ledger: key = kind|tf|nearExt.
+// A zone with ≥1 hold counts as held; a broken fate counts as broken (a zone can be both).
+// Grade S (strong) ≥60% over ≥10, W (weak) ≤35% over ≥10, M in between, U = not enough data.
+function zoneStats(sym) {
+  const L = (S[sym] && S[sym]._zoneLedger) || {}; const b = {};
+  for (const id of Object.keys(L)) { const z = L[id]; const k = z.kind + '|' + z.tf + '|' + (z.nearExt ? 'ext' : 'mid'); b[k] = b[k] || { n: 0, held: 0, broken: 0, expired: 0, touched: 0, live: 0 }; const o = b[k]; o.n++; if (z.holds > 0) o.held++; if (z.fate === 'broken') o.broken++; if (z.fate === 'expired') o.expired++; if (z.touches > 0) o.touched++; if (!z.fate) o.live++; }
+  Object.values(b).forEach(o => { const d = o.held + o.broken; o.holdRate = d ? +(100 * o.held / d).toFixed(0) : null; o.grade = d >= 10 ? (o.holdRate >= 60 ? 'S' : o.holdRate <= 35 ? 'W' : 'M') : 'U'; });
+  return b;
+}
+function zoneGrade(sym, z) { try { const b = zoneStats(sym); const L = S[sym]._zoneLedger && z.id ? S[sym]._zoneLedger[z.id] : null; const k = z.kind + '|' + z.tf + '|' + ((L && L.nearExt) ? 'ext' : 'mid'); return (b[k] && b[k].grade) || 'U'; } catch (e) { return 'U'; } }
+app.get('/zones/:sym', (req, res) => {
+  try {
+    const sym = resolveSymbol(req.params.sym); const s = S[sym]; if (!s) return res.status(404).json({ error: 'unknown' });
+    const L = s._zoneLedger || {}; const arr = Object.values(L);
+    res.json({ symbol: sym, ts: Date.now(), ledgerN: arr.length, live: arr.filter(z => !z.fate).length, byBucket: zoneStats(sym),
+      recent: arr.sort((a, b) => b.ts - a.ts).slice(0, 40).map(z => ({ id: z.id, kind: z.kind, tf: z.tf, dir: z.dir, lo: z.lo, hi: z.hi, hAtr: z.hAtr, body: z.body, nearExt: z.nearExt, withTrend: z.withTrend, regime: z.regime, touches: z.touches, holds: z.holds, maxReact: z.maxReact, fate: z.fate, lifeMin: z.lifeMin || null })),
+      zoneReact: { all: (cohortTally[sym] || {})['ZONE-REACT'] || null, multi: (cohortTally[sym] || {})['ZONE-REACT-MULTI'] || null } });
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
 function trendTrackerFor(sym) {
   const rows = trendWr[sym] || [];
   const tally = (cohortTally[sym] || {});
@@ -4105,6 +4125,7 @@ function processPrice(sym, price, hi, lo) {
         if (_zr) {
           s._m5 = _zr.m5 || []; s._zoneObs = _zr.zones || []; s._zoneTouched = _zr.touched || {}; s._msTrend = _zr.msTrend || s._msTrend;
           if (Array.isArray(_zr.m5h) && _zr.m5h.length) s._m5hist = _zr.m5h; // week-long ring restore (2026-09-20)
+          if (_zr.zl && typeof _zr.zl === 'object') s._zoneLedger = _zr.zl; // zone ledger restore (2026-10-07)
           log(sym, '🗺️ Zone map restored ungated at boot — ' + (s._zoneObs.length) + ' zones, ' + (s._m5.length) + ' M5 candles, msTrend ' + (s._msTrend || '—') + ' (2026-09-16 fix: no more 45min post-deploy blackout).');
         }
       }
@@ -8021,6 +8042,7 @@ function processPrice(sym, price, hi, lo) {
           const _zvInAge = _zvIn.ts ? Math.round((Date.now() - _zvIn.ts) / 60000) : null;
           const _zvInMsg = '🚧 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ZONE-VETO: price is INSIDE opposing ' + (_zvIn.kind || 'OB') + ' ' + (_zvIn.tf || '') + ' $' + _zvIn.lo.toFixed(2) + '-$' + _zvIn.hi.toFixed(2) + (_zvInAge !== null ? ' · zone age ' + _zvInAge + 'min [' + (_zvInAge < 240 ? 'ZAGE-FRESH' : _zvInAge <= 720 ? 'ZAGE-MID' : 'ZAGE-OLD') + ']' : '') + ' — inside-zone rule holds even on latched trend days (2026-08-28, 8/27 23:46 case).' + grindReclaimTag(s, sig.type, price, _zvIn, atrVal) + _zvTok;
           log(sym, _zvInMsg); trackBlockedOutcome(sym, _zvInMsg, true);
+          try { const _lastE = s.blockedOutcomes && s.blockedOutcomes[s.blockedOutcomes.length - 1]; if (_lastE && _lastE.blockReason === _zvInMsg) { _lastE.zoneGrade = zoneGrade(sym, _zvIn); _lastE.zoneId = _zvIn.id || null; } } catch (eZG) {} // zone grade on the veto row (2026-10-07)
           return false;
         }
         if (tdLatchEase(s, sig.type) || _zvBigLeg) {
@@ -8046,6 +8068,7 @@ function processPrice(sym, price, hi, lo) {
           const _zvAgeTag = _zvAge !== null ? ' · zone age ' + _zvAge + 'min [' + (_zvAge < 240 ? 'ZAGE-FRESH' : _zvAge <= 720 ? 'ZAGE-MID' : 'ZAGE-OLD') + ']' : '';
           const _zvMsg = '🚧 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' BLOCKED — ZONE-VETO: opposing ' + (_zv.kind || 'OB') + ' ' + (_zv.tf || '') + ' $' + _zv.lo.toFixed(2) + '-$' + _zv.hi.toFixed(2) + ' sits ' + (_zvC ? (_zv.lo - price) : (price - _zv.hi)).toFixed(2) + ' ahead (<1.2×ATR)' + _zvAgeTag + ' — path runs into mapped ' + (_zvC ? 'supply' : 'demand') + ' (Layer 3, 2026-08-13).' + grindReclaimTag(s, sig.type, price, _zv, atrVal) + _zvTok;
           log(sym, _zvMsg); trackBlockedOutcome(sym, _zvMsg, true);
+          try { const _lastE = s.blockedOutcomes && s.blockedOutcomes[s.blockedOutcomes.length - 1]; if (_lastE && _lastE.blockReason === _zvMsg) { _lastE.zoneGrade = zoneGrade(sym, _zv); _lastE.zoneId = _zv.id || null; } } catch (eZG2) {}
           return false;
         }
         }
@@ -11313,11 +11336,11 @@ function processPrice(sym, price, hi, lo) {
           for (let i = 2; i < cs.length; i++) {
             const a = cs[i - 2], b = cs[i - 1], c = cs[i];
             // FVG (3-candle gap with displacement middle candle)
-            if (a.h < c.l && (c.l - a.h) >= 0.3 * atrVal && Math.abs(b.c - b.o) >= 0.8 * atrVal) _zones.push({ hi: c.l, lo: a.h, dir: 'call', ts: c.ts, kind: 'FVG', tf });
-            if (a.l > c.h && (a.l - c.h) >= 0.3 * atrVal && Math.abs(b.c - b.o) >= 0.8 * atrVal) _zones.push({ hi: a.l, lo: c.h, dir: 'put', ts: c.ts, kind: 'FVG', tf });
+            if (a.h < c.l && (c.l - a.h) >= 0.3 * atrVal && Math.abs(b.c - b.o) >= 0.8 * atrVal) _zones.push({ hi: c.l, lo: a.h, dir: 'call', ts: c.ts, kind: 'FVG', tf, body: +(Math.abs(b.c - b.o) / atrVal).toFixed(2) });
+            if (a.l > c.h && (a.l - c.h) >= 0.3 * atrVal && Math.abs(b.c - b.o) >= 0.8 * atrVal) _zones.push({ hi: a.l, lo: c.h, dir: 'put', ts: c.ts, kind: 'FVG', tf, body: +(Math.abs(b.c - b.o) / atrVal).toFixed(2) });
             // OB (opposing candle before displacement closing beyond its extreme)
-            if (b.c < b.o && c.c > b.h && (c.c - c.o) >= 0.8 * atrVal) _zones.push({ hi: b.h, lo: b.l, dir: 'call', ts: c.ts, kind: 'OB', tf });
-            if (b.c > b.o && c.c < b.l && (c.o - c.c) >= 0.8 * atrVal) _zones.push({ hi: b.h, lo: b.l, dir: 'put', ts: c.ts, kind: 'OB', tf });
+            if (b.c < b.o && c.c > b.h && (c.c - c.o) >= 0.8 * atrVal) _zones.push({ hi: b.h, lo: b.l, dir: 'call', ts: c.ts, kind: 'OB', tf, body: +((c.c - c.o) / atrVal).toFixed(2) });
+            if (b.c > b.o && c.c < b.l && (c.o - c.c) >= 0.8 * atrVal) _zones.push({ hi: b.h, lo: b.l, dir: 'put', ts: c.ts, kind: 'OB', tf, body: +((c.o - c.c) / atrVal).toFixed(2) });
           }
         }
         // mitigation: a later M5 CLOSE through the far side kills the zone
@@ -11342,6 +11365,39 @@ function processPrice(sym, price, hi, lo) {
         // pruning, not display cleanup.
         s._zoneObs = s._zoneObs.filter(z => z && (_zNow - z.ts) < 1500 * 60000);
         if (s._zoneObs.length > 60) s._zoneObs = s._zoneObs.slice(-60);
+        // ===== ZONE LEDGER (2026-10-07, Jean: "train the system to understand which OB/FVG is
+        // relevant and which one is easily breakable") ===== Every zone gets a record at birth
+        // (features) and a fate when the market decides: HELD = price entered and reversed
+        // ≥1×ATR within 30 min without a close through; BROKEN = mitigated (M5 close through
+        // the far side); EXPIRED = aged out untouched. Hold-rate by bucket → zone grade →
+        // (phase 3, dormant-first) the gates read the grade. Store: s._zoneLedger[id].
+        try {
+          s._zoneLedger = s._zoneLedger || {};
+          const _zid = z => z.kind + '|' + z.tf + '|' + z.dir + '|' + z.ts + '|' + (+z.lo).toFixed(2);
+          const _nowL = Date.now();
+          const _liveIds = new Set();
+          for (const z of s._zoneObs) {
+            const id = _zid(z); _liveIds.add(id); z.id = id;
+            if (!s._zoneLedger[id]) {
+              const _h = z.hi - z.lo;
+              const _nearLo = isFinite(s.sessionLow) && z.lo <= s.sessionLow + 0.5 * atrVal;
+              const _nearHi = isFinite(s.sessionHigh) && z.hi >= s.sessionHigh - 0.5 * atrVal;
+              s._zoneLedger[id] = { id, sym, kind: z.kind, tf: z.tf, dir: z.dir, lo: z.lo, hi: z.hi, ts: z.ts, born: _nowL,
+                hAtr: atrVal > 0 ? +(_h / atrVal).toFixed(2) : null, body: z.body || null,
+                withTrend: (z.dir === 'call' && s._msTrend === 'up') || (z.dir === 'put' && s._msTrend === 'down'),
+                regime: (s._dayRegime && s._dayRegime.label) || null, hour: +new Date(z.ts).toLocaleTimeString('en-US', { hour: '2-digit', hour12: false, timeZone: 'America/New_York' }).slice(0, 2),
+                nearExt: (z.dir === 'call' && _nearLo) || (z.dir === 'put' && _nearHi), tick: (typeof s._tickRateSess === 'number') ? +s._tickRateSess.toFixed(2) : null,
+                confl: s._zoneObs.filter(o => o !== z && o.dir === z.dir && o.lo < z.hi && o.hi > z.lo).length,
+                touches: 0, lastTouch: 0, inZone: false, holds: 0, maxReact: 0, fate: null, fateTs: null };
+            }
+          }
+          // fates: a ledger zone no longer live → broken (mitigated) or expired (age)
+          for (const id of Object.keys(s._zoneLedger)) {
+            const L = s._zoneLedger[id];
+            if (L.fate) { if (_nowL - (L.fateTs || 0) > 7 * 86400000) delete s._zoneLedger[id]; continue; }
+            if (!_liveIds.has(id)) { L.fate = (_nowL - L.ts >= 1500 * 60000) ? 'expired' : 'broken'; L.fateTs = _nowL; L.lifeMin = Math.round((_nowL - L.ts) / 60000); }
+          }
+        } catch (eZL) {}
         // ===== FVG-RT — RETIRED (2026-09-18, Jean: "ok to retire rt2") =====
         // The mapped-FVG retest lane (2026-09-12, born from Jean's 9/9 +$3,113 hand
         // trade) failed in BOTH grading geometries: v1 symmetric ±cap 8W/41L (16%),
@@ -11352,6 +11408,57 @@ function processPrice(sym, price, hi, lo) {
         // the tally as the permanent record; cohortFor mappings retained so any
         // in-flight entries resolve into the right buckets.
       }
+      // ===== ZONE LEDGER — per-tick touches / holds, and ZONE-REACT shadow lane (2026-10-07) =====
+      // Jean's M1 example: price tapped 4128.5 three times and flew; "we can take small wins just
+      // by playing on OB reaction". The lane: a mapped zone sitting at the session extreme (demand
+      // within 0.5×ATR of the session low / supply at the high), price ENTERS it, then REACTS —
+      // trades back out through the zone edge by ≥0.15×ATR within 15 min. Entry on the reaction,
+      // SL beyond the zone's far side (and the touch low/high) by 0.1×ATR, TP1 = 1R (the small win),
+      // TP2 = 2R. Cohorts ZONE-REACT (first touch) / ZONE-REACT-MULTI (zone touched ≥2× before) —
+      // the triple-bottom case graded apart. Shadow; promotion ≥60% over ≥20. All MT5 symbols.
+      try {
+        if (s._zoneLedger && Array.isArray(s._zoneObs) && atrVal > 0) {
+          const _nowT = Date.now();
+          for (const z of s._zoneObs) {
+            const L = z.id ? s._zoneLedger[z.id] : null; if (!L || L.fate) continue;
+            const inside = price >= z.lo && price <= z.hi;
+            const isDem = z.dir === 'call';
+            // touch (debounced 10 min)
+            if (inside && !L.inZone) { L.inZone = true; if (_nowT - L.lastTouch > 600000) { L.touches++; L.lastTouch = _nowT; L.touchPx = price; L.touchExt = price; L.reactDone = false; } }
+            if (inside) L.touchExt = isDem ? Math.min(L.touchExt || price, price) : Math.max(L.touchExt || price, price);
+            if (!inside && L.inZone) L.inZone = false;
+            // hold = after a touch, price moves ≥1×ATR away from the zone edge within 30 min
+            if (L.lastTouch && _nowT - L.lastTouch <= 1800000) {
+              const away = isDem ? price - z.hi : z.lo - price;
+              if (away > (L.maxReact || 0)) L.maxReact = +away.toFixed(2);
+              if (away >= 1.0 * atrVal && L.lastHoldTouch !== L.lastTouch) { L.holds++; L.lastHoldTouch = L.lastTouch; }
+            }
+            // ZONE-REACT: zone at the session extreme, touched, now reacting back out of the zone
+            const nearExt = isDem ? (isFinite(s.sessionLow) && z.lo <= s.sessionLow + 0.5 * atrVal) : (isFinite(s.sessionHigh) && z.hi >= s.sessionHigh - 0.5 * atrVal);
+            if (nearExt && L.lastTouch && !L.reactDone && _nowT - L.lastTouch <= 900000 && !inside) {
+              const react = isDem ? price >= z.hi + 0.15 * atrVal : price <= z.lo - 0.15 * atrVal;
+              if (react) {
+                L.reactDone = true;
+                const dir = isDem ? 'call' : 'put';
+                const slLvl = isDem ? Math.min(z.lo, L.touchExt || z.lo) - 0.1 * atrVal : Math.max(z.hi, L.touchExt || z.hi) + 0.1 * atrVal;
+                const R = Math.abs(price - slLvl);
+                if (R > 0 && R <= 2.5 * atrVal) {
+                  const tp1 = isDem ? price + R : price - R;
+                  const lane = 'ZONE-REACT' + (L.touches >= 2 ? '-MULTI' : '');
+                  s._zrTs = s._zrTs || {};
+                  if (_nowT - (s._zrTs[z.id] || 0) >= 1800000) {
+                    s._zrTs[z.id] = _nowT;
+                    const m = '🧱 ' + sym + ' ' + lane + ' ' + dir.toUpperCase() + ' @ $' + price.toFixed(2) + ' — ' + z.kind + ' ' + z.tf + ' $' + z.lo.toFixed(2) + '-$' + z.hi.toFixed(2) + ' at the session ' + (isDem ? 'low' : 'high') + ' touched ' + L.touches + '× (last ' + Math.round((_nowT - L.lastTouch) / 60000) + 'min ago, extreme $' + (+L.touchExt).toFixed(2) + '), price reacted back out by ≥0.15×ATR; SL $' + slLvl.toFixed(2) + ' (R $' + R.toFixed(2) + '), TP1 1R $' + tp1.toFixed(2) + '. Shadow, promotion ≥60% over ≥20 (2026-10-07). ' + lane;
+                    s.blockedOutcomes = s.blockedOutcomes || [];
+                    s.blockedOutcomes.push({ ts: _nowT, time: ts(), symbol: sym, detector: lane, type: dir, price, virtualTp1: +tp1.toFixed(2), virtualSl: +slLvl.toFixed(2), maxMin: 120, blockReason: m, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null, zoneId: z.id, zoneTouches: L.touches });
+                    log(sym, m);
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch (eZR2) {}
       // ===== BREAKOUT TIME-STOP (2026-08-19, Jean) =====
       // 8/19 16:57 TREND CALL @4523.40: fired through the live-break window (fresh
       // session-high break — the sanctioned door), then went NOWHERE: +$0.4 peak,
@@ -18962,7 +19069,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.28-20261007-bigleg-ext-band30', // bump on each deploy — lets /state verify what's live
+    build: '7.30-20261007-zone-ledger', // bump on each deploy — lets /state verify what's live
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const _since = (fundedEpoch && fundedEpoch.since) || ''; const _base = (fundedEpoch && fundedEpoch.base) || {}; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; if (d >= _since) wk += pnlLedger[d][sym].pnl - ((_base[d] && typeof _base[d][sym] === 'number') ? _base[d][sym] : 0); } } out.weekTotal = +wk.toFixed(2); out.account = (fundedEpoch && fundedEpoch.label) || null; return out; } catch (e) { return {}; } })(), // weekTotal counts the current funded-account epoch only (2026-10-01) // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
