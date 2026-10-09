@@ -808,7 +808,7 @@ const TRUMP_STATE_FILE = path.join(DATA_DIR, 'trump_state.json');
 const TRUMP_BIAS_TTL_MS = parseInt(process.env.TRUMP_BIAS_TTL_MS) || 3600000; // 60 min default
 const TRUMP_MIN_INTENSITY = parseInt(process.env.TRUMP_MIN_INTENSITY) || 3;   // skip weak tweets
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
-const TRUMP_CLASSIFIER_MODEL = process.env.TRUMP_CLASSIFIER_MODEL || 'claude-haiku-4-5-20251001';
+const TRUMP_CLASSIFIER_MODEL = process.env.TRUMP_CLASSIFIER_MODEL || 'claude-haiku-5-5'; // refreshed 2026-10-09 (old dated id)
 
 // Per-instrument bias map (added 2026-05-10). Replaces the legacy single trumpBias +
 // trumpInstruments combo so a single tweet can express OPPOSITE directions across symbols
@@ -2201,6 +2201,7 @@ function nasRthBlocked(sym) {
   try { const m = gET(); return (m < 570 || m >= 960); } catch (e) { return false; }
 }
 function cohortFor(reason) {
+  { const _ag = reason.match(/\bAGENT-([A-Z0-9]+)-(FILL|WAIT|SKIP)-(NOW|FILL)\b/); if (_ag) return _ag[0]; } // entry agent shadow cohorts (2026-10-09)
   { const _tw = reason.match(/\bTREND-(WT|CT)\b/); if (_tw) return 'TREND-' + _tw[1]; }
   { const _pb = reason.match(/\bEXT-PB-(LEFT|EXPIRED)\b/); if (_pb) return 'EXT-PB-' + _pb[1]; }
   { const _pt = reason.match(/\bPATH-(CLEAR|ZONED)-([TRM])\b/); if (_pt) return 'PATH-' + _pt[1] + '-' + _pt[2]; } // path sampler (2026-10-07)
@@ -4315,6 +4316,7 @@ function processPrice(sym, price, hi, lo) {
                 s.trade = buildCfdTrade(dir, price, (s._atr || _srAdr / 20), sym);
                 s.trade._oteVetted = true; s.trade._sessLive = true;
                 s.trade.slPrice = +sl.toFixed(2); s.trade.tp1Price = +_tp1.toFixed(2); s.trade.tp2Price = +_tp2.toFixed(2); s.trade.tp3Price = +_tp3.toFixed(2);
+                try { entryAgentConsult(sym, s, { price, atr: s._atr || _srAdr / 20, dir, detector: 'SESSREJ-RT', trade: s.trade, rule: { action: 'fill', via: 'SESS-REJ live (market)' }, rsi: s._rsi, macdL: s._macdL, roc3: s._roc3, histTs: (s.lastHistEntry && s.lastHistEntry.symbol === sym) ? s.lastHistEntry.ts : null }); } catch (eAG) {}
                 log(sym, '🎯 BTC SESS-REJ ' + dir.toUpperCase() + ' LIVE FIRE @ $' + price.toFixed(0) + ' — session ' + (isL ? 'low' : 'high') + ' rejected (M5 closed back inside, regime RANGE) · SL $' + sl.toFixed(0) + ' (beyond the extreme) · TP1 $' + _tp1.toFixed(0) + ' · TP2 $' + _tp2.toFixed(0) + ' · TP3 $' + _tp3.toFixed(0) + ' · live record ' + ((global._srRec && global._srRec.w) || 0) + 'W/' + ((global._srRec && global._srRec.l) || 0) + 'L [promoted 2026-10-05 on 9W/3L/5S].');
                 sendPush('🎯 BTC SESS-REJ ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(0) + ' · SL $' + sl.toFixed(0) + ' · TP1 $' + _tp1.toFixed(0) + ' · session-extreme rejection', 'signal');
                 return true;
@@ -4611,6 +4613,7 @@ function processPrice(sym, price, hi, lo) {
                 s.trade = buildCfdTrade(_bDir, price, (s._atr || _bAdr / 20), sym);
                 s.trade._oteVetted = true; s.trade._legLive = true; s.trade.bigLeg = true;
                 s.trade.slPrice = _bSl; s.trade.tp1Price = _lTp1; s.trade.tp2Price = _lTp2; s.trade.tp3Price = _lTp3;
+                try { entryAgentConsult(sym, s, { price, atr: s._atr || _bAdr / 20, dir: _bDir, detector: 'BIGLEG', trade: s.trade, rule: { action: 'fill', via: 'BIGLEG live (market)' }, rsi: s._rsi, macdL: s._macdL, roc3: s._roc3, histTs: (s.lastHistEntry && s.lastHistEntry.symbol === sym) ? s.lastHistEntry.ts : null }); } catch (eAG) {}
                 log(sym, '🦵 BTC-BIGLEG ' + _bDir.toUpperCase() + ' LIVE FIRE @ $' + price.toFixed(0) + ' — leg $' + _bLeg.toFixed(0) + ' (' + (_bLeg / _bAdr).toFixed(2) + '×ADR) from pivot $' + s._legPivot.ext.toFixed(0) + ' · SL $' + _bSl.toFixed(0) + ' (pivot, risk $' + Math.abs(price - _bSl).toFixed(0) + ') · TP1 $' + _lTp1.toFixed(0) + ' · TP2 $' + _lTp2.toFixed(0) + ' · TP3 $' + _lTp3.toFixed(0) + ' [BTC_BIGLEG_LIVE].');
                 sendPush('🦵 BTC BIGLEG ' + _bDir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(0) + ' · SL $' + _bSl.toFixed(0) + ' · TP1 $' + _lTp1.toFixed(0), 'signal');
               }
@@ -11548,6 +11551,7 @@ function processPrice(sym, price, hi, lo) {
                     s.trade = buildCfdTrade(dir, price, atrVal, sym);
                     s.trade._oteVetted = true; s.trade._pathLive = true; s.trade.scalp = true; delete s.trade.oteLimit; delete s.trade.oteExpiry;
                     s.trade.slPrice = +sl.toFixed(2); s.trade.tp1Price = +tp1.toFixed(2); s.trade.tp2Price = +tp1.toFixed(2); s.trade.tp3Price = +tp1.toFixed(2); s.trade._ladder = 'PATH-1ATR';
+                    try { entryAgentConsult(sym, s, { price, atr: atrVal, dir, detector: lane, trade: s.trade, rule: { action: 'fill', via: 'PATH live (market, 1×ATR scalp)' }, rsi: s._rsi, macdL: s._macdL, roc3: s._roc3, histTs: (s.lastHistEntry && s.lastHistEntry.symbol === sym) ? s.lastHistEntry.ts : null }); } catch (eAG) {}
                     try { const h = s.lastHistEntry; if (h && h.symbol === sym) { h.sl = s.trade.slPrice; h.tp1 = s.trade.tp1Price; h.tp2 = s.trade.tp2Price; h.tp3 = s.trade.tp3Price; h.ladder = 'PATH-1ATR'; } } catch (eHP) {}
                     s.lastSignalDir = dir; s.lastSignalTs = _nowP; s.lastNTs = _nowP; s.lastAT = dir; if (dir === 'call') s.nC++; else s.nP++;
                     log(sym, '🛣️ ' + sym + ' ' + lane + ' ' + dir.toUpperCase() + ' LIVE FIRE @ $' + price.toFixed(2) + ' — msTrend ' + s._msTrend + ', ' + note + ' · SL $' + sl.toFixed(2) + ' · TP $' + tp1.toFixed(2) + ' (1×ATR $' + atrVal.toFixed(2) + ' each way, 100% out at TP, half lot) · regime ' + ((s._dayRegime && s._dayRegime.label) || '?') + ' [#' + s.dailySignalCount + '; promoted 2026-10-09 on 27W/17L; bench rule armed]');
@@ -11888,8 +11892,10 @@ function processPrice(sym, price, hi, lo) {
           // EXTREME-PULLBACK zone (2026-10-01): inside 1×max(ATR) of the session extreme every
           // release path (no impulse / at-or-beyond OTE / fast-lane) is off — hold for the pullback.
           const _ohPB = extPullbackZone(s, sym, _ohDir, price, atrVal > 0 ? atrVal : (_ohT.atr || 0));
+          let _agRule = null, _agPick = null; // entry-agent shadow: what the rule decided here (2026-10-09)
           if (!_ohPB.at && (!_ohOte || (_ohDir === 'call' ? price <= _ohOte.limit : price >= _ohOte.limit))) {
             _ohT._oteVetted = true; // no valid impulse, or already at/beyond OTE → release to market now
+            _agRule = { action: 'fill', via: _ohOte ? 'at-or-beyond OTE' : 'no valid impulse' };
             delete _ohT.oteLimit; delete _ohT.oteExpiry; delete _ohT.oteImpulseHi; delete _ohT.oteImpulseLo; // XAU: server-side hold supersedes the legacy EA-side limit — never send both
             if (_ohOte) log(sym, '🎯 OTE-HOLD skipped — $' + price.toFixed(2) + ' already at/beyond OTE $' + _ohOte.limit.toFixed(2) + '; released at market.');
             // ===== VISIBILITY STAMP (2026-09-10, Jean's 01:20 case) ===== Instant
@@ -11915,6 +11921,7 @@ function processPrice(sym, price, hi, lo) {
             // NOW instead of auctioning for a pullback that isn't coming.
             _ohT._oteVetted = true;
             delete _ohT.oteLimit; delete _ohT.oteExpiry; delete _ohT.oteImpulseHi; delete _ohT.oteImpulseLo;
+            _agRule = { action: 'fill', via: 'momentum fast-lane' };
             log(sym, '🎯 OTE-HOLD skipped — momentum fast-lane: ROC ' + (roc3 >= 0 ? '+' : '') + roc3.toFixed(3) + '% already accelerating in fire direction; released at market @ $' + price.toFixed(2) + ' (2026-09-12).');
             try {
               const _ohFl = s.signals.length ? s.signals[s.signals.length - 1] : null;
@@ -11946,13 +11953,16 @@ function processPrice(sym, price, hi, lo) {
                            // env overrides without a deploy.
                            runaway: (_ohPB.at ? (parseFloat(process.env.EXT_PB_RUNAWAY_MULT) || 0.75) : (parseFloat(process.env.OTE_RUNAWAY_MULT) || 0.3)) * (atrVal > 0 ? atrVal : (_ohT.atr || 0)), // extreme-pullback leash 0.75×ATR (2026-10-02; resolver live every tick since 7.12)
                            armTs: _zNow, expiry: _zNow + (_ohPB.at ? (parseInt(process.env.EXT_PB_HOLD_SEC, 10) || 180) * 1000 : 240000) };
+            _agPick = _ohPick; _agRule = { action: 'wait', limit: _ohPick.limit, via: _ohPick.via, windowSec: Math.round((s._oteHold.expiry - _zNow) / 1000), leashAtr: +((s._oteHold.runaway || 0) / Math.max(1e-9, _ohA)).toFixed(2), extremePullbackHold: !!_ohPB.at };
             s.trade = { active: false }; // NEVER null (2026-09-07 crash: /prices//status/checkExit read .active unguarded — the 18:48 MFLIP auction nulled this and crash-looped the server)
             if (_ohPB.at) log(sym, '⏸️ EXTREME-PULLBACK HOLD ' + _ohDir.toUpperCase() + ' @ $' + price.toFixed(2) + ' — $' + (_ohPB.dist || 0).toFixed(2) + ' from the session ' + (_ohDir === 'put' ? 'low' : 'high') + ' (zone $' + _ohPB.zone.toFixed(2) + ' = 1×ATR); no market fire. Fires only if price pulls back to ' + _ohPick.via + ' $' + _ohPick.limit.toFixed(2) + ' within ' + Math.round((s._oteHold.expiry - _zNow) / 1000) + 's; runaway = signal left → no trade (Jean 2026-10-01).');
             else log(sym, '⏳ OTE-HOLD ' + _ohDir.toUpperCase() + ' armed @ $' + price.toFixed(2) + ' — auctioning toward ' + _ohPick.via + ' $' + _ohPick.limit.toFixed(2) + (_ohPick.via === 'AVWAP' ? ' (pivot-anchored VWAP, ' + _ohPick.basis + ' n=' + _ohPick.n + ', leg ' + _ohPick.ageMin + 'min; OTE fib was $' + _ohOte.limit.toFixed(2) + ')' : ' (70.5% of impulse $' + _ohOte.impulseLo.toFixed(2) + '-$' + _ohOte.impulseHi.toFixed(2) + (_ohPick.avwap ? '; AVWAP $' + _ohPick.avwap.toFixed(2) + ' not eligible' : '') + ')') + ' ≤4min; early fire on touch or ≥0.5×ATR runaway; invalidates at SL' + (s._oteHold.slPrice ? ' $' + s._oteHold.slPrice.toFixed(2) : '') + ' (Jean 2026-08-26; AVWAP candidate 2026-09-20).');
             sendPush('⏳ ' + sym + ' OTE-HOLD ' + _ohDir.toUpperCase(), 'waiting for ' + _ohPick.via + ' $' + _ohPick.limit.toFixed(2) + ' (now $' + price.toFixed(2) + ') · ≤4min', 'signal');
           }
+          try { if (_agRule) entryAgentConsult(sym, s, { price, atr: atrVal > 0 ? atrVal : (_ohT.atr || 0), dir: _ohDir, detector: (s.lastHistEntry && s.lastHistEntry.symbol === sym && s.lastHistEntry.score) || (s.signals.length ? s.signals[s.signals.length - 1].score : '?'), trade: _ohT, rule: _agRule, ote: _ohOte, pb: _ohPB, pick: _agPick, rsi: rsiV, macdL, roc3, roc6, histTs: (s.lastHistEntry && s.lastHistEntry.symbol === sym) ? s.lastHistEntry.ts : null }); } catch (eAG) {}
         }
       } catch (eOV) { if (s.trade && s.trade._oteVetted === false) s.trade._oteVetted = true; /* never strand a trade unvetted */ }
+      try { entryAgentTick(sym, s, price); } catch (eAT) {} // entry-agent shadow: WAIT limit trackers + outcome back-fill (2026-10-09)
       // ===== MACD-HOLD RESOLVER (2026-10-02, Jean) ===== A continuation candidate deferred
       // for a wrong-sense MACD line is parked in s._macdHold. Every tick: the line turned
       // (crossed to the trade's side, or moved toward it for ≥60s / with aligned acceleration)
@@ -18826,6 +18836,247 @@ app.post('/trade/close', (req, res) => {
   res.json({ ok: true, sym, id, closeRequest: s.closeRequest });
 });
 
+// ===== ENTRY AGENT — SHADOW (2026-10-09, Jean: "replace OTE by an AI agent that would decide if the
+// trade needs to be filled / wait for pullback / skipped") =====
+// At every entry decision the rule-based auction makes (XAU/NAS OTE vet: release at market, fast-lane,
+// hold; BTC lane fires: market), the server builds a market snapshot and asks one or more Claude models
+// for their own call: FILL now / WAIT for a limit (price, window, leash) / SKIP. In SHADOW the answer
+// changes nothing — it is logged with its reason, and graded exactly like the rule: a "fill now"
+// bracket from the decision price (cohort AGENT-<MODEL>-<ACTION>-NOW) and, for WAIT, a limit tracker
+// that opens a second bracket at the limit if price gets there (AGENT-<MODEL>-WAIT-FILL). /agent shows
+// the scoreboard per model next to what the rule's real trade did. Promotion bar (pre-registered):
+// the agent beats the rule by ≥8 points of W/(W+L) over ≥40 decisions, or clears 60% on its own; then
+// a later build lets it set the hold parameters for real. Kill: ENTRY_AGENT=0. Models: ENTRY_AGENT_MODELS
+// (comma list; default = ENTRY_AGENT_MODEL + haiku side by side, or opus+haiku). Effort: ENTRY_AGENT_EFFORT (low).
+const ENTRY_AGENT_FILE = path.join(DATA_DIR, 'entry_agent.json');
+const entryAgent = { decisions: [], waits: {}, dirty: false, stats: { calls: 0, errors: 0, msSum: 0, inTok: 0, outTok: 0, lastErr: null, lastErrTs: 0 } };
+try { if (fs.existsSync(ENTRY_AGENT_FILE)) { const _j = JSON.parse(fs.readFileSync(ENTRY_AGENT_FILE, 'utf8')); if (Array.isArray(_j.decisions)) entryAgent.decisions = _j.decisions.slice(-600); if (_j.stats) entryAgent.stats = Object.assign(entryAgent.stats, _j.stats); console.log('[' + ts() + '] ENTRY AGENT: ' + entryAgent.decisions.length + ' past decisions restored'); } } catch (e) {}
+setInterval(() => { if (!entryAgent.dirty) return; entryAgent.dirty = false; try { fs.writeFileSync(ENTRY_AGENT_FILE, JSON.stringify({ decisions: entryAgent.decisions.slice(-600), stats: entryAgent.stats })); } catch (e) {} }, 60000);
+function entryAgentEnabled() { return process.env.ENTRY_AGENT !== '0' && !!process.env.ANTHROPIC_API_KEY; }
+function entryAgentModels() { const m = process.env.ENTRY_AGENT_MODELS || (process.env.ENTRY_AGENT_MODEL ? process.env.ENTRY_AGENT_MODEL + ',claude-haiku-5-5' : 'claude-opus-5-5,claude-haiku-5-5'); return Array.from(new Set(m.split(',').map(x => x.trim()).filter(Boolean))); }
+function entryAgentShort(m) { return /opus/i.test(m) ? 'OPUS' : /haiku/i.test(m) ? 'HAIKU' : /sonnet/i.test(m) ? 'SONNET' : /fable/i.test(m) ? 'FABLE' : String(m).replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 8); }
+function etClock(ms) { try { return new Date(ms).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'America/New_York' }); } catch (e) { return ''; } }
+console.log('[' + ts() + '] ENTRY AGENT (shadow): ' + (entryAgentEnabled() ? 'ON — models ' + entryAgentModels().join(' + ') + ', effort ' + (process.env.ENTRY_AGENT_EFFORT || 'low') : (process.env.ENTRY_AGENT === '0' ? 'OFF (ENTRY_AGENT=0)' : 'OFF — ANTHROPIC_API_KEY missing')));
+
+const ENTRY_AGENT_SYSTEM = [
+  'You are the ENTRY DESK of an intraday CFD scalping system trading XAUUSD (gold), NAS100 and BTCUSD on 1-second ticks.',
+  'A detector has just fired a directional signal and the system has built a stop/target ladder for it. Your ONLY job is the entry decision:',
+  '  FILL — enter at market now.',
+  '  WAIT — do not chase; place a limit at a pullback price and give it a time window and a leash (if price runs away in the signal direction by more than the leash before filling, the wait is abandoned — no trade).',
+  '  SKIP — no trade at all.',
+  'How you are graded: every decision is scored on whether the first target (TP1) is reached before the stop (SL) from the fill price. A WAIT that never fills is scored by what the market did from the decision price: a missed winner counts against you, an avoided stop counts for you. You are competing against a rule-based auction whose decision is shown to you as rule_decision; you may agree with it.',
+  'Trading judgment to apply (not rules — judgment):',
+  '  • Fresh impulse + price still near the origin of the leg → FILL or a shallow WAIT. Leg already run ≥1 ATR from its pivot with momentum fading → WAIT for a real pullback (0.3–0.7 ATR) or SKIP.',
+  '  • Momentum already accelerating in the signal direction (ROC, MACD line expanding) → pullbacks rarely come; FILL beats WAIT.',
+  '  • Inside the extreme-pullback zone (at/near the session high for a call, session low for a put, within ~1 ATR) → never FILL a continuation at the extreme; WAIT for the pullback or SKIP.',
+  '  • Opposing zone (OB/FVG the other way) within 1 ATR ahead with grade S (strong) → the path is blocked: WAIT until price is through it or SKIP. Weak (W) or unknown zones matter less. No opposing zone within 2 ATR = clear path → favours FILL.',
+  '  • Regime RANGE with a candidate that is NOT at a session extreme → low expectancy for continuation; prefer SKIP unless the path is clear and momentum is live. Regime TREND with-trend → FILL/shallow WAIT; counter-trend in TREND → SKIP unless at an extreme with a clean rejection.',
+  '  • News blackout active or a high-impact release within 10 minutes → SKIP.',
+  '  • Use lane_stats_7d: if this detector\'s market fills have been losing and its pullback fills winning, lean WAIT; and vice versa. Use my_recent_decisions to avoid repeating a graded mistake.',
+  'Constraints for WAIT: limit must be on the pullback side of the current price (below it for a call, above it for a put), between 0.25 and 1.0 ATR away; window_sec 60–300; leash_atr 0.3–1.0.',
+  'Answer with ONE JSON object and nothing else: {"action":"fill"|"wait"|"skip","limit":<number or null>,"window_sec":<int or null>,"leash_atr":<number or null>,"confidence":<0..1>,"reason":"<max 160 chars, concrete: cite the numbers that decided it>"}'
+].join('\n');
+
+function entryAgentLaneStats(sym, detector) {
+  const mk = () => ({ market: { w: 0, l: 0 }, pullback_fill: { w: 0, l: 0 }, late_fill: { w: 0, l: 0 }, cancelled_would: { win: 0, lose: 0 } });
+  const out = { detector: mk(), all: mk() };
+  try {
+    const since = Date.now() - 7 * 86400000; const base = String(detector || '').replace(/[⬆⬇]/g, '').split(/[\s·+]/)[0];
+    for (let i = signalHistory.length - 1; i >= 0; i--) {
+      const h = signalHistory[i]; if (h.ts < since) break; if (h.symbol !== sym || !h.outcomes || (h.conv && (h.conv.enrichBlocked || h.conv.label === 'BLOCKED'))) continue;
+      const w = !!h.outcomes.tp1Hit, l = !!h.outcomes.slHit && !h.outcomes.tp1Hit; if (!w && !l) continue;
+      const mine = base && String(h.score || '').indexOf(base) >= 0;
+      const groups = [out.all].concat(mine ? [out.detector] : []);
+      if (typeof h.oteHold === 'string') { for (const g of groups) { if (w) g.cancelled_would.win++; else g.cancelled_would.lose++; } continue; }
+      let bucket = 'market';
+      if (h.oteHold && h.oteHold.via) { const v = String(h.oteHold.via); bucket = /touch|resumption/i.test(v) ? 'pullback_fill' : /expiry|runaway/i.test(v) ? 'late_fill' : 'market'; }
+      for (const g of groups) { if (w) g[bucket].w++; else g[bucket].l++; }
+    }
+  } catch (e) {}
+  return out;
+}
+function entryAgentSnapshot(sym, s, ctx) {
+  const price = +ctx.price, dir = ctx.dir, atr = Math.max(ctx.atr || 0, s._atr || 0) || 0;
+  const A = (x) => (atr > 0 && isFinite(x)) ? +(x / atr).toFixed(2) : null;
+  const t = ctx.trade || {};
+  const zones = Array.isArray(s._zoneObs) ? s._zoneObs : [];
+  const opp = zones.filter(z => z && z.dir !== dir), own = zones.filter(z => z && z.dir === dir);
+  const ahead = opp.filter(z => dir === 'put' ? z.hi <= price : z.lo >= price).map(z => ({ kind: z.kind, tf: z.tf, lo: +(+z.lo).toFixed(2), hi: +(+z.hi).toFixed(2), dist_atr: A(dir === 'put' ? price - z.hi : z.lo - price), grade: zoneGrade(sym, z) })).sort((a, b) => a.dist_atr - b.dist_atr).slice(0, 4);
+  const inside = opp.filter(z => price >= z.lo && price <= z.hi).map(z => ({ kind: z.kind, tf: z.tf, lo: +(+z.lo).toFixed(2), hi: +(+z.hi).toFixed(2), grade: zoneGrade(sym, z) })).slice(0, 2);
+  const behind = own.filter(z => dir === 'call' ? z.hi <= price : z.lo >= price).map(z => ({ kind: z.kind, tf: z.tf, lo: +(+z.lo).toFixed(2), hi: +(+z.hi).toFixed(2), dist_atr: A(dir === 'call' ? price - z.hi : z.lo - price), grade: zoneGrade(sym, z) })).sort((a, b) => a.dist_atr - b.dist_atr).slice(0, 3);
+  const m5 = (Array.isArray(s._m5) ? s._m5.slice(-12) : []).map(b => [etClock(b.ts), +(+b.o).toFixed(2), +(+b.h).toFixed(2), +(+b.l).toFixed(2), +(+b.c).toFixed(2)]);
+  let m1 = []; try { const P = s.prices || []; const step = 60; for (let i = P.length - 1, n = 0; i >= 0 && n < 20; i -= step, n++) m1.unshift(+(+P[i]).toFixed(2)); } catch (e) {}
+  const recent = entryAgent.decisions.filter(d => d.sym === sym && d.model === ctx._model && !d.err).slice(-8).map(d => ({ time: d.time, dir: d.dir, action: d.action, reason: d.reason, graded: d.nowOutcome ? ('fill-now would have been a ' + d.nowOutcome + (d.waitResult ? '; wait ' + d.waitResult + (d.fillOutcome ? ' → ' + d.fillOutcome : '') : '')) : 'pending' }));
+  const nb = s.newsBlackout || {};
+  return {
+    symbol: sym, direction: dir, detector: ctx.detector || '?', time_et: etClock(Date.now()), weekday: new Date().toLocaleDateString('en-US', { weekday: 'short', timeZone: 'America/New_York' }),
+    price, atr: +atr.toFixed(2),
+    regime: s._dayRegime ? { label: s._dayRegime.label, ker: s._dayRegime.ker, chop: s._dayRegime.chop, hurst: s._dayRegime.hurst } : null,
+    ms_trend: s._msTrend || null,
+    session: { high: isFinite(s.sessionHigh) ? +(+s.sessionHigh).toFixed(2) : null, low: isFinite(s.sessionLow) ? +(+s.sessionLow).toFixed(2) : null, range_atr: A(s.sessionHigh - s.sessionLow), dist_to_high_atr: A(s.sessionHigh - price), dist_to_low_atr: A(price - s.sessionLow) },
+    indicators: { rsi: isFinite(ctx.rsi) ? +(+ctx.rsi).toFixed(1) : null, macd_line: isFinite(ctx.macdL) ? +(+ctx.macdL).toFixed(3) : null, roc_3min_pct: isFinite(ctx.roc3) ? +(+ctx.roc3).toFixed(3) : null, roc_6min_pct: isFinite(ctx.roc6) ? +(+ctx.roc6).toFixed(3) : null },
+    leg: s._legPivot ? { trend: s._legPivot.trend, pivot: +(+s._legPivot.ext).toFixed(2), run_from_pivot_atr: A(Math.abs(price - s._legPivot.ext)), pivot_age_min: s._legPivot.ts ? Math.round((Date.now() - s._legPivot.ts) / 60000) : null } : null,
+    impulse_ote: ctx.ote ? { impulse_lo: +(+ctx.ote.impulseLo).toFixed(2), impulse_hi: +(+ctx.ote.impulseHi).toFixed(2), ote_705_limit: +(+ctx.ote.limit).toFixed(2), dist_to_ote_atr: A(Math.abs(price - ctx.ote.limit)), price_already_beyond_ote: dir === 'call' ? price <= ctx.ote.limit : price >= ctx.ote.limit } : null,
+    extreme_pullback_zone: ctx.pb ? { at_extreme: !!ctx.pb.at, zone_width: +(+ctx.pb.zone || 0).toFixed(2), dist_from_extreme: ctx.pb.dist != null ? +(+ctx.pb.dist).toFixed(2) : null } : null,
+    rule_candidate_limit: ctx.pick ? { limit: ctx.pick.limit, via: ctx.pick.via, avwap: ctx.pick.avwap } : null,
+    opposing_zones_ahead: ahead, inside_opposing_zone: inside, supporting_zones_behind: behind,
+    m5_bars_last12_time_o_h_l_c: m5, m1_closes_last20: m1,
+    news: { blackout: !!nb.active, next_event: nb.eventName ? (nb.eventName + ' in ' + nb.minutesUntil + ' min (' + (nb.impact || '?') + ')') : null },
+    lane_stats_7d: entryAgentLaneStats(sym, ctx.detector),
+    trade_ladder: { sl: t.slPrice, tp1: t.tp1Price, tp2: t.tp2Price, tp3: t.tp3Price, sl_dist_atr: A(Math.abs((t.ep || price) - (t.slPrice || price))), tp1_dist_atr: A(Math.abs((t.ep || price) - (t.tp1Price || price))), scalp: !!t.scalp },
+    rule_decision: ctx.rule || null,
+    my_recent_decisions: recent
+  };
+}
+function entryAgentCall(model, userText, timeoutMs) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    try {
+      const httpsLib = require('https');
+      const body = JSON.stringify({ model, max_tokens: parseInt(process.env.ENTRY_AGENT_MAX_TOKENS, 10) || 3000, system: ENTRY_AGENT_SYSTEM, messages: [{ role: 'user', content: userText }], output_config: { effort: process.env.ENTRY_AGENT_EFFORT || 'low' } });
+      const req = httpsLib.request({ hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), 'x-api-key': process.env.ANTHROPIC_API_KEY || '', 'anthropic-version': '2023-06-01' } }, (resp) => {
+        let chunks = ''; resp.on('data', (c) => chunks += c);
+        resp.on('end', () => {
+          const ms = Date.now() - t0;
+          if (resp.statusCode >= 300) return resolve({ ok: false, err: 'HTTP ' + resp.statusCode + ': ' + chunks.slice(0, 200), ms });
+          try { const data = JSON.parse(chunks); const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n'); resolve({ ok: true, text, usage: data.usage || {}, ms, stop: data.stop_reason }); } catch (e) { resolve({ ok: false, err: 'bad json: ' + String(e).slice(0, 100), ms }); }
+        });
+      });
+      req.on('error', (e) => resolve({ ok: false, err: String(e).slice(0, 160), ms: Date.now() - t0 }));
+      req.setTimeout(timeoutMs || 20000, () => { try { req.destroy(new Error('timeout')); } catch (e) {} });
+      req.write(body); req.end();
+    } catch (e) { resolve({ ok: false, err: String(e).slice(0, 160), ms: Date.now() - t0 }); }
+  });
+}
+function entryAgentParse(text, snap) {
+  const m = String(text || '').match(/\{[\s\S]*\}/); if (!m) return { err: 'no json' };
+  let j; try { j = JSON.parse(m[0]); } catch (e) { return { err: 'json parse' }; }
+  const action = String(j.action || '').toLowerCase(); if (!/^(fill|wait|skip)$/.test(action)) return { err: 'bad action ' + action };
+  const out = { action, confidence: isFinite(+j.confidence) ? Math.max(0, Math.min(1, +j.confidence)) : null, reason: String(j.reason || '').slice(0, 200), limit: null, windowSec: null, leashAtr: null, note: '' };
+  if (action === 'wait') {
+    const atr = snap.atr || 0, price = snap.price, isC = snap.direction === 'call';
+    const lim = +j.limit; if (!isFinite(lim) || !(atr > 0)) return { err: 'wait without a valid limit' };
+    let d = isC ? price - lim : lim - price; // positive = on the pullback side
+    if (d <= 0) return { err: 'wait limit on the wrong side (' + lim + ' vs ' + price + ')' };
+    if (d < 0.25 * atr) { d = 0.25 * atr; out.note = 'limit clamped to 0.25×ATR'; } else if (d > 1.0 * atr) { d = 1.0 * atr; out.note = 'limit clamped to 1.0×ATR'; }
+    out.limit = +(isC ? price - d : price + d).toFixed(2);
+    out.windowSec = Math.max(60, Math.min(300, parseInt(j.window_sec, 10) || 180));
+    out.leashAtr = Math.max(0.3, Math.min(1.0, isFinite(+j.leash_atr) ? +j.leash_atr : 0.5));
+  }
+  return out;
+}
+// One consult per decision point (throttled 45s per symbol+direction so a vet re-run doesn't double-ask).
+function entryAgentConsult(sym, s, ctx) {
+  try {
+    if (!entryAgentEnabled() || !s || !(ctx && ctx.price > 0)) return;
+    const now = Date.now(); s._agLastTs = s._agLastTs || {};
+    if (now - (s._agLastTs[ctx.dir] || 0) < 45000) return; s._agLastTs[ctx.dir] = now;
+    const t = ctx.trade || {}; const ep = +(t.ep || ctx.price);
+    const slD = (t.slPrice > 0) ? Math.abs(ep - t.slPrice) : (ctx.atr || s._atr || 0) * 1.0;
+    const tpD = (t.tp1Price > 0) ? Math.abs(ep - t.tp1Price) : (ctx.atr || s._atr || 0) * 1.0;
+    if (!(slD > 0 && tpD > 0)) return;
+    const models = entryAgentModels();
+    models.forEach(async (model) => {
+      const id = sym + '-' + now + '-' + entryAgentShort(model);
+      const snap = entryAgentSnapshot(sym, s, Object.assign({}, ctx, { _model: model }));
+      const userText = 'Decide the entry for this signal. Snapshot (JSON):\n' + JSON.stringify(snap);
+      entryAgent.stats.calls++;
+      const r = await entryAgentCall(model, userText, parseInt(process.env.ENTRY_AGENT_TIMEOUT_MS, 10) || 20000);
+      const dec = { id, ts: now, time: etClock(now), sym, dir: ctx.dir, detector: ctx.detector || '?', model, short: entryAgentShort(model), price: +(+ctx.price).toFixed(2), atr: +(+snap.atr).toFixed(2), slDist: +slD.toFixed(2), tpDist: +tpD.toFixed(2), rule: ctx.rule || null, histTs: ctx.histTs || null, ms: r.ms, inTok: (r.usage && r.usage.input_tokens) || 0, outTok: (r.usage && r.usage.output_tokens) || 0 };
+      entryAgent.stats.msSum += r.ms || 0; entryAgent.stats.inTok += dec.inTok; entryAgent.stats.outTok += dec.outTok;
+      if (!r.ok) { entryAgent.stats.errors++; entryAgent.stats.lastErr = r.err; entryAgent.stats.lastErrTs = now; dec.err = r.err; entryAgent.decisions.push(dec); entryAgent.dirty = true; log(sym, '🤖 ENTRY-AGENT ' + dec.short + ' ERROR after ' + r.ms + 'ms — ' + String(r.err).slice(0, 140)); return; }
+      const p = entryAgentParse(r.text, snap);
+      if (p.err) { entryAgent.stats.errors++; entryAgent.stats.lastErr = p.err; entryAgent.stats.lastErrTs = now; dec.err = p.err; dec.raw = String(r.text || '').slice(0, 200); entryAgent.decisions.push(dec); entryAgent.dirty = true; log(sym, '🤖 ENTRY-AGENT ' + dec.short + ' unusable answer (' + p.err + ') — ' + String(r.text || '').slice(0, 120)); return; }
+      Object.assign(dec, { action: p.action, limit: p.limit, windowSec: p.windowSec, leashAtr: p.leashAtr, confidence: p.confidence, reason: p.reason, note: p.note });
+      // (1) the "fill now" bracket — graded for every decision (what the agent's FILL would do; what a SKIP gave up; what a WAIT risks missing)
+      const isC = ctx.dir === 'call'; const px = +ctx.price;
+      const tok = 'AGENT-' + dec.short + '-' + p.action.toUpperCase() + '-NOW';
+      s.blockedOutcomes = s.blockedOutcomes || [];
+      s.blockedOutcomes.push({ ts: now, time: ts(), symbol: sym, detector: 'AGENT-' + dec.short, type: ctx.dir, price: px, virtualTp1: +(isC ? px + tpD : px - tpD).toFixed(2), virtualSl: +(isC ? px - slD : px + slD).toFixed(2), maxMin: 240, agentId: id, blockReason: '🤖 ' + tok + ' ' + ctx.dir.toUpperCase() + ' @ $' + px.toFixed(2) + ' — agent says ' + p.action.toUpperCase() + (p.action === 'wait' ? ' for $' + p.limit + ' (' + p.windowSec + 's, leash ' + p.leashAtr + '×ATR)' : '') + ' (conf ' + (p.confidence == null ? '?' : p.confidence) + '): "' + p.reason + '" · rule: ' + (ctx.rule ? ctx.rule.action + (ctx.rule.limit ? ' $' + ctx.rule.limit : '') + ' via ' + ctx.rule.via : '?') + ' · ' + tok, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+      // (2) WAIT → a limit tracker (resolved per tick by entryAgentTick)
+      if (p.action === 'wait') { entryAgent.waits[sym] = entryAgent.waits[sym] || []; entryAgent.waits[sym].push({ id, model: dec.short, dir: ctx.dir, limit: p.limit, armPrice: px, slD, tpD, leash: p.leashAtr * (snap.atr || 0), expiry: now + p.windowSec * 1000, ts: now }); }
+      entryAgent.decisions.push(dec); if (entryAgent.decisions.length > 600) entryAgent.decisions.shift(); entryAgent.dirty = true;
+      const agree = ctx.rule ? ((ctx.rule.action === 'fill' && p.action === 'fill') || (ctx.rule.action === 'wait' && p.action === 'wait')) : null;
+      log(sym, '🤖 ENTRY-AGENT ' + dec.short + ' (' + r.ms + 'ms, ' + dec.inTok + '/' + dec.outTok + ' tok) → ' + p.action.toUpperCase() + (p.action === 'wait' ? ' @ $' + p.limit + ' for ' + p.windowSec + 's (leash ' + p.leashAtr + '×ATR)' : '') + (p.confidence != null ? ' · conf ' + p.confidence : '') + ' — "' + p.reason + '"' + (p.note ? ' [' + p.note + ']' : '') + ' · rule did: ' + (ctx.rule ? ctx.rule.action.toUpperCase() + (ctx.rule.limit ? ' @ $' + ctx.rule.limit : '') + ' (' + ctx.rule.via + ')' : '?') + (agree === null ? '' : agree ? ' · AGREES' : ' · DISAGREES') + ' [shadow — no effect on the trade]');
+    });
+  } catch (e) { try { log(sym, '⚠️ ENTRY-AGENT consult error: ' + String(e).slice(0, 120)); } catch (e2) {} }
+}
+// Per tick: resolve WAIT limit trackers (touch → open the fill bracket at the limit; leash/expiry → abandoned) and
+// copy graded outcomes back onto the decisions (so the agent's own memory and /agent read them).
+function entryAgentTick(sym, s, price) {
+  try {
+    const W = entryAgent.waits[sym]; if (W && W.length) {
+      const now = Date.now();
+      for (let i = W.length - 1; i >= 0; i--) {
+        const w = W[i]; const isC = w.dir === 'call';
+        const touched = isC ? price <= w.limit : price >= w.limit;
+        const ran = isC ? price - w.armPrice >= w.leash : w.armPrice - price >= w.leash;
+        const d = entryAgent.decisions.find(x => x.id === w.id);
+        if (touched) {
+          const tok = 'AGENT-' + w.model + '-WAIT-FILL';
+          s.blockedOutcomes = s.blockedOutcomes || [];
+          s.blockedOutcomes.push({ ts: now, time: ts(), symbol: sym, detector: 'AGENT-' + w.model, type: w.dir, price: +w.limit, virtualTp1: +(isC ? w.limit + w.tpD : w.limit - w.tpD).toFixed(2), virtualSl: +(isC ? w.limit - w.slD : w.limit + w.slD).toFixed(2), maxMin: 240, agentId: w.id + '-fill', blockReason: '🤖 ' + tok + ' ' + w.dir.toUpperCase() + ' filled @ $' + (+w.limit).toFixed(2) + ' after ' + Math.round((now - w.ts) / 1000) + 's (armed @ $' + w.armPrice.toFixed(2) + ') · ' + tok, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+          if (d) { d.waitResult = 'filled @ $' + (+w.limit).toFixed(2) + ' after ' + Math.round((now - w.ts) / 1000) + 's'; entryAgent.dirty = true; }
+          log(sym, '🤖 ENTRY-AGENT ' + w.model + ' WAIT filled (virtual) @ $' + (+w.limit).toFixed(2) + ' after ' + Math.round((now - w.ts) / 1000) + 's — bracket opened for grading.');
+          W.splice(i, 1);
+        } else if (ran) { if (d) { d.waitResult = 'left (ran ' + (w.leash / Math.max(1e-9, d.atr || 1)).toFixed(2) + '×ATR without filling)'; entryAgent.dirty = true; } log(sym, '🤖 ENTRY-AGENT ' + w.model + ' WAIT abandoned — price ran ' + Math.abs(price - w.armPrice).toFixed(2) + ' from $' + w.armPrice.toFixed(2) + ' without touching $' + (+w.limit).toFixed(2) + ' (leash).'); W.splice(i, 1); }
+        else if (now > w.expiry) { if (d) { d.waitResult = 'expired unfilled'; entryAgent.dirty = true; } log(sym, '🤖 ENTRY-AGENT ' + w.model + ' WAIT expired unfilled — $' + (+w.limit).toFixed(2) + ' never traded (now $' + price.toFixed(2) + ').'); W.splice(i, 1); }
+      }
+    }
+    // outcome back-fill, once a minute per symbol
+    s._agSweepTs = s._agSweepTs || 0; if (Date.now() - s._agSweepTs < 60000) return; s._agSweepTs = Date.now();
+    const rows = s.blockedOutcomes || [];
+    for (const d of entryAgent.decisions) {
+      if (d.sym !== sym || d.err) continue;
+      if (!d.nowOutcome) { const r = rows.find(b => b.agentId === d.id); if (r && r.closed) { d.nowOutcome = r.outcome; d.nowMfe = r.mfe || 0; entryAgent.dirty = true; } }
+      if (d.waitResult && /^filled/.test(d.waitResult) && !d.fillOutcome) { const r = rows.find(b => b.agentId === d.id + '-fill'); if (r && r.closed) { d.fillOutcome = r.outcome; entryAgent.dirty = true; } }
+      if (!d.ruleOutcome && d.histTs) { const h = signalHistory.find(x => x.ts === d.histTs && x.symbol === sym); if (h && h.outcomes) { if (h.outcomes.tp1Hit) d.ruleOutcome = 'win'; else if (h.outcomes.slHit) d.ruleOutcome = 'loss'; else if (typeof h.oteHold === 'string') d.ruleOutcome = 'cancelled:' + h.oteHold; if (d.ruleOutcome) { d.ruleVia = (h.oteHold && h.oteHold.via) || (typeof h.oteHold === 'string' ? h.oteHold : null); entryAgent.dirty = true; } } }
+    }
+  } catch (e) {}
+}
+// GET /admin/agent-test?sym=XAU&dir=call[&model=] — one real consult on the current market state, answer returned
+// inline (not recorded, no bracket). The key check after a deploy: a working key answers in a few seconds.
+app.get('/admin/agent-test', async (req, res) => {
+  try {
+    if (!process.env.ANTHROPIC_API_KEY) return res.status(409).json({ ok: false, error: 'ANTHROPIC_API_KEY missing on the server' });
+    const sym = resolveSymbol(req.query.sym || 'XAU'); const s = S[sym]; if (!s) return res.status(400).json({ ok: false, error: 'bad sym' });
+    const dir = String(req.query.dir || 'call').toLowerCase() === 'put' ? 'put' : 'call';
+    const price = +(req.query.price || s.lastPrice || 0); if (!(price > 0)) return res.status(409).json({ ok: false, error: 'no live price for ' + sym });
+    const atr = s._atr || 0;
+    const fake = { ep: price, slPrice: dir === 'call' ? price - atr : price + atr, tp1Price: dir === 'call' ? price + atr : price - atr, tp2Price: dir === 'call' ? price + 2 * atr : price - 2 * atr, tp3Price: dir === 'call' ? price + 3 * atr : price - 3 * atr };
+    const models = req.query.model ? [String(req.query.model)] : entryAgentModels();
+    const out = [];
+    for (const model of models) {
+      const snap = entryAgentSnapshot(sym, s, { price, atr, dir, detector: 'TEST', trade: fake, rule: { action: 'fill', via: 'admin test' }, rsi: s._rsi, macdL: s._macdL, roc3: s._roc3, _model: model });
+      const r = await entryAgentCall(model, 'Decide the entry for this signal. Snapshot (JSON):\n' + JSON.stringify(snap), 30000);
+      out.push({ model, ok: r.ok, ms: r.ms, err: r.err || null, usage: r.usage || null, answer: r.ok ? entryAgentParse(r.text, snap) : null, raw: r.ok ? String(r.text || '').slice(0, 400) : null });
+    }
+    res.json({ ok: true, sym, dir, price, atr, effort: process.env.ENTRY_AGENT_EFFORT || 'low', results: out });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
+// GET /agent — scoreboard per model vs the rule, recent decisions with reasons
+app.get('/agent', (req, res) => {
+  try {
+    const since = req.query.since ? Date.parse(req.query.since) : (Date.now() - 14 * 86400000);
+    const D = entryAgent.decisions.filter(d => d.ts >= since && (!req.query.sym || d.sym === String(req.query.sym).toUpperCase()));
+    const board = {};
+    for (const d of D) {
+      const b = board[d.short] = board[d.short] || { decisions: 0, errors: 0, avgMs: 0, _ms: 0, fill: { n: 0, win: 0, loss: 0, scratch: 0, pending: 0 }, skip: { n: 0, avoided_loss: 0, missed_win: 0, scratch: 0, pending: 0 }, wait: { n: 0, filled: 0, filled_win: 0, filled_loss: 0, filled_scratch: 0, left: 0, expired: 0, unfilled_missed_win: 0, unfilled_avoided_loss: 0, pending: 0 }, agreeWithRule: 0, rule: { win: 0, loss: 0, cancelled: 0 } };
+      b.decisions++; b._ms += d.ms || 0; if (d.err) { b.errors++; continue; }
+      const o = d.nowOutcome;
+      if (d.action === 'fill') { b.fill.n++; if (o === 'win') b.fill.win++; else if (o === 'loss') b.fill.loss++; else if (o) b.fill.scratch++; else b.fill.pending++; }
+      else if (d.action === 'skip') { b.skip.n++; if (o === 'win') b.skip.missed_win++; else if (o === 'loss') b.skip.avoided_loss++; else if (o) b.skip.scratch++; else b.skip.pending++; }
+      else if (d.action === 'wait') { b.wait.n++; const wr = d.waitResult || ''; if (/^filled/.test(wr)) { b.wait.filled++; const fo = d.fillOutcome; if (fo === 'win') b.wait.filled_win++; else if (fo === 'loss') b.wait.filled_loss++; else if (fo) b.wait.filled_scratch++; else b.wait.pending++; } else if (/^left/.test(wr) || /^expired/.test(wr)) { if (/^left/.test(wr)) b.wait.left++; else b.wait.expired++; if (o === 'win') b.wait.unfilled_missed_win++; else if (o === 'loss') b.wait.unfilled_avoided_loss++; else if (!o) b.wait.pending++; } else b.wait.pending++; }
+      if (d.rule && ((d.rule.action === 'fill' && d.action === 'fill') || (d.rule.action === 'wait' && d.action === 'wait'))) b.agreeWithRule++;
+      if (d.ruleOutcome === 'win') b.rule.win++; else if (d.ruleOutcome === 'loss') b.rule.loss++; else if (d.ruleOutcome && /cancelled/.test(d.ruleOutcome)) b.rule.cancelled++;
+    }
+    for (const k in board) { const b = board[k]; b.avgMs = b.decisions ? Math.round(b._ms / b.decisions) : 0; delete b._ms; const w = b.fill.win + b.wait.filled_win + b.skip.avoided_loss + b.wait.unfilled_avoided_loss, l = b.fill.loss + b.wait.filled_loss + b.skip.missed_win + b.wait.unfilled_missed_win; b.agentScore = { right: w, wrong: l, pct: (w + l) ? +(100 * w / (w + l)).toFixed(0) : null, note: 'right = fills/wait-fills that won + skips/unfilled waits that avoided a loss; wrong = fills that lost + skips/unfilled waits that missed a win' }; b.ruleScore = { win: b.rule.win, loss: b.rule.loss, pct: (b.rule.win + b.rule.loss) ? +(100 * b.rule.win / (b.rule.win + b.rule.loss)).toFixed(0) : null }; }
+    const st = entryAgent.stats;
+    const cost = { calls: st.calls, errors: st.errors, avgMs: st.calls ? Math.round(st.msSum / st.calls) : 0, inTok: st.inTok, outTok: st.outTok, lastErr: st.lastErr, lastErrAt: st.lastErrTs ? new Date(st.lastErrTs).toISOString() : null };
+    res.json({ enabled: entryAgentEnabled(), mode: 'shadow', models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', bar: 'agent beats the rule by ≥8 pts of W/(W+L) over ≥40 decisions, or ≥60% on its own', since: new Date(since).toISOString(), board, cost, waitsOpen: Object.fromEntries(Object.entries(entryAgent.waits).map(([k, v]) => [k, v.length])), recent: D.slice(-(parseInt(req.query.limit, 10) || 30)).reverse().map(d => ({ time: d.time, sym: d.sym, dir: d.dir, det: d.detector, model: d.short, action: d.action, limit: d.limit, window: d.windowSec, conf: d.confidence, reason: d.reason, err: d.err || undefined, rule: d.rule, nowOutcome: d.nowOutcome || null, waitResult: d.waitResult || null, fillOutcome: d.fillOutcome || null, ruleOutcome: d.ruleOutcome || null, ms: d.ms })) });
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
+
 // ===== MANUAL LAUNCH (2026-10-04, Jean: "a button that I can hit to launch the signal when I
 // think it is the right momentum") ===== POST /manual/fire { sym, type: 'call'|'put',
 // mode: 'market'|'hold', note } → a REAL server trade built with the regime-adaptive ladder,
@@ -19273,7 +19524,8 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.35-20261009-path-live-bigleg-guard', // bump on each deploy — lets /state verify what's live
+    build: '7.36-20261009-entry-agent-shadow', // bump on each deploy — lets /state verify what's live
+    entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const _since = (fundedEpoch && fundedEpoch.since) || ''; const _base = (fundedEpoch && fundedEpoch.base) || {}; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; if (d >= _since) wk += pnlLedger[d][sym].pnl - ((_base[d] && typeof _base[d][sym] === 'number') ? _base[d][sym] : 0); } } out.weekTotal = +wk.toFixed(2); out.account = (fundedEpoch && fundedEpoch.label) || null; return out; } catch (e) { return {}; } })(), // weekTotal counts the current funded-account epoch only (2026-10-01) // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
