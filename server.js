@@ -18901,9 +18901,12 @@ function entryAgentSnapshot(sym, s, ctx) {
   const t = ctx.trade || {};
   const zones = Array.isArray(s._zoneObs) ? s._zoneObs : [];
   const opp = zones.filter(z => z && z.dir !== dir), own = zones.filter(z => z && z.dir === dir);
-  const ahead = opp.filter(z => dir === 'put' ? z.hi <= price : z.lo >= price).map(z => ({ kind: z.kind, tf: z.tf, lo: +(+z.lo).toFixed(2), hi: +(+z.hi).toFixed(2), dist_atr: A(dir === 'put' ? price - z.hi : z.lo - price), grade: zoneGrade(sym, z) })).sort((a, b) => a.dist_atr - b.dist_atr).slice(0, 4);
-  const inside = opp.filter(z => price >= z.lo && price <= z.hi).map(z => ({ kind: z.kind, tf: z.tf, lo: +(+z.lo).toFixed(2), hi: +(+z.hi).toFixed(2), grade: zoneGrade(sym, z) })).slice(0, 2);
-  const behind = own.filter(z => dir === 'call' ? z.hi <= price : z.lo >= price).map(z => ({ kind: z.kind, tf: z.tf, lo: +(+z.lo).toFixed(2), hi: +(+z.hi).toFixed(2), dist_atr: A(dir === 'call' ? price - z.hi : z.lo - price), grade: zoneGrade(sym, z) })).sort((a, b) => a.dist_atr - b.dist_atr).slice(0, 3);
+  // zone facts the ledger has learned (2026-10-10): age matters most so far (fresh <4h zones stop candidates
+  // 74% of the time, 4-12h old ones 57%), prior touches/holds tell the agent whether the zone has already reacted
+  const zx = (z) => { const L = (s._zoneLedger && z.id) ? s._zoneLedger[z.id] : null; return { age_min: z.ts ? Math.round((Date.now() - z.ts) / 60000) : null, touches: L ? (L.touches || 0) : null, holds: L ? (L.holds || 0) : null }; };
+  const ahead = opp.filter(z => dir === 'put' ? z.hi <= price : z.lo >= price).map(z => Object.assign({ kind: z.kind, tf: z.tf, lo: +(+z.lo).toFixed(2), hi: +(+z.hi).toFixed(2), dist_atr: A(dir === 'put' ? price - z.hi : z.lo - price), grade: zoneGrade(sym, z) }, zx(z))).sort((a, b) => a.dist_atr - b.dist_atr).slice(0, 4);
+  const inside = opp.filter(z => price >= z.lo && price <= z.hi).map(z => Object.assign({ kind: z.kind, tf: z.tf, lo: +(+z.lo).toFixed(2), hi: +(+z.hi).toFixed(2), grade: zoneGrade(sym, z) }, zx(z))).slice(0, 2);
+  const behind = own.filter(z => dir === 'call' ? z.hi <= price : z.lo >= price).map(z => Object.assign({ kind: z.kind, tf: z.tf, lo: +(+z.lo).toFixed(2), hi: +(+z.hi).toFixed(2), dist_atr: A(dir === 'call' ? price - z.hi : z.lo - price), grade: zoneGrade(sym, z) }, zx(z))).sort((a, b) => a.dist_atr - b.dist_atr).slice(0, 3);
   const m5 = (Array.isArray(s._m5) ? s._m5.slice(-12) : []).map(b => [etClock(b.ts), +(+b.o).toFixed(2), +(+b.h).toFixed(2), +(+b.l).toFixed(2), +(+b.c).toFixed(2)]);
   let m1 = []; try { const P = s.prices || []; const step = 60; for (let i = P.length - 1, n = 0; i >= 0 && n < 20; i -= step, n++) m1.unshift(+(+P[i]).toFixed(2)); } catch (e) {}
   const recent = entryAgent.decisions.filter(d => d.sym === sym && d.model === ctx._model && !d.err).slice(-8).map(d => ({ time: d.time, dir: d.dir, action: d.action, reason: d.reason, graded: d.nowOutcome ? ('fill-now would have been a ' + d.nowOutcome + (d.waitResult ? '; wait ' + d.waitResult + (d.fillOutcome ? ' → ' + d.fillOutcome : '') : '')) : 'pending' }));
