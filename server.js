@@ -18873,6 +18873,7 @@ const ENTRY_AGENT_SYSTEM = [
   '  • Regime RANGE with a candidate that is NOT at a session extreme → low expectancy for continuation; prefer SKIP unless the path is clear and momentum is live. Regime TREND with-trend → FILL/shallow WAIT; counter-trend in TREND → SKIP unless at an extreme with a clean rejection.',
   '  • News blackout active or a high-impact release within 10 minutes → SKIP.',
   '  • Use lane_stats_7d: if this detector\'s market fills have been losing and its pullback fills winning, lean WAIT; and vice versa. Use my_recent_decisions to avoid repeating a graded mistake.',
+  'What the zone ledger has learned about OB/FVG zones in THIS system (measured on 258 graded vetoes and ~1,500 zones, Oct 2026): a continuation that runs into an opposing zone within 1.2 ATR AHEAD wins only ~17-30% of the time, whatever the zone\'s grade — even "weak" zones that later break produce enough first-touch reaction to stop a 1 ATR bracket; being already INSIDE an opposing zone is less dangerous (~31%). Zone AGE matters most: zones younger than 4h stop candidates ~74% of the time, 4-12h-old zones ~57%, older ones less. Higher timeframes hold more (M15 order blocks ~45-52% hold rate, M10 ~35-45%, M5 zones ~25-30% = noise). Zones sitting AT the session extreme hold poorly (<25% on gold) — the level gets retested and run; the zone itself is not a reason to fade. No zone class holds more than ~52%, so a zone BEHIND you is modest support, not a wall. Use zone_ledger_buckets to read what a grade means today.',
   'Constraints for WAIT: limit must be on the pullback side of the current price (below it for a call, above it for a put), between 0.25 and 1.0 ATR away; window_sec 60–300; leash_atr 0.3–1.0.',
   'Answer with ONE JSON object and nothing else: {"action":"fill"|"wait"|"skip","limit":<number or null>,"window_sec":<int or null>,"leash_atr":<number or null>,"confidence":<0..1>,"reason":"<max 160 chars, concrete: cite the numbers that decided it>"}'
 ].join('\n');
@@ -18926,6 +18927,7 @@ function entryAgentSnapshot(sym, s, ctx) {
     m5_bars_last12_time_o_h_l_c: m5, m1_closes_last20: m1,
     news: { blackout: !!nb.active, next_event: nb.eventName ? (nb.eventName + ' in ' + nb.minutesUntil + ' min (' + (nb.impact || '?') + ')') : null },
     lane_stats_7d: entryAgentLaneStats(sym, ctx.detector),
+    zone_ledger_buckets: (function () { try { const b = zoneStats(sym); const o = {}; for (const k of Object.keys(b).sort()) { const v = b[k]; if (!(v.held + v.broken)) continue; o[k.replace('|', ' ').replace('|', ' ')] = (v.holdRate == null ? '?' : v.holdRate + '% hold') + ' (' + (v.held + v.broken) + ' tested, grade ' + v.grade + ')'; } return o; } catch (e) { return null; } })(),
     trade_ladder: { sl: t.slPrice, tp1: t.tp1Price, tp2: t.tp2Price, tp3: t.tp3Price, sl_dist_atr: A(Math.abs((t.ep || price) - (t.slPrice || price))), tp1_dist_atr: A(Math.abs((t.ep || price) - (t.tp1Price || price))), scalp: !!t.scalp },
     rule_decision: ctx.rule || null,
     my_recent_decisions: recent
