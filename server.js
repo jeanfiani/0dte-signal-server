@@ -15928,6 +15928,24 @@ function processPrice(sym, price, hi, lo) {
         // already confirmed, releases on runaway if the break is real. The row carries ts
         // so the /prices state-hide keeps the EA out until the server has filled.
         sig.ts = Date.now();
+        // SAME-DIRECTION CONTINUATION FOR THE HAND-BUILT TRv2 TRADE (2026-10-12, the 10/11 20:11:57 RIDE call):
+        // every buildCfdTrade() site keeps a live same-direction trade (continuation); TRv2 builds its trade by
+        // hand and OVERWROTE the active one — the 20:10 PATH-CLEAR-M scalp was replaced 85s after firing by an
+        // unvetted RIDE trade, the vet parked that in an extreme-pullback hold (s.trade → inactive), the hold was
+        // cancelled "signal left" at 20:14 — and the live PATH trade had simply vanished: no TP1 exit for the EA,
+        // nothing booked. Now: an active same-direction trade is JOINED, not replaced — levels kept (TP1 locked
+        // to the easier of the two), the row is stamped joined and hidden from the EA (it is already in).
+        if (s.trade && s.trade.active && s.trade.type === sigType && !s.trade.t1) {
+          const _jT = s.trade; const _jC = sigType === 'call';
+          if (typeof _jT.tp1Price === 'number' && isFinite(tp1)) _jT.tp1Price = _jC ? Math.min(_jT.tp1Price, tp1) : Math.max(_jT.tp1Price, tp1);
+          sig.pendingEntry = true; sig.oteHold = 'joined-active-trade';
+          const _prevLH = s.lastHistEntry; // the ACTIVE trade's row keeps owning the outcomes — a joined row must not hijack lastHistEntry
+          s.signals.push(sig); logSignal(sym, sig);
+          try { if (s.lastHistEntry && s.lastHistEntry !== _prevLH && s.lastHistEntry.symbol === sym && s.lastHistEntry.type === sigType) { s.lastHistEntry.pendingEntry = true; s.lastHistEntry.oteHold = 'joined-active-trade'; } } catch (eJ) {}
+          if (_prevLH) s.lastHistEntry = _prevLH;
+          log(sym, '🔒 TRv2 ' + sigType.toUpperCase() + ' JOINS the active ' + String(_jT.type).toUpperCase() + ' trade @ $' + (+_jT.ep).toFixed(2) + ' (same direction, TP1 not yet hit) — no new entry, levels kept (TP1 $' + (+_jT.tp1Price).toFixed(2) + '); row stamped joined (2026-10-12).');
+          return;
+        }
         s.trade = { active: true, type: sigType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, ts: Date.now(), pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: sl, tp1Price: tp1, tp2Price: tp2, tp3Price: tp3, atr: trv2Atr, bestPrice: price, worstPrice: price, trailSl: 0,
                     _oteVetted: (sym !== 'XAU' && sym !== 'NAS100') };
         s.signals.push(sig);
@@ -19529,7 +19547,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.36-20261009-entry-agent-shadow', // bump on each deploy — lets /state verify what's live
+    build: '7.37-20261012-trv2-joins-active-trade', // bump on each deploy — lets /state verify what's live
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
