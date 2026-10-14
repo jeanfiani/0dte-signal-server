@@ -1308,6 +1308,13 @@ if (FMP_API_KEY) {
 // Finnhub endpoint: /calendar/economic?from=YYYY-MM-DD&to=YYYY-MM-DD (free tier OK)
 const NEWS_BLACKOUT_BEFORE_MIN = 30;   // 15 -> 30 (2026-08-13, Jean: PPI-day put fired 10min pre-release and SL'd — either the 15min window was too thin or the event ts parsing missed; 30min covers positioning drift before releases)
 const NEWS_BLACKOUT_AFTER_MIN  = 30;   // block entries this many min AFTER event
+// TIER-1 EVENTS get a longer pre-window (2026-10-14, Jean: "the bot fired a put 35 minutes prior to CPI and got
+// SL'd — extend the news gate"): CPI, NFP, FOMC rate/statement/press conference and Core PCE drift and whipsaw
+// in the 30-45 min before the print. NEWS_T1_BEFORE_MIN (default 45) applies to these; the other high-impact
+// prints keep NEWS_BLACKOUT_BEFORE_MIN.
+const NEWS_T1_RE = /\bCPI\b|Non-Farm|Nonfarm|NFP|Federal Funds Rate|FOMC (Statement|Press|Rate)|Core PCE|PCE Price/i;
+const NEWS_T1_BEFORE_MIN = parseInt(process.env.NEWS_T1_BEFORE_MIN, 10) || 45;
+const newsBeforeMinFor = (e) => (e && NEWS_T1_RE.test(String(e.event || ''))) ? NEWS_T1_BEFORE_MIN : NEWS_BLACKOUT_BEFORE_MIN;
 // ===== POST-NEWS OVERRIDE LOCKOUT (2026-07-29) =====
 // Normal signals resume at +30 min. The OVERRIDES do not: a news print moves price, momentum
 // and BOTH higher timeframes at once, which is precisely the str+mom+htf "confirmed flip"
@@ -1406,6 +1413,20 @@ async function pollEconomicCalendar() {
     console.log('[' + ts() + '] Economic calendar poll failed: ' + e.message);
   }
 }
+// ===== BOOT WARM-UP GATE (2026-10-14) ===== The process restarted at 07:59:29 ET and 31 s later the PATH lane fired an
+// XAU put with a $40 bracket: atrCandles were empty so atrVal fell back to the SESSION RANGE, and the calendar had not
+// been fetched yet so the CPI blackout (T-30) was not in force. Nothing fires until the ATR has 14 candles and the
+// calendar has loaded (or 3 min have passed since boot, whichever comes first for the calendar). Blocks are logged
+// once a minute per symbol under BOOT-WARMUP so the nightly can see what the window cost.
+const SERVER_BOOT_TS = Date.now();
+function bootWarm(sym, s) {
+  try {
+    const why = [];
+    if (s && (sym === 'XAU' || sym === 'NAS100' || sym === 'BTC') && !(Array.isArray(s.atrCandles) && s.atrCandles.length >= 14)) why.push('ATR not warm (' + ((s.atrCandles && s.atrCandles.length) || 0) + '/14 candles — atrVal would be the session range)');
+    if (!_econCalCache.lastFetchTs && Date.now() - SERVER_BOOT_TS < 180000) why.push('calendar not loaded yet (' + Math.round((Date.now() - SERVER_BOOT_TS) / 1000) + 's since boot)');
+    return { ok: why.length === 0, why: why.join('; ') };
+  } catch (e) { return { ok: true, why: '' }; }
+}
 // Apply blackout state to all symbols based on cached events. Runs every 30 sec.
 function applyEconomicCalendarBlackout() {
   const now = Date.now();
@@ -1415,7 +1436,7 @@ function applyEconomicCalendarBlackout() {
   for (const e of events) {
     if (e.high === false) continue; // blackout = HIGH impact only (2026-10-04); medium core data stays on the desk, not in the gate
     const minsUntil = (e.ts - now) / 60000;
-    if (minsUntil >= -NEWS_BLACKOUT_AFTER_MIN && minsUntil <= NEWS_BLACKOUT_BEFORE_MIN) {
+    if (minsUntil >= -NEWS_BLACKOUT_AFTER_MIN && minsUntil <= newsBeforeMinFor(e)) {
       active = true; eventName = e.event; minutesUntil = Math.round(minsUntil); impact = e.impact; eventTs = e.ts;
       break;
     }
@@ -1443,7 +1464,7 @@ function applyEconomicCalendarBlackout() {
   SYMBOLS.forEach(sym => {
     const s = S[sym];
     if (!s) return;
-    s.newsBlackout = { active, eventName, minutesUntil, impact, eventTs };
+    s.newsBlackout = { active, eventName, minutesUntil, impact, eventTs, tier1: !!(eventName && NEWS_T1_RE.test(eventName)), loaded: !!_econCalCache.lastFetchTs };
   });
 }
 // ===== NEWS DESK (2026-10-04, Jean: "analyze economic announcements and give advice on the
@@ -2202,6 +2223,7 @@ function nasRthBlocked(sym) {
 }
 function cohortFor(reason) {
   { const _ag = reason.match(/\bAGENT-([A-Z0-9]+)-(FILL|WAIT|SKIP)-(NOW|FILL)\b/); if (_ag) return _ag[0]; } // entry agent shadow cohorts (2026-10-09)
+  if (/BOOT-WARMUP/.test(reason)) return 'BOOT-WARMUP'; // cold-start blocks (2026-10-14)
   { const _tw = reason.match(/\bTREND-(WT|CT)\b/); if (_tw) return 'TREND-' + _tw[1]; }
   { const _pb = reason.match(/\bEXT-PB-(LEFT|EXPIRED)\b/); if (_pb) return 'EXT-PB-' + _pb[1]; }
   { const _pt = reason.match(/\bPATH-(CLEAR|ZONED)-([TRM])\b/); if (_pt) return 'PATH-' + _pt[1] + '-' + _pt[2]; } // path sampler (2026-10-07)
@@ -4288,6 +4310,7 @@ function processPrice(sym, price, hi, lo) {
               try {
                 if (!/^BTC-SESS-REJ(-MULTI)?$/.test(lane) || process.env.BTC_SESSREJ_LIVE === '0') return false; // RNG arm (single or multi-test); CRASH stays shadow; XAU lanes never live here
                 if ((s.trade && s.trade.active) || s._oteHold || s._invHold || s._macdHold) return false;
+                if (!bootWarm(sym, s).ok) return false; // cold ATR / unloaded calendar (2026-10-14)
                 // bench check (cached 10 min)
                 const _nowB = Date.now();
                 if (!global._srBenchTs || _nowB - global._srBenchTs > 600000) {
@@ -4599,7 +4622,7 @@ function processPrice(sym, price, hi, lo) {
               if (!_bWk && !_bRng && process.env.BTC_BIGLEG_LIVE !== '0' && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold && _bR > _bMaxR) {
                 log(sym, '🦵 BTC-BIGLEG ' + _bDir.toUpperCase() + ' NOT fired live — entry $' + price.toFixed(0) + ' sits $' + _bR.toFixed(0) + ' (' + (_bR / _bAdr).toFixed(2) + '×ADR) from the pivot stop $' + _bSl.toFixed(0) + ' > 0.35×ADR $' + _bMaxR.toFixed(0) + ': too far into the leg for a 1R target (geometry guard 2026-10-09). Shadow row measured.');
               }
-              if (!_bWk && !_bRng && process.env.BTC_BIGLEG_LIVE !== '0' && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold && _bR <= _bMaxR) { // !_bRng: no live leg fires in RANGE regime (2026-09-24)
+              if (!_bWk && !_bRng && process.env.BTC_BIGLEG_LIVE !== '0' && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold && _bR <= _bMaxR && bootWarm(sym, s).ok) { // !_bRng: no live leg fires in RANGE regime (2026-09-24)
                 const _lTp1 = _bDir === 'call' ? +(price + Math.max(0.25 * _bAdr, _bR)).toFixed(2) : +(price - Math.max(0.25 * _bAdr, _bR)).toFixed(2); // ≥ 1R (guard 2026-10-09)
                 // TP2 explicit 0.5×ADR (2026-09-29, Jean's monitor screenshot): the live lane
                 // had been reusing the SHADOW target (_bTp), which 6.88 cut to 0.25×ADR — so
@@ -8399,6 +8422,8 @@ function processPrice(sym, price, hi, lo) {
       const isFadeP2 = /VREV|LHF|LLF|OBREJ|OBMIT|RETEST|STRUCT_SWEEP|STRUCT_LIQ_GRAB|STRUCT_OB_FILL|INVERSAL_BREAK/.test(tagP2);
       const isP2Mt5 = isXAU || isBTC || isNAS;
 
+      // ── 2.0: Boot warm-up gate (2026-10-14) — no fire on a cold ATR / unloaded calendar
+      { const _bw = bootWarm(sym, s); if (!_bw.ok) { Object.assign(s, _emitSnapshot); s._bwLogTs = s._bwLogTs || 0; if (Date.now() - s._bwLogTs > 60000) { s._bwLogTs = Date.now(); const _bwMsg = '🥶 ' + tagP2 + ' ' + sig.type.toUpperCase() + ' BLOCKED — BOOT-WARMUP: ' + _bw.why + '.'; log(sym, _bwMsg); } return false; } }
       // ── 2.1: News Blackout Gate (task #189)
       // Block ALL entries when within 15min before / 30min after high-impact USD event.
       // s.newsBlackout populated by pollEconomicCalendar (Phase 1.7).
@@ -11492,7 +11517,7 @@ function processPrice(sym, price, hi, lo) {
       // The pair answers the question directly: does a clear path pay, and does a zone ahead
       // actually stop the move. Regime letter T/R/M so the answer is per regime.
       try {
-        if (atrVal > 0 && (s._msTrend === 'up' || s._msTrend === 'down') && Array.isArray(s._zoneObs)) {
+        if (atrVal > 0 && (s._msTrend === 'up' || s._msTrend === 'down') && Array.isArray(s._zoneObs) && Array.isArray(s.atrCandles) && s.atrCandles.length >= 14) { // ATR must be warm (2026-10-14): after a restart atrVal is the session range — the 08:00 PATH put carried a $40 bracket
           const _nowP = Date.now();
           s._pathTs = s._pathTs || 0;
           if (_nowP - s._pathTs >= 300000) {
@@ -11528,6 +11553,7 @@ function processPrice(sym, price, hi, lo) {
                   if (_nowP - (s.lastSignalTs || 0) < 120000) _plWhy.push('another fire <2min ago');
                   if (s.newsBlackout && s.newsBlackout.active) _plWhy.push('news blackout');
                   if (typeof cfdMarketOpenET === 'function' && !cfdMarketOpenET(_nowP)) _plWhy.push('market closed');
+                  { const _bw = bootWarm(sym, s); if (!_bw.ok) _plWhy.push('boot warm-up: ' + _bw.why); }
                   const _fg = global._fundedGuard || {};
                   if ((_fg.dayLimit && _fg.day <= -_fg.dayLimit) || (_fg.totalLimit && _fg.total <= -_fg.totalLimit)) _plWhy.push('funded guard');
                   // bench rule (cached 10 min per lane)
@@ -11566,6 +11592,35 @@ function processPrice(sym, price, hi, lo) {
           }
         }
       } catch (ePS) {}
+      // ===== PRE-NEWS FLATTEN / PROTECT (2026-10-14, Jean: "fired a put 35 minutes prior to CPI and got SL'd") =====
+      // Inside the last NEWS_FLAT_MIN (10) minutes before a TIER-1 print (CPI/NFP/FOMC/PCE), an open trade is
+      // settled BEFORE the print decides it: pre-TP1 and under +0.5R → close at market (pre-news-flat; the
+      // EA flattens, the server books the flat exit and ends the trade); at/after TP1 or ≥ +0.5R → the stop
+      // moves to breakeven (trailSl = entry; EA improve-only) and the runner rides the print. Once per trade.
+      try {
+        const _pn = s.newsBlackout, _pt = s.trade;
+        if (_pn && _pn.active && _pn.tier1 && _pt && _pt.active && !_pt._preNewsDone && typeof _pn.minutesUntil === 'number' && _pn.minutesUntil > 0 && _pn.minutesUntil <= (parseInt(process.env.NEWS_FLAT_MIN, 10) || 10) && !(s.closeRequest && s.closeRequest.active) && process.env.NEWS_FLAT !== '0') {
+          _pt._preNewsDone = true;
+          const _isC = _pt.type === 'call'; const _fav = _isC ? price - _pt.ep : _pt.ep - price; const _R = Math.abs((_pt.ep || 0) - (_pt.slPrice || 0)) || 1;
+          if (_pt.t1 || _fav >= 0.5 * _R) {
+            const _be = +(+_pt.ep).toFixed(2);
+            if (!(_pt.trailSl > 0) || (_isC ? _be > _pt.trailSl : _be < _pt.trailSl)) _pt.trailSl = _be;
+            log(sym, '📰 PRE-NEWS PROTECT — ' + String(_pt.type).toUpperCase() + ' @ $' + (+_pt.ep).toFixed(2) + ' is +$' + _fav.toFixed(2) + ' (' + (_fav / _R).toFixed(2) + 'R) ' + _pn.minutesUntil + ' min before ' + _pn.eventName + ': stop moved to breakeven, runner rides the print (2026-10-14).');
+            try { sendPush('📰 ' + sym + ' pre-news protect', String(_pt.type).toUpperCase() + ' @ $' + (+_pt.ep).toFixed(2) + ' → stop at breakeven before ' + _pn.eventName, 'signal'); } catch (ePP) {}
+          } else {
+            const _id = 'prenews-' + Date.now();
+            s.closeRequest = { active: true, id: _id, ts: Date.now(), type: _pt.type || '', ep: _pt.ep || 0, source: 'pre-news-flat' };
+            log(sym, '📰 PRE-NEWS FLAT — ' + String(_pt.type).toUpperCase() + ' @ $' + (+_pt.ep).toFixed(2) + ' is ' + (_fav >= 0 ? '+' : '') + '$' + _fav.toFixed(2) + ' (' + (_fav / _R).toFixed(2) + 'R, < 0.5R) ' + _pn.minutesUntil + ' min before ' + _pn.eventName + ' — closing at market @ $' + price.toFixed(2) + ' rather than holding a pre-TP1 trade through a tier-1 print (Jean 2026-10-14).');
+            try { sendPush('📰 ' + sym + ' pre-news flat', 'Closing ' + String(_pt.type).toUpperCase() + ' @ $' + price.toFixed(2) + ' before ' + _pn.eventName, 'signal'); } catch (ePF) {}
+            try {
+              const _pnE = s.lastHistEntry;
+              if (_pnE && _pnE.symbol === sym) { _pnE.outcomes = _pnE.outcomes || {}; _pnE.outcomes.preNewsFlat = +price.toFixed(2); _pnE.outcomes.closePrice = +price.toFixed(2); }
+              bookPnl(sym, _fav * pnlMultFor(sym, _pt), 'close');
+              s.trade = { active: false };
+            } catch (ePNc) {}
+          }
+        }
+      } catch (ePN) {}
       // ===== BREAKOUT TIME-STOP (2026-08-19, Jean) =====
       // 8/19 16:57 TREND CALL @4523.40: fired through the live-break window (fresh
       // session-high break — the sanctioned door), then went NOWHERE: +$0.4 peak,
@@ -19568,7 +19623,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.38-20261014-nofill-release-agent-tuned', // bump on each deploy — lets /state verify what's live
+    build: '7.38-20261014-news-t1-bootwarm-nofill-agent', // bump on each deploy — lets /state verify what's live
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
