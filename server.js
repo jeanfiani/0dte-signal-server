@@ -18886,7 +18886,8 @@ const ENTRY_AGENT_SYSTEM = [
   'Trading judgment to apply (not rules — judgment):',
   '  • Fresh impulse + price still near the origin of the leg → FILL or a shallow WAIT. Leg already run ≥1 ATR from its pivot with momentum fading → WAIT for a real pullback (0.3–0.7 ATR) or SKIP.',
   '  • Momentum already accelerating in the signal direction (ROC, MACD line expanding) → pullbacks rarely come; FILL beats WAIT.',
-  '  • Inside the extreme-pullback zone (at/near the session high for a call, session low for a put, within ~1 ATR) → never FILL a continuation at the extreme; WAIT for the pullback or SKIP.',
+  '  • At the session extreme (within ~1 ATR of the session high for a call / low for a put): a WAIT for a 0.3-0.7 ATR pullback is the textbook answer, but MEASURE IT against this system\'s evidence — in the first two weeks of this desk, with-trend continuation fires at a fresh extreme in MIXED regime with a clear path won 7 of 9 at MARKET, while the desk\'s WAITs filled only ~15% of the time and the unfilled waits missed the run. A pullback that does not come is a missed winner, scored against you exactly like a losing fill. So: at an extreme with momentum still expanding and a clear path, FILL; WAIT only when momentum is visibly fading (ROC rolling over, last M1 bars overlapping) or a strong opposing zone sits ahead; SKIP when the leg is exhausted (≥4 ATR from pivot AND momentum fading).',
+  '  • Read my_scoreboard_14d before deciding: if your WAITs are mostly unfilled-and-missed, you are too cautious for this tape; if your FILLs are losing, you are chasing. Adjust.',
   '  • Opposing zone (OB/FVG the other way) within 1 ATR ahead with grade S (strong) → the path is blocked: WAIT until price is through it or SKIP. Weak (W) or unknown zones matter less. No opposing zone within 2 ATR = clear path → favours FILL.',
   '  • Regime RANGE with a candidate that is NOT at a session extreme → low expectancy for continuation; prefer SKIP unless the path is clear and momentum is live. Regime TREND with-trend → FILL/shallow WAIT; counter-trend in TREND → SKIP unless at an extreme with a clean rejection.',
   '  • News blackout active or a high-impact release within 10 minutes → SKIP.',
@@ -18948,7 +18949,8 @@ function entryAgentSnapshot(sym, s, ctx) {
     zone_ledger_buckets: (function () { try { const b = zoneStats(sym); const o = {}; for (const k of Object.keys(b).sort()) { const v = b[k]; if (!(v.held + v.broken)) continue; o[k.replace('|', ' ').replace('|', ' ')] = (v.holdRate == null ? '?' : v.holdRate + '% hold') + ' (' + (v.held + v.broken) + ' tested, grade ' + v.grade + ')'; } return o; } catch (e) { return null; } })(),
     trade_ladder: { sl: t.slPrice, tp1: t.tp1Price, tp2: t.tp2Price, tp3: t.tp3Price, sl_dist_atr: A(Math.abs((t.ep || price) - (t.slPrice || price))), tp1_dist_atr: A(Math.abs((t.ep || price) - (t.tp1Price || price))), scalp: !!t.scalp },
     rule_decision: ctx.rule || null,
-    my_recent_decisions: recent
+    my_recent_decisions: recent,
+    my_scoreboard_14d: (function () { try { const D = entryAgent.decisions.filter(d => d.sym === sym && d.model === ctx._model && !d.err && Date.now() - d.ts < 14 * 86400000); const o = { decisions: D.length, fill: { win: 0, loss: 0 }, wait: { filled: 0, filled_win: 0, filled_loss: 0, unfilled: 0, unfilled_missed_win: 0, unfilled_avoided_loss: 0 }, skip: { avoided_loss: 0, missed_win: 0 }, rule_on_same_decisions: { win: 0, loss: 0 } }; for (const d of D) { const r = d.nowOutcome; if (d.action === 'fill') { if (r === 'win') o.fill.win++; else if (r === 'loss') o.fill.loss++; } else if (d.action === 'skip') { if (r === 'win') o.skip.missed_win++; else if (r === 'loss') o.skip.avoided_loss++; } else if (d.action === 'wait') { if (/^filled/.test(d.waitResult || '')) { o.wait.filled++; if (d.fillOutcome === 'win') o.wait.filled_win++; else if (d.fillOutcome === 'loss') o.wait.filled_loss++; } else if (d.waitResult) { o.wait.unfilled++; if (r === 'win') o.wait.unfilled_missed_win++; else if (r === 'loss') o.wait.unfilled_avoided_loss++; } } if (d.ruleOutcome === 'win') o.rule_on_same_decisions.win++; else if (d.ruleOutcome === 'loss') o.rule_on_same_decisions.loss++; } return o; } catch (e) { return null; } })()
   };
 }
 function entryAgentCall(model, userText, timeoutMs) {
@@ -18972,8 +18974,12 @@ function entryAgentCall(model, userText, timeoutMs) {
   });
 }
 function entryAgentParse(text, snap) {
-  const m = String(text || '').match(/\{[\s\S]*\}/); if (!m) return { err: 'no json' };
-  let j; try { j = JSON.parse(m[0]); } catch (e) { return { err: 'json parse' }; }
+  // the answer is a FLAT object — scan every {...} without nested braces and take the first that parses (Haiku twice
+  // wrapped its JSON in prose with stray braces, 2026-10-12)
+  const txt = String(text || ''); let j = null;
+  for (const m of txt.match(/\{[^{}]*\}/g) || []) { try { const c = JSON.parse(m); if (c && typeof c === 'object' && c.action) { j = c; break; } } catch (e) {} }
+  if (!j) { const m2 = txt.match(/\{[\s\S]*\}/); if (m2) { try { j = JSON.parse(m2[0]); } catch (e) {} } }
+  if (!j) return { err: txt.length ? 'json parse' : 'empty answer' };
   const action = String(j.action || '').toLowerCase(); if (!/^(fill|wait|skip)$/.test(action)) return { err: 'bad action ' + action };
   const out = { action, confidence: isFinite(+j.confidence) ? Math.max(0, Math.min(1, +j.confidence)) : null, reason: String(j.reason || '').slice(0, 200), limit: null, windowSec: null, leashAtr: null, note: '' };
   if (action === 'wait') {
@@ -19314,6 +19320,21 @@ app.post('/ea/event', (req, res) => {
         const _h = S[sym].lastHistEntry;
         if (_h && _h.symbol === sym) { _h.outcomes = _h.outcomes || {}; _h.outcomes.eaFailed = detail.slice(0, 120); }
         log(sym, '🧾 trade marked NO-FILL — EA could not open it; P&L booking suspended for this trade (grading continues as shadow).');
+        // NO-FILL SLOT RELEASE (2026-10-14, the 10/13 08:20 BTC RANGE5 put: refused with 10027, never filled, and the
+        // phantom held BTC's one-trade slot for 30 hours). If no terminal reports a fill within 6 min of the failure
+        // (the EA's young-signal rule stops re-taking a row at 5 min), the server trade ends: the row keeps grading
+        // virtually through its track, the slot is free for the next fire. ORDER_OK inside the window cancels this.
+        try {
+          const _nfT = S[sym].trade, _nfSym = sym;
+          setTimeout(() => { try {
+            const _s2 = S[_nfSym]; if (!_s2 || _s2.trade !== _nfT || !_nfT.active) return;
+            if (_nfT._fills && Object.keys(_nfT._fills).length) return; // a terminal filled after all
+            if (!_nfT._eaFailed) return;
+            const _h2 = _s2.lastHistEntry; if (_h2 && _h2.symbol === _nfSym) { _h2.outcomes = _h2.outcomes || {}; _h2.outcomes.noFillReleased = true; }
+            log(_nfSym, '🧾 NO-FILL slot RELEASED — ' + String(_nfT.type || '').toUpperCase() + ' @ $' + (+_nfT.ep || 0).toFixed(2) + ' was never filled by any terminal (' + String(_nfT._eaFailed).slice(0, 60) + '); server trade ended after 6 min so the next fire is not blocked by a phantom (2026-10-14).');
+            _s2.trade = { active: false }; if (_s2.closeRequest && _s2.closeRequest.active) _s2.closeRequest = null;
+          } catch (eNR) {} }, parseInt(process.env.NOFILL_RELEASE_MS, 10) || 360000);
+        } catch (eNF2) {}
       }
     } catch (eEF) {}
     const k = sym + '|' + kind;
@@ -19547,7 +19568,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.37-20261012-trv2-joins-active-trade', // bump on each deploy — lets /state verify what's live
+    build: '7.38-20261014-nofill-release-agent-tuned', // bump on each deploy — lets /state verify what's live
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
