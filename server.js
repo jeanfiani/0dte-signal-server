@@ -1424,6 +1424,7 @@ function bootWarm(sym, s) {
     const why = [];
     if (s && (sym === 'XAU' || sym === 'NAS100' || sym === 'BTC') && !(Array.isArray(s.atrCandles) && s.atrCandles.length >= 14)) why.push('ATR not warm (' + ((s.atrCandles && s.atrCandles.length) || 0) + '/14 candles — atrVal would be the session range)');
     if (!_econCalCache.lastFetchTs && Date.now() - SERVER_BOOT_TS < 180000) why.push('calendar not loaded yet (' + Math.round((Date.now() - SERVER_BOOT_TS) / 1000) + 's since boot)');
+    if (s && s._feedResumeTs && Date.now() - s._feedResumeTs < 120000) why.push('feed resumed ' + Math.round((Date.now() - s._feedResumeTs) / 1000) + 's ago after a gap — indicators re-settling');
     return { ok: why.length === 0, why: why.join('; ') };
   } catch (e) { return { ok: true, why: '' }; }
 }
@@ -4012,6 +4013,10 @@ function logSignal(sym, sig) {
 
 // ===== PROCESS PRICE (same engine as mobile/desktop) =====
 function processPrice(sym, price, hi, lo) {
+  // FEED-GAP RE-ARM (2026-10-14, Jean: "we had a feed issue today — price wasn't updated"): a tick arriving after
+  // ≥3 min of silence re-arms the warm-up gate — the first prints after a gap jump, and the indicators built across
+  // the gap are not trustworthy for 2 min (bootWarm() reads s._feedResumeTs).
+  try { const _s0 = S[sym]; if (_s0) { const _n0 = Date.now(); if (_s0._prevTickTs && _n0 - _s0._prevTickTs >= 180000) { _s0._feedResumeTs = _n0; log(sym, '📶 FEED RESUMED after a ' + Math.round((_n0 - _s0._prevTickTs) / 60000) + '-min gap — no fires for 2 min while the indicators re-settle (2026-10-14).'); } _s0._prevTickTs = _n0; } } catch (eFG) {}
   const s = S[sym];
   const mi = MAX_IND[sym];
   const isXAU = sym === 'XAU';
@@ -4311,6 +4316,18 @@ function processPrice(sym, price, hi, lo) {
                 if (!/^BTC-SESS-REJ(-MULTI)?$/.test(lane) || process.env.BTC_SESSREJ_LIVE === '0') return false; // RNG arm (single or multi-test); CRASH stays shadow; XAU lanes never live here
                 if ((s.trade && s.trade.active) || s._oteHold || s._invHold || s._macdHold) return false;
                 if (!bootWarm(sym, s).ok) return false; // cold ATR / unloaded calendar (2026-10-14)
+                // FRESH-EXTREME + COUNTER-TREND GUARD (2026-10-15, the night of 10/14: four SESS-REJ calls at 14:35, 16:35,
+                // 18:35, 20:40 — each the FIRST test of a brand-new session low in a down-trending tape (msTrend down),
+                // each stopped as the low broke again). The lane's own cohorts say it: second-or-later tests of the same
+                // level (MULTI) 5W/1L, first tests 13W/7L and all four of last night's were first tests. Live fires now
+                // need the level to have been tested before (hiN/loN ≥ 2) OR msTrend on the trade's side; and two
+                // SESS-REJ stops on one side in a session lock that side until the session rolls.
+                const _srN = dir === 'call' ? (s._sr.loN || 1) : (s._sr.hiN || 1);
+                const _srWith = s._msTrend ? ((dir === 'call' && s._msTrend === 'up') || (dir === 'put' && s._msTrend === 'down')) : false;
+                if (_srN < 2 && !_srWith && process.env.SESSREJ_FRESH_GUARD !== '0') { log(sym, '🎯 BTC SESS-REJ ' + dir.toUpperCase() + ' NOT fired live — first test of a fresh session ' + (dir === 'call' ? 'low' : 'high') + ' against msTrend ' + (s._msTrend || '?') + ' (needs a re-test or a with-trend tape; 10/14 night 0W/4L on exactly this shape). Shadow row measured.'); return false; }
+                s._srStrikes = { day: todayDateET(), call: 0, put: 0, callLogged: (s._srStrikes || {}).callLogged, putLogged: (s._srStrikes || {}).putLogged };
+                try { for (let i = signalHistory.length - 1; i >= 0; i--) { const h = signalHistory[i]; if (Date.now() - h.ts > 20 * 3600000) break; if (h.symbol !== 'BTC' || !/SESSREJ-RT/.test(h.score || '') || h.date !== todayDateET() || !h.outcomes) continue; if (h.outcomes.slHit && !h.outcomes.tp1Hit) s._srStrikes[h.type]++; } } catch (eSK) {}
+                if (s._srStrikes[dir] >= 2) { if (!s._srStrikes[dir + 'Logged']) { s._srStrikes[dir + 'Logged'] = true; log(sym, '🎯 BTC SESS-REJ ' + dir.toUpperCase() + ' side LOCKED for the session — two stops on this side already today (2026-10-15 two-strikes rule).'); } return false; }
                 // bench check (cached 10 min)
                 const _nowB = Date.now();
                 if (!global._srBenchTs || _nowB - global._srBenchTs > 600000) {
@@ -11544,7 +11561,7 @@ function processPrice(sym, price, hi, lo) {
               // within 2 min of another fire. PRE-REGISTERED BENCH RULE per lane: net-negative over the first
               // 6 live fires → back to shadow (PATH_LIVE=0 kills by hand; PATH_LIVE_LANES lists the lanes).
               try {
-                const _plLanes = String(process.env.PATH_LIVE_LANES || 'XAU:PATH-CLEAR-M,XAU:PATH-ZONED-T').split(',').map(x => x.trim());
+                const _plLanes = String(process.env.PATH_LIVE_LANES || 'XAU:PATH-CLEAR-M').split(',').map(x => x.trim()); // PATH-ZONED-T back to shadow 2026-10-15: promoted at 10W/3L (n=13), sampler cohort now 17W/20L (46%) and live 6W/5L — re-earn at ≥60% over ≥15 (PATH_LIVE_LANES env re-adds it)
                 if (process.env.PATH_LIVE !== '0' && _plLanes.indexOf(sym + ':' + lane) >= 0) {
                   const _plWhy = [];
                   if (s.trade && s.trade.active) _plWhy.push('trade active');
@@ -19081,6 +19098,17 @@ function entryAgentConsult(sym, s, ctx) {
       if (p.action === 'wait') { entryAgent.waits[sym] = entryAgent.waits[sym] || []; entryAgent.waits[sym].push({ id, model: dec.short, dir: ctx.dir, limit: p.limit, armPrice: px, slD, tpD, leash: p.leashAtr * (snap.atr || 0), expiry: now + p.windowSec * 1000, ts: now }); }
       entryAgent.decisions.push(dec); if (entryAgent.decisions.length > 600) entryAgent.decisions.shift(); entryAgent.dirty = true;
       const agree = ctx.rule ? ((ctx.rule.action === 'fill' && p.action === 'fill') || (ctx.rule.action === 'wait' && p.action === 'wait')) : null;
+      // CONSENSUS WOULD-VETO (2026-10-15): when every consulted model says SKIP on a live fire, stamp the fired row so the
+      // weekly review can measure the veto's precision on real trades (10/14 night: both-skip = 4 losers avoided / 1 winner
+      // missed). Shadow only — AGENT_VETO_LIVE is the future switch; nothing changes execution here.
+      try {
+        const _peers = entryAgent.decisions.filter(x => x.ts === now && x.sym === sym && x.dir === ctx.dir && !x.err);
+        if (_peers.length >= models.length && _peers.every(x => x.action === 'skip')) {
+          const _hv = ctx.histTs ? signalHistory.find(x => x.ts === ctx.histTs && x.symbol === sym) : null;
+          if (_hv) { _hv.outcomes = _hv.outcomes || {}; _hv.outcomes.agentWouldVeto = _peers.map(x => x.short).join('+'); }
+          log(sym, '🤖 ENTRY-AGENT CONSENSUS SKIP on a live ' + String(ctx.detector || '').replace(/[⬆⬇]/g, '') + ' ' + ctx.dir.toUpperCase() + ' — ' + _peers.map(x => x.short + ': "' + (x.reason || '').slice(0, 90) + '"').join(' · ') + ' [would-veto stamped on the row; shadow]');
+        }
+      } catch (eCV) {}
       log(sym, '🤖 ENTRY-AGENT ' + dec.short + ' (' + r.ms + 'ms, ' + dec.inTok + '/' + dec.outTok + ' tok) → ' + p.action.toUpperCase() + (p.action === 'wait' ? ' @ $' + p.limit + ' for ' + p.windowSec + 's (leash ' + p.leashAtr + '×ATR)' : '') + (p.confidence != null ? ' · conf ' + p.confidence : '') + ' — "' + p.reason + '"' + (p.note ? ' [' + p.note + ']' : '') + ' · rule did: ' + (ctx.rule ? ctx.rule.action.toUpperCase() + (ctx.rule.limit ? ' @ $' + ctx.rule.limit : '') + ' (' + ctx.rule.via + ')' : '?') + (agree === null ? '' : agree ? ' · AGREES' : ' · DISAGREES') + ' [shadow — no effect on the trade]');
     });
   } catch (e) { try { log(sym, '⚠️ ENTRY-AGENT consult error: ' + String(e).slice(0, 120)); } catch (e2) {} }
@@ -19379,7 +19407,10 @@ app.post('/ea/event', (req, res) => {
         // phantom held BTC's one-trade slot for 30 hours). If no terminal reports a fill within 6 min of the failure
         // (the EA's young-signal rule stops re-taking a row at 5 min), the server trade ends: the row keeps grading
         // virtually through its track, the slot is free for the next fire. ORDER_OK inside the window cancels this.
-        try {
+        // OPT-IN (2026-10-15, Jean: an OLD-build EA on a second funded account takes every signal and reports nothing —
+        // a 10027 from the other terminal would release a slot whose position is live on the first). Enabled only
+        // with NOFILL_RELEASE=1, i.e. once every terminal runs a build that reports ORDER_OK with its account.
+        if (process.env.NOFILL_RELEASE === '1') try {
           const _nfT = S[sym].trade, _nfSym = sym;
           setTimeout(() => { try {
             const _s2 = S[_nfSym]; if (!_s2 || _s2.trade !== _nfT || !_nfT.active) return;
@@ -19623,7 +19654,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.38-20261014-news-t1-bootwarm-nofill-agent', // bump on each deploy — lets /state verify what's live
+    build: '7.39-20261015-sessrej-guard-zonedT-bench-veto-stamp', // bump on each deploy — lets /state verify what's live
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
