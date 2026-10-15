@@ -2302,6 +2302,7 @@ function cohortFor(reason) {
   if (/EOD-CONT-WF/.test(reason)) return 'EOD-CONT-WF'; // with-trend blocks in the last 90min of RTH (2026-09-28, Jean's end-of-session drift hypothesis) — must precede TREND-CONT-WF
   if (/LADDER-77/.test(reason)) return 'LADDER-77'; // proportional 7/7 ladder sim on live XAU fires (2026-09-28)
   if (/LADDER-510/.test(reason)) return 'LADDER-510'; // current 5/10 ladder, same fires, same sequence rule
+  { const _v2 = reason.match(/\b(XAU|BTC)-SESS-REJ-V2\b/); if (_v2) return _v2[0]; } // rejection v2 trigger (2026-10-15) — must precede the plain matches
   if (/XAU-SESS-REJ-MULTI/.test(reason)) return 'XAU-SESS-REJ-MULTI'; // XAU session-extreme rejection, extreme tested ≥2× (2026-10-05, the 4125 triple bottom)
   if (/XAU-SESS-REJ-CRASH/.test(reason)) return 'XAU-SESS-REJ-CRASH';
   if (/XAU-SESS-REJ/.test(reason)) return 'XAU-SESS-REJ';
@@ -2419,7 +2420,7 @@ setInterval(() => {
     const out = {};
     for (const sy of ['XAU', 'BTC', 'NAS100']) {
       const st = S[sy]; if (!st) continue;
-      out[sy] = { zones: st._zoneObs || [], touched: st._zoneTouched || {}, m5: (st._m5 || []).slice(-72), m5h: (st._m5hist || []).slice(-2016), msTrend: st._msTrend || null, zl: st._zoneLedger || {} }; // m5h: week-long M5 ring for the Lorentzian prep (2026-09-20)
+      out[sy] = { zones: st._zoneObs || [], touched: st._zoneTouched || {}, m5: (st._m5 || []).slice(-72), m5h: (st._m5hist || []).slice(-2016), msTrend: st._msTrend || null, msTrendTs: st._msTrendTs || 0, msTrendP0: st._msTrendP0 || 0, zl: st._zoneLedger || {} }; // m5h: week-long M5 ring for the Lorentzian prep (2026-09-20)
     }
     fs.writeFileSync(ZONE_MAP_FILE, JSON.stringify(out));
   } catch (e) {}
@@ -2703,7 +2704,7 @@ function _flushPersist() {
     const out = {};
     for (const sy of ['XAU', 'BTC', 'NAS100']) {
       const st = S[sy]; if (!st) continue;
-      out[sy] = { zones: st._zoneObs || [], touched: st._zoneTouched || {}, m5: (st._m5 || []).slice(-72), m5h: (st._m5hist || []).slice(-2016), msTrend: st._msTrend || null, zl: st._zoneLedger || {} };
+      out[sy] = { zones: st._zoneObs || [], touched: st._zoneTouched || {}, m5: (st._m5 || []).slice(-72), m5h: (st._m5hist || []).slice(-2016), msTrend: st._msTrend || null, msTrendTs: st._msTrendTs || 0, msTrendP0: st._msTrendP0 || 0, zl: st._zoneLedger || {} };
     }
     fs.writeFileSync(ZONE_MAP_FILE, JSON.stringify(out));
     fs.writeFileSync(COHORT_TALLY_FILE, JSON.stringify(cohortTally));
@@ -4156,7 +4157,7 @@ function processPrice(sym, price, hi, lo) {
         s._zoneRestored = true;
         const _zr = _zoneRestore && _zoneRestore[sym];
         if (_zr) {
-          s._m5 = _zr.m5 || []; s._zoneObs = _zr.zones || []; s._zoneTouched = _zr.touched || {}; s._msTrend = _zr.msTrend || s._msTrend;
+          s._m5 = _zr.m5 || []; s._zoneObs = _zr.zones || []; s._zoneTouched = _zr.touched || {}; s._msTrend = _zr.msTrend || s._msTrend; if (_zr.msTrendTs) { s._msTrendTs = _zr.msTrendTs; s._msTrendP0 = _zr.msTrendP0 || 0; } // run start survives a restart (2026-10-15)
           if (Array.isArray(_zr.m5h) && _zr.m5h.length) s._m5hist = _zr.m5h; // week-long ring restore (2026-09-20)
           if (_zr.zl && typeof _zr.zl === 'object') s._zoneLedger = _zr.zl; // zone ledger restore (2026-10-07)
           log(sym, '🗺️ Zone map restored ungated at boot — ' + (s._zoneObs.length) + ' zones, ' + (s._m5.length) + ' M5 candles, msTrend ' + (s._msTrend || '—') + ' (2026-09-16 fix: no more 45min post-deploy blackout).');
@@ -4302,6 +4303,28 @@ function processPrice(sym, price, hi, lo) {
           if (_lc && _lc.ts !== s._sr.m5Ts) {
             s._sr.m5Ts = _lc.ts;
             const _fresh = (t0) => t0 > 0 && Date.now() - t0 < 5400000; // tag within the last 90min
+            // REJECTION FEATURES (2026-10-15, Jean: "such a low WR — the strategy can be improved"): every would-fire is
+            // stamped with what the rejection actually looked like, so the review can read W/L per feature and the
+            // lane is rebuilt from evidence, not taste. SR-RETEST = level tested ≥2× (≥20 min apart, ±0.05×ADR);
+            // SR-WICK = this M5 touched the extreme and closed in the far 40% of its range (a real rejection bar);
+            // SR-DISP = the bar displaced (body ≥0.8×ATR or range ≥1.2×ATR); SR-LDNNY = 03:00-16:00 ET (no Asian
+            // extremes); SR-ZONE = an own-direction OB/FVG sits at the extreme (±0.5×ATR); SR-WT = msTrend on the
+            // trade's side. V2 trigger (own cohort <SYM>-SESS-REJ-V2): (RETEST or WICK) and (DISP or ZONE) and LDNNY.
+            const _srFeat = (side) => {
+              try {
+                const isL = side === 'call'; const _atr = _srAtr > 0 ? _srAtr : _srAdr / 20;
+                const N = isL ? (s._sr.loN || 1) : (s._sr.hiN || 1);
+                const ext = isL ? s.sessionLow : s.sessionHigh; const rng = Math.max(1e-9, _lc.h - _lc.l);
+                const wick = isL ? ((_lc.l <= ext + 0.02 * _srAdr) && (_lc.c - _lc.l) >= 0.6 * rng) : ((_lc.h >= ext - 0.02 * _srAdr) && (_lc.h - _lc.c) >= 0.6 * rng);
+                const disp = Math.abs(_lc.c - _lc.o) >= 0.8 * _atr || rng >= 1.2 * _atr;
+                let hr = 12; try { hr = parseInt(new Date().toLocaleTimeString('en-US', { hour: '2-digit', hour12: false, timeZone: 'America/New_York' }), 10); } catch (eH) {}
+                const session = hr >= 3 && hr < 16;
+                const zone = Array.isArray(s._zoneObs) && s._zoneObs.some(z => z && z.dir === side && ((ext >= z.lo && ext <= z.hi) || Math.min(Math.abs(z.lo - ext), Math.abs(z.hi - ext)) <= 0.5 * _atr));
+                const withTrend = s._msTrend ? ((isL && s._msTrend === 'up') || (!isL && s._msTrend === 'down')) : false;
+                const tags = []; if (N >= 2) tags.push('SR-RETEST'); if (wick) tags.push('SR-WICK'); if (disp) tags.push('SR-DISP'); if (session) tags.push('SR-LDNNY'); if (zone) tags.push('SR-ZONE'); if (withTrend) tags.push('SR-WT');
+                return { tags, v2: (N >= 2 || wick) && (disp || zone) && session, N, wick, disp, session, zone, withTrend };
+              } catch (e) { return { tags: [], v2: false }; }
+            };
             const _push = (lane, dir, sl, tp, m) => { s.blockedOutcomes = s.blockedOutcomes || []; s.blockedOutcomes.push({ ts: Date.now(), time: ts(), symbol: sym, detector: lane, type: dir, price: price, virtualTp1: tp, virtualSl: sl, maxMin: 480, blockReason: m, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null }); log(sym, m); };
             // ===== SESS-REJ GOES LIVE (2026-10-05, Jean: "it should have earned its go-live from now") =====
             // Cohort BTC-SESS-REJ 9W/3L/5S = 75% W/(W+L) over 17 resolved — past the bar set on
@@ -4365,12 +4388,12 @@ function processPrice(sym, price, hi, lo) {
             // PUT side: needs RANGE regime or an up-spike flush (CRASH arm)
             if (_fresh(s._sr.hiTag) && _lc.c < _hiIn && Date.now() - s._sr.hiTs > 7200000 && (_srRng || _crashUp)) {
               s._sr.hiTs = Date.now(); const _lane = (_srRng ? sym + '-SESS-REJ' : sym + '-SESS-REJ-CRASH') + ((s._sr.hiN || 1) >= 2 && _srRng ? '-MULTI' : ''); const _sl = +(s.sessionHigh + 0.1 * _srAdr).toFixed(2), _tp = +((_vp && _vp.poc < price) ? _vp.poc : price - 0.3 * _srAdr).toFixed(2);
-              if (_tp < price) { _push(_lane, 'put', _sl, _tp, '🎯 ' + _lane + ' PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session high $' + s.sessionHigh.toFixed(0) + ' tagged (test #' + (s._sr.hiN || 1) + '), M5 closed back inside (' + (_vp ? 'VAH $' + _vp.vah.toFixed(0) : 'extreme −0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm: ' + _srSwing.toFixed(1) + '×ATR spike in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp ? ' (POC)' : ' (0.3×ADR)') + ' (2026-09-22; two arms 2026-09-24).'); _srLiveFire('put', _sl, _tp, _lane); }
+              if (_tp < price) { _push(_lane, 'put', _sl, _tp, '🎯 ' + _lane + ' PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session high $' + s.sessionHigh.toFixed(0) + ' tagged (test #' + (s._sr.hiN || 1) + '), M5 closed back inside (' + (_vp ? 'VAH $' + _vp.vah.toFixed(0) : 'extreme −0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm: ' + _srSwing.toFixed(1) + '×ATR spike in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp ? ' (POC)' : ' (0.3×ADR)') + ' (2026-09-22; two arms 2026-09-24).' + (function () { const _f = _srFeat('put'); if (_f.v2) _push(sym + '-SESS-REJ-V2', 'put', _sl, _tp, '🎯 ' + sym + '-SESS-REJ-V2 PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — rejection v2 at the session high $' + s.sessionHigh.toFixed(0) + ' (' + _f.tags.join(' ') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + ' (2026-10-15).'); return _f.tags.length ? ' [' + _f.tags.join(' ') + ']' : ' [no-feature]'; })()); _srLiveFire('put', _sl, _tp, _lane); }
             }
             // CALL side: needs RANGE regime or a down-flush (CRASH arm = V-REC v2)
             if (_fresh(s._sr.loTag) && _lc.c > _loIn && Date.now() - s._sr.loTs > 7200000 && (_srRng || _crashDn)) {
               s._sr.loTs = Date.now(); const _lane = (_srRng ? sym + '-SESS-REJ' : sym + '-SESS-REJ-CRASH') + ((s._sr.loN || 1) >= 2 && _srRng ? '-MULTI' : ''); const _sl = +(s.sessionLow - 0.1 * _srAdr).toFixed(2), _tp = +((_vp && _vp.poc > price) ? _vp.poc : price + 0.3 * _srAdr).toFixed(2);
-              if (_tp > price) { _push(_lane, 'call', _sl, _tp, '🎯 ' + _lane + ' CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session low $' + s.sessionLow.toFixed(0) + ' tagged (test #' + (s._sr.loN || 1) + '), M5 closed back inside (' + (_vp ? 'VAL $' + _vp.val.toFixed(0) : 'extreme +0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm (V-REC v2): ' + _srSwing.toFixed(1) + '×ATR flush in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp ? ' (POC)' : ' (0.3×ADR)') + ' (the 82,879 ATL case, 2026-09-24).'); _srLiveFire('call', _sl, _tp, _lane); }
+              if (_tp > price) { _push(_lane, 'call', _sl, _tp, '🎯 ' + _lane + ' CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session low $' + s.sessionLow.toFixed(0) + ' tagged (test #' + (s._sr.loN || 1) + '), M5 closed back inside (' + (_vp ? 'VAL $' + _vp.val.toFixed(0) : 'extreme +0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm (V-REC v2): ' + _srSwing.toFixed(1) + '×ATR flush in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp ? ' (POC)' : ' (0.3×ADR)') + ' (the 82,879 ATL case, 2026-09-24).' + (function () { const _f = _srFeat('call'); if (_f.v2) _push(sym + '-SESS-REJ-V2', 'call', _sl, _tp, '🎯 ' + sym + '-SESS-REJ-V2 CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — rejection v2 at the session low $' + s.sessionLow.toFixed(0) + ' (' + _f.tags.join(' ') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + ' (2026-10-15).'); return _f.tags.length ? ' [' + _f.tags.join(' ') + ']' : ' [no-feature]'; })()); _srLiveFire('call', _sl, _tp, _lane); }
             }
           }
         }
@@ -11561,7 +11584,7 @@ function processPrice(sym, price, hi, lo) {
               // within 2 min of another fire. PRE-REGISTERED BENCH RULE per lane: net-negative over the first
               // 6 live fires → back to shadow (PATH_LIVE=0 kills by hand; PATH_LIVE_LANES lists the lanes).
               try {
-                const _plLanes = String(process.env.PATH_LIVE_LANES || 'XAU:PATH-CLEAR-M').split(',').map(x => x.trim()); // PATH-ZONED-T back to shadow 2026-10-15: promoted at 10W/3L (n=13), sampler cohort now 17W/20L (46%) and live 6W/5L — re-earn at ≥60% over ≥15 (PATH_LIVE_LANES env re-adds it)
+                const _plLanes = String(process.env.PATH_LIVE_LANES || 'XAU:PATH-CLEAR-M,XAU:PATH-ZONED-T').split(',').map(x => x.trim()); // ZONED-T live again 2026-10-15 under the persistence filter (sampler 16W/3L on that subset; 1W/16L on the rest)
                 if (process.env.PATH_LIVE !== '0' && _plLanes.indexOf(sym + ':' + lane) >= 0) {
                   const _plWhy = [];
                   if (s.trade && s.trade.active) _plWhy.push('trade active');
@@ -11570,6 +11593,26 @@ function processPrice(sym, price, hi, lo) {
                   if (_nowP - (s.lastSignalTs || 0) < 120000) _plWhy.push('another fire <2min ago');
                   if (s.newsBlackout && s.newsBlackout.active) _plWhy.push('news blackout');
                   if (typeof cfdMarketOpenET === 'function' && !cfdMarketOpenET(_nowP)) _plWhy.push('market closed');
+                  // PERSISTENCE FILTER (2026-10-15, Jean: "keep only the winners and remove the losers"). 8 days of XAU sampler
+                  // (ZONED-T 36 resolved, CLEAR-M 78): the winners live in ESTABLISHED runs — msTrend older than 60 min that has
+                  // already travelled ≥3 ATR; fresh runs lose (ZONED-T 0W/8L, CLEAR-M 6W/32L). ZONED-T additionally wins only in
+                  // the Asian session (18:00-03:00 ET: 17W/16L vs 0W/3L outside), in a quiet tape (ATR ≤ $5: 16W/8L vs 1W/11L
+                  // above) and never inside/into an M5 FVG (1W/5L) — that subset is 16W/3L. CLEAR-M keeps all hours (its live
+                  // NY fires are 4W/2L) but takes the persistence filter (sampler 22W/18L vs 6W/32L fresh). Env overrides:
+                  // PATH_MIN_RUN_MIN (60), PATH_MIN_EXT_ATR (3), PATH_ZONED_MAX_ATR (5), PATH_ZONED_ASIA_ONLY (1).
+                  try {
+                    const _runMin = s._msTrendTs ? (_nowP - s._msTrendTs) / 60000 : null;
+                    const _runExt = (s._msTrendP0 > 0 && atrVal > 0) ? Math.abs(price - s._msTrendP0) / atrVal : null;
+                    const _minRun = parseFloat(process.env.PATH_MIN_RUN_MIN) || 60, _minExt = parseFloat(process.env.PATH_MIN_EXT_ATR) || 3;
+                    if (_runMin === null || _runExt === null) _plWhy.push('msTrend run age unknown (no flip seen since boot)');
+                    else if (_runMin < _minRun || _runExt < _minExt) _plWhy.push('fresh run (' + Math.round(_runMin) + ' min, ' + _runExt.toFixed(1) + '×ATR travelled; needs ≥' + _minRun + ' min & ≥' + _minExt + '×ATR)');
+                    if (/PATH-ZONED/.test(lane)) {
+                      let _hrP = 12; try { _hrP = parseInt(new Date(_nowP).toLocaleTimeString('en-US', { hour: '2-digit', hour12: false, timeZone: 'America/New_York' }), 10); } catch (eHP) {}
+                      if (process.env.PATH_ZONED_ASIA_ONLY !== '0' && !(_hrP >= 18 || _hrP < 3)) _plWhy.push('ZONED outside the Asian session (' + _hrP + ':00 ET)');
+                      if (atrVal > (parseFloat(process.env.PATH_ZONED_MAX_ATR) || 5)) _plWhy.push('ZONED in a fast tape (ATR $' + atrVal.toFixed(2) + ' > $' + (parseFloat(process.env.PATH_ZONED_MAX_ATR) || 5) + ')');
+                      if (/FVG M5/.test(note)) _plWhy.push('ZONED on an M5 FVG (1W/5L)');
+                    }
+                  } catch (ePF) {}
                   { const _bw = bootWarm(sym, s); if (!_bw.ok) _plWhy.push('boot warm-up: ' + _bw.why); }
                   const _fg = global._fundedGuard || {};
                   if ((_fg.dayLimit && _fg.day <= -_fg.dayLimit) || (_fg.totalLimit && _fg.total <= -_fg.totalLimit)) _plWhy.push('funded guard');
@@ -11589,7 +11632,7 @@ function processPrice(sym, price, hi, lo) {
                   } else {
                     s._pathLiveTs = _nowP;
                     s.dailySignalCount++;
-                    const _pSig = { type: dir, time: ts(), price: price.toFixed(2), score: (dir === 'call' ? '⬆' : '⬇') + lane, rsi: '', macd: (typeof s._macdL === 'number') ? s._macdL.toFixed(3) : '', roc: (typeof s._roc3 === 'number') ? ((s._roc3 >= 0 ? '+' : '') + s._roc3.toFixed(3) + '%') : '', num: s.dailySignalCount, sl: sl.toFixed(2), tp1: tp1.toFixed(2), tp2: tp1.toFixed(2), tp3: tp1.toFixed(2), regime: (s._dayRegime && s._dayRegime.label) || null, path: { lane, note, msTrend: s._msTrend, atr: +atrVal.toFixed(2) }, oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: 'path sampler moment' } };
+                    const _pSig = { type: dir, time: ts(), price: price.toFixed(2), score: (dir === 'call' ? '⬆' : '⬇') + lane, rsi: '', macd: (typeof s._macdL === 'number') ? s._macdL.toFixed(3) : '', roc: (typeof s._roc3 === 'number') ? ((s._roc3 >= 0 ? '+' : '') + s._roc3.toFixed(3) + '%') : '', num: s.dailySignalCount, sl: sl.toFixed(2), tp1: tp1.toFixed(2), tp2: tp1.toFixed(2), tp3: tp1.toFixed(2), regime: (s._dayRegime && s._dayRegime.label) || null, path: { lane, note, msTrend: s._msTrend, atr: +atrVal.toFixed(2), runMin: s._msTrendTs ? Math.round((_nowP - s._msTrendTs) / 60000) : null, runExtAtr: (s._msTrendP0 > 0 && atrVal > 0) ? +(Math.abs(price - s._msTrendP0) / atrVal).toFixed(2) : null }, oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: 'path sampler moment' } };
                     s.signals.push(_pSig); logSignal(sym, _pSig);
                     s.trade = buildCfdTrade(dir, price, atrVal, sym);
                     s.trade._oteVetted = true; s.trade._pathLive = true; s.trade.scalp = true; delete s.trade.oteLimit; delete s.trade.oteExpiry;
@@ -11602,7 +11645,7 @@ function processPrice(sym, price, hi, lo) {
                   }
                 }
               } catch (ePL) { try { log(sym, '⚠️ PATH live lane error (sampler unaffected): ' + String(ePL).slice(0, 120)); } catch (e2) {} }
-              const m = '🛣️ ' + sym + ' ' + lane + ' ' + dir.toUpperCase() + ' sample @ $' + price.toFixed(2) + ' — msTrend ' + s._msTrend + ', ' + note + '; symmetric 1×ATR bracket (sampler 2026-10-07). ' + lane;
+              const m = '🛣️ ' + sym + ' ' + lane + ' ' + dir.toUpperCase() + ' sample @ $' + price.toFixed(2) + ' — msTrend ' + s._msTrend + (s._msTrendTs ? ' (run ' + Math.round((_nowP - s._msTrendTs) / 60000) + 'min, ' + ((s._msTrendP0 > 0) ? (Math.abs(price - s._msTrendP0) / atrVal).toFixed(1) : '?') + '×ATR)' : '') + ', ' + note + '; symmetric 1×ATR bracket (sampler 2026-10-07). ' + lane;
               s.blockedOutcomes = s.blockedOutcomes || [];
               s.blockedOutcomes.push({ ts: _nowP, time: ts(), symbol: sym, detector: lane.slice(0, 10), type: dir, price, virtualTp1: +tp1.toFixed(2), virtualSl: +sl.toFixed(2), maxMin: 60, blockReason: m, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
             }
@@ -12368,10 +12411,10 @@ function processPrice(sym, price, hi, lo) {
           }
           const _lh = _sw.hi[_sw.hi.length - 1], _ll = _sw.lo[_sw.lo.length - 1];
           if (_lh && _ll) {
-            if (_last.c > _lh.h && s._msTrend !== 'up') { s._msTrend = 'up';
+            if (_last.c > _lh.h && s._msTrend !== 'up') { s._msTrend = 'up'; s._msTrendTs = Date.now(); s._msTrendP0 = price; // run start (2026-10-15, PATH persistence filter)
               const _cm = '🔀 CHOCH-V2 CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — M5 close above last swing high $' + _lh.h.toFixed(2) + ' (structure shift up).';
               log(sym, _cm); trackBlockedOutcome(sym, _cm, true); }
-            if (_last.c < _ll.l && s._msTrend !== 'down') { s._msTrend = 'down';
+            if (_last.c < _ll.l && s._msTrend !== 'down') { s._msTrend = 'down'; s._msTrendTs = Date.now(); s._msTrendP0 = price;
               const _cm2 = '🔀 CHOCH-V2 PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — M5 close below last swing low $' + _ll.l.toFixed(2) + ' (structure shift down).';
               log(sym, _cm2); trackBlockedOutcome(sym, _cm2, true); }
           }
@@ -19654,7 +19697,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.39-20261015-sessrej-guard-zonedT-bench-veto-stamp', // bump on each deploy — lets /state verify what's live
+    build: '7.39-20261015-path-persistence-sessrej-v2-veto-stamp', // bump on each deploy — lets /state verify what's live
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
