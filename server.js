@@ -8114,7 +8114,7 @@ function processPrice(sym, price, hi, lo) {
         // the 9/28 FULL-only restriction assumed the classifier would call the trend; on 10/01-02 it
         // never did while the legs ran 2-10×ATR (with-trend ZONE-VETO blocks graded 11W/3L across the
         // two nights). The exhaustion risk that motivated 9/28 is now the extreme-pullback hold's job.
-        const _zvBigLeg = s._bigLeg === sig.type && process.env.BIGLEG_DISABLED !== '1' && /RIDE|TREND|FAST|SUST|6\/6|CHoCH|SWEEP/.test(tagEarly || '') && legModeActive(s, sym, sig.type, atrVal);
+        let _zvBigLeg = s._bigLeg === sig.type && process.env.BIGLEG_DISABLED !== '1' && /RIDE|TREND|FAST|SUST|6\/6|CHoCH|SWEEP/.test(tagEarly || '') && legModeActive(s, sym, sig.type, atrVal);
         if (_zvBigLeg) sig._legMode = true;
         const _zvTok = ' ZONE-VETO-' + (((s._msTrend === 'up' && sig.type === 'call') || (s._msTrend === 'down' && sig.type === 'put')) ? 'WT' : 'CT'); // live-direction split (2026-10-02): the 31h sample read with-trend 67% vs counter-trend 40%
         const _zvInLatch = _zvIn && latchAdvSource(s, sig.type) && (sig.type === 'put'
@@ -8132,9 +8132,18 @@ function processPrice(sym, price, hi, lo) {
           try { const _lastE = s.blockedOutcomes && s.blockedOutcomes[s.blockedOutcomes.length - 1]; if (_lastE && _lastE.blockReason === _zvInMsg) { _lastE.zoneGrade = zoneGrade(sym, _zvIn); _lastE.zoneId = _zvIn.id || null; } } catch (eZG) {} // zone grade on the veto row (2026-10-07)
           return false;
         }
+        // LOOK-AHEAD = max(1.2×ATR, the TP1 distance) (2026-10-16, the 14:30 XAU TREND put: ATR $1.09, TP1 at the $5 floor =
+        // 4.6 ATR away, and a 5-touch OB M15 sat $1.1-1.7 below — outside the 1.2×ATR window, squarely on the path to TP1).
+        // A trade whose first target has to cross a held zone is a trade into the zone, whatever the ATR says.
+        const _zvTp1Dist = (sig && sig.tp1 != null && isFinite(parseFloat(sig.tp1))) ? Math.abs(price - parseFloat(sig.tp1)) : (sym === 'XAU' ? 5 : 0); // the row's TP1 when the detector stamped one, else gold's $5 floor
+        const _zvLook = Math.max(1.2 * atrVal, (typeof _zvTp1Dist === 'number' && _zvTp1Dist > 0) ? _zvTp1Dist : 0);
+        // LEG-MODE WAIVER EXCEPTION (2026-10-16): a zone the ledger has already seen HOLD (or touched ≥3×) is not waived —
+        // the 14:30 put was sold through an OB that had held 5 touches at the session low. LEG MODE waives untested zones only.
+        const _zvHeldAhead = _zvBigLeg ? s._zoneObs.find(z => { if (!z || z.dir === sig.type) return false; const near = _zvC ? (z.lo >= price && z.lo <= price + _zvLook) : (z.hi <= price && z.hi >= price - _zvLook); if (!near) return false; const L = (s._zoneLedger && z.id) ? s._zoneLedger[z.id] : null; return !!(L && ((L.holds || 0) >= 1 || (L.touches || 0) >= 3)); }) : null;
+        if (_zvHeldAhead) { _zvBigLeg = false; delete sig._legMode; log(sym, '🚀 ' + tagEarly + ' ' + sig.type.toUpperCase() + ' LEG-MODE waiver REFUSED — opposing ' + (_zvHeldAhead.kind || 'OB') + ' ' + (_zvHeldAhead.tf || '') + ' $' + _zvHeldAhead.lo.toFixed(2) + '-$' + _zvHeldAhead.hi.toFixed(2) + ' on the path to TP1 has already held (ledger holds/touches); a leg does not get to run through a proven zone (2026-10-16).'); }
         if (tdLatchEase(s, sig.type) || _zvBigLeg) {
           const _zvE = s._zoneObs.find(z => z && z.dir !== sig.type &&
-            (_zvC ? (z.lo >= price && z.lo <= price + 1.2 * atrVal) : (z.hi <= price && z.hi >= price - 1.2 * atrVal)));
+            (_zvC ? (z.lo >= price && z.lo <= price + _zvLook) : (z.hi <= price && z.hi >= price - _zvLook)));
           if (_zvE) log(sym, (_zvBigLeg && !tdLatchEase(s, sig.type) ? '🚀 ' : '📈 ') + tagEarly + ' ' + sig.type.toUpperCase() + ' TREND-CONT EASE — ZONE-VETO waived: opposing ' + (_zvE.kind || 'OB') + ' ' + (_zvE.tf || '') + ' ahead ignored, ' + (_zvBigLeg && !tdLatchEase(s, sig.type) ? 'BIG-LEG armed (BIGLEG-ZONE-EASE 2026-09-21)' : 'trend-day latch with-trend (2026-08-19, 8/19 launch case)') + '.');
         } else {
         // INSIDE-ZONE EXTENSION (2026-08-27, Jean's 20:03 autopsy): the veto only saw
@@ -8143,7 +8152,7 @@ function processPrice(sym, price, hi, lo) {
         // @4626.15 bought inside the 7h-old 4623.95-4631.93 supply OB and SL'd in 149s
         // (-$321.50, adverseFrac 1.04). Buying inside supply is worse than under it.
         const _zv = s._zoneObs.find(z => z && z.dir !== sig.type &&
-          ((_zvC ? (z.lo >= price && z.lo <= price + 1.2 * atrVal) : (z.hi <= price && z.hi >= price - 1.2 * atrVal)) ||
+          ((_zvC ? (z.lo >= price && z.lo <= price + _zvLook) : (z.hi <= price && z.hi >= price - _zvLook)) ||
            (price >= z.lo && price <= z.hi)));
         if (_zv) {
           Object.assign(s, _emitSnapshot);
@@ -16895,10 +16904,12 @@ function btcWeekendClosed() {
     const nowW = new Date();
     const wkdW = new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone: 'America/New_York' }).format(nowW);
     if (wkdW === 'Sat') return true;
-    if (wkdW === 'Sun') {
-      const hrW = parseInt(new Intl.DateTimeFormat('en-US', { hour: '2-digit', hour12: false, timeZone: 'America/New_York' }).format(nowW), 10);
-      return hrW < 12;
-    }
+    const hrW = parseInt(new Intl.DateTimeFormat('en-US', { hour: '2-digit', hour12: false, timeZone: 'America/New_York' }).format(nowW), 10);
+    if (wkdW === 'Sun') return hrW < 12;
+    // Friday evening joins the weekend split (2026-10-18): the 10/16 18:32 BIGLEG call fired after the US close into the
+    // Friday-night drift and stopped — same shape as the two 9/21 weekend losses. BTC lanes treat Fri ≥17:00 ET as weekend
+    // (shadow cohort -WKND keeps measuring; BTC_FRI_EVENING_LIVE=1 restores the old behaviour).
+    if (wkdW === 'Fri' && hrW >= 17 && process.env.BTC_FRI_EVENING_LIVE !== '1') return true;
   } catch (eW) {}
   return false;
 }
@@ -19209,6 +19220,29 @@ app.get('/admin/agent-test', async (req, res) => {
     res.json({ ok: true, sym, dir, price, atr, effort: process.env.ENTRY_AGENT_EFFORT || 'low', results: out });
   } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
+// SPREAD LOG persistence + GET /spreads (2026-10-16, broker selection)
+const SPREADS_FILE = path.join(DATA_DIR, 'spreads.json');
+try { if (fs.existsSync(SPREADS_FILE)) global._spreads = JSON.parse(fs.readFileSync(SPREADS_FILE, 'utf8')); } catch (e) {}
+setInterval(() => { if (!global._spreadsDirty) return; global._spreadsDirty = false; try { fs.writeFileSync(SPREADS_FILE, JSON.stringify(global._spreads || {})); } catch (e) {} }, 60000);
+app.get('/spreads', (req, res) => {
+  try {
+    const sess = (h) => { const x = +h; return (x >= 18 || x < 3) ? 'ASIA' : x < 8 ? 'LONDON' : x < 16 ? 'NY' : 'CLOSE'; };
+    const out = {};
+    for (const [ak, A] of Object.entries(global._spreads || {})) {
+      out[ak] = {};
+      for (const [sy, Sy] of Object.entries(A)) {
+        const byHour = {}, bySess = {}; let n = 0, sum = 0, mn = Infinity, mx = 0;
+        for (const [d, D] of Object.entries(Sy.days || {})) { if (req.query.day && d !== req.query.day) continue; for (const [h, H] of Object.entries(D)) {
+          const b = byHour[h] = byHour[h] || { n: 0, sum: 0, min: Infinity, max: 0 }; b.n += H.n; b.sum += H.sum; b.min = Math.min(b.min, H.min); b.max = Math.max(b.max, H.max);
+          const sb = bySess[sess(h)] = bySess[sess(h)] || { n: 0, sum: 0, min: Infinity, max: 0 }; sb.n += H.n; sb.sum += H.sum; sb.min = Math.min(sb.min, H.min); sb.max = Math.max(sb.max, H.max);
+          n += H.n; sum += H.sum; mn = Math.min(mn, H.min); mx = Math.max(mx, H.max); } }
+        const fmt = (b) => ({ samples: b.n, avg: +(b.sum / b.n).toFixed(3), min: +b.min.toFixed(3), max: +b.max.toFixed(3) });
+        out[ak][sy] = { last: Sy.last, lastAgoSec: Sy.lastTs ? Math.round((Date.now() - Sy.lastTs) / 1000) : null, all: n ? fmt({ n, sum, min: mn, max: mx }) : null, bySession: Object.fromEntries(Object.entries(bySess).map(([k, b]) => [k, fmt(b)])), byHourET: Object.fromEntries(Object.entries(byHour).sort().map(([k, b]) => [k, fmt(b)])), days: Object.keys(Sy.days || {}) };
+      }
+    }
+    res.json({ ts: Date.now(), note: 'spread in price units (XAU $/oz, NAS100 points, BTC $); one sample per EA poll (~2s); compare accounts side by side; ?day=YYYY-MM-DD filters', accounts: out });
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
 // GET /agent — scoreboard per model vs the rule, recent decisions with reasons
 app.get('/agent', (req, res) => {
   try {
@@ -19697,7 +19731,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.39-20261015-path-persistence-sessrej-v2-veto-stamp', // bump on each deploy — lets /state verify what's live
+    build: '7.40-20261018-spread-log-zone-lookahead-fri-wknd', // bump on each deploy — lets /state verify what's live
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
@@ -19974,6 +20008,19 @@ app.get('/prices', (req, res) => {
       // ORDER_FAILED 10027 yet both filled for real — consistent with a second MT5 terminal
       // (old account, Algo Trading off) still polling. Track distinct account logins seen in
       // the last 2 min; ≥2 → log + push (30-min dedupe) and surface on /state.eaHeartbeat.
+      // SPREAD TELEMETRY (2026-10-16): &spr=XAU:0.12,BTC:25.4,NAS100:1.2 &broker=... → per account/broker, symbol, ET hour: n/avg/min/max
+      try {
+        if (req.query.spr) {
+          global._spreads = global._spreads || {};
+          const _ak = (req.query.broker ? String(req.query.broker).slice(0, 30) + ' ' : '') + String(req.query.acct || '?').slice(0, 20);
+          const _hr = new Date().toLocaleTimeString('en-US', { hour: '2-digit', hour12: false, timeZone: 'America/New_York' }).slice(0, 2);
+          const _dk = todayDateET();
+          for (const part of String(req.query.spr).split(',')) { const [sy, v] = part.split(':'); const x = parseFloat(v); if (!sy || !isFinite(x) || x < 0 || x > 1e6) continue;
+            const A = global._spreads[_ak] = global._spreads[_ak] || {}; const Sy = A[sy] = A[sy] || { days: {} }; const D = Sy.days[_dk] = Sy.days[_dk] || {}; const H = D[_hr] = D[_hr] || { n: 0, sum: 0, min: Infinity, max: 0 };
+            H.n++; H.sum += x; if (x < H.min) H.min = x; if (x > H.max) H.max = x; Sy.last = x; Sy.lastTs = Date.now(); }
+          global._spreadsDirty = true;
+        }
+      } catch (eSP) {}
       if (req.query.acct) {
         global._eaAccts = global._eaAccts || {};
         global._eaAccts[String(req.query.acct).slice(0, 20)] = Date.now();
