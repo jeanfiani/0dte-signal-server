@@ -17418,12 +17418,16 @@ function checkExit(sym, price) {
     // (idempotent, also re-fixes OTE-fill level shifts): call tp1≤tp2≤tp3, put mirrored.
     if (!t.t1 && !t.sl && typeof t.tp1Price === 'number' && typeof t.tp2Price === 'number') {
       const _mb2 = t.tp2Price, _mb3 = t.tp3Price;
+      // The CAPITAL_MODE equality guard deliberately parks TP3 one epsilon INSIDE TP2 (so the last portion closes
+      // first) — the clamp must tolerate that epsilon or the two fight every tick (gate reports 10/14-10/16 read the
+      // 0.10 nudge as an "inverted ladder"; 2026-10-18).
+      const _mbEps = (sym === 'XAU' ? 0.1 : sym === 'NAS100' ? 2 : sym === 'BTC' ? 10 : 0.05) + 1e-9;
       if (iC) {
         if (t.tp2Price < t.tp1Price) t.tp2Price = t.tp1Price;
-        if (typeof t.tp3Price === 'number' && t.tp3Price < t.tp2Price) t.tp3Price = t.tp2Price;
+        if (typeof t.tp3Price === 'number' && t.tp3Price < t.tp2Price - _mbEps) t.tp3Price = t.tp2Price;
       } else {
         if (t.tp2Price > t.tp1Price) t.tp2Price = t.tp1Price;
-        if (typeof t.tp3Price === 'number' && t.tp3Price > t.tp2Price) t.tp3Price = t.tp2Price;
+        if (typeof t.tp3Price === 'number' && t.tp3Price > t.tp2Price + _mbEps) t.tp3Price = t.tp2Price;
       }
       // Row write-through (2026-09-17, the 03:10 call): when the clamp reorders the live
       // ladder, the history row must follow — dashboards/mobile/EA render the ROW, and a
@@ -19731,7 +19735,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.40-20261018-spread-log-zone-lookahead-fri-wknd', // bump on each deploy — lets /state verify what's live
+    build: '7.41-20261018-ladder-eps-fri-wknd', // bump on each deploy — lets /state verify what's live
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
