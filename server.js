@@ -2225,6 +2225,8 @@ function nasRthBlocked(sym) {
 function cohortFor(reason) {
   { const _ag = reason.match(/\bAGENT-([A-Z0-9]+)-(FILL|WAIT|SKIP)-(NOW|FILL)\b/); if (_ag) return _ag[0]; } // entry agent shadow cohorts (2026-10-09)
   if (/BOOT-WARMUP/.test(reason)) return 'BOOT-WARMUP'; // cold-start blocks (2026-10-14)
+  { const _ld = reason.match(/\bBTC-LAD-(LIVE|ZONE|VOL|TIME|CHAND)\b/); if (_ld) return _ld[0]; } // BTC dynamic-ladder sim (2026-10-19)
+  { const _rs = reason.match(/\bRUNNER-(LIVE|PCT50|STRUCT\+PCT50|STRUCT|REGIME)-(XAU|BTC|NAS100)\b/); if (_rs) return _rs[0]; } // runner-exit sim (2026-10-19)
   { const _tw = reason.match(/\bTREND-(WT|CT)\b/); if (_tw) return 'TREND-' + _tw[1]; }
   { const _pb = reason.match(/\bEXT-PB-(LEFT|EXPIRED)\b/); if (_pb) return 'EXT-PB-' + _pb[1]; }
   { const _pt = reason.match(/\bPATH-(CLEAR|ZONED)-([TRM])\b/); if (_pt) return 'PATH-' + _pt[1] + '-' + _pt[2]; } // path sampler (2026-10-07)
@@ -17528,6 +17530,100 @@ function checkExit(sym, price) {
         } catch (eCI) {}
       }
     }
+    // ===== RUNNER-EXIT SIM — ALL SYMBOLS, SHADOW (2026-10-19, Jean: "TP1 is not the issue, the problem is afterwards:
+    // the best exit of the trade") ===== 7-day replay of the 12 non-scalp runners: the move offered 6.7R on average
+    // after TP1 (12h horizon), the live exit (BE-lock → TP1 after TP2 → out at TP3) captured 1.36R; a STRUCTURE
+    // trail (stop under the last M5 swing low / over the last swing high) captured 1.84R, carried by the trend legs
+    // (XAU 10/14 20:08: 7.55R vs 2.83R; NAS 10/12 LHFP: 5.67R vs 1.95R) but exits early in chop (median 1.02R).
+    // Measured live from here, per symbol, on every runner: LIVE · PCT50 (50% of peak, the live trail) · STRUCT
+    // (swing trail, no TP3 cap) · STRUCT+PCT50 (the tighter of the two) · REGIME (STRUCT when the day regime is
+    // TREND, LIVE otherwise). Cohorts RUNNER-<VARIANT>-<SYM>; row carries runnerSim. Pre-registered: a variant
+    // replaces the live runner rule for a symbol when it beats LIVE by ≥0.3R mean over ≥15 runners. RUNNER_SIM=0 off.
+    try {
+      if (t.t1 && !t.scalp && process.env.RUNNER_SIM !== '0' && t.ep > 0 && (sym === 'XAU' || sym === 'BTC' || sym === 'NAS100')) {
+        const _R = Math.abs(t.ep - t.slPrice) || 1;
+        if (!t._rs) {
+          const _ra = (typeof t.atr === 'number' && t.atr > 0) ? t.atr : (s._atr || 0);
+          const _be = 0.3 * _ra;
+          t._rs = { ts: now, R: _R, atr: _ra, be: _be, peak: 0, struct: null, m5Ts: 0, regime: (s._dayRegime && s._dayRegime.label) || 'M', v: ['LIVE', 'PCT50', 'STRUCT', 'STRUCT+PCT50', 'REGIME'].map(n => ({ name: n, done: false, exitR: null })) };
+          log(sym, '🧪 RUNNER-SIM armed after TP1 — R $' + _R.toFixed(2) + ', regime ' + t._rs.regime + ' (shadow, 2026-10-19).');
+        }
+        const S0 = t._rs; const favNow = iC ? price - t.ep : t.ep - price; if (favNow > S0.peak) S0.peak = favNow;
+        // structure: on each completed M5 bar, a swing low (call) / swing high (put) two bars back moves the struct stop
+        try { const M = s._m5; if (Array.isArray(M) && M.length >= 3) { const last = M[M.length - 1]; if (last.ts !== S0.m5Ts) { S0.m5Ts = last.ts; const a = M[M.length - 3], b = M[M.length - 2], c = last; if (iC && b.l < a.l && b.l < c.l) S0.struct = Math.max(S0.struct || -Infinity, b.l - 0.1 * S0.atr); if (!iC && b.h > a.h && b.h > c.h) S0.struct = Math.min(S0.struct || Infinity, b.h + 0.1 * S0.atr); } } } catch (eSw) {}
+        const favOf = (p) => iC ? p - t.ep : t.ep - p;
+        const stopFav = {
+          LIVE: (t.t2 ? Math.abs(t.tp1Price - t.ep) : S0.be),
+          PCT50: Math.max(S0.be, 0.5 * S0.peak),
+          STRUCT: Math.max(S0.be, S0.struct !== null && isFinite(S0.struct) ? favOf(S0.struct) : -Infinity),
+        };
+        stopFav['STRUCT+PCT50'] = Math.max(stopFav.STRUCT, stopFav.PCT50);
+        stopFav.REGIME = S0.regime === 'TREND' ? stopFav.STRUCT : stopFav.LIVE;
+        const t3F = Math.abs(t.tp3Price - t.ep);
+        for (const v of S0.v) {
+          if (v.done) continue;
+          const cap = (v.name === 'LIVE' || (v.name === 'REGIME' && S0.regime !== 'TREND')) ? t3F : null;
+          if (cap !== null && favNow >= cap) { v.done = true; v.exitR = +(cap / S0.R).toFixed(2); }
+          else if (favNow <= stopFav[v.name]) { v.done = true; v.exitR = +(stopFav[v.name] / S0.R).toFixed(2); }
+          if (v.done) { try { bumpCohortTally(sym, 'RUNNER-' + v.name + '-' + sym, v.exitR >= 0.5 ? 'win' : v.exitR <= 0.1 ? 'loss' : 'scratch'); } catch (eRB) {} }
+        }
+        if (S0.v.every(v => v.done) && !S0.logged) { S0.logged = true; log(sym, '🧪 RUNNER-SIM resolved — ' + S0.v.map(v => v.name + ' ' + v.exitR + 'R').join(' · ') + ' · peak ' + (S0.peak / S0.R).toFixed(2) + 'R.'); try { if (s.lastHistEntry && s.lastHistEntry.symbol === sym) s.lastHistEntry.runnerSim = Object.assign({ peakR: +(S0.peak / S0.R).toFixed(2), regime: S0.regime }, Object.fromEntries(S0.v.map(v => [v.name, v.exitR]))); } catch (eRS3) {} }
+      }
+    } catch (eRSIM) {}
+    // ===== BTC DYNAMIC-LADDER SIM — SHADOW (2026-10-19, Jean: "for BTC I think we can have a dynamic TP and/or SL") =====
+    // Every live BTC trade is graded tick-by-tick against four alternative ladders built at entry from the SAME
+    // fire, so the choice is made on sequence-exact outcomes, not on taste:
+    //   LIVE   — the lane's own ladder (baseline).
+    //   ZONE   — TP1 just inside the nearest OPPOSING zone ahead when it sits 0.5-1.5R away (take the money before
+    //            the wall); SL just beyond the nearest SUPPORTING zone behind when that is 0.5-1.2× the live R.
+    //   VOL    — ATR-scaled: SL 1.5×ATR(M5), TP1 1.5×ATR, 1:1 — the geometry that made PATH on gold.
+    //   TIME   — live ladder, but the stop goes to breakeven if the trade has not reached +0.5R after 30 min
+    //            (time decay: a leg that stalls has lost its premise).
+    //   CHAND  — live ladder to TP1, then a chandelier: exit when price gives back 1.0×ATR(M5) from the peak.
+    // Each variant's first-leg result (TP1 before SL, or SL first) and $/unit exit are tallied in cohorts
+    // BTC-LAD-<NAME>; the row carries ladSim. Pre-registered: a variant is adopted for a lane when it beats LIVE by
+    // ≥$150/unit average over ≥15 BTC fires of that lane (BTC_LADSIM=0 disables).
+    try {
+      if (sym === 'BTC' && process.env.BTC_LADSIM !== '0') {
+        if (!t._lad) {
+          const _R = Math.abs(t.ep - t.slPrice) || 0, _T1 = Math.abs(t.tp1Price - t.ep) || 0, _atrB = (typeof t.atr === 'number' && t.atr > 0) ? t.atr : (s._atr || 0);
+          const mk = (name, sl, tp1, extra) => Object.assign({ name, sl: +sl.toFixed(2), tp1: +tp1.toFixed(2), done: false, out: null, exitPnl: null, peak: 0 }, extra || {});
+          const V = [mk('LIVE', t.slPrice, t.tp1Price)];
+          // ZONE
+          try {
+            const Z = Array.isArray(s._zoneObs) ? s._zoneObs : [];
+            const oppAhead = Z.filter(z => z && z.dir !== t.type && (iC ? z.lo > t.ep : z.hi < t.ep)).map(z => ({ z, d: iC ? z.lo - t.ep : t.ep - z.hi })).filter(o => o.d >= 0.5 * _R && o.d <= 1.5 * _R).sort((a, b) => a.d - b.d)[0];
+            const supBehind = Z.filter(z => z && z.dir === t.type && (iC ? z.hi < t.ep : z.lo > t.ep)).map(z => ({ z, d: iC ? t.ep - z.lo : z.hi - t.ep })).filter(o => o.d >= 0.5 * _R && o.d <= 1.2 * _R).sort((a, b) => a.d - b.d)[0];
+            const zTp = oppAhead ? (iC ? oppAhead.z.lo - 0.05 * _atrB : oppAhead.z.hi + 0.05 * _atrB) : t.tp1Price;
+            const zSl = supBehind ? (iC ? supBehind.z.lo - 0.1 * _atrB : supBehind.z.hi + 0.1 * _atrB) : t.slPrice;
+            V.push(mk('ZONE', zSl, zTp, { note: (oppAhead ? 'tp@' + oppAhead.z.kind + oppAhead.z.tf : 'tp=live') + '/' + (supBehind ? 'sl@' + supBehind.z.kind + supBehind.z.tf : 'sl=live') }));
+          } catch (eZ) { V.push(mk('ZONE', t.slPrice, t.tp1Price, { note: 'n/a' })); }
+          if (_atrB > 0) V.push(mk('VOL', iC ? t.ep - 1.5 * _atrB : t.ep + 1.5 * _atrB, iC ? t.ep + 1.5 * _atrB : t.ep - 1.5 * _atrB));
+          V.push(mk('TIME', t.slPrice, t.tp1Price, { timeStop: true }));
+          V.push(mk('CHAND', t.slPrice, t.tp1Price, { chand: _atrB }));
+          t._lad = { ts: now, v: V, R: _R, T1: _T1 };
+          log(sym, '🧪 BTC LADDER-SIM armed — ' + V.map(v => v.name + ' sl $' + v.sl.toFixed(0) + ' tp1 $' + v.tp1.toFixed(0) + (v.note ? ' (' + v.note + ')' : '')).join(' · ') + ' (shadow, 2026-10-19).');
+        }
+        const L = t._lad; const _fav = iC ? price - t.ep : t.ep - price; const _ageMin = (now - L.ts) / 60000;
+        for (const v of L.v) {
+          if (v.done) continue;
+          if (_fav > v.peak) v.peak = _fav;
+          let sl = v.sl;
+          if (v.timeStop && _ageMin >= 30 && v.peak < 0.5 * L.R && !v.beMoved) { v.beMoved = true; sl = v.sl = +t.ep.toFixed(2); }
+          const hitTp = iC ? price >= v.tp1 : price <= v.tp1, hitSl = iC ? price <= sl : price >= sl;
+          if (!v.t1 && hitTp) { v.t1 = true; v.t1Ts = now; if (!v.chand) { v.done = true; v.out = 'win'; v.exitPnl = +(iC ? v.tp1 - t.ep : t.ep - v.tp1).toFixed(2); } }
+          else if (!v.t1 && hitSl) { v.done = true; v.out = 'loss'; v.exitPnl = +(iC ? sl - t.ep : t.ep - sl).toFixed(2); }
+          else if (v.t1 && v.chand) { if (_fav <= v.peak - v.chand) { v.done = true; v.out = 'win'; v.exitPnl = +_fav.toFixed(2); } }
+          if (v.done) { try { bumpCohortTally(sym, 'BTC-LAD-' + v.name, v.out); } catch (eB) {} }
+        }
+        if (L.v.every(v => v.done) && !L.logged) {
+          L.logged = true;
+          const summ = L.v.map(v => v.name + ' ' + v.out + ' ' + (v.exitPnl >= 0 ? '+' : '') + '$' + (v.exitPnl || 0).toFixed(0)).join(' · ');
+          log(sym, '🧪 BTC LADDER-SIM resolved — ' + summ + ' (first-leg, $/unit).');
+          try { if (s.lastHistEntry && s.lastHistEntry.symbol === sym) s.lastHistEntry.ladSim = Object.fromEntries(L.v.map(v => [v.name, { out: v.out, exit: v.exitPnl, peak: +v.peak.toFixed(0) }])); } catch (eLS2) {}
+        }
+      }
+    } catch (eLAD) {}
     // ===== SL5-SIM — "SL = TP1" SHADOW (2026-08-30, Jean: "should we do SL = TP1?") =====
     // Evidence for: winners' MAE ≤ $3.42 (July backtest) and ≤ $4.40 all this week,
     // while losers run adverseFrac ≈ 1.0 — a $5 stop halves loser cost and kept every
@@ -19791,7 +19887,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.42-20261019-stall-fill-2min-runner-trail', // bump on each deploy — lets /state verify what's live
+    build: '7.43-20261019-btc-ladder-runner-sim', // bump on each deploy — lets /state verify what's live
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
