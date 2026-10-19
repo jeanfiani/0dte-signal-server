@@ -12156,6 +12156,36 @@ function processPrice(sym, price, hi, lo) {
           if (_ohResume) _ohTouch = true;
           const _ohRun = _oh.runaway > 0 && (_ohC ? (price - _oh.sigPrice) >= _oh.runaway : (_oh.sigPrice - price) >= _oh.runaway);
           const _ohExp = _zNow >= _oh.expiry;
+          // STALL FILL (2026-10-19, Jean: the Sunday 18:25 XAU TREND call — "after 4 minutes price didn't leave but didn't
+          // pull back either", he bought 4177 by hand → TP3 +$2,876; the hold cancelled EXT-PB-EXPIRED). Jean's rule:
+          // "if 0 pullback after 2 minutes, price within 0.2 ATR → fire directly". Applies to BOTH hold kinds (OTE and
+          // extreme-pullback): EXT_PB_STALL_SEC (120 s) into the auction, if price sits within EXT_PB_STALL_ATR (0.2×ATR) of
+          // the fire price AND the deepest pullback so far is also ≤0.2×ATR (nothing to buy into) AND momentum has not
+          // turned against the trade, fill at market — the market is offering the fire price and the premise is intact.
+          // Fallback at EXPIRY: an extreme-pullback hold that times out with price still within EXT_PB_EXPIRY_STALL_ATR
+          // (0.5×ATR) of the fire fills the same way instead of cancelling. EXT_PB_STALL_FILL=0 kills both.
+          let _ohStall = false, _ohStallWhy = '';
+          if (!_ohTouch && !_ohRun && !_ohSlX && process.env.EXT_PB_STALL_FILL !== '0') {
+            try {
+              const _a2 = Math.max(_oh.atrAtArm || 0, atrVal || 0, s._atr || 0);
+              if (_a2 > 0) {
+                _oh.pbBest = (_oh.pbBest === undefined || _oh.pbBest === null) ? price : (_ohC ? Math.min(_oh.pbBest, price) : Math.max(_oh.pbBest, price));
+                const _pbDepth2 = _ohC ? (_oh.sigPrice - _oh.pbBest) : (_oh.pbBest - _oh.sigPrice);
+                const _distNow = Math.abs(price - _oh.sigPrice);
+                const _momOk = !(isFinite(macdL) && (_ohC ? macdL < -0.05 : macdL > 0.05)) && !(isFinite(roc3) && (_ohC ? roc3 < -0.05 : roc3 > 0.05));
+                const _stallSec = parseInt(process.env.EXT_PB_STALL_SEC, 10) || 120;
+                const _stallAtr = parseFloat(process.env.EXT_PB_STALL_ATR) || 0.2;
+                const _aged = (_zNow - _oh.armTs) >= _stallSec * 1000;
+                if (_aged && _distNow <= _stallAtr * _a2 && _pbDepth2 <= _stallAtr * _a2) {
+                  if (_momOk) { _ohStall = true; _ohStallWhy = 'stall fill (' + Math.round((_zNow - _oh.armTs) / 1000) + 's, no pullback, price within ' + _stallAtr + '×ATR of the fire)'; }
+                  else if (!_oh._stallMomLogged) { _oh._stallMomLogged = true; log(sym, '⏸️ ' + (_oh.extPb ? 'EXTREME-PULLBACK' : 'OTE-HOLD') + ' ' + _oh.dir.toUpperCase() + ' stalled at the fire price for ' + Math.round((_zNow - _oh.armTs) / 1000) + 's but momentum has turned against it (MACD ' + (isFinite(macdL) ? macdL.toFixed(3) : '?') + ', ROC ' + (isFinite(roc3) ? roc3.toFixed(3) + '%' : '?') + ') — no stall fill yet (2026-10-19).'); }
+                } else if (_oh.extPb && _ohExp && _distNow <= (parseFloat(process.env.EXT_PB_EXPIRY_STALL_ATR) || 0.5) * _a2 && _momOk) {
+                  _ohStall = true; _ohStallWhy = 'stall fill (expiry, price held within 0.5×ATR)';
+                }
+              }
+            } catch (eSF) {}
+          }
+          if (_ohStall) _ohTouch = true;
           if (_ohSlX) {
             s._oteHold = null;
             const _ohM = '⏳ OTE-HOLD ' + _oh.dir.toUpperCase() + ' INVALIDATED — price crossed the SL level $' + _oh.slPrice.toFixed(2) + ' while auctioning; the market entry @ $' + _oh.sigPrice.toFixed(2) + ' would have been a full loss. Zero-loss save (Jean 2026-08-26).';
@@ -12214,7 +12244,7 @@ function processPrice(sym, price, hi, lo) {
             delete _t.oteLimit; delete _t.oteExpiry; delete _t.oteImpulseHi; delete _t.oteImpulseLo; // server-side hold supersedes the legacy EA-side OTE limit on XAU
             _t._oteVetted = true;
             s.trade = _t;
-            const _ohWhy = _ohTouch ? (_oh.extPb ? (_ohResume ? 'extreme pullback resumption' : 'extreme pullback ' + (_oh.limVia === 'AVWAP' ? 'AVWAP' : /PULLBACK/.test(_oh.limVia || '') ? 'capped-limit' : 'OTE') + ' touch') : (_oh.limVia === 'AVWAP' ? 'AVWAP touch' : 'OTE touch')) : _ohRun ? 'runaway ≥0.5×ATR' : 'window expiry'; // resumption / capped-limit added 2026-10-05
+            const _ohWhy = _ohTouch ? (_ohStall ? (_oh.extPb ? 'extreme pullback ' : 'OTE ') + _ohStallWhy : _oh.extPb ? (_ohResume ? 'extreme pullback resumption' : 'extreme pullback ' + (_oh.limVia === 'AVWAP' ? 'AVWAP' : /PULLBACK/.test(_oh.limVia || '') ? 'capped-limit' : 'OTE') + ' touch') : (_oh.limVia === 'AVWAP' ? 'AVWAP touch' : 'OTE touch')) : _ohRun ? 'runaway ≥0.5×ATR' : 'window expiry'; // resumption / capped-limit added 2026-10-05
             const _ohInfo = { fill: +price.toFixed(2), sigPrice: +_oh.sigPrice.toFixed(2), improve: +_ohImp.toFixed(2), waitedSec: Math.round((_zNow - _oh.armTs) / 1000), via: _ohWhy, extPb: _oh.extPb === true || undefined };
             if (_oh.extPb) _t._extPb = true;
             if (_oh.sigRef) { _oh.sigRef.pendingEntry = false; _oh.sigRef.entryActual = _ohInfo.fill; _oh.sigRef.oteHold = _ohInfo; _oh.sigRef.price = price.toFixed(2); /* 2026-09-08: the EA anchors its chase-guard (and its dedupe key) on sig.price — a fill un-hiding a minutes-old row must present the FILL, not the stale signal price */ if (typeof _t.slPrice === 'number') { _oh.sigRef.sl = _t.slPrice.toFixed(2); _oh.sigRef.tp1 = _t.tp1Price.toFixed(2); _oh.sigRef.tp2 = _t.tp2Price.toFixed(2); _oh.sigRef.tp3 = _t.tp3Price.toFixed(2); } }
@@ -17531,6 +17561,32 @@ function checkExit(sym, price) {
       }
     }
 
+    // ===== RUNNER TRAIL — LIVE (2026-10-19, Jean: "BTC call is still running, do we have an extreme-reverse block so we
+    // don't lose the whole upside if price reverses?") ===== After TP1 the runner used to sit on entry±0.3×ATR until TP2;
+    // a reversal from +$1,200 to the lock gave the whole leg back. TRAIL-SIM (shadow since 8/28, 40% give-back) graded
+    // 6 better / 2 worse / 3 equal, +$574/unit over the last 11 runners, +$807 over the 14 before — but 40% cut two TP3
+    // runs. Live rule, looser: once the peak favorable excursion is ≥ RUNNER_TRAIL_ARM_R × TP1 distance (1.0 = armed at
+    // TP1), the stop RATCHETS to entry + RUNNER_TRAIL_PCT (50%) of the peak gain, never backwards. It is a real stop:
+    // trailSl goes to the EA, which moves the broker SL (improve-only), so the protection holds even if the server dies.
+    // RUNNER_TRAIL=0 kills it. TRAIL-SIM keeps measuring the 40% variant alongside.
+    try {
+      if (t.t1 && !t.scalp && !t.sl && process.env.RUNNER_TRAIL !== '0' && t.ep > 0) {
+        const _rtFav = iC ? price - t.ep : t.ep - price;
+        if (typeof t.bestPrice === 'number' && !t._rtPeak) { const _bp = iC ? t.bestPrice - t.ep : t.ep - t.bestPrice; if (_bp > 0) t._rtPeak = _bp; } // seed from the trade's own best price (a trade restored after a deploy keeps its peak)
+        if (_rtFav > (t._rtPeak || 0)) t._rtPeak = _rtFav;
+        const _rtPct = parseFloat(process.env.RUNNER_TRAIL_PCT) || 0.5;
+        const _rtArm = (parseFloat(process.env.RUNNER_TRAIL_ARM_R) || 1.0) * Math.abs((t.tp1Price || t.ep) - t.ep);
+        if ((t._rtPeak || 0) > 0 && t._rtPeak >= _rtArm) {
+          const _rtLock = +(iC ? t.ep + _rtPct * t._rtPeak : t.ep - _rtPct * t._rtPeak).toFixed(2);
+          if (!(t.trailSl > 0) || (iC ? _rtLock > t.trailSl : _rtLock < t.trailSl)) {
+            const _rtPrev = t.trailSl || 0; t.trailSl = _rtLock;
+            const _stepA = (typeof t.atr === 'number' && t.atr > 0) ? 0.2 * t.atr : 0;
+            if (!t._rtLogAt || Math.abs(_rtLock - t._rtLogAt) >= _stepA) { t._rtLogAt = _rtLock; log(sym, '🪜 RUNNER TRAIL — ' + t.type.toUpperCase() + ' @ $' + (+t.ep).toFixed(2) + ' peaked +$' + t._rtPeak.toFixed(2) + ' → stop ratcheted to $' + _rtLock.toFixed(2) + ' (locks ' + Math.round(_rtPct * 100) + '% of the peak' + (_rtPrev ? ', was $' + _rtPrev.toFixed(2) : '') + ') (2026-10-19).'); }
+          }
+        }
+      }
+    } catch (eRT) {}
+
     // TP1 hit → lock small profit (changed 2026-07-02: was pure breakeven).
     // ~1/3 of fired trades were ending as BE scratches — e.g. 7/02 XAU peaked +$5.04 and
     // exited at $0.00; BTC 09:31 TP1'd then scratched while price ran +$266 more. Trailing
@@ -17590,7 +17646,7 @@ function checkExit(sym, price) {
     }
     // TP2 hit → trail SL to TP1
     if (!t.t2 && ((iC && price >= t.tp2Price) || (!iC && price <= t.tp2Price))) {
-      t.t2 = true; t.trailSl = t.tp1Price; t.lastETs = now;
+      t.t2 = true; t.trailSl = (t.trailSl > 0) ? (iC ? Math.max(t.trailSl, t.tp1Price) : Math.min(t.trailSl, t.tp1Price)) : t.tp1Price; t.lastETs = now; // never below a ratcheted runner trail (2026-10-19)
       log(sym, '🎯 TP2 HIT — $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2) + ' · SL → TP1 $' + t.tp1Price.toFixed(2));
       sendPush('🎯 ' + sym + ' TP2 HIT', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · SL → TP1', 'signal');
       updateSignalOutcome(sym, price);
@@ -19735,7 +19791,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.41-20261018-ladder-eps-fri-wknd', // bump on each deploy — lets /state verify what's live
+    build: '7.42-20261019-stall-fill-2min-runner-trail', // bump on each deploy — lets /state verify what's live
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
