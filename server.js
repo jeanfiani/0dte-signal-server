@@ -1955,7 +1955,7 @@ function trackBlockedOutcome(sym, msg, force) {
   // Only actual blocks/deferrals qualify; validator/dormant lines are excluded explicitly.
   try {
     const _isBlockMsg = /BLOCKED|DEFERRED|REFUSED|SKIPPED|conv \d+ < \d+|below (the )?floor|too (low|weak)/i.test(msg)
-      && !/DORMANT|WOULD-FIRE|TREND-CONT-WF|TREND-REGIME|TREND-WT|TREND-CT|EXT-PB-|EXTREME-PULLBACK|NEWS-FADE|NEWS-CONT|ZONE-REACT|PATH-CLEAR|PATH-ZONED|ARMED \(dormant|CONF-SCORE|dormant validator|no firing effect|LC-AGREE|LC-DISAGREE|ML-DIR|EOD-CONT-WF|BIGLEG-CT-WF|FAST-PRE|LADDER-|BE-HELD|ZONE-MICRO-WF|LEVEL-PROX/i.test(msg);
+      && !/DORMANT|WOULD-FIRE|EXH-REV|TREND-CONT-WF|TREND-REGIME|TREND-WT|TREND-CT|EXT-PB-|EXTREME-PULLBACK|NEWS-FADE|NEWS-CONT|ZONE-REACT|PATH-CLEAR|PATH-ZONED|ARMED \(dormant|CONF-SCORE|dormant validator|no firing effect|LC-AGREE|LC-DISAGREE|ML-DIR|EOD-CONT-WF|BIGLEG-CT-WF|FAST-PRE|LADDER-|BE-HELD|ZONE-MICRO-WF|LEVEL-PROX/i.test(msg);
     if (_isBlockMsg) {
       s._lastBlock = s._lastBlock || {}; s._lastBlock[type] = { msg: msg.slice(0, 200), ts: now };
       const _gj = s._gateJournal = s._gateJournal || [];
@@ -2223,6 +2223,8 @@ function nasRthBlocked(sym) {
   try { const m = gET(); return (m < 570 || m >= 960); } catch (e) { return false; }
 }
 function cohortFor(reason) {
+  { const _ex = reason.match(/\b(XAU|BTC|NAS100)-EXH-REV(-1ST)?\b/); if (_ex) return _ex[0]; } // exhaustion-reversal shadow lane (2026-10-21)
+  { const _bl = reason.match(/\bBTC-BIGLEG-(CONT|LATCH)\b/); if (_bl) return _bl[0]; } // continuation / latch arms (2026-10-21) — before the plain BIGLEG matches
   { const _ag = reason.match(/\bAGENT-([A-Z0-9]+)-(FILL|WAIT|SKIP)-(NOW|FILL)\b/); if (_ag) return _ag[0]; } // entry agent shadow cohorts (2026-10-09)
   if (/BOOT-WARMUP/.test(reason)) return 'BOOT-WARMUP'; // cold-start blocks (2026-10-14)
   { const _ld = reason.match(/\bBTC-LAD-(LIVE|ZONE|VOL|TIME|CHAND)\b/); if (_ld) return _ld[0]; } // BTC dynamic-ladder sim (2026-10-19)
@@ -4607,8 +4609,25 @@ function processPrice(sym, price, hi, lo) {
         const _bDl = Array.isArray(s.dailyLevels) ? s.dailyLevels : [];
         const _bAdr = _bDl.length >= 3 ? _bDl.reduce((a, d0) => a + (d0.high - d0.low), 0) / _bDl.length : 0;
         if (_bAdr > 0 && s._legPivot) {
+          // CONTINUATION RE-ANCHOR (2026-10-21, Jean: "the bot didn't fire a lot of opportunities today" — BTC ran
+          // 82,532 → 84,867 and BIGLEG fired once, at 05:04: the pivot stays at the day's low, so once the leg passes
+          // 0.6×ADR nothing can arm again, and every later pullback-and-break goes unused). Now: in an up-trend, a NEW
+          // session high made after a pullback of ≥0.15×ADR re-anchors the pivot to that pullback low (mirror for
+          // down) — each pullback offers a fresh 0.15-0.6×ADR leg. Such arms grade as BTC-BIGLEG-CONT (shadow) and
+          // fire live only with BTC_BIGLEG_CONT_LIVE=1; promotion bar as every lane (≥60% over ≥15).
+          try {
+            const C = s._legCont = (s._legCont && s._legCont.trend === s._legPivot.trend) ? s._legCont : { trend: s._legPivot.trend, hi: price, lo: price, pull: price };
+            if (s._legPivot.trend === 'up') {
+              if (price > C.hi) { if (C.hi - C.pull >= 0.15 * _bAdr && C.pull > s._legPivot.ext) { s._legPivot.ext = C.pull; s._legPivot.cont = true; s._legPivot.ts = Date.now(); log(sym, '🦵 BTC-BIGLEG pivot RE-ANCHORED to the pullback low $' + C.pull.toFixed(0) + ' after a new session high $' + price.toFixed(0) + ' (pullback $' + (C.hi - C.pull).toFixed(0) + ' ≥ 0.15×ADR) — continuation leg measured from here (2026-10-21).'); } C.hi = price; C.pull = price; }
+              else if (price < C.pull) C.pull = price;
+            } else {
+              if (price < C.lo) { if (C.pull - C.lo >= 0.15 * _bAdr && C.pull < s._legPivot.ext) { s._legPivot.ext = C.pull; s._legPivot.cont = true; s._legPivot.ts = Date.now(); log(sym, '🦵 BTC-BIGLEG pivot RE-ANCHORED to the pullback high $' + C.pull.toFixed(0) + ' after a new session low $' + price.toFixed(0) + ' — continuation leg measured from here (2026-10-21).'); } C.lo = price; C.pull = price; }
+              else if (price > C.pull) C.pull = price;
+            }
+          } catch (eLC) {}
           const _bLeg = s._legPivot.trend === 'up' ? price - s._legPivot.ext : s._legPivot.ext - price;
           const _bDir = s._legPivot.trend === 'up' ? 'call' : 'put';
+          const _bCont = s._legPivot.cont === true;
           s._bblTs = s._bblTs || {};
           // NO ARM AT THE EXTREME (2026-09-29, the 9/28 evening: five shadow puts at 82,927-
           // 83,210 within $300 of the session low after a $2,000 drop, all lost — the XAU/NAS
@@ -4621,7 +4640,8 @@ function processPrice(sym, price, hi, lo) {
           // out of the zone — the XAU extreme-hold rule, expressed in BIGLEG's own terms.
           const _bRange = (isFinite(s.sessionHigh) && isFinite(s.sessionLow)) ? (s.sessionHigh - s.sessionLow) : 0;
           const _bExtBand = Math.max(0.1 * _bAdr, (parseFloat(process.env.BIGLEG_EXT_RANGE_FRAC) || 0.3) * _bRange); // 30% of the session range (Jean, 2026-10-07): BTC legs overshoot; the first third of the retrace is not an entry
-          const _bAtExt = _bDir === 'put' ? (isFinite(s.sessionLow) && price - s.sessionLow <= _bExtBand) : (isFinite(s.sessionHigh) && s.sessionHigh - price <= _bExtBand);
+          const _bBand2 = _bCont ? 0.1 * _bAdr : _bExtBand; // a continuation arm sits near the extreme by construction — only the 0.1×ADR no-arm band applies (2026-10-21)
+          const _bAtExt = _bDir === 'put' ? (isFinite(s.sessionLow) && price - s.sessionLow <= _bBand2) : (isFinite(s.sessionHigh) && s.sessionHigh - price <= _bBand2);
           if (_bAtExt && _bLeg >= 0.15 * _bAdr && Date.now() - (s._bblExtTs || 0) > 300000) { s._bblExtTs = Date.now(); log(sym, '🦵 BTC-BIGLEG ' + _bDir.toUpperCase() + ' NOT ARMED — within 0.1×ADR of the session extreme (2026-09-29).'); }
           if (!_bAtExt && _bLeg >= 0.15 * _bAdr && _bLeg < 0.6 * _bAdr && Date.now() - (s._bblTs[_bDir] || 0) >= 1800000) {
             s._bblTs[_bDir] = Date.now();
@@ -4633,7 +4653,9 @@ function processPrice(sym, price, hi, lo) {
             // (the 9/24 whipsaw turned four +$770-1,800 MFE puts into losses — 10W/7L → 10W/11L)
             // and never fire live; the promotion cohort BTC-BIGLEG is weekday, non-RANGE.
             const _bRng = !!(s._dayRegime && s._dayRegime.label === 'RANGE');
-            const _bLane = _bWk ? 'BTC-BIGLEG-WKND' : _bRng ? 'BTC-BIGLEG-RNG' : 'BTC-BIGLEG';
+            const _bLatch = _bRng && tdLatchEase(s, _bDir); // trend-day latch armed with-trend while the 3h classifier still says RANGE (10/21: BTC +$2,300 labelled RANGE all day)
+            const _bLane = _bWk ? 'BTC-BIGLEG-WKND' : _bCont ? 'BTC-BIGLEG-CONT' : _bLatch ? 'BTC-BIGLEG-LATCH' : _bRng ? 'BTC-BIGLEG-RNG' : 'BTC-BIGLEG';
+            const _bLiveOk = !_bWk && (( !_bRng && !_bCont) || (_bCont && process.env.BTC_BIGLEG_CONT_LIVE === '1' && (!_bRng || _bLatch)) || (_bLatch && !_bCont && process.env.BTC_BIGLEG_LATCH_LIVE === '1')); // live eligibility per cohort (2026-10-21)
             const _bSl = _bDir === 'call' ? +(s._legPivot.ext - 0.1 * _bAdr).toFixed(2) : +(s._legPivot.ext + 0.1 * _bAdr).toFixed(2);
             // Shadow TP 0.5→0.25×ADR (2026-09-28): 31 of 54 virtuals expired unresolved with
             // MFE $400-1,500 — the 0.5×ADR target (~$1,300) hid the lane's real hit rate, the
@@ -4661,10 +4683,10 @@ function processPrice(sym, price, hi, lo) {
               // (0.35×ADR); and the ladder scales with R: TP1 ≥ 1R, TP2 ≥ 2R, TP3 ≥ 3R ("reward proportional to loss").
               const _bR = Math.abs(price - _bSl);
               const _bMaxR = (parseFloat(process.env.BIGLEG_MAX_R_ADR) || 0.35) * _bAdr;
-              if (!_bWk && !_bRng && process.env.BTC_BIGLEG_LIVE !== '0' && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold && _bR > _bMaxR) {
+              if (_bLiveOk && process.env.BTC_BIGLEG_LIVE !== '0' && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold && _bR > _bMaxR) {
                 log(sym, '🦵 BTC-BIGLEG ' + _bDir.toUpperCase() + ' NOT fired live — entry $' + price.toFixed(0) + ' sits $' + _bR.toFixed(0) + ' (' + (_bR / _bAdr).toFixed(2) + '×ADR) from the pivot stop $' + _bSl.toFixed(0) + ' > 0.35×ADR $' + _bMaxR.toFixed(0) + ': too far into the leg for a 1R target (geometry guard 2026-10-09). Shadow row measured.');
               }
-              if (!_bWk && !_bRng && process.env.BTC_BIGLEG_LIVE !== '0' && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold && _bR <= _bMaxR && bootWarm(sym, s).ok) { // !_bRng: no live leg fires in RANGE regime (2026-09-24)
+              if (_bLiveOk && process.env.BTC_BIGLEG_LIVE !== '0' && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold && _bR <= _bMaxR && bootWarm(sym, s).ok) { // !_bRng: no live leg fires in RANGE regime (2026-09-24)
                 const _lTp1 = _bDir === 'call' ? +(price + Math.max(0.25 * _bAdr, _bR)).toFixed(2) : +(price - Math.max(0.25 * _bAdr, _bR)).toFixed(2); // ≥ 1R (guard 2026-10-09)
                 // TP2 explicit 0.5×ADR (2026-09-29, Jean's monitor screenshot): the live lane
                 // had been reusing the SHADOW target (_bTp), which 6.88 cut to 0.25×ADR — so
@@ -11559,6 +11581,48 @@ function processPrice(sym, price, hi, lo) {
           }
         }
       } catch (eZR2) {}
+      // ===== EXHAUSTION-REVERSAL LANE — SHADOW (2026-10-21, Jean: the 10/20 10:28 put at 4153 — "train the bot to find the
+      // reversal point when a price rises") ===== What that top looked like in the data: a $34 vertical run in 25 min
+      // (5 consecutive M5 up-bars, ~5×ATR), straight into the prior day's high (4158.86), RSI pinned above 80, then the
+      // 10:30 bar printed the extreme and closed in its lower half (rejection wick). The desk's reversal lanes saw it —
+      // ZONE-REACT puts at 10:30/10:32 (MFE +8/+31), FAST-PRE puts 10:33/10:45 (MFE +17/+16) — but the FIRST reactions
+      // (10:24, 10:25) lost: the first touch of a blow-off fails, the second holds. This lane codifies the shape and
+      // measures it: on a completed M5 bar, (1) the last ≤6 bars ran ≥ EXH_RUN_ATR (3×ATR) one way, (2) RSI ≥ 75 / ≤ 25,
+      // (3) that bar printed the run's extreme and closed in the far half (rejection), (4) not the first signal of this
+      // run (EXH-2ND) OR the extreme sits within 0.3×ATR of the prior-day high/low (EXH-PDH) OR above the value-area
+      // high (EXH-VAH). Bracket: SL 0.1×ATR beyond the extreme, TP1 = 1R. Cohort <SYM>-EXH-REV with feature tags; first
+      // rejections are also recorded (EXH-1ST, expected to lose) so the review can confirm the second-touch rule.
+      try {
+        if (atrVal > 0 && Array.isArray(s._m5) && s._m5.length >= 8 && isFinite(rsiV) && process.env.EXH_REV !== '0') {
+          const _xb = s._m5[s._m5.length - 1];
+          s._exh = s._exh || { m5Ts: 0, lastDir: null, lastTs: 0, count: 0 };
+          if (_xb.ts !== s._exh.m5Ts) {
+            s._exh.m5Ts = _xb.ts;
+            const W = s._m5.slice(-6);
+            const runUp = _xb.h - Math.min(...W.map(b => b.l)), runDn = Math.max(...W.map(b => b.h)) - _xb.l;
+            const rng = Math.max(1e-9, _xb.h - _xb.l);
+            const minRun = (parseFloat(process.env.EXH_RUN_ATR) || 3) * atrVal;
+            const topRej = runUp >= minRun && rsiV >= 75 && _xb.h >= Math.max(...W.map(b => b.h)) && (_xb.h - _xb.c) >= 0.5 * rng;
+            const botRej = runDn >= minRun && rsiV <= 25 && _xb.l <= Math.min(...W.map(b => b.l)) && (_xb.c - _xb.l) >= 0.5 * rng;
+            if (topRej || botRej) {
+              const dir = topRej ? 'put' : 'call'; const ext = topRej ? _xb.h : _xb.l;
+              const pd = (s.dailyLevels && s.dailyLevels.length) ? s.dailyLevels[s.dailyLevels.length - 1] : null;
+              const nearPd = pd && ((topRej && pd.high > 0 && Math.abs(ext - pd.high) <= 0.3 * atrVal) || (botRej && pd.low > 0 && Math.abs(ext - pd.low) <= 0.3 * atrVal));
+              const vp = s._vp || null; const beyondVa = vp && ((topRej && price > vp.vah) || (botRej && price < vp.val));
+              const second = s._exh.lastDir === dir && Date.now() - s._exh.lastTs <= 45 * 60000;
+              const tags = [second ? 'EXH-2ND' : 'EXH-1ST']; if (nearPd) tags.push('EXH-PDH'); if (beyondVa) tags.push('EXH-VAH'); if (topRej ? rsiV >= 80 : rsiV <= 20) tags.push('EXH-RSI80');
+              const qualifies = second || nearPd || beyondVa;
+              const sl = +(topRej ? ext + 0.1 * atrVal : ext - 0.1 * atrVal).toFixed(2); const R = Math.abs(price - sl); const tp = +(topRej ? price - R : price + R).toFixed(2);
+              const lane = sym + '-EXH-REV' + (qualifies ? '' : '-1ST');
+              const m = '🔻 ' + lane + ' ' + dir.toUpperCase() + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — ' + (topRej ? 'run +$' : 'run −$') + (topRej ? runUp : runDn).toFixed(2) + ' (' + ((topRej ? runUp : runDn) / atrVal).toFixed(1) + '×ATR) in ≤30min, RSI ' + rsiV.toFixed(1) + ', rejection bar at the extreme $' + ext.toFixed(2) + (nearPd ? ' = prior-day ' + (topRej ? 'high' : 'low') + ' $' + (topRej ? pd.high : pd.low).toFixed(2) : '') + ' [' + tags.join(' ') + '] · SL $' + sl.toFixed(2) + ' · TP1 $' + tp.toFixed(2) + ' (1R) (2026-10-21).';
+              s.blockedOutcomes = s.blockedOutcomes || [];
+              s.blockedOutcomes.push({ ts: Date.now(), time: ts(), symbol: sym, detector: lane.slice(0, 14), type: dir, price, virtualTp1: tp, virtualSl: sl, maxMin: 240, blockReason: m, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+              log(sym, m);
+              s._exh.lastDir = dir; s._exh.lastTs = Date.now();
+            }
+          }
+        }
+      } catch (eEXH) {}
       // ===== PATH SAMPLER (2026-10-07, Jean: "when price is going down and all OB/FVG has no more
       // support, check in how many situations a put would have been a winner — same on the other
       // side") ===== Detector-independent measurement. Every 5 min per symbol, in the msTrend
@@ -19308,6 +19372,7 @@ function entryAgentConsult(sym, s, ctx) {
       if (p.action === 'wait') { entryAgent.waits[sym] = entryAgent.waits[sym] || []; entryAgent.waits[sym].push({ id, model: dec.short, dir: ctx.dir, limit: p.limit, armPrice: px, slD, tpD, leash: p.leashAtr * (snap.atr || 0), expiry: now + p.windowSec * 1000, ts: now }); }
       entryAgent.decisions.push(dec); if (entryAgent.decisions.length > 600) entryAgent.decisions.shift(); entryAgent.dirty = true;
       const agree = ctx.rule ? ((ctx.rule.action === 'fill' && p.action === 'fill') || (ctx.rule.action === 'wait' && p.action === 'wait')) : null;
+      if (ctx.pushVerdict) { try { const _lanes = (ctx.lanesAgree && ctx.lanesAgree.length) ? ' · lanes agreeing: ' + ctx.lanesAgree.join(', ') : ' · no shadow lane fired this way in the last 15 min'; sendPush('🧭 ' + sym + ' hand ' + ctx.dir.toUpperCase() + ' — ' + dec.short + ' says ' + p.action.toUpperCase(), (p.reason || '').slice(0, 110) + _lanes + ' · stop $' + (+((ctx.trade || {}).slPrice || 0)).toFixed(2) + ' · 1R $' + (+((ctx.trade || {}).tp1Price || 0)).toFixed(2), 'signal'); } catch (ePV) {} }
       // CONSENSUS WOULD-VETO (2026-10-15): when every consulted model says SKIP on a live fire, stamp the fired row so the
       // weekly review can measure the veto's precision on real trades (10/14 night: both-skip = 4 losers avoided / 1 winner
       // missed). Shadow only — AGENT_VETO_LIVE is the future switch; nothing changes execution here.
@@ -19528,6 +19593,16 @@ app.post('/manual/adopt', (req, res) => {
     try { const h = s.lastHistEntry; if (h && h.symbol === sym) { h.sl = s.trade.slPrice; h.tp1 = s.trade.tp1Price; h.tp2 = s.trade.tp2Price; h.tp3 = s.trade.tp3Price; h.ladder = s.trade._ladder || null; h.outcomes = h.outcomes || {}; h.outcomes.eaFill = 'adopted manual #' + ticket + ' (' + lots.toFixed(2) + ' lots)' + (acct ? ' [acct ' + acct + ']' : ''); h.outcomes.eaTickets = [ticket]; sig.sl = (+s.trade.slPrice).toFixed(2); sig.tp1 = (+s.trade.tp1Price).toFixed(2); sig.tp2 = (+s.trade.tp2Price).toFixed(2); sig.tp3 = (+s.trade.tp3Price).toFixed(2); } } catch (eH) {}
     s.lastSignalDir = type; s.lastSignalTs = Date.now(); s.lastNTs = Date.now(); s.lastAT = type; if (type === 'call') s.nC++; else s.nP++;
     const own = (b.sl > 0 ? ' · your SL $' + (+b.sl).toFixed(2) : ' · no SL on the position') + (b.tp > 0 ? ' · your TP $' + (+b.tp).toFixed(2) : '');
+    // HAND-TRADE COACH (2026-10-21, Jean on his 4153 put: "I closed because I was scared I was not right — with the help of
+    // the bot I would have kept it"): every adopted hand trade is put to the entry agent and to the shadow reversal/continuation
+    // lanes, and the verdict goes to the phone: which lanes agree, what the models think, where the structural stop and the
+    // 1R target sit. Pure information — the trade stays Jean's.
+    try {
+      const _agree = (s.blockedOutcomes || []).filter(b => b.type === type && Date.now() - b.ts <= 15 * 60000 && /EXH-REV|ZONE-REACT|SESS-REJ|VA-FADE|FAST-PRE|LIQ-POOL|PATH-CLEAR|BIGLEG|TREND-DAY/.test(b.blockReason || '')).map(b => (b.blockReason.match(/\b([A-Z0-9]+-[A-Z0-9-]+(?:-[A-Z0-9]+)?)\b/) || [])[1]).filter(Boolean);
+      const _uniq = Array.from(new Set(_agree)).slice(0, 4);
+      s.trade._coachLanes = _uniq;
+      entryAgentConsult(sym, s, { price: ep, atr: s._atr || 0, dir: type, detector: 'HAND', trade: s.trade, rule: { action: 'fill', via: 'hand trade adopted' }, rsi: s._rsi, macdL: s._macdL, roc3: s._roc3, histTs: (s.lastHistEntry && s.lastHistEntry.symbol === sym) ? s.lastHistEntry.ts : null, pushVerdict: true, lanesAgree: _uniq });
+    } catch (eCoach) {}
     log(sym, '🖐️ ' + sym + ' MANUAL ' + type.toUpperCase() + ' ADOPTED from MT5 — ticket #' + ticket + ' · ' + lots.toFixed(2) + ' lots @ $' + ep.toFixed(2) + ' (opened ' + Math.round(ageSec) + 's ago' + (acct ? ', acct ' + acct : '') + ')' + own + ' → EA now manages it with SL $' + (+s.trade.slPrice).toFixed(2) + ' · TP1 $' + (+s.trade.tp1Price).toFixed(2) + ' · TP2 $' + (+s.trade.tp2Price).toFixed(2) + ' · TP3 $' + (+s.trade.tp3Price).toFixed(2) + ' · ladder ' + (s.trade._ladder || '—') + ' · regime ' + (sig.manual.regime || '?') + (_cancelled.length ? ' · cancelled ' + _cancelled.join(', ') : '') + ' [#' + s.dailySignalCount + ', MANUAL-MT5 class] (2026-10-07).');
     try { sendPush('🖐️ ' + sym + ' MANUAL ' + type.toUpperCase() + ' adopted', '#' + ticket + ' · ' + lots.toFixed(2) + ' lots @ $' + ep.toFixed(2) + ' · SL $' + (+s.trade.slPrice).toFixed(2) + ' · TP1 $' + (+s.trade.tp1Price).toFixed(2), 'signal'); } catch (e) {}
     res.json({ ok: true, sym, type, price: +ep.toFixed(2), sl: s.trade.slPrice, tp1: s.trade.tp1Price, tp2: s.trade.tp2Price, tp3: s.trade.tp3Price, scalp: !!s.trade.scalp, ladder: s.trade._ladder || null, key: sig.time + '|' + type + '|' + sig.price, num: s.dailySignalCount, cancelled: _cancelled });
@@ -19887,7 +19962,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.43-20261019-btc-ladder-runner-sim', // bump on each deploy — lets /state verify what's live
+    build: '7.44-20261021-bigleg-cont-latch-exh-rev-coach', // bump on each deploy — lets /state verify what's live
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
