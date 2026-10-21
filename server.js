@@ -1933,6 +1933,78 @@ function log(sym, msg) {
 // winners — relax it").
 const BLOCK_TRACK_COOLDOWN_MS = 35 * 60 * 1000;
 
+// ===== GATE-OVERRIDE SCORE — PHASE A: FEATURE STAMP (2026-10-21, Jean: "rank each data in order to overpass a
+// gate at the right moment") ===== A blocked row used to carry only text tags (ZAGE-*, WT/CT, GRIND-RECLAIM); you
+// cannot rank what you did not record. Every tracked block now carries a compact, COARSELY BUCKETED feature
+// vector read from the symbol state at block time. Buckets are pre-registered here (not tuned later) so the
+// /gate-score lifts are honest counts, not a fit. Direction-relative where it matters: "with" means in the
+// candidate's direction. Pure measurement — no gate reads this.
+function blockFeat(sym, s, type, price) {
+  try {
+    const atr = s._atr > 0 ? s._atr : 0;
+    const A = (x) => (atr > 0 && isFinite(x)) ? x / atr : null;
+    const sgn = type === 'call' ? 1 : -1;
+    const B = (v, cuts, labels) => { if (v == null || !isFinite(v)) return null; for (let i = 0; i < cuts.length; i++) if (v < cuts[i]) return labels[i]; return labels[cuts.length]; };
+    const f = {};
+    // momentum
+    f.rsi = isFinite(s._rsi) ? +(+s._rsi).toFixed(1) : null;
+    f.rsiB = B(f.rsi, [30, 45, 55, 70], ['<30', '30-45', '45-55', '55-70', '70+']);
+    const macdW = isFinite(s._macdL) ? A(sgn * s._macdL) : null; // MACD line in ATR units, + = with the candidate
+    f.macdW = macdW == null ? null : +macdW.toFixed(3);
+    f.macdB = B(macdW, [-0.15, -0.03, 0.03, 0.15], ['strong-against', 'against', 'flat', 'with', 'strong-with']);
+    const r3 = isFinite(s._roc3) ? sgn * s._roc3 : null, r6 = isFinite(s._roc6) ? sgn * s._roc6 : null; // % with the candidate
+    f.roc3W = r3 == null ? null : +r3.toFixed(3); f.roc6W = r6 == null ? null : +r6.toFixed(3);
+    f.momB = r3 == null ? null : (r3 < -0.03 ? 'against' : r3 > 0.03 ? 'with' : 'flat');
+    f.accel = (r3 == null || r6 == null) ? null : (r3 > 0 && r6 > 0 ? (r3 >= 0.5 * r6 ? 'accel' : 'fading') : (r3 <= 0 && r6 > 0 ? 'reversing' : 'none')); // the 3-min leg vs the 6-min leg, both with-direction
+    // regime / trend
+    f.regime = (s._dayRegime && s._dayRegime.label) || null;
+    f.ker = (s._dayRegime && isFinite(s._dayRegime.ker)) ? +(+s._dayRegime.ker).toFixed(2) : null;
+    f.ms = s._msTrend ? ((s._msTrend === 'up') === (type === 'call') ? 'WT' : 'CT') : 'none';
+    f.msRunMin = (s._msTrendTs && s._msTrend) ? Math.round((Date.now() - s._msTrendTs) / 60000) : null;
+    f.msRunB = B(f.msRunMin, [30, 60, 180], ['<30m', '30-60m', '1-3h', '3h+']);
+    f.latch = (s._tdLatch && (Date.now() - s._tdLatch.ts) < 600000) ? (s._tdLatch.dir === type ? 'with' : 'against') : 'none';
+    f.chop = !!s.chopActive;
+    // leg extension
+    const legRun = (s._legPivot && isFinite(s._legPivot.ext)) ? A(Math.abs(price - s._legPivot.ext)) : null;
+    f.legRunAtr = legRun == null ? null : +legRun.toFixed(2);
+    f.legB = B(legRun, [1, 2, 3], ['<1', '1-2', '2-3', '3+']);
+    // position in the session range, direction-relative: 'extended' = already near the extreme the candidate runs toward
+    const rng = (isFinite(s.sessionHigh) && isFinite(s.sessionLow) && s.sessionHigh > s.sessionLow) ? (s.sessionHigh - s.sessionLow) : 0;
+    const pos = rng > 0 ? (price - s.sessionLow) / rng : null;
+    f.rangePos = pos == null ? null : +pos.toFixed(2);
+    const posW = pos == null ? null : (type === 'call' ? pos : 1 - pos);
+    f.posB = posW == null ? null : (posW < 0.33 ? 'fresh' : posW < 0.67 ? 'mid' : 'extended');
+    f.rangeAtr = rng > 0 ? +(A(rng) || 0).toFixed(2) : null;
+    // zones: nearest opposing zone ahead (the ZONE-VETO object) + whether inside one
+    const zones = Array.isArray(s._zoneObs) ? s._zoneObs : [];
+    const opp = zones.filter(z => z && z.dir !== type);
+    const ahead = opp.filter(z => type === 'put' ? z.hi <= price : z.lo >= price).map(z => ({ z, d: type === 'put' ? price - z.hi : z.lo - price })).sort((a, b) => a.d - b.d)[0];
+    const inside = opp.find(z => price >= z.lo && price <= z.hi) || null;
+    const zx = (z) => { const L = (s._zoneLedger && z.id) ? s._zoneLedger[z.id] : null; const age = z.ts ? Math.round((Date.now() - z.ts) / 60000) : null; return { kind: z.kind || null, tf: z.tf || null, ageMin: age, ageB: age == null ? null : (age < 240 ? 'fresh' : age <= 720 ? 'mid' : 'old'), touches: L ? (L.touches || 0) : 0, holds: L ? (L.holds || 0) : 0, grade: (typeof zoneGrade === 'function') ? zoneGrade(sym, z) : 'U', hAtr: +(A(Math.abs(z.hi - z.lo)) || 0).toFixed(2) }; };
+    f.zAhead = ahead ? Object.assign(zx(ahead.z), { distAtr: +(A(ahead.d) || 0).toFixed(2), distB: B(A(ahead.d), [0.5, 1.2], ['<0.5', '0.5-1.2', '1.2+']) }) : null;
+    f.zInside = inside ? zx(inside) : null;
+    f.zB = inside ? 'inside' : ahead ? ('ahead-' + (f.zAhead.distB || '?')) : 'clear';
+    f.zAgeB = inside ? f.zInside.ageB : ahead ? f.zAhead.ageB : 'none';
+    f.zTouchB = inside ? (f.zInside.touches >= 2 ? '2+' : String(f.zInside.touches)) : ahead ? (f.zAhead.touches >= 2 ? '2+' : String(f.zAhead.touches)) : 'none';
+    f.zGrade = inside ? f.zInside.grade : ahead ? f.zAhead.grade : 'none';
+    // tape / clock / news
+    const tkR = (s._tickRate > 0 && s._tickRateSess > 0) ? s._tickRate / s._tickRateSess : null;
+    f.tickRatio = tkR == null ? null : +tkR.toFixed(2);
+    f.tapeB = tkR == null ? null : (tkR < 0.7 ? 'thin' : tkR > 1.3 ? 'thick' : 'normal');
+    const hr = +new Date().toLocaleTimeString('en-US', { hour: '2-digit', hour12: false, timeZone: 'America/New_York' }).slice(0, 2);
+    f.hourET = hr;
+    f.sessB = (hr >= 18 || hr < 3) ? 'asia' : hr < 8 ? 'london' : hr < 12 ? 'ny-am' : hr < 17 ? 'ny-pm' : 'close';
+    const nb = s.newsBlackout || {};
+    f.newsMin = (typeof nb.minutesUntil === 'number') ? nb.minutesUntil : null;
+    f.newsB = (f.newsMin != null && f.newsMin >= 0 && f.newsMin <= 60) ? (nb.tier1 ? 'tier1-60m' : 'news-60m') : 'none';
+    f.atr = atr ? +atr.toFixed(2) : null;
+    return f;
+  } catch (e) { return null; }
+}
+// The factors /gate-score ranks (bucket keys on the stamp above). Pre-registered list — adding one later is a
+// new experiment, not a re-fit of this one.
+const GATE_SCORE_FACTORS = ['rsiB', 'macdB', 'momB', 'accel', 'regime', 'ms', 'msRunB', 'latch', 'legB', 'posB', 'zB', 'zAgeB', 'zTouchB', 'zGrade', 'tapeB', 'sessB', 'newsB'];
+
 function trackBlockedOutcome(sym, msg, force) {
   // force=true (added 2026-07-02): dormant-analysis detectors (V-REV) bypass the shared
   // 35-min sampling cooldown — every dormant trigger is tracked, and forced entries do
@@ -2034,6 +2106,7 @@ function trackBlockedOutcome(sym, msg, force) {
     virtualTp1: +virtualTp1.toFixed(2),
     virtualSl: +virtualSl.toFixed(2),
     blockReason: msg.substring(0, 320), // 200 → 320 (2026-07-02): keep [EXEMPT-CANDIDATE] tag intact
+    feat: blockFeat(sym, s, type, price), // gate-override score features (2026-10-21) — bucketed state at block time
     snaps: { p5m: null, p15m: null, p30m: null, p60m: null },
     tp1Hit: false, tp1HitTs: null,
     slHit: false, slHitTs: null,
@@ -2041,6 +2114,8 @@ function trackBlockedOutcome(sym, msg, force) {
     outcome: null  // 'win' | 'loss' | 'scratch' | 'no_resolve'
   });
   if (!force) s.lastBlockTrackedTs = now; // forced (dormant-analysis) entries don't consume the sampling slot
+  // GATE REVIEW — agent UNBLOCK/UPHOLD shadow on judgment-gate blocks (2026-10-21); throttled inside, never fires
+  try { gateAgentConsult(sym, s, s.blockedOutcomes[s.blockedOutcomes.length - 1], msg); } catch (eGA) {}
   // Cap raised 50 → 200 (2026-07-02): 50 forced mixed-regime analysis (BTC/NAS entries
   // spanned Jun 9 → Jul 1 configs in one bucket). 200 ≈ 3-4 weeks at current sampling,
   // enough for date-windowed gate reports via /blocked-outcomes/:sym?days=N.
@@ -2226,6 +2301,7 @@ function cohortFor(reason) {
   { const _ex = reason.match(/\b(XAU|BTC|NAS100)-EXH-REV(-1ST)?\b/); if (_ex) return _ex[0]; } // exhaustion-reversal shadow lane (2026-10-21)
   { const _bl = reason.match(/\bBTC-BIGLEG-(CONT|LATCH)\b/); if (_bl) return _bl[0]; } // continuation / latch arms (2026-10-21) — before the plain BIGLEG matches
   { const _ag = reason.match(/\bAGENT-([A-Z0-9]+)-(FILL|WAIT|SKIP)-(NOW|FILL)\b/); if (_ag) return _ag[0]; } // entry agent shadow cohorts (2026-10-09)
+  { const _agU = reason.match(/\bAGENT-([A-Z0-9]+)-(UNBLOCK|UPHOLD)(-[A-Z0-9\-]+)?\b/); if (_agU) return _agU[0]; } // gate-review shadow cohorts (2026-10-21): AGENT-<MODEL>-UNBLOCK[-<GATE>]
   if (/BOOT-WARMUP/.test(reason)) return 'BOOT-WARMUP'; // cold-start blocks (2026-10-14)
   { const _ld = reason.match(/\bBTC-LAD-(LIVE|ZONE|VOL|TIME|CHAND)\b/); if (_ld) return _ld[0]; } // BTC dynamic-ladder sim (2026-10-19)
   { const _rs = reason.match(/\bRUNNER-(LIVE|PCT50|STRUCT\+PCT50|STRUCT|REGIME)-(XAU|BTC|NAS100)\b/); if (_rs) return _rs[0]; } // runner-exit sim (2026-10-19)
@@ -17235,6 +17311,17 @@ function buildCfdTrade(type, price, atr, sym) {
     }
   } catch (eT2) { /* anchor must never break trade construction */ }
 
+  // ===== SCALP = ONE TARGET AT THE BROKER TOO (2026-10-21, Jean: "change fast put scalp with TP1=TP3 for next
+  // time") ===== The 15:00 FAST put was an elite-continuation scalp: the server took the full exit at TP1
+  // (4107.64, 15:02:57) and raised the close request, but the EA's next poll only saw "trade cleared" — no
+  // TP1 flag ever reached it (the scalp path clears the trade in the same tick), its local TP1 detect missed
+  // the 2-second dip, and the close request was not in the poll. The position stayed open on the ORIGINAL
+  // stop and rode the V-bounce back through entry. The poll channel is too thin for a one-target trade:
+  // TP2 = TP3 = TP1, so the broker's hard TP (the EA sets it to tp3Price at open) closes 100% at TP1 by
+  // itself — no poll, no flag, no request needed. The server exit logic is unchanged (t.scalp still exits
+  // in full at TP1); this only moves the enforcement to the broker.
+  if (_scalp) { tp2 = tp1; tp3 = tp1; }
+
   // ===== SAME-DIRECTION CONTINUATION — LOCK TP1 (added 2026-05-14) =====
   // When a new same-direction signal fires while the existing trade is still active and
   // hasn't hit TP1 yet, KEEP the original entry + the existing (closer-to-current-price) TP1.
@@ -17260,8 +17347,8 @@ function buildCfdTrade(type, price, atr, sym) {
       ts: oldTrade.ts,                  // keep original entry timestamp
       slPrice: oldTrade.slPrice,        // keep original SL — the risk budget was set at entry
       tp1Price: lockedTp1,              // the EASIER TP1 → take partial profit sooner
-      tp2Price: tp2,                    // new (further) — stretch target OK to extend
-      tp3Price: tp3,                    // new (further) — stretch target OK to extend
+      tp2Price: (_scalp || oldTrade.scalp) ? lockedTp1 : tp2,                    // new (further) — stretch target OK to extend; scalp: one target (2026-10-21)
+      tp3Price: (_scalp || oldTrade.scalp) ? lockedTp1 : tp3,                    // new (further) — stretch target OK to extend; scalp: broker hard TP = TP1 (2026-10-21)
       atr: atr,
       bestPrice: oldTrade.bestPrice || price, worstPrice: oldTrade.worstPrice || price,  // keep best-price tracking
       trailSl: oldTrade.trailSl || 0,
@@ -19299,12 +19386,12 @@ function entryAgentSnapshot(sym, s, ctx) {
     my_scoreboard_14d: (function () { try { const D = entryAgent.decisions.filter(d => d.sym === sym && d.model === ctx._model && !d.err && Date.now() - d.ts < 14 * 86400000); const o = { decisions: D.length, fill: { win: 0, loss: 0 }, wait: { filled: 0, filled_win: 0, filled_loss: 0, unfilled: 0, unfilled_missed_win: 0, unfilled_avoided_loss: 0 }, skip: { avoided_loss: 0, missed_win: 0 }, rule_on_same_decisions: { win: 0, loss: 0 } }; for (const d of D) { const r = d.nowOutcome; if (d.action === 'fill') { if (r === 'win') o.fill.win++; else if (r === 'loss') o.fill.loss++; } else if (d.action === 'skip') { if (r === 'win') o.skip.missed_win++; else if (r === 'loss') o.skip.avoided_loss++; } else if (d.action === 'wait') { if (/^filled/.test(d.waitResult || '')) { o.wait.filled++; if (d.fillOutcome === 'win') o.wait.filled_win++; else if (d.fillOutcome === 'loss') o.wait.filled_loss++; } else if (d.waitResult) { o.wait.unfilled++; if (r === 'win') o.wait.unfilled_missed_win++; else if (r === 'loss') o.wait.unfilled_avoided_loss++; } } if (d.ruleOutcome === 'win') o.rule_on_same_decisions.win++; else if (d.ruleOutcome === 'loss') o.rule_on_same_decisions.loss++; } return o; } catch (e) { return null; } })()
   };
 }
-function entryAgentCall(model, userText, timeoutMs) {
+function entryAgentCall(model, userText, timeoutMs, systemText) {
   return new Promise((resolve) => {
     const t0 = Date.now();
     try {
       const httpsLib = require('https');
-      const body = JSON.stringify({ model, max_tokens: parseInt(process.env.ENTRY_AGENT_MAX_TOKENS, 10) || 3000, system: ENTRY_AGENT_SYSTEM, messages: [{ role: 'user', content: userText }], output_config: { effort: process.env.ENTRY_AGENT_EFFORT || 'low' } });
+      const body = JSON.stringify({ model, max_tokens: parseInt(process.env.ENTRY_AGENT_MAX_TOKENS, 10) || 3000, system: systemText || ENTRY_AGENT_SYSTEM, messages: [{ role: 'user', content: userText }], output_config: { effort: process.env.ENTRY_AGENT_EFFORT || 'low' } });
       const req = httpsLib.request({ hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), 'x-api-key': process.env.ANTHROPIC_API_KEY || '', 'anthropic-version': '2023-06-01' } }, (resp) => {
         let chunks = ''; resp.on('data', (c) => chunks += c);
         resp.on('end', () => {
@@ -19388,6 +19475,67 @@ function entryAgentConsult(sym, s, ctx) {
     });
   } catch (e) { try { log(sym, '⚠️ ENTRY-AGENT consult error: ' + String(e).slice(0, 120)); } catch (e2) {} }
 }
+// ===== GATE REVIEW — AGENT UNBLOCK SHADOW (2026-10-21, Jean: phase 2 of "rank each data to overpass a gate") =====
+// When a JUDGMENT gate blocks a candidate (zone veto, counter-trend veto, MACD defer, extreme guard, session-extreme,
+// chop), the agent is shown the block — the gate's reason, the bucketed features, and what THIS gate's ledger says
+// about rows like this one — and answers UNBLOCK (fire at market with the shown bracket) or UPHOLD. Graded on the
+// blocked row's own bracket (the same measure the gate is graded on): UNBLOCK = win/loss as the trade would have
+// gone; UPHOLD = avoided loss / missed win. Cohorts AGENT-<MODEL>-UNBLOCK / -UPHOLD. Throttled to one review per
+// symbol per AGENT_UNBLOCK_MIN_SEC (300). AGENT_UNBLOCK=0 kills it. Shadow only — nothing fires from this.
+const GATE_AGENT_RE = new RegExp(process.env.AGENT_UNBLOCK_GATES || '^(ZONE-VETO|ZONE-MICRO-WF|CT-VETO|MACD-DEFER|EXT-GUARD|SESS-EXTREME|CHOP-GATE|CHOP-MOM|CHOP-BREAK|CHOP-TREND-WF|GRIND-RECLAIM)');
+const GATE_AGENT_SYSTEM = [
+  'You are the GATE REVIEW desk of an intraday CFD scalping system trading XAUUSD (gold), NAS100 and BTCUSD on 1-second ticks.',
+  'A detector fired a directional candidate and one of the system\'s judgment gates BLOCKED it. The gate\'s name and its exact reason are in the snapshot (gate.name, gate.reason), with the bucketed market features at block time (gate.features) and what this gate\'s own ledger says about blocked rows like this one (gate.ledger: how often blocked candidates would have won overall, and the win rate of past blocked rows sharing each of this row\'s feature buckets).',
+  'Your ONLY job: UNBLOCK (the system should fire this candidate at market now, with the stop/target bracket shown) or UPHOLD (the gate is right, no trade).',
+  'How you are graded: on the candidate\'s own bracket from the current price — first target (TP1) before stop (SL) = the candidate would have won. UNBLOCK on a winner counts for you, UNBLOCK on a loser against you; UPHOLD on a loser counts for you (avoided loss), UPHOLD on a winner against you (missed win). The gates you review have been right 65–84% of the time, so UPHOLD is the default: UNBLOCK only when the evidence is specific and the ledger does not contradict you.',
+  'Judgment to apply: a gate is usually right when the candidate runs into a FRESH (<4h) untested opposing zone, when momentum is fading or reversing (accel=fading/reversing), when the leg has already run ≥2 ATR, when the candidate is counter-trend (ms=CT) or against the trend-day latch, or in RANGE regime away from a session extreme. A gate is more often wrong when the opposing zone is OLD or already tested 2+ times, momentum is accelerating with the candidate (macdB with/strong-with, accel=accel), the leg is young (<1 ATR from pivot), the candidate is with-trend on a latched trend day, and the tape is thick. Weigh gate.ledger over these priors when it has ≥10 rows in a bucket.',
+  'Answer with ONE JSON object and nothing else: {"action":"unblock"|"uphold","confidence":<0..1>,"reason":"<max 160 chars, concrete: cite the numbers that decided it>"}'
+].join('\n');
+// What this gate's ledger says about rows like this one (resolved, stamped, last 21 days)
+function gateLedgerFor(sym, gate, feat) {
+  try {
+    const s = S[sym]; const cutoff = Date.now() - 21 * 86400000;
+    const rows = (s.blockedOutcomes || []).filter(o => o && o.ts >= cutoff && o.feat && o.closed && (o.outcome === 'win' || o.outcome === 'loss') && String(cohortFor(o.blockReason || '') || o.detector) === gate);
+    const W = rows.filter(o => o.outcome === 'win').length;
+    const out = { gate, resolved: rows.length, blocked_would_have_won_pct: rows.length ? Math.round(100 * W / rows.length) : null, gate_right_pct: rows.length ? Math.round(100 * (rows.length - W) / rows.length) : null, this_row_buckets: {} };
+    if (feat) for (const fk of GATE_SCORE_FACTORS) { const v = feat[fk]; if (v == null) continue; const sub = rows.filter(o => String(o.feat[fk]) === String(v)); if (sub.length < 5) continue; const w = sub.filter(o => o.outcome === 'win').length; out.this_row_buckets[fk + '=' + v] = Math.round(100 * w / sub.length) + '% would have won (' + sub.length + ' rows)'; }
+    return out;
+  } catch (e) { return null; }
+}
+function gateAgentConsult(sym, s, row, msg) {
+  try {
+    if (!entryAgentEnabled() || process.env.AGENT_UNBLOCK === '0' || !s || !row) return;
+    const gate = String(cohortFor(msg) || row.detector || 'unmatched');
+    if (!GATE_AGENT_RE.test(gate)) return;
+    const now = Date.now();
+    if (now - (s._agUnblockTs || 0) < (parseInt(process.env.AGENT_UNBLOCK_MIN_SEC, 10) || 300) * 1000) return; s._agUnblockTs = now;
+    const price = +row.price, dir = row.type, atr = s._atr || 0;
+    const fake = { ep: price, slPrice: row.virtualSl, tp1Price: row.virtualTp1, tp2Price: row.virtualTp1, tp3Price: row.virtualTp1, scalp: true };
+    const models = entryAgentModels();
+    row.agentReview = row.agentReview || {};
+    models.forEach(async (model) => {
+      const id = sym + '-gate-' + now + '-' + entryAgentShort(model);
+      const snap = entryAgentSnapshot(sym, s, { price, atr, dir, detector: row.detector, trade: fake, rule: { action: 'block', via: gate }, rsi: s._rsi, macdL: s._macdL, roc3: s._roc3, roc6: s._roc6, _model: model });
+      snap.gate = { name: gate, reason: String(msg || '').replace(/[\u{1F300}-\u{1FAFF}]/gu, '').slice(0, 320), features: row.feat || null, ledger: gateLedgerFor(sym, gate, row.feat) };
+      delete snap.rule_decision; delete snap.my_recent_decisions; delete snap.my_scoreboard_14d;
+      snap.my_gate_reviews_14d = (function () { try { const D = entryAgent.decisions.filter(d => d.kind === 'unblock' && d.sym === sym && d.model === model && !d.err && now - d.ts < 14 * 86400000); const o = { reviews: D.length, unblock: { win: 0, loss: 0 }, uphold: { avoided_loss: 0, missed_win: 0 } }; for (const d of D) { if (d.action === 'unblock') { if (d.nowOutcome === 'win') o.unblock.win++; else if (d.nowOutcome === 'loss') o.unblock.loss++; } else if (d.action === 'uphold') { if (d.nowOutcome === 'loss') o.uphold.avoided_loss++; else if (d.nowOutcome === 'win') o.uphold.missed_win++; } } return o; } catch (e) { return null; } })();
+      const userText = 'Review this blocked candidate. Snapshot (JSON):\n' + JSON.stringify(snap);
+      entryAgent.stats.calls++;
+      const r = await entryAgentCall(model, userText, parseInt(process.env.ENTRY_AGENT_TIMEOUT_MS, 10) || 20000, GATE_AGENT_SYSTEM);
+      const dec = { id, kind: 'unblock', ts: now, time: etClock(now), sym, dir, detector: row.detector || '?', gate, model, short: entryAgentShort(model), price: +price.toFixed(2), atr: +atr.toFixed(2), rowTs: row.ts, ms: r.ms, inTok: (r.usage && r.usage.input_tokens) || 0, outTok: (r.usage && r.usage.output_tokens) || 0 };
+      entryAgent.stats.msSum += r.ms || 0; entryAgent.stats.inTok += dec.inTok; entryAgent.stats.outTok += dec.outTok;
+      if (!r.ok) { entryAgent.stats.errors++; entryAgent.stats.lastErr = r.err; entryAgent.stats.lastErrTs = now; dec.err = r.err; entryAgent.decisions.push(dec); entryAgent.dirty = true; log(sym, '🤖 GATE-REVIEW ' + dec.short + ' ERROR after ' + r.ms + 'ms — ' + String(r.err).slice(0, 140)); return; }
+      let j = null; for (const m of String(r.text || '').match(/\{[^{}]*\}/g) || []) { try { const c = JSON.parse(m); if (c && c.action) { j = c; break; } } catch (e) {} }
+      const action = j ? String(j.action).toLowerCase() : '';
+      if (!/^(unblock|uphold)$/.test(action)) { entryAgent.stats.errors++; dec.err = 'bad answer'; dec.raw = String(r.text || '').slice(0, 200); entryAgent.decisions.push(dec); entryAgent.dirty = true; log(sym, '🤖 GATE-REVIEW ' + dec.short + ' unusable answer — ' + String(r.text || '').slice(0, 120)); return; }
+      Object.assign(dec, { action, confidence: isFinite(+j.confidence) ? Math.max(0, Math.min(1, +j.confidence)) : null, reason: String(j.reason || '').slice(0, 200) });
+      row.agentReview[dec.short] = action;
+      entryAgent.decisions.push(dec); if (entryAgent.decisions.length > 600) entryAgent.decisions.shift(); entryAgent.dirty = true;
+      log(sym, '🤖 GATE-REVIEW ' + dec.short + ' on ' + gate + ' ' + dir.toUpperCase() + ' @ $' + price.toFixed(2) + ' (' + r.ms + 'ms) → ' + action.toUpperCase() + (dec.confidence != null ? ' · conf ' + dec.confidence : '') + ' — "' + dec.reason.slice(0, 120) + '" [shadow; graded on the blocked row\'s bracket]');
+    });
+  } catch (e) { try { log(sym, '⚠️ GATE-REVIEW consult error: ' + String(e).slice(0, 120)); } catch (e2) {} }
+}
+
 // Per tick: resolve WAIT limit trackers (touch → open the fill bracket at the limit; leash/expiry → abandoned) and
 // copy graded outcomes back onto the decisions (so the agent's own memory and /agent read them).
 function entryAgentTick(sym, s, price) {
@@ -19415,6 +19563,12 @@ function entryAgentTick(sym, s, price) {
     const rows = s.blockedOutcomes || [];
     for (const d of entryAgent.decisions) {
       if (d.sym !== sym || d.err) continue;
+      // GATE-REVIEW grading (2026-10-21): the verdict is graded on the blocked row's own bracket; one cohort bump per
+      // model+verdict (AGENT-<MODEL>-UNBLOCK / -UPHOLD) and one per gate (…-UNBLOCK-ZONE-VETO) when it resolves
+      if (d.kind === 'unblock') {
+        if (!d.nowOutcome) { const r = rows.find(b => b.ts === d.rowTs && b.type === d.dir); if (r && r.closed && r.outcome) { d.nowOutcome = r.outcome; entryAgent.dirty = true; if (r.outcome === 'win' || r.outcome === 'loss') { const _tok = 'AGENT-' + d.short + '-' + String(d.action).toUpperCase(); bumpCohortTally(sym, _tok, r.outcome); bumpCohortTally(sym, _tok + '-' + String(d.gate || '').replace(/[^A-Z0-9\-]/g, ''), r.outcome); } } }
+        continue;
+      }
       if (!d.nowOutcome) { const r = rows.find(b => b.agentId === d.id); if (r && r.closed) { d.nowOutcome = r.outcome; d.nowMfe = r.mfe || 0; entryAgent.dirty = true; } }
       if (d.waitResult && /^filled/.test(d.waitResult) && !d.fillOutcome) { const r = rows.find(b => b.agentId === d.id + '-fill'); if (r && r.closed) { d.fillOutcome = r.outcome; entryAgent.dirty = true; } }
       if (!d.ruleOutcome && d.histTs) { const h = signalHistory.find(x => x.ts === d.histTs && x.symbol === sym); if (h && h.outcomes) { if (h.outcomes.tp1Hit) d.ruleOutcome = 'win'; else if (h.outcomes.slHit) d.ruleOutcome = 'loss'; else if (typeof h.oteHold === 'string') d.ruleOutcome = 'cancelled:' + h.oteHold; if (d.ruleOutcome) { d.ruleVia = (h.oteHold && h.oteHold.via) || (typeof h.oteHold === 'string' ? h.oteHold : null); entryAgent.dirty = true; } } }
@@ -19474,6 +19628,15 @@ app.get('/agent', (req, res) => {
       const b = board[d.short] = board[d.short] || { decisions: 0, errors: 0, avgMs: 0, _ms: 0, fill: { n: 0, win: 0, loss: 0, scratch: 0, pending: 0 }, skip: { n: 0, avoided_loss: 0, missed_win: 0, scratch: 0, pending: 0 }, wait: { n: 0, filled: 0, filled_win: 0, filled_loss: 0, filled_scratch: 0, left: 0, expired: 0, unfilled_missed_win: 0, unfilled_avoided_loss: 0, pending: 0 }, agreeWithRule: 0, rule: { win: 0, loss: 0, cancelled: 0 } };
       b.decisions++; b._ms += d.ms || 0; if (d.err) { b.errors++; continue; }
       const o = d.nowOutcome;
+      // GATE-REVIEW (2026-10-21): the unblock/uphold shadow, scored on the blocked row's bracket, kept apart from the entry desk
+      if (d.kind === 'unblock') {
+        const u = b.gateReview = b.gateReview || { reviews: 0, unblock: { n: 0, win: 0, loss: 0, scratch: 0, pending: 0 }, uphold: { n: 0, avoided_loss: 0, missed_win: 0, scratch: 0, pending: 0 }, byGate: {} };
+        u.reviews++;
+        const g = u.byGate[d.gate] = u.byGate[d.gate] || { unblock: 0, unblock_win: 0, unblock_loss: 0, uphold: 0, uphold_right: 0, uphold_wrong: 0 };
+        if (d.action === 'unblock') { u.unblock.n++; g.unblock++; if (o === 'win') { u.unblock.win++; g.unblock_win++; } else if (o === 'loss') { u.unblock.loss++; g.unblock_loss++; } else if (o) u.unblock.scratch++; else u.unblock.pending++; }
+        else { u.uphold.n++; g.uphold++; if (o === 'loss') { u.uphold.avoided_loss++; g.uphold_right++; } else if (o === 'win') { u.uphold.missed_win++; g.uphold_wrong++; } else if (o) u.uphold.scratch++; else u.uphold.pending++; }
+        continue;
+      }
       if (d.action === 'fill') { b.fill.n++; if (o === 'win') b.fill.win++; else if (o === 'loss') b.fill.loss++; else if (o) b.fill.scratch++; else b.fill.pending++; }
       else if (d.action === 'skip') { b.skip.n++; if (o === 'win') b.skip.missed_win++; else if (o === 'loss') b.skip.avoided_loss++; else if (o) b.skip.scratch++; else b.skip.pending++; }
       else if (d.action === 'wait') { b.wait.n++; const wr = d.waitResult || ''; if (/^filled/.test(wr)) { b.wait.filled++; const fo = d.fillOutcome; if (fo === 'win') b.wait.filled_win++; else if (fo === 'loss') b.wait.filled_loss++; else if (fo) b.wait.filled_scratch++; else b.wait.pending++; } else if (/^left/.test(wr) || /^expired/.test(wr)) { if (/^left/.test(wr)) b.wait.left++; else b.wait.expired++; if (o === 'win') b.wait.unfilled_missed_win++; else if (o === 'loss') b.wait.unfilled_avoided_loss++; else if (!o) b.wait.pending++; } else b.wait.pending++; }
@@ -19483,7 +19646,7 @@ app.get('/agent', (req, res) => {
     for (const k in board) { const b = board[k]; b.avgMs = b.decisions ? Math.round(b._ms / b.decisions) : 0; delete b._ms; const w = b.fill.win + b.wait.filled_win + b.skip.avoided_loss + b.wait.unfilled_avoided_loss, l = b.fill.loss + b.wait.filled_loss + b.skip.missed_win + b.wait.unfilled_missed_win; b.agentScore = { right: w, wrong: l, pct: (w + l) ? +(100 * w / (w + l)).toFixed(0) : null, note: 'right = fills/wait-fills that won + skips/unfilled waits that avoided a loss; wrong = fills that lost + skips/unfilled waits that missed a win' }; b.ruleScore = { win: b.rule.win, loss: b.rule.loss, pct: (b.rule.win + b.rule.loss) ? +(100 * b.rule.win / (b.rule.win + b.rule.loss)).toFixed(0) : null }; }
     const st = entryAgent.stats;
     const cost = { calls: st.calls, errors: st.errors, avgMs: st.calls ? Math.round(st.msSum / st.calls) : 0, inTok: st.inTok, outTok: st.outTok, lastErr: st.lastErr, lastErrAt: st.lastErrTs ? new Date(st.lastErrTs).toISOString() : null };
-    res.json({ enabled: entryAgentEnabled(), mode: 'shadow', models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', bar: 'agent beats the rule by ≥8 pts of W/(W+L) over ≥40 decisions, or ≥60% on its own', since: new Date(since).toISOString(), board, cost, waitsOpen: Object.fromEntries(Object.entries(entryAgent.waits).map(([k, v]) => [k, v.length])), recent: D.slice(-(parseInt(req.query.limit, 10) || 30)).reverse().map(d => ({ time: d.time, sym: d.sym, dir: d.dir, det: d.detector, model: d.short, action: d.action, limit: d.limit, window: d.windowSec, conf: d.confidence, reason: d.reason, err: d.err || undefined, rule: d.rule, nowOutcome: d.nowOutcome || null, waitResult: d.waitResult || null, fillOutcome: d.fillOutcome || null, ruleOutcome: d.ruleOutcome || null, ms: d.ms })) });
+    res.json({ enabled: entryAgentEnabled(), mode: 'shadow', gateReview: { enabled: entryAgentEnabled() && process.env.AGENT_UNBLOCK !== '0', gates: GATE_AGENT_RE.source, minSec: parseInt(process.env.AGENT_UNBLOCK_MIN_SEC, 10) || 300, bar: 'UNBLOCK verdicts ≥60% winners over ≥25 resolved per gate, and UPHOLD verdicts at least as right as the gate itself (see /gate-score)' }, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', bar: 'agent beats the rule by ≥8 pts of W/(W+L) over ≥40 decisions, or ≥60% on its own', since: new Date(since).toISOString(), board, cost, waitsOpen: Object.fromEntries(Object.entries(entryAgent.waits).map(([k, v]) => [k, v.length])), recent: D.slice(-(parseInt(req.query.limit, 10) || 30)).reverse().map(d => ({ time: d.time, sym: d.sym, dir: d.dir, det: d.detector, kind: d.kind || 'entry', gate: d.gate || undefined, model: d.short, action: d.action, limit: d.limit, window: d.windowSec, conf: d.confidence, reason: d.reason, err: d.err || undefined, rule: d.rule, nowOutcome: d.nowOutcome || null, waitResult: d.waitResult || null, fillOutcome: d.fillOutcome || null, ruleOutcome: d.ruleOutcome || null, ms: d.ms })) });
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
@@ -19887,6 +20050,95 @@ app.get('/blocked-outcomes/:sym', (req, res) => {
   });
 });
 
+// ===== GATE-OVERRIDE SCORE — PHASE A: THE SHADOW CALCULATION (2026-10-21, Jean: "go ahead with the shadow gate
+// calculation, N>25") =====
+//   GET /gate-score/:sym?days=21&gate=ZONE-VETO&min=25&bar=60&keep=65
+// For every gate cohort (cohortFor of the block message) over RESOLVED blocked rows that carry a feature stamp:
+//   • base      = would-have-won rate of the blocked rows (W/(W+L)) — what unblocking everything would score
+//   • factors   = per bucket of each pre-registered factor: n, W, L, win rate, lift = log-odds vs the gate's base
+//   • score     = per row, the SUM of its buckets' lifts computed LEAVE-ONE-OUT (the row's own outcome removed from
+//                 every count it sits in; buckets left with <5 rows contribute 0) — so the sweep below is not graded
+//                 on a fit that already saw the answer
+//   • sweep     = for each threshold: the override subset (rows with score ≥ t) W/L and win rate, and the remainder
+//                 (rows that stay blocked) "gate right" rate = L/(W+L) of what stays blocked
+//   • verdict   = pre-registered bar: subset n ≥ min (25), subset win rate ≥ bar (60%), remainder gate-right ≥ keep
+//                 (65%). BAR MET names the loosest threshold that passes (largest subset). Nothing fires from this —
+//                 it is the measurement that decides whether a rule-based override earns a live test.
+app.get('/gate-score/:sym', (req, res) => {
+  try {
+    const sym = resolveSymbol(req.params.sym);
+    const s = S[sym];
+    if (!s) return res.status(404).json({ error: 'Unknown symbol: ' + sym });
+    const q = req.query || {};
+    const days = isFinite(parseFloat(q.days)) ? parseFloat(q.days) : 21;
+    const minN = isFinite(parseInt(q.min, 10)) ? parseInt(q.min, 10) : 25;
+    const bar = (isFinite(parseFloat(q.bar)) ? parseFloat(q.bar) : 60) / 100;
+    const keep = (isFinite(parseFloat(q.keep)) ? parseFloat(q.keep) : 65) / 100;
+    const minBucket = 5;
+    const cutoff = Date.now() - days * 86400000;
+    const all = (Array.isArray(s.blockedOutcomes) ? s.blockedOutcomes : []).filter(o => o && o.ts >= cutoff && o.feat && typeof o.feat === 'object');
+    const stamped = all.length;
+    const resolved = all.filter(o => o.closed && (o.outcome === 'win' || o.outcome === 'loss'));
+    const scratches = all.filter(o => o.closed && o.outcome === 'scratch').length;
+    const gateOf = (o) => { try { return String(cohortFor(o.blockReason || '') || o.detector || 'unmatched'); } catch (e) { return o.detector || 'unmatched'; } };
+    const groups = {};
+    for (const o of resolved) { const g = gateOf(o); if (q.gate && g.indexOf(String(q.gate)) !== 0) continue; (groups[g] = groups[g] || []).push(o); }
+    const lo = (w, l) => Math.log((w + 0.5) / (l + 0.5));
+    const out = { symbol: sym, days, stamped_rows: stamped, resolved_rows: resolved.length, scratch_rows: scratches, bar: { min_n: minN, subset_win_rate: Math.round(bar * 100) + '%', remainder_gate_right: Math.round(keep * 100) + '%', bucket_min: minBucket }, factors_ranked: GATE_SCORE_FACTORS, gates: [] };
+    for (const g of Object.keys(groups).sort((a, b) => groups[b].length - groups[a].length)) {
+      const rows = groups[g];
+      const W = rows.filter(o => o.outcome === 'win').length, L = rows.length - W;
+      const baseLo = lo(W, L);
+      // bucket counts per factor
+      const F = {};
+      for (const fk of GATE_SCORE_FACTORS) {
+        const B = F[fk] = {};
+        for (const o of rows) { const v = o.feat[fk]; if (v == null) continue; const k = String(v); const b = B[k] = B[k] || { n: 0, w: 0, l: 0 }; b.n++; if (o.outcome === 'win') b.w++; else b.l++; }
+      }
+      const factors = {};
+      for (const fk of GATE_SCORE_FACTORS) {
+        const tbl = [];
+        for (const k of Object.keys(F[fk])) { const b = F[fk][k]; if (b.n < minBucket) continue; tbl.push({ bucket: k, n: b.n, win: b.w, loss: b.l, win_rate: Math.round(100 * b.w / b.n), lift: +(lo(b.w, b.l) - baseLo).toFixed(2) }); }
+        if (tbl.length) factors[fk] = tbl.sort((a, b) => b.lift - a.lift);
+      }
+      // leave-one-out score per row
+      const scored = rows.map(o => {
+        const isW = o.outcome === 'win';
+        const bW = W - (isW ? 1 : 0), bL = L - (isW ? 0 : 1);
+        const base2 = lo(bW, bL);
+        let sc = 0, used = 0;
+        for (const fk of GATE_SCORE_FACTORS) {
+          const v = o.feat[fk]; if (v == null) continue; const b = F[fk][String(v)]; if (!b) continue;
+          const n2 = b.n - 1; if (n2 < minBucket) continue;
+          const w2 = b.w - (isW ? 1 : 0), l2 = b.l - (isW ? 0 : 1);
+          sc += lo(w2, l2) - base2; used++;
+        }
+        return { score: +sc.toFixed(2), used, win: isW, o };
+      });
+      // threshold sweep on the LOO scores
+      const ths = Array.from(new Set(scored.map(r => r.score))).sort((a, b) => b - a);
+      const sweep = []; let best = null;
+      for (const t of ths) {
+        const sub = scored.filter(r => r.score >= t), rem = scored.filter(r => r.score < t);
+        const sw = sub.filter(r => r.win).length, sl = sub.length - sw;
+        const rw = rem.filter(r => r.win).length, rl = rem.length - rw;
+        const row = { t, override_n: sub.length, override_win: sw, override_loss: sl, override_win_rate: sub.length ? Math.round(100 * sw / sub.length) : null, remain_n: rem.length, remain_gate_right: rem.length ? Math.round(100 * rl / rem.length) : null };
+        row.meets_bar = sub.length >= minN && sub.length && (sw / sub.length) >= bar && (rem.length === 0 || (rl / rem.length) >= keep);
+        if (row.meets_bar && (!best || row.override_n > best.override_n)) best = row;
+        sweep.push(row);
+      }
+      // keep the sweep readable: every bar-meeting threshold + ~10 evenly spaced others
+      const keepIdx = new Set(); sweep.forEach((r, i) => { if (r.meets_bar) keepIdx.add(i); }); const step = Math.max(1, Math.floor(sweep.length / 10)); for (let i = 0; i < sweep.length; i += step) keepIdx.add(i); if (sweep.length) keepIdx.add(sweep.length - 1);
+      const top = []; for (const fk of Object.keys(factors)) for (const b of factors[fk]) top.push(Object.assign({ factor: fk }, b));
+      top.sort((a, b) => Math.abs(b.lift) - Math.abs(a.lift));
+      const verdict = rows.length < minN ? ('n<' + minN + ' — keep measuring (' + rows.length + ' resolved)') : best ? ('BAR MET at score ≥ ' + best.t + ': override ' + best.override_win + 'W/' + best.override_loss + 'L (' + best.override_win_rate + '%), the rest stays blocked and the gate is right ' + best.remain_gate_right + '% there') : 'no threshold meets the bar — the gate stays as is';
+      const latest = scored.filter(r => r.o.ts >= Date.now() - 86400000).sort((a, b) => b.o.ts - a.o.ts).slice(0, 12).map(r => ({ time: r.o.time, dir: r.o.type, price: r.o.price, outcome: r.o.outcome, score: r.score, top: GATE_SCORE_FACTORS.filter(fk => r.o.feat[fk] != null && F[fk][String(r.o.feat[fk])] && F[fk][String(r.o.feat[fk])].n >= minBucket).map(fk => fk + '=' + r.o.feat[fk]).slice(0, 8) }));
+      out.gates.push({ gate: g, n: rows.length, win: W, loss: L, base_would_have_won: rows.length ? Math.round(100 * W / rows.length) : null, gate_right: rows.length ? Math.round(100 * L / rows.length) : null, verdict, best_threshold: best, top_factors: top.slice(0, 12), factors, sweep: sweep.filter((r, i) => keepIdx.has(i)), last_24h: latest });
+    }
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
+
 // ===== ADMIN: MANUAL LEVEL INJECTION (2026-08-12) =====
 // For feed-outage recovery (8/11: 5h dark, Asian levels locked on partial data).
 // Usage: /admin/asian?sym=XAU&hi=4401.65&lo=4367.24&key=jean2026
@@ -19962,7 +20214,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.44-20261021-bigleg-cont-latch-exh-rev-coach', // bump on each deploy — lets /state verify what's live
+    build: '7.46-20261021-gate-score-shadow', // bump on each deploy — lets /state verify what's live
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
