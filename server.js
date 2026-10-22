@@ -2381,6 +2381,7 @@ function cohortFor(reason) {
   if (/ZONE-MICRO-WF/.test(reason)) return 'ZONE-MICRO-WF'; // inside-zone vetoes skipped because the zone was < 0.5×ATR tall (2026-09-28) — must precede ZONE-VETO
   if (/EOD-CONT-WF/.test(reason)) return 'EOD-CONT-WF'; // with-trend blocks in the last 90min of RTH (2026-09-28, Jean's end-of-session drift hypothesis) — must precede TREND-CONT-WF
   if (/LADDER-77/.test(reason)) return 'LADDER-77'; // proportional 7/7 ladder sim on live XAU fires (2026-09-28)
+  if (/TP1-GAP/.test(reason)) return 'TP1-GAP'; // fires that touched +$5.00 below a TP1 >$5 (2026-10-22): win = still reached TP1, loss = stopped (would have banked at $5)
   if (/LADDER-610/.test(reason)) return 'LADDER-610'; // TP1 $6 / stop $10 on the same fires (2026-10-22, Jean: "and if TP1 at 6$?")
   if (/LADDER-510/.test(reason)) return 'LADDER-510'; // current 5/10 ladder, same fires, same sequence rule
   { const _v2 = reason.match(/\b(XAU|BTC)-SESS-REJ-V2\b/); if (_v2) return _v2[0]; } // rejection v2 trigger (2026-10-15) — must precede the plain matches
@@ -17236,7 +17237,11 @@ function buildCfdTrade(type, price, atr, sym) {
   if (_ladder === 'WIDE') mults = isNAS ? { sl: 2.5, t1: 4, t2: 6, t3: 9 } : { sl: 2.5, t1: 2.25, t2: 3.75, t3: 6 };
   else if (_ladder === 'TIGHT') mults = isNAS ? { sl: 1.5, t1: 3, t2: 4, t3: 6 } : { sl: 1.5, t1: 1.5, t2: 2.5, t3: 4 };
   const _xauSlCap = _ladder === 'WIDE' ? (parseFloat(process.env.XAU_SL_WIDE) || 12.5) : _ladder === 'TIGHT' ? (parseFloat(process.env.XAU_SL_TIGHT) || 7.5) : 10;
-  const _xauTp1 = _ladder === 'WIDE' ? (parseFloat(process.env.XAU_TP1_WIDE) || 7.5) : 5.0;
+  // TP1 $5.00 → $5.24 (2026-10-22, Jean: IC Markets Raw costs ~$0.12/oz per round trip — $0.05 spread + $0.07 commission
+  // — so the same $5 target now nets $4.88; +$0.24 covers the cost on the winner AND the extra $0.12 every loser pays,
+  // at any win rate above 50%). XAU_TP1=5 reverts. TP1-GAP cohort grades what the extra $0.24 costs: fires that
+  // touched +$5.00 but ended without reaching the new TP1.
+  const _xauTp1 = _ladder === 'WIDE' ? (parseFloat(process.env.XAU_TP1_WIDE) || 7.5) : (parseFloat(process.env.XAU_TP1) || 5.24);
   // Minimum $5 for SL and TP1 — prevents noise-level levels during low-ATR periods
   // XAU SL cap by ladder profile ($7.50 / $10 / $12.50) — keeps risk tight on gold's typical ATR range
   const slDist = isXAU ? Math.min(Math.max(atr * mults.sl, 5), _xauSlCap) : Math.max(atr * mults.sl, 5);
@@ -17467,6 +17472,7 @@ function updateSignalOutcome(sym, finalPrice) {
   try { if (t.ts && now - t.ts < 12000 && !entry.outcomes.flash) entry.outcomes.flash = true; } catch (eFL) {}
   if (t.t1 && !entry.outcomes.tp1Hit) {
     entry.outcomes.tp1Hit = true; entry.outcomes.tp1HitTs = now;
+    if (t._tp1Gap) { try { bumpCohortTally(sym, 'TP1-GAP', 'win'); entry.outcomes.tp1Gap = 'reached'; } catch (eG1) {} }
     // book the realized TP1 half (2026-08-17)
     if (t.tp1Price > 0 && t.ep > 0) bookPnl(sym, 0.5 * Math.abs(t.tp1Price - t.ep) * pnlMultFor(sym, t), 't1');
   }
@@ -17498,6 +17504,7 @@ function updateSignalOutcome(sym, finalPrice) {
       else if (t.type === 'put') s.lastTp3PutTs = now;
     } else {
       // Real stop loss (before TP2)
+      if (t._tp1Gap && !entry.outcomes.tp1Hit) { try { bumpCohortTally(sym, 'TP1-GAP', 'loss'); entry.outcomes.tp1Gap = 'missed'; log(sym, '📏 TP1-GAP → LOSS — touched +$5.00, never reached TP1, stopped: the $5.00 target would have banked this one.'); } catch (eG2) {} }
       entry.outcomes.slHit = true; entry.outcomes.slHitTs = now;
       entry.outcomes.closePrice = finalPrice;
       if (t.ep > 0 && finalPrice > 0) bookPnl(sym, (entry.outcomes.tp1Hit ? 0.5 : 1.0) * (t.type === 'call' ? finalPrice - t.ep : t.ep - finalPrice) * pnlMultFor(sym, t), 'close');
@@ -17788,6 +17795,8 @@ function checkExit(sym, price) {
     // BEFORE TP1 (sl5WouldStop on the fired row). Nightly compares actual P&L vs the
     // $5-stop world. Promote to live SL policy if the shadow shows it net-positive
     // over ≥15 fires including at least one high-ATR day.
+    // TP1-GAP marker (2026-10-22): price touched +$5.00 while TP1 sits further out (5.24 default) — graded at TP1 / stop
+    try { if (sym === 'XAU' && !t.t1 && !t.sl && !t._tp1Gap && typeof t.tp1Price === 'number' && Math.abs(t.tp1Price - t.ep) > 5.001 && Math.abs(t.tp1Price - t.ep) < 6 && (iC ? price - t.ep : t.ep - price) >= 5) { t._tp1Gap = true; log(sym, '📏 TP1-GAP — ' + t.type.toUpperCase() + ' @ $' + (+t.ep).toFixed(2) + ' touched +$5.00; TP1 is +$' + Math.abs(t.tp1Price - t.ep).toFixed(2) + ' (cost-adjusted 2026-10-22) — graded at TP1 or stop.'); } } catch (eG5) {}
     if (sym === 'XAU' && !t.t1 && !t.sl && !t._sl5Hit) {
       const _sl5Adv = iC ? t.ep - price : price - t.ep;
       if (_sl5Adv >= 5) {
@@ -20218,7 +20227,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.47-20261022-ladder-610-sim', // bump on each deploy — lets /state verify what's live
+    build: '7.48-20261022-tp1-cost-adjusted', // bump on each deploy — lets /state verify what's live
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
