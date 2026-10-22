@@ -2381,6 +2381,7 @@ function cohortFor(reason) {
   if (/ZONE-MICRO-WF/.test(reason)) return 'ZONE-MICRO-WF'; // inside-zone vetoes skipped because the zone was < 0.5×ATR tall (2026-09-28) — must precede ZONE-VETO
   if (/EOD-CONT-WF/.test(reason)) return 'EOD-CONT-WF'; // with-trend blocks in the last 90min of RTH (2026-09-28, Jean's end-of-session drift hypothesis) — must precede TREND-CONT-WF
   if (/LADDER-77/.test(reason)) return 'LADDER-77'; // proportional 7/7 ladder sim on live XAU fires (2026-09-28)
+  if (/LADDER-610/.test(reason)) return 'LADDER-610'; // TP1 $6 / stop $10 on the same fires (2026-10-22, Jean: "and if TP1 at 6$?")
   if (/LADDER-510/.test(reason)) return 'LADDER-510'; // current 5/10 ladder, same fires, same sequence rule
   { const _v2 = reason.match(/\b(XAU|BTC)-SESS-REJ-V2\b/); if (_v2) return _v2[0]; } // rejection v2 trigger (2026-10-15) — must precede the plain matches
   if (/XAU-SESS-REJ-MULTI/.test(reason)) return 'XAU-SESS-REJ-MULTI'; // XAU session-extreme rejection, extreme tested ≥2× (2026-10-05, the 4125 triple bottom)
@@ -17588,10 +17589,13 @@ function checkExit(sym, price) {
     // over ≥20 fires. Sequence-exact, unlike MFE/MAE snapshots.
     try {
       if (sym === 'XAU' && t.ep > 0 && price > 0) {
-        t._lsim = t._lsim || { a: null, b: null };
+        t._lsim = t._lsim || { a: null, b: null, c: null };
         const _fav = iC ? price - t.ep : t.ep - price;
         if (!t._lsim.a) { if (_fav >= 7) t._lsim.a = 'win'; else if (_fav <= -7) t._lsim.a = 'loss'; if (t._lsim.a) { bumpCohortTally(sym, 'LADDER-77', t._lsim.a); log(sym, '📐 LADDER-SIM 7/7 → ' + t._lsim.a.toUpperCase() + ' (' + (_fav >= 0 ? '+' : '') + _fav.toFixed(2) + ' from entry $' + (+t.ep).toFixed(2) + ').'); } }
         if (!t._lsim.b) { if (_fav >= 5) t._lsim.b = 'win'; else if (_fav <= -10) t._lsim.b = 'loss'; if (t._lsim.b) bumpCohortTally(sym, 'LADDER-510', t._lsim.b); }
+        // LADDER-610 (2026-10-22): $6 first leg vs the same −$10 stop. Pre-registered: TP1 → $6 when, over ≥25 resolved fires,
+        // 6×WR610 − 10×(1−WR610) beats 5×WR510 − 10×(1−WR510) on the SAME fires (both cohorts read side by side).
+        if (!t._lsim.c) { if (_fav >= 6) t._lsim.c = 'win'; else if (_fav <= -10) t._lsim.c = 'loss'; if (t._lsim.c) { bumpCohortTally(sym, 'LADDER-610', t._lsim.c); log(sym, '📐 LADDER-SIM 6/10 → ' + t._lsim.c.toUpperCase() + ' (' + (_fav >= 0 ? '+' : '') + _fav.toFixed(2) + ' from entry $' + (+t.ep).toFixed(2) + ').'); } }
       }
     } catch (eLS) {}
     // ===== TP LADDER MONOTONICITY CLAMP (2026-09-04, Jean's 02:57 put) =====
@@ -19482,7 +19486,7 @@ function entryAgentConsult(sym, s, ctx) {
 // blocked row's own bracket (the same measure the gate is graded on): UNBLOCK = win/loss as the trade would have
 // gone; UPHOLD = avoided loss / missed win. Cohorts AGENT-<MODEL>-UNBLOCK / -UPHOLD. Throttled to one review per
 // symbol per AGENT_UNBLOCK_MIN_SEC (300). AGENT_UNBLOCK=0 kills it. Shadow only — nothing fires from this.
-const GATE_AGENT_RE = new RegExp(process.env.AGENT_UNBLOCK_GATES || '^(ZONE-VETO|ZONE-MICRO-WF|CT-VETO|MACD-DEFER|EXT-GUARD|SESS-EXTREME|CHOP-GATE|CHOP-MOM|CHOP-BREAK|CHOP-TREND-WF|GRIND-RECLAIM)');
+const GATE_AGENT_RE = new RegExp(process.env.AGENT_UNBLOCK_GATES || '^(ZONE-VETO|ZONE-MICRO-WF|CT-VETO|MACD-DEFER|EXT-GUARD|SESS-EXTREME|CHOP-GATE|CHOP-MOM|CHOP-BREAK|CHOP-TREND-WF|GRIND-RECLAIM|FAST-PRE|TREND-CONT-WF)');
 const GATE_AGENT_SYSTEM = [
   'You are the GATE REVIEW desk of an intraday CFD scalping system trading XAUUSD (gold), NAS100 and BTCUSD on 1-second ticks.',
   'A detector fired a directional candidate and one of the system\'s judgment gates BLOCKED it. The gate\'s name and its exact reason are in the snapshot (gate.name, gate.reason), with the bucketed market features at block time (gate.features) and what this gate\'s own ledger says about blocked rows like this one (gate.ledger: how often blocked candidates would have won overall, and the win rate of past blocked rows sharing each of this row\'s feature buckets).',
@@ -20214,7 +20218,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.46-20261021-gate-score-shadow', // bump on each deploy — lets /state verify what's live
+    build: '7.47-20261022-ladder-610-sim', // bump on each deploy — lets /state verify what's live
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
