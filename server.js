@@ -2381,6 +2381,7 @@ function cohortFor(reason) {
   if (/ZONE-MICRO-WF/.test(reason)) return 'ZONE-MICRO-WF'; // inside-zone vetoes skipped because the zone was < 0.5×ATR tall (2026-09-28) — must precede ZONE-VETO
   if (/EOD-CONT-WF/.test(reason)) return 'EOD-CONT-WF'; // with-trend blocks in the last 90min of RTH (2026-09-28, Jean's end-of-session drift hypothesis) — must precede TREND-CONT-WF
   if (/LADDER-77/.test(reason)) return 'LADDER-77'; // proportional 7/7 ladder sim on live XAU fires (2026-09-28)
+  if (/STALL-FILL-SHADOW/.test(reason)) return 'STALL-FILL-SHADOW'; // benched stall fills graded in shadow (2026-10-27)
   if (/TP1-GAP/.test(reason)) return 'TP1-GAP'; // fires that touched +$5.00 below a TP1 >$5 (2026-10-22): win = still reached TP1, loss = stopped (would have banked at $5)
   if (/LADDER-610/.test(reason)) return 'LADDER-610'; // TP1 $6 / stop $10 on the same fires (2026-10-22, Jean: "and if TP1 at 6$?")
   if (/LADDER-510/.test(reason)) return 'LADDER-510'; // current 5/10 ladder, same fires, same sequence rule
@@ -11737,7 +11738,7 @@ function processPrice(sym, price, hi, lo) {
               // within 2 min of another fire. PRE-REGISTERED BENCH RULE per lane: net-negative over the first
               // 6 live fires → back to shadow (PATH_LIVE=0 kills by hand; PATH_LIVE_LANES lists the lanes).
               try {
-                const _plLanes = String(process.env.PATH_LIVE_LANES || 'XAU:PATH-CLEAR-M,XAU:PATH-ZONED-T').split(',').map(x => x.trim()); // ZONED-T live again 2026-10-15 under the persistence filter (sampler 16W/3L on that subset; 1W/16L on the rest)
+                const _plLanes = String(process.env.PATH_LIVE_LANES || '') /* BENCHED 2026-10-27: 7 live fills −$2,264 (first six −$1,289 = the pre-registered bench rule); the sampler keeps measuring. Set PATH_LIVE_LANES to re-arm a lane */.split(',').map(x => x.trim()); // ZONED-T live again 2026-10-15 under the persistence filter (sampler 16W/3L on that subset; 1W/16L on the rest)
                 if (process.env.PATH_LIVE !== '0' && _plLanes.indexOf(sym + ':' + lane) >= 0) {
                   const _plWhy = [];
                   if (s.trade && s.trade.active) _plWhy.push('trade active');
@@ -12328,6 +12329,26 @@ function processPrice(sym, price, hi, lo) {
                 }
               }
             } catch (eSF) {}
+          }
+          // STALL FILL BENCHED → SHADOW (2026-10-27): live since 10/19 it filled 5 fires for 1W/4L (10/20 TREND put L,
+          // 10/22 NAS FAST put L, 10/22 21:12 XAU FAST put −$3,302, 10/23 EXT-FLIP call W +$1,310, 10/23 NAS LLFP call
+          // −$1,197) — net-negative, the pre-registered bench rule. The stall condition still grades itself: one
+          // STALL-FILL-SHADOW row per hold with the trade's own bracket, and the hold continues as before (touch /
+          // runaway / expiry). EXT_PB_STALL_FILL=1 puts it live again.
+          if (_ohStall && process.env.EXT_PB_STALL_FILL !== '1') {
+            if (!_oh._stallShadowed) {
+              _oh._stallShadowed = true;
+              try {
+                const _sT = _oh.trade || {}; const _sC = _oh.dir === 'call'; const _sSl = +_sT.slPrice || +_oh.slPrice; const _sTp = +_sT.tp1Price;
+                if (_sSl > 0 && _sTp > 0) {
+                  const _sM = '⏸️ STALL-FILL-SHADOW ' + _oh.dir.toUpperCase() + ' @ $' + price.toFixed(2) + ' — ' + _ohStallWhy + '; benched 2026-10-27 (live 1W/4L), the hold continues. Bracket SL $' + _sSl.toFixed(2) + ' / TP1 $' + _sTp.toFixed(2) + '. STALL-FILL-SHADOW';
+                  s.blockedOutcomes = s.blockedOutcomes || [];
+                  s.blockedOutcomes.push({ ts: Date.now(), time: ts(), symbol: sym, detector: 'STALL-FILL', type: _oh.dir, price: +price.toFixed(2), virtualTp1: +_sTp.toFixed(2), virtualSl: +_sSl.toFixed(2), maxMin: 240, blockReason: _sM, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+                  log(sym, _sM);
+                }
+              } catch (eSS) {}
+            }
+            _ohStall = false;
           }
           if (_ohStall) _ohTouch = true;
           if (_ohSlX) {
@@ -16128,6 +16149,15 @@ function processPrice(sym, price, hi, lo) {
             }
           }
         } catch (e) { /* impulse logic must never block entries */ }
+        // ===== XAU STOP CAP FOR THE HAND-BUILT RIDE TRADE (2026-10-27) ===== buildCfdTrade caps every XAU stop at
+        // $7.50/$10/$12.50 by ladder; TRv2 builds its trade by hand and had no cap. The 10/26 11:03 RIDE call ran on
+        // ATR $11.58 → stop 2×ATR = $23.15 below entry (4 lots = $9,260 at risk on one trade; price did reach it).
+        // Cap at XAU_SL_WIDE (default $12.50) — the widest stop any other XAU fire may carry.
+        if (sym === 'XAU') {
+          const _rCap = parseFloat(process.env.XAU_SL_WIDE) || 12.5;
+          const _rDist = Math.abs(price - sl);
+          if (_rDist > _rCap) { sl = dir === 'long' ? price - _rCap : price + _rCap; log(sym, '🛡️ TRv2 XAU STOP CAPPED — $' + _rDist.toFixed(2) + ' (ATR $' + trv2Atr.toFixed(2) + ') → $' + _rCap.toFixed(2) + ' (the widest XAU ladder stop, 2026-10-27).'); }
+        }
         // ===== PHASE 3.28 — Fix TP2/TP3 < TP1 bug (added 2026-06-22, task #228) =====
         // Previously TP1 had a Math.max(...,tp1Floor) clamp but TP2/TP3 used raw
         // ATR multipliers. On low-ATR XAU entries (ATR=1.38), TP1 hit the $5 floor
@@ -19791,6 +19821,23 @@ app.post('/manual/adopt', (req, res) => {
 // REJECTED — so a miss reaches Jean's phone the minute it happens instead of the next
 // morning's autopsy. Logged under the symbol, pushed (60s throttle per kind).
 global._eaEvtTs = global._eaEvtTs || {};
+// ===== LEDGER ACCOUNT (2026-10-27) ===== A second terminal (acct 5510028279, 0.01 lots) started reporting fills and
+// closes on 10/26: its ORDER_OK overwrote the row's eaFill and its CLOSED "reconciled" the 4-lot IC Markets result to its
+// own cents (10/27 PATH put: booked −$975 → corrected to −$4.85) — and a secondary close can END the server trade. Only
+// ONE account drives the ledger and trade lifecycle: LEDGER_ACCT env, else the registered account with the largest
+// balance×scale, else the account whose fills carry the most lots. Other accounts are recorded (eaFillOther /
+// eaCloseOther) but never book, never reconcile, never end a trade.
+global._acctLots = global._acctLots || {};
+function ledgerAcct() {
+  try {
+    if (process.env.LEDGER_ACCT) return String(process.env.LEDGER_ACCT);
+    const ids = Object.keys(eaAccounts || {});
+    if (ids.length) return ids.sort((a, b) => ((eaAccounts[b].balance || 0) * (eaAccounts[b].scale || 1)) - ((eaAccounts[a].balance || 0) * (eaAccounts[a].scale || 1)))[0];
+    const L = Object.keys(global._acctLots); if (L.length) return L.sort((a, b) => global._acctLots[b] - global._acctLots[a])[0];
+  } catch (e) {}
+  return null;
+}
+function isLedgerAcct(acct) { const L = ledgerAcct(); return !acct || !L || String(acct) === L; }
 app.post('/ea/event', (req, res) => {
   try {
     const b = req.body || {};
@@ -19811,6 +19858,12 @@ app.post('/ea/event', (req, res) => {
       }
     } catch (eAF) {}
     try {
+      if (/ORDER_OK|FILLED/i.test(kind) && _acct) { const _lv = parseFloat((detail.match(/([\d.]+) lots/) || [])[1]); if (isFinite(_lv) && _lv > 0) global._acctLots[_acct] = _lv; } // latest fill size per account — the 4-lot terminal outranks a 0.01-lot test terminal
+      if (/ORDER_OK|FILLED/i.test(kind) && !isLedgerAcct(_acct) && S[sym] && S[sym].trade && S[sym].trade.active) {
+        // secondary account: keep the ticket→account map (so its later CLOSED is recognised) but never touch the row's fill/no-fill state
+        try { const _tk2 = (detail.match(/ticket #?(\d+)/) || [])[1]; const _h2 = S[sym].lastHistEntry; if (_tk2) { const _tt2 = S[sym].trade; _tt2._ticketsOther = _tt2._ticketsOther || {}; _tt2._ticketsOther[_tk2] = _acct; } if (_h2 && _h2.symbol === sym) { _h2.outcomes = _h2.outcomes || {}; _h2.outcomes.eaFillOther = _h2.outcomes.eaFillOther || {}; _h2.outcomes.eaFillOther[_acct] = detail.slice(0, 120); if (_tk2) { _h2.outcomes.eaTicketsOther = _h2.outcomes.eaTicketsOther || []; if (_h2.outcomes.eaTicketsOther.indexOf(_tk2) < 0) _h2.outcomes.eaTicketsOther.push(_tk2); } } } catch (eFO) {}
+        return res.json({ ok: true, ledger: false });
+      }
       if (/ORDER_OK|FILLED/i.test(kind) && S[sym] && S[sym].trade && S[sym].trade.active) {
         const _was = S[sym].trade._eaFailed;
         delete S[sym].trade._eaFailed;
@@ -19827,6 +19880,16 @@ app.post('/ea/event', (req, res) => {
     // trade got protected by the EA and closed on EP" — the server had booked a full stop, −$1,723,
     // for a trade the EA had taken out flat). detail = "<reason> @ <price> | total <pnl> | vol <v> | ticket <n>".
     try {
+      if (/^CLOSED$/i.test(kind) && S[sym] && !isLedgerAcct(_acct)) {
+        // secondary account close (2026-10-27): recorded on its row, never booked, never reconciles, never ends the server trade
+        try {
+          const _tkO = (detail.match(/ticket #?(\d+)/) || [])[1] || null; const _totO = parseFloat((detail.match(/total (-?[\d.]+)/) || [])[1]);
+          let _rO = null; for (let i = signalHistory.length - 1; i >= 0 && Date.now() - signalHistory[i].ts < 5 * 86400000; i--) { const h = signalHistory[i]; if (h.symbol === sym && h.outcomes && ((Array.isArray(h.outcomes.eaTicketsOther) && h.outcomes.eaTicketsOther.indexOf(_tkO) >= 0) || (Array.isArray(h.outcomes.eaTickets) && h.outcomes.eaTickets.indexOf(_tkO) >= 0))) { _rO = h; break; } }
+          if (_rO) { _rO.outcomes.eaCloseOther = _rO.outcomes.eaCloseOther || {}; _rO.outcomes.eaCloseOther[_acct] = { total: isFinite(_totO) ? _totO : null, ticket: _tkO, reason: detail.split(' @ ')[0].slice(0, 40) }; }
+          log(sym, '🧾 EA CLOSE from secondary account ' + _acct + (_tkO ? ' (ticket #' + _tkO + ')' : '') + ' — recorded only; ledger account is ' + ledgerAcct() + ' (2026-10-27).');
+        } catch (eCO) {}
+        return res.json({ ok: true, ledger: false });
+      }
       if (/^CLOSED$/i.test(kind) && S[sym]) {
         const _tot = parseFloat((detail.match(/total (-?[\d.]+)/) || [])[1]);
         const _px = parseFloat((detail.match(/@ (-?[\d.]+)/) || [])[1]);
@@ -20227,7 +20290,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.48-20261022-tp1-cost-adjusted', // bump on each deploy — lets /state verify what's live
+    build: '7.49-20261027-ledger-acct-exit-fix-benches', // bump on each deploy — lets /state verify what's live
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
@@ -20612,7 +20675,7 @@ app.get('/prices', (req, res) => {
       // signals[] it would trade rejected setups. Filter to FIRED-ONLY here so a blocked
       // signal can never reach the executor, regardless of EA logic. The `trade` object below
       // is already fired-only (set by buildCfdTrade); analytics keep full history via /signals.
-      signals: s.signals.filter(sg => !(sg && (sg._restored === true || (sg.conv && (sg.conv.enrichBlocked === true || sg.conv.label === 'BLOCKED')) || sg.pendingEntry === true || ((sym === 'XAU' || sym === 'NAS100') && sg.ts && !sg.entryActual && !sg.oteHold && (Date.now() - sg.ts < 12000 || (s.trade && s.trade.active && s.trade._oteVetted === false && s.trade.type === sg.type)))))).slice(-20), // _restored guard 2026-09-10: reboot-resurrected rows are never served to the EA (the 6.47-deploy "call with no signal" — key flipped back to the pre-fill price and the EA re-entered a 75min-old row) // STATE-based hide added 2026-09-10 (the 02:29 vet-stall leak, −$738): a row stays hidden for as long as its trade sits unvetted — the 12s clock assumed the vet runs next tick, but ATR warm-up after a deploy starved it for 3min and the EA took the naked row @4418.82. Rows un-hide the moment the vet resolves (oteHold stamped on fills AND instant releases since 6.46). // pendingEntry filter 2026-08-25 + 5s XAU youth filter 2026-09-08: the OTE vet marks pendingEntry on the NEXT TICK after fire — an EA poll landing in that ≤1s gap saw the naked row and market-entered DURING the auction (Jean's 02:03 case, EA in @4414 while the server auctioned to 4411.83). Rows younger than 5s stay hidden until the vet has claimed or released them; the EA's own entry delay (15-25s) makes this free.
+      signals: s.signals.filter(sg => !(sg && ((sg.type !== 'call' && sg.type !== 'put') /* EXIT ROWS NEVER REACH THE EA (2026-10-27): the 10/26 13:47 TRv2 '🔄EXIT' row (type exit-call) was opened by the EA as a 4-lot SELL (−$1,142) and later flattened Jean's hand call */ || sg._restored === true || (sg.conv && (sg.conv.enrichBlocked === true || sg.conv.label === 'BLOCKED')) || sg.pendingEntry === true || ((sym === 'XAU' || sym === 'NAS100') && sg.ts && !sg.entryActual && !sg.oteHold && (Date.now() - sg.ts < 12000 || (s.trade && s.trade.active && s.trade._oteVetted === false && s.trade.type === sg.type)))))).slice(-20), // _restored guard 2026-09-10: reboot-resurrected rows are never served to the EA (the 6.47-deploy "call with no signal" — key flipped back to the pre-fill price and the EA re-entered a 75min-old row) // STATE-based hide added 2026-09-10 (the 02:29 vet-stall leak, −$738): a row stays hidden for as long as its trade sits unvetted — the 12s clock assumed the vet runs next tick, but ATR warm-up after a deploy starved it for 3min and the EA took the naked row @4418.82. Rows un-hide the moment the vet resolves (oteHold stamped on fills AND instant releases since 6.46). // pendingEntry filter 2026-08-25 + 5s XAU youth filter 2026-09-08: the OTE vet marks pendingEntry on the NEXT TICK after fire — an EA poll landing in that ≤1s gap saw the naked row and market-entered DURING the auction (Jean's 02:03 case, EA in @4414 while the server auctioned to 4411.83). Rows younger than 5s stay hidden until the vet has claimed or released them; the EA's own entry delay (15-25s) makes this free.
       // OTE auction visibility (2026-09-04, Jean: "the signal disappeared from the app").
       // While OTE-HOLD auctions the entry, the signal is hidden above (by design — no
       // levels yet) and s.trade is parked, so the mobile monitor showed a black hole.
