@@ -2029,7 +2029,7 @@ function trackBlockedOutcome(sym, msg, force) {
     const _isBlockMsg = /BLOCKED|DEFERRED|REFUSED|SKIPPED|conv \d+ < \d+|below (the )?floor|too (low|weak)/i.test(msg)
       && !/DORMANT|WOULD-FIRE|EXH-REV|TREND-CONT-WF|TREND-REGIME|TREND-WT|TREND-CT|EXT-PB-|EXTREME-PULLBACK|NEWS-FADE|NEWS-CONT|ZONE-REACT|PATH-CLEAR|PATH-ZONED|ARMED \(dormant|CONF-SCORE|dormant validator|no firing effect|LC-AGREE|LC-DISAGREE|ML-DIR|EOD-CONT-WF|BIGLEG-CT-WF|FAST-PRE|LADDER-|BE-HELD|ZONE-MICRO-WF|LEVEL-PROX/i.test(msg);
     if (_isBlockMsg) {
-      s._lastBlock = s._lastBlock || {}; s._lastBlock[type] = { msg: msg.slice(0, 200), ts: now };
+      s._lastBlock = s._lastBlock || {}; s._lastBlock[type] = { msg: msg.slice(0, 200), ts: now, price: +(s.lastPrice || 0), gate: String(cohortFor(msg) || 'unmatched') }; // price + gate (2026-10-27, gate hysteresis)
       const _gj = s._gateJournal = s._gateJournal || [];
       const _det = (msg.match(/[⬆⬇]\s*([A-Z0-9_\-\/+]+)/) || [])[1] || (msg.match(/^[^A-Za-z]*([A-Z][A-Z0-9_\-\/]{2,})/) || [])[1] || '?';
       const _gate = String(cohortFor(msg) || 'unmatched');
@@ -2302,6 +2302,9 @@ function cohortFor(reason) {
   { const _bl = reason.match(/\bBTC-BIGLEG-(CONT|LATCH)\b/); if (_bl) return _bl[0]; } // continuation / latch arms (2026-10-21) — before the plain BIGLEG matches
   { const _ag = reason.match(/\bAGENT-([A-Z0-9]+)-(FILL|WAIT|SKIP)-(NOW|FILL)\b/); if (_ag) return _ag[0]; } // entry agent shadow cohorts (2026-10-09)
   { const _agU = reason.match(/\bAGENT-([A-Z0-9]+)-(UNBLOCK|UPHOLD)(-[A-Z0-9\-]+)?\b/); if (_agU) return _agU[0]; } // gate-review shadow cohorts (2026-10-21): AGENT-<MODEL>-UNBLOCK[-<GATE>]
+  if (/INV-STALE/.test(reason)) return 'INV-STALE'; // INVERSAL_BREAK refused: stale sweep / at the opposite extreme (2026-10-27)
+  if (/RR-FLOOR/.test(reason)) return 'RR-FLOOR'; // trades cancelled at birth for risk > 2× TP1 (2026-10-27)
+  if (/GATE-HYSTERESIS/.test(reason)) return 'GATE-HYST'; // same-direction candidate refused within 3 min of a judgment block at the same price (2026-10-27)
   if (/BOOT-WARMUP/.test(reason)) return 'BOOT-WARMUP'; // cold-start blocks (2026-10-14)
   { const _ld = reason.match(/\bBTC-LAD-(LIVE|ZONE|VOL|TIME|CHAND)\b/); if (_ld) return _ld[0]; } // BTC dynamic-ladder sim (2026-10-19)
   { const _rs = reason.match(/\bRUNNER-(LIVE|PCT50|STRUCT\+PCT50|STRUCT|REGIME)-(XAU|BTC|NAS100)\b/); if (_rs) return _rs[0]; } // runner-exit sim (2026-10-19)
@@ -8576,6 +8579,28 @@ function processPrice(sym, price, hi, lo) {
 
       // ── 2.0: Boot warm-up gate (2026-10-14) — no fire on a cold ATR / unloaded calendar
       { const _bw = bootWarm(sym, s); if (!_bw.ok) { Object.assign(s, _emitSnapshot); s._bwLogTs = s._bwLogTs || 0; if (Date.now() - s._bwLogTs > 60000) { s._bwLogTs = Date.now(); const _bwMsg = '🥶 ' + tagP2 + ' ' + sig.type.toUpperCase() + ' BLOCKED — BOOT-WARMUP: ' + _bw.why + '.'; log(sym, _bwMsg); } return false; } }
+      // ===== GATE HYSTERESIS (2026-10-27, Jean: "all the principles we've been working on have been forgotten") =====
+      // The 10:13 XAU TREND call: EXT-GUARD refused it at 10:12:32 (leg 8 ATR from pivot, 95% of the range, momentum
+      // fading — both agents upheld), MACD deferred it at 10:12:58, and at 10:13:10 the same candidate at the same price
+      // passed every gate because the crest arithmetic had moved a few cents. A judgment gate that says no twice and yes
+      // twelve seconds later is noise, not judgment. Rule: after a judgment-gate block, the same direction cannot fire for
+      // GATE_HYST_SEC (180 s) unless price has moved ≥ GATE_HYST_ATR (0.5×ATR) from the blocked price — i.e. the
+      // condition the gate wanted has actually happened — or the gate's own release logic stamped the candidate
+      // (MACD-DEFER release). Graded like any gate (GATE-HYST cohort: win = the refused candidate would have won).
+      try {
+        const _lbH = s._lastBlock && s._lastBlock[sig.type];
+        if (_lbH && _lbH.price > 0 && !sig._macdRelease && process.env.GATE_HYST !== '0' && /^(EXT-GUARD|SESS-EXTREME|MACD-DEFER|MOM-FLOOR|ZONE-VETO|ZONE-MICRO-WF|CT-VETO|FAST-PRE|CHOP|GRIND-RECLAIM|RSI)/.test(_lbH.gate || '')) {
+          const _hAge = (Date.now() - _lbH.ts) / 1000, _hSec = parseInt(process.env.GATE_HYST_SEC, 10) || 180;
+          const _hAtr = Math.max(s._atr || 0, 0) * (parseFloat(process.env.GATE_HYST_ATR) || 0.5);
+          const _hMove = Math.abs(price - _lbH.price);
+          if (_hAge <= _hSec && _hAtr > 0 && _hMove < _hAtr) {
+            Object.assign(s, _emitSnapshot);
+            const _hMsg = '⏲️ ' + tagP2 + ' ' + sig.type.toUpperCase() + ' BLOCKED — GATE-HYSTERESIS: ' + _lbH.gate + ' refused this direction ' + Math.round(_hAge) + 's ago @ $' + _lbH.price.toFixed(2) + ' and price has moved only $' + _hMove.toFixed(2) + ' (< 0.5×ATR $' + _hAtr.toFixed(2) + ') — a gate does not flip in seconds (2026-10-27).';
+            log(sym, _hMsg); trackBlockedOutcome(sym, _hMsg, true);
+            return false;
+          }
+        }
+      } catch (eGH) {}
       // ── 2.1: News Blackout Gate (task #189)
       // Block ALL entries when within 15min before / 30min after high-impact USD event.
       // s.newsBlackout populated by pollEconomicCalendar (Phase 1.7).
@@ -9982,6 +10007,11 @@ function processPrice(sym, price, hi, lo) {
                 if (_ecAligned) {
                   _eliteCont = true;
                   s._scalpUntil = Date.now() + 5000; // buildCfdTrade → TP1-only scalp mode
+                  // AT THE SESSION EXTREME THE SCALP GOES THROUGH THE AUCTION (2026-10-27): the 10:13 XAU TREND call was
+                  // an elite scalp born vetted → market at 95% of a $50 morning range, stopped $0.09 below the pullback
+                  // low, then +$13. Within 1×ATR of the extreme the trade is born UNVETTED like every other XAU/NAS fire
+                  // (extreme-pullback hold / OTE vet decide the fill); away from the extreme it keeps the market entry.
+                  try { const _ecExt = sig.type === 'call' ? (isFinite(s.sessionHigh) ? s.sessionHigh - price : 0) : (isFinite(s.sessionLow) ? price - s.sessionLow : 0); s._scalpAtExt = (atrVal > 0 && _ecExt < 1.0 * atrVal); if (s._scalpAtExt) log(sym, '⏸ elite scalp within ' + (_ecExt / atrVal).toFixed(2) + '×ATR of the session extreme — market entry waived, goes through the entry auction (2026-10-27).'); } catch (eEX) { s._scalpAtExt = false; }
                   log(sym, '↪️ ' + tag + ' ' + sig.type.toUpperCase() + ' — elite-continuation bypass (Phase 3.94): conv ' + _ecScore + ' + ' + _ecMatch + '/' + _ecSet.length + ' cross-asset factors + aligned 30-min drift (' + (_ecChg * 100).toFixed(2) + '%). Session-range bias waived — TP1-ONLY SCALP.');
                 }
               }
@@ -14039,9 +14069,26 @@ function processPrice(sym, price, hi, lo) {
 
       // Fire if we have at least one valid sweep-reversal in either direction
       // PUT: sweep above + reversal back below
+      // ===== INVERSAL FRESHNESS GUARD (2026-10-27) ===== A failed-breakout reversal is a trade AT the swept level, not
+      // 4 ATR away from it. The 09:45 NAS call reversed "from" a trough 150 pts (4×ATR) below, fired 0.7×ATR under the
+      // session high during a flush, stop at the trough: −$3,774. Refuse when price has already travelled more than
+      // INV_FRESH_ATR (1.5×ATR) from the swept level, or sits within 1×ATR of the OPPOSITE session extreme (a call at
+      // the session high is not a reversal from a low). Graded in shadow (INV-STALE cohort).
+      const _invStale = (dir, lvl) => {
+        try {
+          const _a = s._atr > 0 ? s._atr : 0; if (!(_a > 0)) return null;
+          const _trav = dir === 'call' ? price - lvl.level : lvl.level - price;
+          const _oppExt = dir === 'call' ? (isFinite(s.sessionHigh) ? s.sessionHigh - price : Infinity) : (isFinite(s.sessionLow) ? price - s.sessionLow : Infinity);
+          const _maxTrav = (parseFloat(process.env.INV_FRESH_ATR) || 1.5) * _a;
+          if (_trav > _maxTrav) return 'already ' + (_trav / _a).toFixed(1) + '×ATR past the swept level $' + lvl.level.toFixed(2) + ' (max 1.5×ATR)';
+          if (_oppExt < 1.0 * _a) return 'within ' + (_oppExt / _a).toFixed(2) + '×ATR of the opposite session extreme (' + (dir === 'call' ? 'high $' + s.sessionHigh.toFixed(2) : 'low $' + s.sessionLow.toFixed(2)) + ')';
+          return null;
+        } catch (e) { return null; }
+      };
       if (sweptAbove.length > 0 && s.inversalLastDir !== 'put') {
         // Find the highest level swept and the most recent ts (used for SL placement)
         const topLevel = sweptAbove.reduce((a, b) => a.extreme > b.extreme ? a : b);
+        { const _st = _invStale('put', topLevel); if (_st) { if (!s._invStaleLogTs || now2 - s._invStaleLogTs > 180000) { s._invStaleLogTs = now2; const _m = '🔄 INVERSAL_BREAK PUT BLOCKED — INV-STALE: ' + _st + ' (2026-10-27). INV-STALE'; log(sym, _m); trackBlockedOutcome(sym, _m, true); } return; } }
         const fastReversal = (now2 - topLevel.ts) <= 5 * 60 * 1000; // < 5min = sharp = high quality
         const inKZ = s.inKillzone === true;
         s.dailySignalCount++;
@@ -14107,6 +14154,7 @@ function processPrice(sym, price, hi, lo) {
       // CALL: sweep below + reversal back above
       if (sweptBelow.length > 0 && s.inversalLastDir !== 'call') {
         const botLevel = sweptBelow.reduce((a, b) => a.extreme < b.extreme ? a : b);
+        { const _st = _invStale('call', botLevel); if (_st) { if (!s._invStaleLogTs || now2 - s._invStaleLogTs > 180000) { s._invStaleLogTs = now2; const _m = '🔄 INVERSAL_BREAK CALL BLOCKED — INV-STALE: ' + _st + ' (2026-10-27). INV-STALE'; log(sym, _m); trackBlockedOutcome(sym, _m, true); } return; } }
         const fastReversal = (now2 - botLevel.ts) <= 5 * 60 * 1000;
         const inKZ = s.inKillzone === true;
         s.dailySignalCount++;
@@ -16246,7 +16294,7 @@ function processPrice(sym, price, hi, lo) {
         sendPush('🚀 ' + sym + ' ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' · SL $' + sl.toFixed(2), 'signal');
         // 2026-07-17 audit: TRv2 builds its trade manually (no buildCfdTrade), so any
         // one-shot flags armed during this signal's enrichment must be cleared here.
-        s._scalpUntil = 0; s._structSlUntil = 0;
+        s._scalpUntil = 0; s._structSlUntil = 0; s._scalpAtExt = false;
         // TRv2 THROUGH THE AUCTION (2026-09-28, Jean: "both SL'd because we fired too close
         // to the session low"): RIDE was the last detector building its trade by hand with
         // no _oteVetted flag — every RIDE fire went to market at the signal tick, including
@@ -17219,6 +17267,7 @@ function buildCfdTrade(type, price, atr, sym) {
   // TP1-only scalp (full exit at TP1, no TP2/TP3 runners). One-shot flag, 5s window.
   const _scalp = !!(sym && S[sym] && S[sym]._scalpUntil && Date.now() < S[sym]._scalpUntil);
   if (sym && S[sym]) S[sym]._scalpUntil = 0;
+  const _scalpExt = !!(_scalp && sym && S[sym] && S[sym]._scalpAtExt); if (sym && S[sym]) S[sym]._scalpAtExt = false; // one-shot, consumed here (2026-10-27)
   // Phase 3.97 (2026-07-10): structure-anchored SL from the recovery unlock (one-shot,
   // 5s window). Applied only if TIGHTER than the ATR default — structure never widens risk.
   const _structSlP = (sym && S[sym] && S[sym]._structSlUntil && Date.now() < S[sym]._structSlUntil && typeof S[sym]._structSl === 'number') ? S[sym]._structSl : null;
@@ -17274,7 +17323,12 @@ function buildCfdTrade(type, price, atr, sym) {
   const _xauTp1 = _ladder === 'WIDE' ? (parseFloat(process.env.XAU_TP1_WIDE) || 7.5) : (parseFloat(process.env.XAU_TP1) || 5.24);
   // Minimum $5 for SL and TP1 — prevents noise-level levels during low-ATR periods
   // XAU SL cap by ladder profile ($7.50 / $10 / $12.50) — keeps risk tight on gold's typical ATR range
-  const slDist = isXAU ? Math.min(Math.max(atr * mults.sl, 5), _xauSlCap) : Math.max(atr * mults.sl, 5);
+  // XAU STOP FLOOR BY LADDER (2026-10-27): LADDER-510 (a fixed −$10 stop, sequence-exact on every live XAU fire since
+  // 9/28) reads 35W/1L while the live ATR-scaled stop lost 13 of 25 last week — most of them with sl5WouldStop stamped,
+  // i.e. stopped at noise distance on a low-ATR tape (the 10:13 TREND call: 2×ATR = $5.78, stopped by $0.09, then +$13).
+  // BASE now carries the measured $10 stop (XAU_SL_BASE_FLOOR), TIGHT its $7.50 cap, WIDE stays ATR-scaled ≤ $12.50.
+  const _xauSlFloor = _ladder === 'BASE' ? (parseFloat(process.env.XAU_SL_BASE_FLOOR) || 10) : _ladder === 'TIGHT' ? (parseFloat(process.env.XAU_SL_TIGHT) || 7.5) : 5;
+  const slDist = isXAU ? Math.min(Math.max(atr * mults.sl, _xauSlFloor), _xauSlCap) : Math.max(atr * mults.sl, 5);
   // XAU TP1 hard-capped (added 2026-05-19, regime-adaptive 2026-09-28): fast profit-secure
   // since the SL→breakeven scratch logic depends on TP1 hitting; $7.50 on TREND with-trend.
   // NAS TP1 min floor raised $5 → $30 (added 2026-05-25): NAS at $29k+ makes $5 floor
@@ -17413,7 +17467,7 @@ function buildCfdTrade(type, price, atr, sym) {
     // timing-critical — born vetted, never held.
     // BUG FIX 2026-09-10: was `sym !== 'XAU'` — NAS100 trades were born already-vetted,
     // so the NAS OTE auction shipped in 6.44 never engaged (the vet requires === false).
-    _oteVetted: (sym !== 'XAU' && sym !== 'NAS100') || _vRecActive || _scalp,
+    _oteVetted: (sym !== 'XAU' && sym !== 'NAS100') || _vRecActive || (_scalp && !_scalpExt), // elite scalp at the session extreme auctions like everyone else (2026-10-27)
     _ladder: _ladder // WIDE | TIGHT | BASE — regime-adaptive ladder profile (2026-09-28)
   };
 }
@@ -17429,8 +17483,8 @@ function attachTpSl(sig, type, price, atr, sym) {
     ? { sl: 2, t1: 3, t2: 6, t3: 12 }
     : { sl: 2, t1: 1.5, t2: 2.5, t3: 4 };
   // XAU TP1 hard-capped at $5 (mirrors buildCfdTrade — added 2026-05-19)
-  const tp1D = isXAU ? 5.0 : Math.max(atr * mults.t1, 5);
-  const slD = isXAU ? Math.min(Math.max(atr * mults.sl, 5), 10) : Math.max(atr * mults.sl, 5);
+  const tp1D = isXAU ? (parseFloat(process.env.XAU_TP1) || 5.24) : Math.max(atr * mults.t1, 5); // 5.24 cost-adjusted (2026-10-22)
+  const slD = isXAU ? Math.min(Math.max(atr * mults.sl, parseFloat(process.env.XAU_SL_BASE_FLOOR) || 10), 10) : Math.max(atr * mults.sl, 5); // $10 floor (2026-10-27) — the row shows what the trade carries
   // Birth-order enforcement (2026-09-17): XAU's TP1 is a fixed $5 while TP2/TP3 are
   // ATR multiples — in a dead-ATR tape the ATR ladder can be born INSIDE TP1 (the
   // 03:10 call's inverted panel). Never emit tp2 nearer than tp1, or tp3 nearer than tp2.
@@ -17610,6 +17664,32 @@ function checkExit(sym, price) {
   // --- CFD trades (XAU/BTC/NAS100) — ATR-based price levels ---
   if (t.isCfd && t.slPrice) {
     const now = Date.now();
+    // ===== RISK:REWARD FLOOR AT BIRTH (2026-10-27, Jean: "reward proportional to loss") ===== The 09:45 NAS
+    // INVERSAL_BREAK call filled at 29464.75 with the stop at the swept trough 116 pts below (3.3×ATR) and TP1 50 pts
+    // above: 2.3× more risk than reward, −$3,774. Every ladder in this system is ≤2:1 by design (5.24/10, 7.5/12.5,
+    // NAS 1.5×/2×ATR); a trade born outside that is a construction error, not a setup. Checked once on the trade's
+    // first tick (the EA has not entered yet — rows are hidden for 5 s and its own entry wait is 15 s): risk >
+    // RR_MAX (2.05) × TP1 distance → the trade is cancelled and graded in shadow (RR-FLOOR cohort). Lanes promoted
+    // with their own measured geometry (BIGLEG, RANGE5, SESS-REJ, PATH) and hand trades are exempt.
+    try {
+      if (!t._rrChecked) {
+        t._rrChecked = true;
+        const _rrMax = parseFloat(process.env.RR_MAX) || 2.05;
+        const _rrRisk = Math.abs((+t.ep) - (+t.slPrice)), _rrTp = Math.abs((+t.tp1Price) - (+t.ep));
+        const _rrExempt = t._r5Live || t._legLive || t._sessLive || t._pathLive || t._manual || t._adopted || !(_rrTp > 0);
+        if (!_rrExempt && _rrRisk > _rrMax * _rrTp) {
+          const _rrM = '📐 ' + t.type.toUpperCase() + ' CANCELLED AT BIRTH — RR-FLOOR: risk $' + _rrRisk.toFixed(2) + ' vs TP1 $' + _rrTp.toFixed(2) + ' = ' + (_rrRisk / _rrTp).toFixed(2) + '× (max ' + _rrMax + '×); SL $' + (+t.slPrice).toFixed(2) + ' / TP1 $' + (+t.tp1Price).toFixed(2) + ' from $' + (+t.ep).toFixed(2) + ' (2026-10-27). RR-FLOOR';
+          log(sym, _rrM);
+          try { sendPush('📐 ' + sym + ' ' + t.type.toUpperCase() + ' cancelled — risk ' + (_rrRisk / _rrTp).toFixed(1) + '× the target', 'SL $' + _rrRisk.toFixed(2) + ' vs TP1 $' + _rrTp.toFixed(2) + ' — a trade is not born with more risk than reward (RR-FLOOR)', 'signal'); } catch (eP) {}
+          try { const _h = s.lastHistEntry; if (_h && _h.symbol === sym) { _h.outcomes = _h.outcomes || {}; _h.outcomes.rrCancelled = +(_rrRisk / _rrTp).toFixed(2); _h.pendingEntry = true; _h.oteHold = 'rr-floor-cancelled'; } } catch (eH) {}
+          s.blockedOutcomes = s.blockedOutcomes || [];
+          s.blockedOutcomes.push({ ts: now, time: ts(), symbol: sym, detector: 'RR-FLOOR', type: t.type, price: +(+t.ep).toFixed(2), virtualTp1: +(+t.tp1Price).toFixed(2), virtualSl: +(+t.slPrice).toFixed(2), maxMin: 240, blockReason: _rrM, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+          if (s.closeRequest && s.closeRequest.active) s.closeRequest = null;
+          s.trade = { active: false };
+          return;
+        }
+      }
+    } catch (eRR) {}
     // Track best price for trailing
     if (iC && price > t.bestPrice) t.bestPrice = price;
     if (!iC && price < t.bestPrice) t.bestPrice = price;
@@ -20290,7 +20370,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.49-20261027-ledger-acct-exit-fix-benches', // bump on each deploy — lets /state verify what's live
+    build: '7.50-20261027-principles-hysteresis-rr-stopfloor', // bump on each deploy — lets /state verify what's live
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
