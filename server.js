@@ -2818,6 +2818,41 @@ process.on('SIGINT', () => { _flushPersist(); process.exit(0); });
 // price runs away without the pullback → TD-PULLBACK-LEFT at the refusal price (what the wait cost); window closes →
 // TD-PULLBACK-EXPIRED at the refusal price. Promotion bar, pre-registered: FILL ≥60% W/(W+L) over ≥25 resolved AND
 // (FILL wins − FILL losses) > LEFT wins. TD_PULLBACK=0 kills it. Nothing fires from this.
+// ===== LIVE-LANE BENCH, ENFORCED (2026-10-27, Jean: "BTC took the wrong decisions too many times") ===== The BIGLEG lane's
+// pre-registered rule ("net-negative over 6 live fires → back to shadow") lived in a comment; the lane went 1W/5L
+// (−$1,942 on the account, 10/20→10/27) and kept firing. Generic rule for any live lane: the last 6 filled fires'
+// ACCOUNT results (EA close totals, else the server booking) net-negative → the lane is benched (shadow rows keep
+// grading); it re-arms by itself when the lane's shadow cohort reads ≥60% W/(W+L) over ≥15 rows resolved since the
+// bench. LANE_BENCH=0 disables the automatic bench (the manual kill switches still apply).
+global._laneBench = global._laneBench || {};
+function liveLaneBenched(sym, scoreRe, cohort) {
+  try {
+    if (process.env.LANE_BENCH === '0') return false;
+    const key = sym + '|' + cohort, now = Date.now(), c = global._laneBench[key];
+    if (c && now - c.ts < 60000) return c.benched;
+    const fills = [];
+    for (const h of signalHistory) {
+      if (h.symbol !== sym || h.manual || !scoreRe.test(h.score || '') || !h.outcomes || !(h.outcomes.eaFill || h.outcomes.eaFailedThenFilled)) continue;
+      const o = h.outcomes; let res = null;
+      if (o.eaClose && isFinite(o.eaClose.total)) res = +o.eaClose.total;
+      else if ((o.slHit || o.tp3Hit || o.scalpExit || o.endedByEa) && isFinite(h.booked)) res = +h.booked;
+      if (res === null) continue;
+      fills.push({ ts: h.ts, res });
+    }
+    const last6 = fills.slice(-6); const net = last6.reduce((a, b) => a + b.res, 0);
+    let benched = last6.length >= 6 && net < 0, since = benched ? last6[last6.length - 1].ts : 0, shadow = null;
+    if (benched) {
+      const st = S[sym]; let w = 0, l = 0;
+      for (const b of (st && st.blockedOutcomes) || []) { if (b.ts <= since || !b.closed) continue; if (String(cohortFor(b.blockReason || '') || b.detector) !== cohort) continue; if (b.outcome === 'win') w++; else if (b.outcome === 'loss') l++; }
+      shadow = { w, l };
+      if (w + l >= 15 && w / (w + l) >= 0.6) benched = false; // re-armed on the shadow bar
+    }
+    const prev = c ? c.benched : null;
+    global._laneBench[key] = { ts: now, benched, since, net: +net.toFixed(2), n: last6.length, shadow };
+    if (prev !== benched) { const m = '🛏️ ' + cohort + ' live lane ' + (benched ? 'BENCHED' : 'RE-ARMED') + ' — last ' + last6.length + ' filled fires net ' + (net >= 0 ? '+' : '') + '$' + net.toFixed(0) + (shadow ? ' · shadow since bench ' + shadow.w + 'W/' + shadow.l + 'L' : '') + ' (enforced bench rule, 2026-10-27).'; log(sym, m); try { sendPush('🛏️ ' + cohort + ' ' + (benched ? 'benched' : 're-armed'), 'last 6 fills net $' + net.toFixed(0), 'alert'); } catch (e) {} }
+    return benched;
+  } catch (e) { return false; }
+}
 function tdPullbackArm(sym, s, sig, price, gate) {
   try {
     if (process.env.TD_PULLBACK === '0' || !s || !sig || !(price > 0)) return;
@@ -4818,7 +4853,7 @@ function processPrice(sym, price, hi, lo) {
               if (_bLiveOk && process.env.BTC_BIGLEG_LIVE !== '0' && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold && _bR > _bMaxR) {
                 log(sym, '🦵 BTC-BIGLEG ' + _bDir.toUpperCase() + ' NOT fired live — entry $' + price.toFixed(0) + ' sits $' + _bR.toFixed(0) + ' (' + (_bR / _bAdr).toFixed(2) + '×ADR) from the pivot stop $' + _bSl.toFixed(0) + ' > 0.35×ADR $' + _bMaxR.toFixed(0) + ': too far into the leg for a 1R target (geometry guard 2026-10-09). Shadow row measured.');
               }
-              if (_bLiveOk && process.env.BTC_BIGLEG_LIVE !== '0' && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold && _bR <= _bMaxR && bootWarm(sym, s).ok) { // !_bRng: no live leg fires in RANGE regime (2026-09-24)
+              if (_bLiveOk && process.env.BTC_BIGLEG_LIVE !== '0' && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold && _bR <= _bMaxR && bootWarm(sym, s).ok && !liveLaneBenched('BTC', /BIGLEG/, 'BTC-BIGLEG')) { // !_bRng: no live leg fires in RANGE regime (2026-09-24) // enforced bench (2026-10-27)
                 const _lTp1 = _bDir === 'call' ? +(price + Math.max(0.25 * _bAdr, _bR)).toFixed(2) : +(price - Math.max(0.25 * _bAdr, _bR)).toFixed(2); // ≥ 1R (guard 2026-10-09)
                 // TP2 explicit 0.5×ADR (2026-09-29, Jean's monitor screenshot): the live lane
                 // had been reusing the SHADOW target (_bTp), which 6.88 cut to 0.25×ADR — so
@@ -19566,6 +19601,16 @@ function entryAgentSnapshot(sym, s, ctx) {
     opposing_zones_ahead: ahead, inside_opposing_zone: inside, supporting_zones_behind: behind,
     m5_bars_last12_time_o_h_l_c: m5, m1_closes_last20: m1,
     news: { blackout: !!nb.active, next_event: nb.eventName ? (nb.eventName + ' in ' + nb.minutesUntil + ' min (' + (nb.impact || '?') + ')') : null },
+    // the clearer picture (2026-10-27): the day so far, the trend's age, the higher timeframe, a 3-hour M15 view
+    trend_context: { trend_day_latch: (s._tdLatch && (Date.now() - s._tdLatch.ts) < 600000) ? { dir: s._tdLatch.dir, with_candidate: s._tdLatch.dir === dir } : null, ms_trend_run: (s._msTrend && s._msTrendTs) ? { dir: s._msTrend, minutes: Math.round((Date.now() - s._msTrendTs) / 60000), travelled_atr: (s._msTrendP0 > 0 && atr > 0) ? +(Math.abs(price - s._msTrendP0) / atr).toFixed(1) : null } : null, h1_direction: s.htf1h_dir || null, day_regime_5d: s._lastRegime ? { dir: s._lastRegime.dir, net_pct: s._lastRegime.netChgPct } : null },
+    session_story: (function () { try {
+      const today = todayDateET();
+      const fired = signalHistory.filter(h => h.symbol === sym && h.date === today && /^(call|put)$/.test(h.type) && !(h.conv && h.conv.enrichBlocked) && h.outcomes && (h.outcomes.eaFill || h.manual)).slice(-8).map(h => ({ time: h.time.slice(0, 5), dir: h.type, det: String(h.score || '').replace(/[⬆⬇]/g, ''), hand: !!h.manual || undefined, result: h.outcomes.tp3Hit ? 'TP3' : h.outcomes.tp2Hit ? 'TP2' : h.outcomes.slHit ? (h.outcomes.tp1Hit ? 'TP1 then stop' : 'STOP') : h.outcomes.tp1Hit ? 'TP1' : 'open', pnl_unit: (h.outcomes.closePrice && h.price) ? +((h.type === 'call' ? h.outcomes.closePrice - +h.price : +h.price - h.outcomes.closePrice)).toFixed(2) : null }));
+      const cutoff = Date.now() - 3 * 3600000;
+      const refused = (s.blockedOutcomes || []).filter(b => b.ts >= cutoff && b.closed && b.outcome && b.outcome !== 'no_resolve' && /BLOCKED|DEFERRED|REFUSED/.test(b.blockReason || '') && !/DORMANT|WOULD-FIRE|CONF-SCORE|AGENT|TREND-CONT-WF|LC-|ML-DIR|PATH-|ZONE-PERM/.test(b.blockReason || '')).slice(-10).map(b => ({ time: b.time.slice(0, 5), dir: b.type, gate: String(cohortFor(b.blockReason || '') || '?'), graded: b.outcome, ran: b.mfe != null ? +(+b.mfe).toFixed(2) : null }));
+      return { fired_today: fired, refused_last_3h_graded: refused, note: 'graded = what the refused candidate would have done on its own bracket (win = the gate was wrong)' };
+    } catch (e) { return null; } })(),
+    m15_bars_last12_time_o_h_l_c: (function () { try { const M = Array.isArray(s._m5) ? s._m5.slice(-36) : []; const out = []; for (let i = 0; i + 3 <= M.length; i += 3) { const g = M.slice(i, i + 3); out.push([etClock(g[0].ts), +(+g[0].o).toFixed(2), +Math.max(...g.map(b => +b.h)).toFixed(2), +Math.min(...g.map(b => +b.l)).toFixed(2), +(+g[2].c).toFixed(2)]); } return out.slice(-12); } catch (e) { return null; } })(),
     lane_stats_7d: entryAgentLaneStats(sym, ctx.detector),
     zone_ledger_buckets: (function () { try { const b = zoneStats(sym); const o = {}; for (const k of Object.keys(b).sort()) { const v = b[k]; if (!(v.held + v.broken)) continue; o[k.replace('|', ' ').replace('|', ' ')] = (v.holdRate == null ? '?' : v.holdRate + '% hold') + ' (' + (v.held + v.broken) + ' tested, grade ' + v.grade + ')'; } return o; } catch (e) { return null; } })(),
     trade_ladder: { sl: t.slPrice, tp1: t.tp1Price, tp2: t.tp2Price, tp3: t.tp3Price, sl_dist_atr: A(Math.abs((t.ep || price) - (t.slPrice || price))), tp1_dist_atr: A(Math.abs((t.ep || price) - (t.tp1Price || price))), scalp: !!t.scalp },
@@ -19656,6 +19701,7 @@ function entryAgentConsult(sym, s, ctx) {
         if (_peers.length >= models.length && _peers.every(x => x.action === 'skip')) {
           const _hv = ctx.histTs ? signalHistory.find(x => x.ts === ctx.histTs && x.symbol === sym) : null;
           if (_hv) { _hv.outcomes = _hv.outcomes || {}; _hv.outcomes.agentWouldVeto = _peers.map(x => x.short).join('+'); }
+          if (ctx.detector !== 'HAND' && agentVetoArmed()) agentVetoApply(sym, s, ctx, _peers); // LIVE veto once the bar is met (2026-10-27)
           log(sym, '🤖 ENTRY-AGENT CONSENSUS SKIP on a live ' + String(ctx.detector || '').replace(/[⬆⬇]/g, '') + ' ' + ctx.dir.toUpperCase() + ' — ' + _peers.map(x => x.short + ': "' + (x.reason || '').slice(0, 90) + '"').join(' · ') + ' [would-veto stamped on the row; shadow]');
         }
       } catch (eCV) {}
@@ -19679,6 +19725,49 @@ const GATE_AGENT_SYSTEM = [
   'Judgment to apply: a gate is usually right when the candidate runs into a FRESH (<4h) untested opposing zone, when momentum is fading or reversing (accel=fading/reversing), when the leg has already run ≥2 ATR, when the candidate is counter-trend (ms=CT) or against the trend-day latch, or in RANGE regime away from a session extreme. A gate is more often wrong when the opposing zone is OLD or already tested 2+ times, momentum is accelerating with the candidate (macdB with/strong-with, accel=accel), the leg is young (<1 ATR from pivot), the candidate is with-trend on a latched trend day, and the tape is thick. Weigh gate.ledger over these priors when it has ≥10 rows in a bucket.',
   'Answer with ONE JSON object and nothing else: {"action":"unblock"|"uphold","confidence":<0..1>,"reason":"<max 160 chars, concrete: cite the numbers that decided it>"}'
 ].join('\n');
+// ===== AGENT VETO — LIVE ON ITS PRE-REGISTERED BAR (2026-10-27, Jean: "the AI agent is the solution") =====
+// The consensus SKIP (every consulted model says skip on a live fire) has been graded in shadow since 10/15. Bar, set
+// on 10/27 before the data came in: ≥70% right over ≥15 resolved consensus verdicts (rolling 30 days; right = the fire
+// lost, wrong = it won). agentVetoArmed() reads the scoreboard every minute and arms itself the moment the bar is met —
+// no deploy. AGENT_VETO_LIVE=1 forces on, =0 forces off. Applied at the consult: an unfilled trade or an armed hold is
+// cancelled before the EA enters (row hidden); a trade the EA has already filled is flattened through the close request
+// (source agent-veto). Hand trades are never vetoed (coach only). Every veto stamps the row (agentVeto) and keeps the
+// bracket grading so the scoreboard keeps auditing the live rule.
+function agentVetoStats() {
+  const since = Date.now() - 30 * 86400000; const byKey = {};
+  for (const d of entryAgent.decisions) { if (d.kind === 'unblock' || d.err || d.ts < since || d.detector === 'HAND') continue; const k = d.sym + '|' + d.ts + '|' + d.dir; (byKey[k] = byKey[k] || []).push(d); }
+  const models = entryAgentModels().length; let right = 0, wrong = 0, pending = 0;
+  for (const k in byKey) { const P = byKey[k]; if (P.length < models || !P.every(x => x.action === 'skip')) continue; const o = P[0].nowOutcome; if (o === 'loss') right++; else if (o === 'win') wrong++; else if (!o) pending++; }
+  const n = right + wrong; return { right, wrong, pending, n, pct: n ? Math.round(100 * right / n) : null };
+}
+function agentVetoArmed() {
+  try {
+    if (process.env.AGENT_VETO_LIVE === '0') return false;
+    if (process.env.AGENT_VETO_LIVE === '1') return true;
+    const now = Date.now(); if (global._agVetoCache && now - global._agVetoCache.ts < 60000) return global._agVetoCache.armed;
+    const st = agentVetoStats(); const minN = parseInt(process.env.AGENT_VETO_MIN, 10) || 15, bar = parseFloat(process.env.AGENT_VETO_BAR) || 0.70;
+    const armed = st.n >= minN && (st.right / st.n) >= bar;
+    if (global._agVetoCache && global._agVetoCache.armed !== armed) { console.log('[' + ts() + '] 🤖 AGENT VETO ' + (armed ? 'ARMED' : 'DISARMED') + ' — consensus-skip scoreboard ' + st.right + ' right / ' + st.wrong + ' wrong (' + st.pct + '%, bar ' + Math.round(bar * 100) + '% over ' + minN + ').'); try { sendPush('🤖 AGENT VETO ' + (armed ? 'ARMED' : 'DISARMED'), st.right + ' right / ' + st.wrong + ' wrong (' + st.pct + '%)', 'alert'); } catch (e) {} }
+    global._agVetoCache = { ts: now, armed, st };
+    return armed;
+  } catch (e) { return false; }
+}
+function agentVetoApply(sym, s, ctx, peers) {
+  try {
+    const dir = ctx.dir, why = peers.map(x => x.short + ': "' + (x.reason || '').slice(0, 100) + '"').join(' · ');
+    const row = ctx.histTs ? signalHistory.find(x => x.ts === ctx.histTs && x.symbol === sym) : ((s.lastHistEntry && s.lastHistEntry.symbol === sym && s.lastHistEntry.type === dir) ? s.lastHistEntry : null);
+    let how = null;
+    const t = s.trade && s.trade.active && s.trade.type === dir ? s.trade : null;
+    const filled = !!(t && t._fills && Object.keys(t._fills).length);
+    if (s._oteHold && s._oteHold.dir === dir) { s._oteHold = null; how = 'hold cancelled before the fill'; }
+    else if (t && !filled) { if (s.closeRequest && s.closeRequest.active) s.closeRequest = null; s.trade = { active: false }; how = 'trade cancelled before the EA entered'; }
+    else if (t && filled) { if (!(s.closeRequest && s.closeRequest.active)) s.closeRequest = { active: true, id: 'agent-veto-' + Date.now(), ts: Date.now(), type: dir, ep: t.ep || 0, source: 'agent-veto' }; t._agentVetoExit = true; how = 'EA already filled — flatten requested'; }
+    else return;
+    if (row) { row.outcomes = row.outcomes || {}; row.outcomes.agentVeto = peers.map(x => x.short).join('+'); row.outcomes.agentVetoHow = how; if (how !== 'EA already filled — flatten requested') { row.pendingEntry = true; row.oteHold = 'agent-veto'; } }
+    log(sym, '🤖 AGENT VETO (LIVE) — ' + String(ctx.detector || '').replace(/[⬆⬇]/g, '') + ' ' + dir.toUpperCase() + ' @ $' + (+ctx.price).toFixed(2) + ': ' + how + ' — ' + why + ' [consensus skip; graded on the row bracket]');
+    try { sendPush('🤖 AGENT VETO — ' + sym + ' ' + dir.toUpperCase() + ' ' + (how.indexOf('flatten') >= 0 ? 'flattened' : 'cancelled'), peers[0].reason ? peers[0].reason.slice(0, 120) : how, 'signal'); } catch (eP) {}
+  } catch (e) { try { log(sym, '⚠️ agent veto apply error: ' + String(e).slice(0, 120)); } catch (e2) {} }
+}
 // What this gate's ledger says about rows like this one (resolved, stamped, last 21 days)
 function gateLedgerFor(sym, gate, feat) {
   try {
@@ -19696,7 +19785,11 @@ function gateAgentConsult(sym, s, row, msg) {
     const gate = String(cohortFor(msg) || row.detector || 'unmatched');
     if (!GATE_AGENT_RE.test(gate)) return;
     const now = Date.now();
-    if (now - (s._agUnblockTs || 0) < (parseInt(process.env.AGENT_UNBLOCK_MIN_SEC, 10) || 300) * 1000) return; s._agUnblockTs = now;
+    s._agUnblockTs2 = s._agUnblockTs2 || {}; const _lastU = s._agUnblockTs2[row.type] || { ts: 0, price: 0 };
+    const _minSec = parseInt(process.env.AGENT_UNBLOCK_MIN_SEC, 10) || 90; // 300 → 90 s per symbol+direction (2026-10-27: the agent decides, so it must see the candidates)
+    if (now - _lastU.ts < _minSec * 1000) return;
+    if (now - _lastU.ts < 180000 && s._atr > 0 && Math.abs(+row.price - _lastU.price) < 0.25 * s._atr) return; // same candidate at the same price within 3 min — one verdict is enough
+    s._agUnblockTs2[row.type] = { ts: now, price: +row.price };
     const price = +row.price, dir = row.type, atr = s._atr || 0;
     const fake = { ep: price, slPrice: row.virtualSl, tp1Price: row.virtualTp1, tp2Price: row.virtualTp1, tp3Price: row.virtualTp1, scalp: true };
     const models = entryAgentModels();
@@ -19834,7 +19927,8 @@ app.get('/agent', (req, res) => {
     for (const k in board) { const b = board[k]; b.avgMs = b.decisions ? Math.round(b._ms / b.decisions) : 0; delete b._ms; const w = b.fill.win + b.wait.filled_win + b.skip.avoided_loss + b.wait.unfilled_avoided_loss, l = b.fill.loss + b.wait.filled_loss + b.skip.missed_win + b.wait.unfilled_missed_win; b.agentScore = { right: w, wrong: l, pct: (w + l) ? +(100 * w / (w + l)).toFixed(0) : null, note: 'right = fills/wait-fills that won + skips/unfilled waits that avoided a loss; wrong = fills that lost + skips/unfilled waits that missed a win' }; b.ruleScore = { win: b.rule.win, loss: b.rule.loss, pct: (b.rule.win + b.rule.loss) ? +(100 * b.rule.win / (b.rule.win + b.rule.loss)).toFixed(0) : null }; }
     const st = entryAgent.stats;
     const cost = { calls: st.calls, errors: st.errors, avgMs: st.calls ? Math.round(st.msSum / st.calls) : 0, inTok: st.inTok, outTok: st.outTok, lastErr: st.lastErr, lastErrAt: st.lastErrTs ? new Date(st.lastErrTs).toISOString() : null };
-    res.json({ enabled: entryAgentEnabled(), mode: 'shadow', gateReview: { enabled: entryAgentEnabled() && process.env.AGENT_UNBLOCK !== '0', gates: GATE_AGENT_RE.source, minSec: parseInt(process.env.AGENT_UNBLOCK_MIN_SEC, 10) || 300, bar: 'UNBLOCK verdicts ≥60% winners over ≥25 resolved per gate, and UPHOLD verdicts at least as right as the gate itself (see /gate-score)' }, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', bar: 'agent beats the rule by ≥8 pts of W/(W+L) over ≥40 decisions, or ≥60% on its own', since: new Date(since).toISOString(), board, cost, waitsOpen: Object.fromEntries(Object.entries(entryAgent.waits).map(([k, v]) => [k, v.length])), recent: D.slice(-(parseInt(req.query.limit, 10) || 30)).reverse().map(d => ({ time: d.time, sym: d.sym, dir: d.dir, det: d.detector, kind: d.kind || 'entry', gate: d.gate || undefined, model: d.short, action: d.action, limit: d.limit, window: d.windowSec, conf: d.confidence, reason: d.reason, err: d.err || undefined, rule: d.rule, nowOutcome: d.nowOutcome || null, waitResult: d.waitResult || null, fillOutcome: d.fillOutcome || null, ruleOutcome: d.ruleOutcome || null, ms: d.ms })) });
+    const _vs = agentVetoStats();
+    res.json({ enabled: entryAgentEnabled(), mode: agentVetoArmed() ? 'VETO LIVE (consensus skip cancels/flattens live fires); entries still rule-based' : 'shadow', veto: { armed: agentVetoArmed(), right: _vs.right, wrong: _vs.wrong, pending: _vs.pending, pct: _vs.pct, bar: (Math.round((parseFloat(process.env.AGENT_VETO_BAR) || 0.70) * 100)) + '% over ' + (parseInt(process.env.AGENT_VETO_MIN, 10) || 15) + ' (rolling 30d)', force: process.env.AGENT_VETO_LIVE || null }, gateReview: { enabled: entryAgentEnabled() && process.env.AGENT_UNBLOCK !== '0', gates: GATE_AGENT_RE.source, minSec: parseInt(process.env.AGENT_UNBLOCK_MIN_SEC, 10) || 90, bar: 'UNBLOCK verdicts ≥60% winners over ≥25 resolved per gate, and UPHOLD verdicts at least as right as the gate itself (see /gate-score)' }, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', bar: 'agent beats the rule by ≥8 pts of W/(W+L) over ≥40 decisions, or ≥60% on its own', since: new Date(since).toISOString(), board, cost, waitsOpen: Object.fromEntries(Object.entries(entryAgent.waits).map(([k, v]) => [k, v.length])), recent: D.slice(-(parseInt(req.query.limit, 10) || 30)).reverse().map(d => ({ time: d.time, sym: d.sym, dir: d.dir, det: d.detector, kind: d.kind || 'entry', gate: d.gate || undefined, model: d.short, action: d.action, limit: d.limit, window: d.windowSec, conf: d.confidence, reason: d.reason, err: d.err || undefined, rule: d.rule, nowOutcome: d.nowOutcome || null, waitResult: d.waitResult || null, fillOutcome: d.fillOutcome || null, ruleOutcome: d.ruleOutcome || null, ms: d.ms })) });
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
@@ -20435,7 +20529,8 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.51-20261027-latch-runner-td-pullback', // bump on each deploy — lets /state verify what's live
+    build: '7.53-20261027-lane-bench-enforced', // bump on each deploy — lets /state verify what's live
+    laneBench: global._laneBench || {}, // enforced live-lane bench state (2026-10-27)
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
