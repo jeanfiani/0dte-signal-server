@@ -2302,6 +2302,8 @@ function cohortFor(reason) {
   { const _bl = reason.match(/\bBTC-BIGLEG-(CONT|LATCH)\b/); if (_bl) return _bl[0]; } // continuation / latch arms (2026-10-21) — before the plain BIGLEG matches
   { const _ag = reason.match(/\bAGENT-([A-Z0-9]+)-(FILL|WAIT|SKIP)-(NOW|FILL)\b/); if (_ag) return _ag[0]; } // entry agent shadow cohorts (2026-10-09)
   { const _agU = reason.match(/\bAGENT-([A-Z0-9]+)-(UNBLOCK|UPHOLD)(-[A-Z0-9\-]+)?\b/); if (_agU) return _agU[0]; } // gate-review shadow cohorts (2026-10-21): AGENT-<MODEL>-UNBLOCK[-<GATE>]
+  if (/LATCH-RUNNER/.test(reason)) return 'LATCH-RUNNER'; // latch-day runner: remainder exit vs TP2 (2026-10-27)
+  if (/TD-PULLBACK-(FILL|LEFT|EXPIRED)/.test(reason)) return reason.match(/TD-PULLBACK-(FILL|LEFT|EXPIRED)/)[0]; // latch-day pullback auction, shadow (2026-10-27)
   if (/INV-STALE/.test(reason)) return 'INV-STALE'; // INVERSAL_BREAK refused: stale sweep / at the opposite extreme (2026-10-27)
   if (/RR-FLOOR/.test(reason)) return 'RR-FLOOR'; // trades cancelled at birth for risk > 2× TP1 (2026-10-27)
   if (/GATE-HYSTERESIS/.test(reason)) return 'GATE-HYST'; // same-direction candidate refused within 3 min of a judgment block at the same price (2026-10-27)
@@ -2806,8 +2808,56 @@ function _flushPersist() {
 process.on('SIGTERM', () => { _flushPersist(); process.exit(0); });
 process.on('SIGINT', () => { _flushPersist(); process.exit(0); });
 
+// ===== TD-PULLBACK — LATCH-DAY PULLBACK AUCTION, SHADOW (2026-10-27, Jean: "it's mainly a question of timing") =====
+// This morning on XAU, 20+ with-trend call candidates between 4011 and 4034 were refused — 15 would have won — mostly by
+// MACD-DEFER (the MACD line dips below zero on every pullback of a trend day, which is exactly where the entry belongs),
+// and the only window the gate set allowed was the crest (10:13, stopped). The ledger says a blanket unblock loses
+// (MACD-DEFER refusals won 31% all-time at the refused price), so the question is the AUCTION: on a latched with-trend
+// day, a MACD-DEFER / MOM-FLOOR refusal arms a virtual limit TD_PB_ATR (0.4×ATR) back from the refusal, 5-min window,
+// leash 1×ATR. Touch → TD-PULLBACK-FILL bracket from the limit (XAU $10 stop / $5.24 target; NAS 2×ATR / 1.5×ATR);
+// price runs away without the pullback → TD-PULLBACK-LEFT at the refusal price (what the wait cost); window closes →
+// TD-PULLBACK-EXPIRED at the refusal price. Promotion bar, pre-registered: FILL ≥60% W/(W+L) over ≥25 resolved AND
+// (FILL wins − FILL losses) > LEFT wins. TD_PULLBACK=0 kills it. Nothing fires from this.
+function tdPullbackArm(sym, s, sig, price, gate) {
+  try {
+    if (process.env.TD_PULLBACK === '0' || !s || !sig || !(price > 0)) return;
+    if (!(sym === 'XAU' || sym === 'NAS100')) return;
+    if (!tdLatchEase(s, sig.type)) return; // latched with-trend day only
+    const atr = s._atr > 0 ? s._atr : 0; if (!(atr > 0)) return;
+    const now = Date.now(); s._tdPbTs = s._tdPbTs || {};
+    if (now - (s._tdPbTs[sig.type] || 0) < 180000) return; s._tdPbTs[sig.type] = now;
+    const iC = sig.type === 'call'; const pb = (parseFloat(process.env.TD_PB_ATR) || 0.4) * atr;
+    const o = { dir: sig.type, det: String(sig.score || '?').replace(/[⬆⬇]/g, ''), gate, armPrice: +price.toFixed(2), limit: +(iC ? price - pb : price + pb).toFixed(2), leash: atr * (parseFloat(process.env.TD_PB_LEASH_ATR) || 1.0), expiry: now + (parseInt(process.env.TD_PB_SEC, 10) || 300) * 1000, ts: now, atr };
+    s._tdPb = s._tdPb || []; s._tdPb.push(o); if (s._tdPb.length > 6) s._tdPb.shift();
+    log(sym, '🪜 TD-PULLBACK armed (shadow) — ' + o.det + ' ' + sig.type.toUpperCase() + ' refused by ' + gate + ' @ $' + o.armPrice.toFixed(2) + ' on a latched with-trend day → virtual limit $' + o.limit.toFixed(2) + ' (0.4×ATR back), 5 min, leash 1×ATR (2026-10-27).');
+  } catch (e) {}
+}
+function tdPullbackTick(sym, s, price) {
+  try {
+    const W = s._tdPb; if (!W || !W.length || !(price > 0)) return;
+    const now = Date.now(); const keep = [];
+    for (const o of W) {
+      const iC = o.dir === 'call';
+      const touched = iC ? price <= o.limit : price >= o.limit;
+      const left = iC ? price >= o.armPrice + o.leash : price <= o.armPrice - o.leash;
+      const expired = now >= o.expiry;
+      if (!touched && !left && !expired) { keep.push(o); continue; }
+      const kind = touched ? 'FILL' : left ? 'LEFT' : 'EXPIRED';
+      const ep = touched ? o.limit : o.armPrice;
+      const slD = sym === 'XAU' ? (parseFloat(process.env.XAU_SL_BASE_FLOOR) || 10) : Math.max(2 * o.atr, 5);
+      const tpD = sym === 'XAU' ? (parseFloat(process.env.XAU_TP1) || 5.24) : Math.max(1.5 * o.atr, 30);
+      const m = '🪜 TD-PULLBACK-' + kind + ' ' + o.dir.toUpperCase() + ' @ $' + ep.toFixed(2) + ' — ' + o.det + ' refused by ' + o.gate + ' @ $' + o.armPrice.toFixed(2) + ', limit $' + o.limit.toFixed(2) + ' ' + (touched ? 'touched after ' + Math.round((now - o.ts) / 1000) + 's' : left ? 'never touched, price ran ' + Math.abs(price - o.armPrice).toFixed(2) + ' away' : 'never touched in 5 min') + '; bracket SL $' + slD.toFixed(2) + ' / TP1 $' + tpD.toFixed(2) + ' (shadow, 2026-10-27). TD-PULLBACK-' + kind;
+      s.blockedOutcomes = s.blockedOutcomes || [];
+      s.blockedOutcomes.push({ ts: now, time: ts(), symbol: sym, detector: 'TD-PB', type: o.dir, price: +ep.toFixed(2), virtualTp1: +(iC ? ep + tpD : ep - tpD).toFixed(2), virtualSl: +(iC ? ep - slD : ep + slD).toFixed(2), maxMin: 240, blockReason: m, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+      log(sym, m);
+    }
+    s._tdPb = keep;
+  } catch (e) {}
+}
+
 function updateBlockedOutcomes(sym, price) {
   const s = S[sym];
+  try { if (s) tdPullbackTick(sym, s, price); } catch (eTP) {} // latch-day pullback auction trackers (shadow, 2026-10-27)
   if (!s || !Array.isArray(s.blockedOutcomes) || s.blockedOutcomes.length === 0) return;
   const now = Date.now();
   for (const b of s.blockedOutcomes) {
@@ -4049,7 +4099,7 @@ function logSignal(sym, sig) {
         } catch (eZD) {}
         // Fired-ladder emission (2026-08-21, gate-report rec, 6 nights standing):
         // sl/tp1-3 machine-readable on every fired history row.
-        try { histEntry.sl = +t.slPrice || null; histEntry.tp1 = +t.tp1Price || null; histEntry.tp2 = +t.tp2Price || null; histEntry.tp3 = +t.tp3Price || null; if (t._ladder) histEntry.ladder = t._ladder; } catch (eTPs) {} // ladder profile on the row (2026-09-28)
+        try { histEntry.sl = +t.slPrice || null; histEntry.tp1 = +t.tp1Price || null; histEntry.tp2 = +t.tp2Price || null; histEntry.tp3 = +t.tp3Price || null; if (t._ladder) histEntry.ladder = t._ladder; if (t._latchRunner) histEntry.latchRunner = true; } catch (eTPs) {} // latchRunner stamp (2026-10-27) // ladder profile on the row (2026-09-28)
         st.cfdTracks = st.cfdTracks || [];
         st.cfdTracks.push({
           entry: histEntry, type: sig.type, ep: ep, ts: _fireTs,
@@ -7181,6 +7231,7 @@ function processPrice(sym, price, hi, lo) {
             const _waited = (!_restart && _md) ? Math.round(_mdAge / 1000) + 's waited' : (_md && _worse25 ? 'clock restarted (line ' + (_md.macd >= 0 ? '+' : '') + _md.macd.toFixed(3) + ' → ' + (_ml >= 0 ? '+' : '') + _ml.toFixed(3) + ', further against)' : 'clock started');
             const _m = '📉 ' + _tagX + ' ' + sig.type.toUpperCase() + ' DEFERRED — MACD line ' + (_ml >= 0 ? '+' : '') + _ml.toFixed(3) + ' against direction (need ' + (sig.type === 'call' ? '≥0' : '≤0') + '); ' + _waited + (_md && !_restart ? (_improved ? ', improving but <60s' : ', not reversing yet') : '') + ' (accel ' + macdAccel.toFixed(3) + '). Releases within 30s-' + Math.round(_mdWin / 60000) + 'min once the line reverses toward the trade (7/27 rule, loosened 2026-10-02).';
             log(sym, _m); trackBlockedOutcome(sym, _m, true);
+            try { tdPullbackArm(sym, s, sig, price, 'MACD-DEFER'); } catch (eTA) {}
             return false;
           }
         } else if (s._macdDefer && s._macdDefer.dir === sig.type) {
@@ -7920,7 +7971,9 @@ function processPrice(sym, price, hi, lo) {
               // advancing legs graded winners; its blocks at the stale 4326 base graded
               // losers — the discriminator separates them). Eased fires stamp
               // LATCH-ADV-EASE for the report. Revert: eased fires net-negative over ~10.
-              const _egEase = latchAdvSource(s, sig.type) && (sig.type === 'put'
+              // continuation tags only (2026-10-27): the 09:45 NAS INVERSAL_BREAK call — a reversal-class detector — took this
+              // ease at 81% of a 137-pt impulse and bought the session high; the ease was written for with-trend continuation
+              const _egEase = /RIDE|TREND|FAST|SUST|6\/6/.test(tagEarly || '') && latchAdvSource(s, sig.type) && (sig.type === 'put'
                 ? ((s.sessionLowUpdateTs || 0) > 0 && (Date.now() - s.sessionLowUpdateTs) < 900000)
                 : ((s.sessionHighUpdateTs || 0) > 0 && (Date.now() - s.sessionHighUpdateTs) < 900000));
               // ===== BIG-LEG EXT-GUARD EASE (2026-09-18, Jean "go ahead with 1&2") =====
@@ -10342,6 +10395,7 @@ function processPrice(sym, price, hi, lo) {
           log(sym, _mfMsg); trackBlockedOutcome(sym, _mfMsg, true);
           Object.assign(s, _emitSnapshot);
           sig._blockedBy = 'MOM-FLOOR'; // REGIME-BIAS audition marker (2026-08-31)
+          try { tdPullbackArm(sym, s, sig, price, 'MOM-FLOOR'); } catch (eTA2) {}
           return false;
         }
       }
@@ -16218,7 +16272,8 @@ function processPrice(sym, price, hi, lo) {
         // when the floor kicks in.
         const tp1Dist = Math.max(trv2Atr * entMults.t1, tp1Floor);
         const tp2Dist = Math.max(trv2Atr * entMults.t2, tp1Dist * (entMults.t2 / entMults.t1));
-        const tp3Dist = CAPITAL_MODE ? tp2Dist : Math.max(trv2Atr * entMults.t3, tp1Dist * (entMults.t3 / entMults.t1)); // capital mode: TP3=TP2 (2026-08-18)
+        const _trvLatchRunner = !!(process.env.LATCH_RUNNER !== '0' && tdLatchEase(s, dir === 'long' ? 'call' : 'put')); // latch-day runner (2026-10-27)
+        const tp3Dist = (CAPITAL_MODE && !_trvLatchRunner) ? tp2Dist : Math.max(trv2Atr * entMults.t3, tp1Dist * (entMults.t3 / entMults.t1)); // capital mode: TP3=TP2 (2026-08-18) — except the latch-day runner
         const tp1 = dir === 'long' ? price + tp1Dist : price - tp1Dist;
         const tp2 = dir === 'long' ? price + tp2Dist : price - tp2Dist;
         const tp3 = dir === 'long' ? price + tp3Dist : price - tp3Dist;
@@ -16322,7 +16377,7 @@ function processPrice(sym, price, hi, lo) {
           log(sym, '🔒 TRv2 ' + sigType.toUpperCase() + ' JOINS the active ' + String(_jT.type).toUpperCase() + ' trade @ $' + (+_jT.ep).toFixed(2) + ' (same direction, TP1 not yet hit) — no new entry, levels kept (TP1 $' + (+_jT.tp1Price).toFixed(2) + '); row stamped joined (2026-10-12).');
           return;
         }
-        s.trade = { active: true, type: sigType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, ts: Date.now(), pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: sl, tp1Price: tp1, tp2Price: tp2, tp3Price: tp3, atr: trv2Atr, bestPrice: price, worstPrice: price, trailSl: 0,
+        s.trade = { active: true, type: sigType, ep: price, t1: false, t2: false, sl: false, rev: false, lastETs: 0, ts: Date.now(), pt1: 30, pt2: 60, sl2: 25, isTrend: true, isCfd: true, slPrice: sl, tp1Price: tp1, tp2Price: tp2, tp3Price: tp3, atr: trv2Atr, _latchRunner: _trvLatchRunner || undefined, bestPrice: price, worstPrice: price, trailSl: 0,
                     _oteVetted: (sym !== 'XAU' && sym !== 'NAS100') };
         s.signals.push(sig);
         logSignal(sym, sig);
@@ -17342,7 +17397,13 @@ function buildCfdTrade(type, price, atr, sym) {
   // 7/30 anomaly (tp2+tp3 12ms apart, tp1 never) and the 8/10 signal Jean caught
   // (TP3 hit before TP1). TP2/TP3 must always sit beyond TP1, whatever ATR says.
   const tp2Dist = Math.max(atr * mults.t2, tp1Dist * 1.6);
-  const tp3Dist = CAPITAL_MODE ? tp2Dist : Math.max(atr * mults.t3, tp1Dist * 2.5); // capital mode: TP3=TP2 -> EA exits fully at TP2
+  // LATCH-DAY RUNNER (2026-10-27, Jean: "it could have kept the 4010 call till now"): capital mode collapses TP3 into TP2
+  // (the August funded-account rule) — the 06:51 XAU TREND call exited in full at +$6.36 on a latched trend day that ran
+  // +$42. On a latched WITH-TREND day the trade keeps its real TP3; after TP2 the remainder runs on the RUNNER TRAIL
+  // (50% of peak, ratcheting, already live) with the stop never below TP1. Risk after TP2 is bounded to the TP2→TP1 band on
+  // the remaining half. LATCH_RUNNER=0 reverts. Rows stamp latchRunner; LATCH-RUNNER cohort = exit beyond TP2 (win) or not.
+  const _latchRunner = !!(sym && S[sym] && process.env.LATCH_RUNNER !== '0' && !_scalp && typeof tdLatchEase === 'function' && tdLatchEase(S[sym], type));
+  const tp3Dist = (CAPITAL_MODE && !_latchRunner) ? tp2Dist : Math.max(atr * mults.t3, tp1Dist * 2.5); // capital mode: TP3=TP2 -> EA exits fully at TP2 (except the latch-day runner)
   let sl = iC ? price - slDist : price + slDist;
   // Phase 3.97: structural SL override — use the level-based stop when it's a real level
   // behind the entry and tighter than (or equal to) the ATR-based default.
@@ -17395,7 +17456,7 @@ function buildCfdTrade(type, price, atr, sym) {
         const _t2New = +(iC ? _t2Z.lo - 0.15 * atr : _t2Z.hi + 0.15 * atr).toFixed(2);
         console.log('[' + ts() + '] ' + sym + ': 🎯 Zone-anchored TP2 — $' + _t2New.toFixed(2) + ' (before opposing ' + (_t2Z.kind || 'OB') + ' ' + (_t2Z.tf || '') + ' $' + _t2Z.lo.toFixed(2) + '-$' + _t2Z.hi.toFixed(2) + ') vs ATR default $' + tp2.toFixed(2) + ' (2026-08-27, 8/26 21:43 case — runner exits at structure).');
         tp2 = _t2New;
-        if (CAPITAL_MODE) tp3 = tp2; // capital mode: TP3 rides the anchored TP2 (equality guard nudges inside)
+        if (CAPITAL_MODE && !_latchRunner) tp3 = tp2; // capital mode: TP3 rides the anchored TP2 (equality guard nudges inside) — not on a latch-day runner (2026-10-27)
         else if (iC ? tp3 < tp2 : tp3 > tp2) tp3 = tp2; // never let TP3 sit inside TP2
       }
     }
@@ -17444,6 +17505,7 @@ function buildCfdTrade(type, price, atr, sym) {
       trailSl: oldTrade.trailSl || 0,
       isCfd: true,
       scalp: _scalp || oldTrade.scalp || false,
+      _latchRunner: oldTrade._latchRunner || _latchRunner || undefined, // latch-day runner survives a continuation (2026-10-27)
       _oteVetted: true // same-dir continuation: EA is already positioned — never OTE-hold
     };
   }
@@ -17457,6 +17519,7 @@ function buildCfdTrade(type, price, atr, sym) {
     atr: atr, bestPrice: price, worstPrice: price, trailSl: 0,
     isCfd: true,
     scalp: _scalp,
+    _latchRunner: _latchRunner || undefined, // latch-day runner (2026-10-27)
     // OTE-HOLD vetting flag (2026-08-26, Jean's design): fresh XAU trades are born
     // UNVETTED — hidden from the EA feeds for one tick while the per-tick OTE-HOLD
     // vet decides whether to hold the entry for a retracement auction (3-5min toward
@@ -17568,6 +17631,7 @@ function updateSignalOutcome(sym, finalPrice) {
       // t.sl was set via the TP3 path (line ~4005) — TP2 already hit, then TP3
       entry.outcomes.tp3Hit = true; entry.outcomes.tp3HitTs = now;
       entry.outcomes.closePrice = finalPrice;
+      try { if (t._latchRunner) { const _lrD = +((t.type === 'call' ? finalPrice - t.tp2Price : t.tp2Price - finalPrice)).toFixed(2); entry.outcomes.latchRunnerDelta = _lrD; bumpCohortTally(sym, 'LATCH-RUNNER', _lrD > 0 ? 'win' : 'loss'); log(sym, '🏃 LATCH-RUNNER → exit $' + finalPrice.toFixed(2) + ' vs TP2 $' + (+t.tp2Price).toFixed(2) + ' = ' + (_lrD >= 0 ? '+' : '') + '$' + _lrD.toFixed(2) + '/unit on the remainder (2026-10-27).'); } } catch (eLR) {}
       if (t.ep > 0 && finalPrice > 0) bookPnl(sym, 0.5 * (t.type === 'call' ? finalPrice - t.ep : t.ep - finalPrice) * pnlMultFor(sym, t), 'close');
       // LB-TIMESTOP-HELD grading (2026-09-21): a benched time-stop would have flattened this trade; held, it swept TP3.
       try { if (t._lbStopWouldClose) { bumpCohortTally(sym, 'LB-TIMESTOP-HELD', 'win'); log(sym, '⏱️ LB-TIMESTOP-HELD → WIN (held through the would-close at $' + (+t._lbStopWouldClose.price).toFixed(2) + ', swept TP3 @ $' + (+finalPrice).toFixed(2) + ').'); } } catch (eLBH) {}
@@ -17588,6 +17652,7 @@ function updateSignalOutcome(sym, finalPrice) {
       else if (t.type === 'put') s.lastTp3PutTs = now;
     } else {
       // Real stop loss (before TP2)
+      try { if (t._latchRunner && entry.outcomes.tp2Hit) { const _lrD = +((t.type === 'call' ? finalPrice - t.tp2Price : t.tp2Price - finalPrice)).toFixed(2); entry.outcomes.latchRunnerDelta = _lrD; bumpCohortTally(sym, 'LATCH-RUNNER', _lrD > 0 ? 'win' : 'loss'); log(sym, '🏃 LATCH-RUNNER → stopped $' + finalPrice.toFixed(2) + ' vs TP2 $' + (+t.tp2Price).toFixed(2) + ' = ' + (_lrD >= 0 ? '+' : '') + '$' + _lrD.toFixed(2) + '/unit on the remainder (2026-10-27).'); } } catch (eLR2) {}
       if (t._tp1Gap && !entry.outcomes.tp1Hit) { try { bumpCohortTally(sym, 'TP1-GAP', 'loss'); entry.outcomes.tp1Gap = 'missed'; log(sym, '📏 TP1-GAP → LOSS — touched +$5.00, never reached TP1, stopped: the $5.00 target would have banked this one.'); } catch (eG2) {} }
       entry.outcomes.slHit = true; entry.outcomes.slHitTs = now;
       entry.outcomes.closePrice = finalPrice;
@@ -20370,7 +20435,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.50-20261027-principles-hysteresis-rr-stopfloor', // bump on each deploy — lets /state verify what's live
+    build: '7.51-20261027-latch-runner-td-pullback', // bump on each deploy — lets /state verify what's live
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
