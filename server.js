@@ -10578,8 +10578,18 @@ function processPrice(sym, price, hi, lo) {
           Object.assign(s, _emitSnapshot);
           return false;
         }
-        const _prDay = pnlLedger[todayDateET()];
-        const _prPnl = (_prDay && _prDay[sym] && typeof _prDay[sym].pnl === 'number') ? _prDay[sym].pnl : 0;
+        // BOT-ONLY DAY CAP (2026-10-29): the cap read the symbol's ledger, which books adopted HAND trades too. On 10/28
+        // eight hand trades on XAU booked −$12,107 (bot: $0) and the cap locked the BOT out of XAU from 16:04 ET to midnight —
+        // through the 21:58–22:33 flush (4063→4011) where nine put candidates all graded winners. The breaker is for the
+        // bot's own losing streaks; it now sums only bot rows (no manual field) closed on today's ET date. PROTECT_DAYCAP_ALL=1
+        // restores the old behaviour.
+        const _prPnl = (function () { try {
+          if (process.env.PROTECT_DAYCAP_ALL === '1') { const _d = pnlLedger[todayDateET()]; return (_d && _d[sym] && typeof _d[sym].pnl === 'number') ? _d[sym].pnl : 0; }
+          global._botDayPnl = global._botDayPnl || {}; const _c = global._botDayPnl[sym]; const _n = Date.now(); if (_c && _n - _c.ts < 60000) return _c.v;
+          const _td = todayDateET(); let v = 0;
+          for (let i = signalHistory.length - 1; i >= 0; i--) { const h = signalHistory[i]; if (_n - h.ts > 2 * 86400000) break; if (h.symbol !== sym || h.manual || !h.outcomes) continue; const o = h.outcomes; const closeTs = (o.eaClose && o.eaClose.ts) || o.slHitTs || o.tp3HitTs || null; const closeDay = closeTs ? new Date(closeTs).toLocaleDateString('en-CA', { timeZone: 'America/New_York' }) : h.date; if (closeDay !== _td) continue; if (o.eaClose && isFinite(o.eaClose.total)) v += +o.eaClose.total; else if ((o.slHit || o.tp3Hit || o.scalpExit || o.endedByEa) && isFinite(h.booked)) v += +h.booked; }
+          global._botDayPnl[sym] = { ts: _n, v }; return v;
+        } catch (e) { return 0; } })();
         if (_prPnl <= -PROTECT_DAY_LOSS) {
           const _prMsg2 = '🛡️ ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — PROTECT-DAYCAP: booked day P&L $' + _prPnl.toFixed(2) + ' ≤ -$' + PROTECT_DAY_LOSS.toFixed(0) + ' — flat until next ET session (Freqtrade MaxDrawdown port 2026-08-28). Virtual tracking continues.';
           log(sym, _prMsg2); trackBlockedOutcome(sym, _prMsg2, true);
@@ -20164,7 +20174,7 @@ app.post('/ea/event', (req, res) => {
           const _booked = _t ? (_t._booked || 0) : (_row ? (_row.booked || 0) : 0);
           const _diff = +(_tot - _booked).toFixed(2);
           if (_t) _t._eaClosed = { total: _tot, price: _px, ts: Date.now() };
-          if (_row) { _row.outcomes = _row.outcomes || {}; _row.outcomes.eaClose = { total: +_tot.toFixed(2), price: isFinite(_px) ? _px : null, reason: detail.split(' @ ')[0].slice(0, 40), booked: _booked, reconcile: _diff, ticket: _tkC }; }
+          if (_row) { _row.outcomes = _row.outcomes || {}; _row.outcomes.eaClose = { total: +_tot.toFixed(2), price: isFinite(_px) ? _px : null, reason: detail.split(' @ ')[0].slice(0, 40), booked: _booked, reconcile: _diff, ticket: _tkC, ts: Date.now() }; } /* eaClose.ts added 2026-10-29 (bot-only day cap) */
           const _prior = !_t && !!(_s.trade && _s.trade.active); // a NEW trade is live — this close is an earlier position's
           if (Math.abs(_diff) >= 1) { bookPnl(sym, _diff, _prior ? 'ea-reconcile-prior' : 'ea-reconcile'); if (_prior && _row) _row.booked = +((_row.booked || 0) + _diff).toFixed(2); }
           log(sym, '🧾 EA CLOSE reconciled — account result $' + _tot.toFixed(2) + ' vs server-booked $' + _booked.toFixed(2) + ' → ' + (_diff >= 0 ? '+' : '') + '$' + _diff.toFixed(2) + ' correction booked.');
@@ -20534,7 +20544,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.55-20261029-bot-only-test', // bump on each deploy — lets /state verify what's live
+    build: '7.56-20261029-daycap-bot-only', // bump on each deploy — lets /state verify what's live
     laneBench: global._laneBench || {}, // enforced live-lane bench state (2026-10-27)
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' /* RETIRED FROM LIVE 2026-10-28 (Jean: "always taking the call after the big leg happened"): live 1W/5L −$1,942 + the 10/28 05:16 call; shadow 0W/2S/4L (14d). The sampler keeps measuring; BTC_BIGLEG_LIVE=1 re-arms by hand */ ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
