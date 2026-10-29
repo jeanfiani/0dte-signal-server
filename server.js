@@ -4850,10 +4850,10 @@ function processPrice(sym, price, hi, lo) {
               // (0.35×ADR); and the ladder scales with R: TP1 ≥ 1R, TP2 ≥ 2R, TP3 ≥ 3R ("reward proportional to loss").
               const _bR = Math.abs(price - _bSl);
               const _bMaxR = (parseFloat(process.env.BIGLEG_MAX_R_ADR) || 0.35) * _bAdr;
-              if (_bLiveOk && process.env.BTC_BIGLEG_LIVE !== '0' && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold && _bR > _bMaxR) {
+              if (_bLiveOk && process.env.BTC_BIGLEG_LIVE === '1' /* RETIRED FROM LIVE 2026-10-28 (Jean: "always taking the call after the big leg happened"): live 1W/5L −$1,942 + the 10/28 05:16 call; shadow 0W/2S/4L (14d). The sampler keeps measuring; BTC_BIGLEG_LIVE=1 re-arms by hand */ && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold && _bR > _bMaxR) {
                 log(sym, '🦵 BTC-BIGLEG ' + _bDir.toUpperCase() + ' NOT fired live — entry $' + price.toFixed(0) + ' sits $' + _bR.toFixed(0) + ' (' + (_bR / _bAdr).toFixed(2) + '×ADR) from the pivot stop $' + _bSl.toFixed(0) + ' > 0.35×ADR $' + _bMaxR.toFixed(0) + ': too far into the leg for a 1R target (geometry guard 2026-10-09). Shadow row measured.');
               }
-              if (_bLiveOk && process.env.BTC_BIGLEG_LIVE !== '0' && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold && _bR <= _bMaxR && bootWarm(sym, s).ok && !liveLaneBenched('BTC', /BIGLEG/, 'BTC-BIGLEG')) { // !_bRng: no live leg fires in RANGE regime (2026-09-24) // enforced bench (2026-10-27)
+              if (_bLiveOk && process.env.BTC_BIGLEG_LIVE === '1' /* RETIRED FROM LIVE 2026-10-28 (Jean: "always taking the call after the big leg happened"): live 1W/5L −$1,942 + the 10/28 05:16 call; shadow 0W/2S/4L (14d). The sampler keeps measuring; BTC_BIGLEG_LIVE=1 re-arms by hand */ && !(s.trade && s.trade.active) && !s._oteHold && !s._invHold && _bR <= _bMaxR && bootWarm(sym, s).ok && !liveLaneBenched('BTC', /BIGLEG/, 'BTC-BIGLEG')) { // !_bRng: no live leg fires in RANGE regime (2026-09-24) // enforced bench (2026-10-27)
                 const _lTp1 = _bDir === 'call' ? +(price + Math.max(0.25 * _bAdr, _bR)).toFixed(2) : +(price - Math.max(0.25 * _bAdr, _bR)).toFixed(2); // ≥ 1R (guard 2026-10-09)
                 // TP2 explicit 0.5×ADR (2026-09-29, Jean's monitor screenshot): the live lane
                 // had been reusing the SHADOW target (_bTp), which 6.88 cut to 0.25×ADR — so
@@ -19690,7 +19690,7 @@ function entryAgentConsult(sym, s, ctx) {
       s.blockedOutcomes.push({ ts: now, time: ts(), symbol: sym, detector: 'AGENT-' + dec.short, type: ctx.dir, price: px, virtualTp1: +(isC ? px + tpD : px - tpD).toFixed(2), virtualSl: +(isC ? px - slD : px + slD).toFixed(2), maxMin: 240, agentId: id, blockReason: '🤖 ' + tok + ' ' + ctx.dir.toUpperCase() + ' @ $' + px.toFixed(2) + ' — agent says ' + p.action.toUpperCase() + (p.action === 'wait' ? ' for $' + p.limit + ' (' + p.windowSec + 's, leash ' + p.leashAtr + '×ATR)' : '') + ' (conf ' + (p.confidence == null ? '?' : p.confidence) + '): "' + p.reason + '" · rule: ' + (ctx.rule ? ctx.rule.action + (ctx.rule.limit ? ' $' + ctx.rule.limit : '') + ' via ' + ctx.rule.via : '?') + ' · ' + tok, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
       // (2) WAIT → a limit tracker (resolved per tick by entryAgentTick)
       if (p.action === 'wait') { entryAgent.waits[sym] = entryAgent.waits[sym] || []; entryAgent.waits[sym].push({ id, model: dec.short, dir: ctx.dir, limit: p.limit, armPrice: px, slD, tpD, leash: p.leashAtr * (snap.atr || 0), expiry: now + p.windowSec * 1000, ts: now }); }
-      entryAgent.decisions.push(dec); if (entryAgent.decisions.length > 600) entryAgent.decisions.shift(); entryAgent.dirty = true;
+      entryAgent.decisions.push(dec); if (entryAgent.decisions.length > 3000) entryAgent.decisions.shift(); entryAgent.dirty = true; // cap 600 → 3000 (2026-10-29: gate reviews were evicting the entry record in days)
       const agree = ctx.rule ? ((ctx.rule.action === 'fill' && p.action === 'fill') || (ctx.rule.action === 'wait' && p.action === 'wait')) : null;
       if (ctx.pushVerdict) { try { const _lanes = (ctx.lanesAgree && ctx.lanesAgree.length) ? ' · lanes agreeing: ' + ctx.lanesAgree.join(', ') : ' · no shadow lane fired this way in the last 15 min'; sendPush('🧭 ' + sym + ' hand ' + ctx.dir.toUpperCase() + ' — ' + dec.short + ' says ' + p.action.toUpperCase(), (p.reason || '').slice(0, 110) + _lanes + ' · stop $' + (+((ctx.trade || {}).slPrice || 0)).toFixed(2) + ' · 1R $' + (+((ctx.trade || {}).tp1Price || 0)).toFixed(2), 'signal'); } catch (ePV) {} }
       // CONSENSUS WOULD-VETO (2026-10-15): when every consulted model says SKIP on a live fire, stamp the fired row so the
@@ -19734,10 +19734,15 @@ const GATE_AGENT_SYSTEM = [
 // (source agent-veto). Hand trades are never vetoed (coach only). Every veto stamps the row (agentVeto) and keeps the
 // bracket grading so the scoreboard keeps auditing the live rule.
 function agentVetoStats() {
-  const since = Date.now() - 30 * 86400000; const byKey = {};
-  for (const d of entryAgent.decisions) { if (d.kind === 'unblock' || d.err || d.ts < since || d.detector === 'HAND') continue; const k = d.sym + '|' + d.ts + '|' + d.dir; (byKey[k] = byKey[k] || []).push(d); }
-  const models = entryAgentModels().length; let right = 0, wrong = 0, pending = 0;
-  for (const k in byKey) { const P = byKey[k]; if (P.length < models || !P.every(x => x.action === 'skip')) continue; const o = P[0].nowOutcome; if (o === 'loss') right++; else if (o === 'win') wrong++; else if (!o) pending++; }
+  // DURABLE SOURCE (2026-10-29): the decisions store is capped and the gate reviews (every 90 s) now evict entry
+  // decisions within days — the first version of this scoreboard read 1R/2W where the rows say 8R/4W. The fired row's
+  // agentWouldVeto stamp is the record: right = the fire lost (stop, or the EA closed it in the red), wrong = it won.
+  const since = Date.now() - 30 * 86400000; let right = 0, wrong = 0, pending = 0;
+  for (const h of signalHistory) {
+    if (h.ts < since || h.manual || !h.outcomes || !h.outcomes.agentWouldVeto) continue;
+    const o = h.outcomes; const ea = o.eaClose && isFinite(o.eaClose.total) ? +o.eaClose.total : null;
+    if (o.tp1Hit) wrong++; else if (o.slHit) right++; else if (ea !== null && Math.abs(ea) >= 50) { if (ea < 0) right++; else wrong++; } else pending++;
+  }
   const n = right + wrong; return { right, wrong, pending, n, pct: n ? Math.round(100 * right / n) : null };
 }
 function agentVetoArmed() {
@@ -19811,7 +19816,7 @@ function gateAgentConsult(sym, s, row, msg) {
       if (!/^(unblock|uphold)$/.test(action)) { entryAgent.stats.errors++; dec.err = 'bad answer'; dec.raw = String(r.text || '').slice(0, 200); entryAgent.decisions.push(dec); entryAgent.dirty = true; log(sym, '🤖 GATE-REVIEW ' + dec.short + ' unusable answer — ' + String(r.text || '').slice(0, 120)); return; }
       Object.assign(dec, { action, confidence: isFinite(+j.confidence) ? Math.max(0, Math.min(1, +j.confidence)) : null, reason: String(j.reason || '').slice(0, 200) });
       row.agentReview[dec.short] = action;
-      entryAgent.decisions.push(dec); if (entryAgent.decisions.length > 600) entryAgent.decisions.shift(); entryAgent.dirty = true;
+      entryAgent.decisions.push(dec); if (entryAgent.decisions.length > 3000) entryAgent.decisions.shift(); entryAgent.dirty = true;
       log(sym, '🤖 GATE-REVIEW ' + dec.short + ' on ' + gate + ' ' + dir.toUpperCase() + ' @ $' + price.toFixed(2) + ' (' + r.ms + 'ms) → ' + action.toUpperCase() + (dec.confidence != null ? ' · conf ' + dec.confidence : '') + ' — "' + dec.reason.slice(0, 120) + '" [shadow; graded on the blocked row\'s bracket]');
     });
   } catch (e) { try { log(sym, '⚠️ GATE-REVIEW consult error: ' + String(e).slice(0, 120)); } catch (e2) {} }
@@ -20529,10 +20534,10 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.53-20261027-lane-bench-enforced', // bump on each deploy — lets /state verify what's live
+    build: '7.55-20261029-bot-only-test', // bump on each deploy — lets /state verify what's live
     laneBench: global._laneBench || {}, // enforced live-lane bench state (2026-10-27)
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
-    btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE !== '0' ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
+    btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' /* RETIRED FROM LIVE 2026-10-28 (Jean: "always taking the call after the big leg happened"): live 1W/5L −$1,942 + the 10/28 05:16 call; shadow 0W/2S/4L (14d). The sampler keeps measuring; BTC_BIGLEG_LIVE=1 re-arms by hand */ ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const _since = (fundedEpoch && fundedEpoch.since) || ''; const _base = (fundedEpoch && fundedEpoch.base) || {}; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; if (d >= _since) wk += pnlLedger[d][sym].pnl - ((_base[d] && typeof _base[d][sym] === 'number') ? _base[d][sym] : 0); } } out.weekTotal = +wk.toFixed(2); out.account = (fundedEpoch && fundedEpoch.label) || null; return out; } catch (e) { return {}; } })(), // weekTotal counts the current funded-account epoch only (2026-10-01) // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     fundedGuard: (function () { try { const g = Object.assign({}, global._fundedGuard || {}); g.accounts = acctIds().map(acctTotals); return g; } catch (e) { return global._fundedGuard || null; } })(), // Neura guard readout (2026-09-20) + per-account day/total/limits/stand-down (2026-10-01)
