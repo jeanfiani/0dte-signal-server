@@ -2030,6 +2030,10 @@ function trackBlockedOutcome(sym, msg, force) {
       && !/DORMANT|WOULD-FIRE|EXH-REV|TREND-CONT-WF|TREND-REGIME|TREND-WT|TREND-CT|EXT-PB-|EXTREME-PULLBACK|NEWS-FADE|NEWS-CONT|ZONE-REACT|PATH-CLEAR|PATH-ZONED|ARMED \(dormant|CONF-SCORE|dormant validator|no firing effect|LC-AGREE|LC-DISAGREE|ML-DIR|EOD-CONT-WF|BIGLEG-CT-WF|FAST-PRE|LADDER-|BE-HELD|ZONE-MICRO-WF|LEVEL-PROX/i.test(msg);
     if (_isBlockMsg) {
       s._lastBlock = s._lastBlock || {}; s._lastBlock[type] = { msg: msg.slice(0, 200), ts: now, price: +(s.lastPrice || 0), gate: String(cohortFor(msg) || 'unmatched') }; // price + gate (2026-10-27, gate hysteresis)
+      // JUDGMENT-ONLY RECORD (2026-10-29): the 16:10 XAU TREND call — MACD-DEFER refused it at 16:10:19, GATE-HYST at :31, an
+      // unnamed gate at :33, and it FIRED at :54 because the unnamed block had overwritten the MACD-DEFER record the hysteresis
+      // reads. Judgment blocks are remembered separately; unnamed blocks and GATE-HYST itself never erase them.
+      try { const _g = s._lastBlock[type].gate; if (/^(EXT-GUARD|SESS-EXTREME|MACD-DEFER|MOM-FLOOR|ZONE-VETO|ZONE-MICRO-WF|CT-VETO|FAST-PRE|CHOP|GRIND-RECLAIM|RSI)/.test(_g)) { s._lastJudgBlock = s._lastJudgBlock || {}; s._lastJudgBlock[type] = s._lastBlock[type]; } } catch (eJB) {}
       const _gj = s._gateJournal = s._gateJournal || [];
       const _det = (msg.match(/[⬆⬇]\s*([A-Z0-9_\-\/+]+)/) || [])[1] || (msg.match(/^[^A-Za-z]*([A-Z][A-Z0-9_\-\/]{2,})/) || [])[1] || '?';
       const _gate = String(cohortFor(msg) || 'unmatched');
@@ -8676,7 +8680,7 @@ function processPrice(sym, price, hi, lo) {
       // condition the gate wanted has actually happened — or the gate's own release logic stamped the candidate
       // (MACD-DEFER release). Graded like any gate (GATE-HYST cohort: win = the refused candidate would have won).
       try {
-        const _lbH = s._lastBlock && s._lastBlock[sig.type];
+        const _lbH = s._lastJudgBlock && s._lastJudgBlock[sig.type]; // judgment-only record (2026-10-29)
         if (_lbH && _lbH.price > 0 && !sig._macdRelease && process.env.GATE_HYST !== '0' && /^(EXT-GUARD|SESS-EXTREME|MACD-DEFER|MOM-FLOOR|ZONE-VETO|ZONE-MICRO-WF|CT-VETO|FAST-PRE|CHOP|GRIND-RECLAIM|RSI)/.test(_lbH.gate || '')) {
           const _hAge = (Date.now() - _lbH.ts) / 1000, _hSec = parseInt(process.env.GATE_HYST_SEC, 10) || 180;
           const _hAtr = Math.max(s._atr || 0, 0) * (parseFloat(process.env.GATE_HYST_ATR) || 0.5);
@@ -17781,6 +17785,24 @@ function checkExit(sym, price) {
     // first tick (the EA has not entered yet — rows are hidden for 5 s and its own entry wait is 15 s): risk >
     // RR_MAX (2.05) × TP1 distance → the trade is cancelled and graded in shadow (RR-FLOOR cohort). Lanes promoted
     // with their own measured geometry (BIGLEG, RANGE5, SESS-REJ, PATH) and hand trades are exempt.
+    // AGENT SEES EVERY FIRE (2026-10-29): the 16:10 XAU TREND call never reached the entry desk — it was born vetted (LEG
+    // MODE waiver, MACD line just crossed zero) and only auction-released trades consult the agent. The gate review had
+    // upheld fourteen refusals of that exact candidate in the preceding 34 minutes; the fire itself got no verdict and
+    // lost −$4,788. Any live trade that has not been consulted in the last 45 s is consulted on its first tick, so the
+    // consensus veto (when armed) covers every fire, not only the auctioned ones. Hand trades keep the HAND coach path.
+    try {
+      if (!t._agBirthChecked && t._oteVetted !== false) { // unvetted trades are consulted by the auction itself; vetted ones here
+        t._agBirthChecked = true;
+        if (!t._manual && !t._adopted && typeof entryAgentConsult === 'function') {
+          const _h = (s.lastHistEntry && s.lastHistEntry.symbol === sym && s.lastHistEntry.type === t.type) ? s.lastHistEntry : null;
+          const _already = _h && entryAgent.decisions.some(d => d.histTs === _h.ts && d.kind !== 'unblock'); // the auction already asked for this row
+          const _agLast = (s._agLastTs && s._agLastTs[t.type]) || 0;
+          if (!_already && Date.now() - _agLast >= 45000) {
+            entryAgentConsult(sym, s, { price: +t.ep, atr: t.atr || s._atr || 0, dir: t.type, detector: _h ? String(_h.score || '?') : '?', trade: t, rule: { action: 'fill', via: 'market (no auction: ' + (t.scalp ? 'scalp' : (_h && _h.legMode) ? 'leg mode' : 'born vetted') + ')' }, rsi: s._rsi, macdL: s._macdL, roc3: s._roc3, roc6: s._roc6, histTs: _h ? _h.ts : null });
+          }
+        }
+      }
+    } catch (eAB) {}
     try {
       if (!t._rrChecked) {
         t._rrChecked = true;
@@ -19533,9 +19555,9 @@ app.post('/trade/close', (req, res) => {
 // a later build lets it set the hold parameters for real. Kill: ENTRY_AGENT=0. Models: ENTRY_AGENT_MODELS
 // (comma list; default = ENTRY_AGENT_MODEL + haiku side by side, or opus+haiku). Effort: ENTRY_AGENT_EFFORT (low).
 const ENTRY_AGENT_FILE = path.join(DATA_DIR, 'entry_agent.json');
-const entryAgent = { decisions: [], waits: {}, dirty: false, stats: { calls: 0, errors: 0, msSum: 0, inTok: 0, outTok: 0, lastErr: null, lastErrTs: 0 } };
-try { if (fs.existsSync(ENTRY_AGENT_FILE)) { const _j = JSON.parse(fs.readFileSync(ENTRY_AGENT_FILE, 'utf8')); if (Array.isArray(_j.decisions)) entryAgent.decisions = _j.decisions.slice(-600); if (_j.stats) entryAgent.stats = Object.assign(entryAgent.stats, _j.stats); console.log('[' + ts() + '] ENTRY AGENT: ' + entryAgent.decisions.length + ' past decisions restored'); } } catch (e) {}
-setInterval(() => { if (!entryAgent.dirty) return; entryAgent.dirty = false; try { fs.writeFileSync(ENTRY_AGENT_FILE, JSON.stringify({ decisions: entryAgent.decisions.slice(-600), stats: entryAgent.stats })); } catch (e) {} }, 60000);
+const entryAgent = { decisions: [], waits: {}, lessons: [], reflectQ: [], dirty: false, stats: { calls: 0, errors: 0, msSum: 0, inTok: 0, outTok: 0, lastErr: null, lastErrTs: 0, reflections: 0 } };
+try { if (fs.existsSync(ENTRY_AGENT_FILE)) { const _j = JSON.parse(fs.readFileSync(ENTRY_AGENT_FILE, 'utf8')); if (Array.isArray(_j.decisions)) entryAgent.decisions = _j.decisions.slice(-3000); if (Array.isArray(_j.lessons)) entryAgent.lessons = _j.lessons.slice(-400); if (_j.stats) entryAgent.stats = Object.assign(entryAgent.stats, _j.stats); console.log('[' + ts() + '] ENTRY AGENT: ' + entryAgent.decisions.length + ' past decisions restored'); } } catch (e) {}
+setInterval(() => { if (!entryAgent.dirty) return; entryAgent.dirty = false; try { fs.writeFileSync(ENTRY_AGENT_FILE, JSON.stringify({ decisions: entryAgent.decisions.slice(-3000), lessons: entryAgent.lessons.slice(-400), stats: entryAgent.stats })); } catch (e) {} }, 60000);
 function entryAgentEnabled() { return process.env.ENTRY_AGENT !== '0' && !!process.env.ANTHROPIC_API_KEY; }
 function entryAgentModels() { const m = process.env.ENTRY_AGENT_MODELS || (process.env.ENTRY_AGENT_MODEL ? process.env.ENTRY_AGENT_MODEL + ',claude-haiku-5-5' : 'claude-opus-5-5,claude-haiku-5-5'); return Array.from(new Set(m.split(',').map(x => x.trim()).filter(Boolean))); }
 function entryAgentShort(m) { return /opus/i.test(m) ? 'OPUS' : /haiku/i.test(m) ? 'HAIKU' : /sonnet/i.test(m) ? 'SONNET' : /fable/i.test(m) ? 'FABLE' : String(m).replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 8); }
@@ -19558,6 +19580,7 @@ const ENTRY_AGENT_SYSTEM = [
   '  • Regime RANGE with a candidate that is NOT at a session extreme → low expectancy for continuation; prefer SKIP unless the path is clear and momentum is live. Regime TREND with-trend → FILL/shallow WAIT; counter-trend in TREND → SKIP unless at an extreme with a clean rejection.',
   '  • News blackout active or a high-impact release within 10 minutes → SKIP.',
   '  • Use lane_stats_7d: if this detector\'s market fills have been losing and its pullback fills winning, lean WAIT; and vice versa. Use my_recent_decisions to avoid repeating a graded mistake.',
+  '  • my_lessons holds rules YOU wrote after grading your own past decisions (lessons_from_my_mistakes, what_has_worked), with how many times each pattern recurred. Check them FIRST: if the current candidate matches a lesson\'s conditions, follow it, and say so in your reason — unless you can state concretely what is different this time. Your FILL calls have lost far more often than they have won; the lessons exist to stop the same mistake a third time.',
   'What the zone ledger has learned about OB/FVG zones in THIS system (measured on 258 graded vetoes and ~1,500 zones, Oct 2026): a continuation that runs into an opposing zone within 1.2 ATR AHEAD wins only ~17-30% of the time, whatever the zone\'s grade — even "weak" zones that later break produce enough first-touch reaction to stop a 1 ATR bracket; being already INSIDE an opposing zone is less dangerous (~31%). Zone AGE matters most: zones younger than 4h stop candidates ~74% of the time, 4-12h-old zones ~57%, older ones less. Higher timeframes hold more (M15 order blocks ~45-52% hold rate, M10 ~35-45%, M5 zones ~25-30% = noise). Zones sitting AT the session extreme hold poorly (<25% on gold) — the level gets retested and run; the zone itself is not a reason to fade. No zone class holds more than ~52%, so a zone BEHIND you is modest support, not a wall. Use zone_ledger_buckets to read what a grade means today.',
   'Constraints for WAIT: limit must be on the pullback side of the current price (below it for a call, above it for a put), between 0.25 and 1.0 ATR away; window_sec 60–300; leash_atr 0.3–1.0.',
   'Answer with ONE JSON object and nothing else: {"action":"fill"|"wait"|"skip","limit":<number or null>,"window_sec":<int or null>,"leash_atr":<number or null>,"confidence":<0..1>,"reason":"<max 160 chars, concrete: cite the numbers that decided it>"}'
@@ -19626,6 +19649,7 @@ function entryAgentSnapshot(sym, s, ctx) {
     trade_ladder: { sl: t.slPrice, tp1: t.tp1Price, tp2: t.tp2Price, tp3: t.tp3Price, sl_dist_atr: A(Math.abs((t.ep || price) - (t.slPrice || price))), tp1_dist_atr: A(Math.abs((t.ep || price) - (t.tp1Price || price))), scalp: !!t.scalp },
     rule_decision: ctx.rule || null,
     my_recent_decisions: recent,
+    my_lessons: entryAgentLessonsFor(sym, dir), // reflection memory (2026-10-29)
     my_scoreboard_14d: (function () { try { const D = entryAgent.decisions.filter(d => d.sym === sym && d.model === ctx._model && !d.err && Date.now() - d.ts < 14 * 86400000); const o = { decisions: D.length, fill: { win: 0, loss: 0 }, wait: { filled: 0, filled_win: 0, filled_loss: 0, unfilled: 0, unfilled_missed_win: 0, unfilled_avoided_loss: 0 }, skip: { avoided_loss: 0, missed_win: 0 }, rule_on_same_decisions: { win: 0, loss: 0 } }; for (const d of D) { const r = d.nowOutcome; if (d.action === 'fill') { if (r === 'win') o.fill.win++; else if (r === 'loss') o.fill.loss++; } else if (d.action === 'skip') { if (r === 'win') o.skip.missed_win++; else if (r === 'loss') o.skip.avoided_loss++; } else if (d.action === 'wait') { if (/^filled/.test(d.waitResult || '')) { o.wait.filled++; if (d.fillOutcome === 'win') o.wait.filled_win++; else if (d.fillOutcome === 'loss') o.wait.filled_loss++; } else if (d.waitResult) { o.wait.unfilled++; if (r === 'win') o.wait.unfilled_missed_win++; else if (r === 'loss') o.wait.unfilled_avoided_loss++; } } if (d.ruleOutcome === 'win') o.rule_on_same_decisions.win++; else if (d.ruleOutcome === 'loss') o.rule_on_same_decisions.loss++; } return o; } catch (e) { return null; } })()
   };
 }
@@ -19687,7 +19711,7 @@ function entryAgentConsult(sym, s, ctx) {
       const userText = 'Decide the entry for this signal. Snapshot (JSON):\n' + JSON.stringify(snap);
       entryAgent.stats.calls++;
       const r = await entryAgentCall(model, userText, parseInt(process.env.ENTRY_AGENT_TIMEOUT_MS, 10) || 20000);
-      const dec = { id, ts: now, time: etClock(now), sym, dir: ctx.dir, detector: ctx.detector || '?', model, short: entryAgentShort(model), price: +(+ctx.price).toFixed(2), atr: +(+snap.atr).toFixed(2), slDist: +slD.toFixed(2), tpDist: +tpD.toFixed(2), rule: ctx.rule || null, histTs: ctx.histTs || null, ms: r.ms, inTok: (r.usage && r.usage.input_tokens) || 0, outTok: (r.usage && r.usage.output_tokens) || 0 };
+      const dec = { id, ts: now, time: etClock(now), sym, dir: ctx.dir, detector: ctx.detector || '?', model, short: entryAgentShort(model), price: +(+ctx.price).toFixed(2), atr: +(+snap.atr).toFixed(2), slDist: +slD.toFixed(2), tpDist: +tpD.toFixed(2), rule: ctx.rule || null, histTs: ctx.histTs || null, feat: (function () { try { return blockFeat(sym, s, ctx.dir, +ctx.price); } catch (e) { return null; } })(), ms: r.ms, inTok: (r.usage && r.usage.input_tokens) || 0, outTok: (r.usage && r.usage.output_tokens) || 0 };
       entryAgent.stats.msSum += r.ms || 0; entryAgent.stats.inTok += dec.inTok; entryAgent.stats.outTok += dec.outTok;
       if (!r.ok) { entryAgent.stats.errors++; entryAgent.stats.lastErr = r.err; entryAgent.stats.lastErrTs = now; dec.err = r.err; entryAgent.decisions.push(dec); entryAgent.dirty = true; log(sym, '🤖 ENTRY-AGENT ' + dec.short + ' ERROR after ' + r.ms + 'ms — ' + String(r.err).slice(0, 140)); return; }
       const p = entryAgentParse(r.text, snap);
@@ -19733,6 +19757,7 @@ const GATE_AGENT_SYSTEM = [
   'Your ONLY job: UNBLOCK (the system should fire this candidate at market now, with the stop/target bracket shown) or UPHOLD (the gate is right, no trade).',
   'How you are graded: on the candidate\'s own bracket from the current price — first target (TP1) before stop (SL) = the candidate would have won. UNBLOCK on a winner counts for you, UNBLOCK on a loser against you; UPHOLD on a loser counts for you (avoided loss), UPHOLD on a winner against you (missed win). The gates you review have been right 65–84% of the time, so UPHOLD is the default: UNBLOCK only when the evidence is specific and the ledger does not contradict you.',
   'Judgment to apply: a gate is usually right when the candidate runs into a FRESH (<4h) untested opposing zone, when momentum is fading or reversing (accel=fading/reversing), when the leg has already run ≥2 ATR, when the candidate is counter-trend (ms=CT) or against the trend-day latch, or in RANGE regime away from a session extreme. A gate is more often wrong when the opposing zone is OLD or already tested 2+ times, momentum is accelerating with the candidate (macdB with/strong-with, accel=accel), the leg is young (<1 ATR from pivot), the candidate is with-trend on a latched trend day, and the tape is thick. Weigh gate.ledger over these priors when it has ≥10 rows in a bucket.',
+  'my_lessons (when present) holds rules you wrote after grading your own past reviews — patterns where your uphold or unblock was wrong, with recurrence counts. Check them first; follow a matching lesson unless you can say what is different now.',
   'Answer with ONE JSON object and nothing else: {"action":"unblock"|"uphold","confidence":<0..1>,"reason":"<max 160 chars, concrete: cite the numbers that decided it>"}'
 ].join('\n');
 // ===== AGENT VETO — LIVE ON ITS PRE-REGISTERED BAR (2026-10-27, Jean: "the AI agent is the solution") =====
@@ -19758,10 +19783,14 @@ function agentVetoStats() {
 function agentVetoArmed() {
   try {
     if (process.env.AGENT_VETO_LIVE === '0') return false;
-    if (process.env.AGENT_VETO_LIVE === '1') return true;
     const now = Date.now(); if (global._agVetoCache && now - global._agVetoCache.ts < 60000) return global._agVetoCache.armed;
     const st = agentVetoStats(); const minN = parseInt(process.env.AGENT_VETO_MIN, 10) || 15, bar = parseFloat(process.env.AGENT_VETO_BAR) || 0.70;
-    const armed = st.n >= minN && (st.right / st.n) >= bar;
+    // FORCED LIVE WITH A FLOOR (2026-10-29, Jean: "is it time to put the AI agent live?"): AGENT_VETO_LIVE=1 arms the veto
+    // ahead of the 70% bar (8 right / 4 wrong, ~$7.3k of stops avoided vs ~$4.6k of wins missed), but it still disarms
+    // itself if the rolling record falls under AGENT_VETO_FLOOR (60%) over ≥15 — a hand-armed veto is not exempt from its
+    // own scoreboard.
+    const floor = parseFloat(process.env.AGENT_VETO_FLOOR) || 0.60;
+    const armed = process.env.AGENT_VETO_LIVE === '1' ? !(st.n >= minN && (st.right / st.n) < floor) : (st.n >= minN && (st.right / st.n) >= bar);
     if (global._agVetoCache && global._agVetoCache.armed !== armed) { console.log('[' + ts() + '] 🤖 AGENT VETO ' + (armed ? 'ARMED' : 'DISARMED') + ' — consensus-skip scoreboard ' + st.right + ' right / ' + st.wrong + ' wrong (' + st.pct + '%, bar ' + Math.round(bar * 100) + '% over ' + minN + ').'); try { sendPush('🤖 AGENT VETO ' + (armed ? 'ARMED' : 'DISARMED'), st.right + ' right / ' + st.wrong + ' wrong (' + st.pct + '%)', 'alert'); } catch (e) {} }
     global._agVetoCache = { ts: now, armed, st };
     return armed;
@@ -19814,11 +19843,12 @@ function gateAgentConsult(sym, s, row, msg) {
       const snap = entryAgentSnapshot(sym, s, { price, atr, dir, detector: row.detector, trade: fake, rule: { action: 'block', via: gate }, rsi: s._rsi, macdL: s._macdL, roc3: s._roc3, roc6: s._roc6, _model: model });
       snap.gate = { name: gate, reason: String(msg || '').replace(/[\u{1F300}-\u{1FAFF}]/gu, '').slice(0, 320), features: row.feat || null, ledger: gateLedgerFor(sym, gate, row.feat) };
       delete snap.rule_decision; delete snap.my_recent_decisions; delete snap.my_scoreboard_14d;
+      snap.my_lessons = entryAgentLessonsFor(sym, dir); // reflection memory (2026-10-29)
       snap.my_gate_reviews_14d = (function () { try { const D = entryAgent.decisions.filter(d => d.kind === 'unblock' && d.sym === sym && d.model === model && !d.err && now - d.ts < 14 * 86400000); const o = { reviews: D.length, unblock: { win: 0, loss: 0 }, uphold: { avoided_loss: 0, missed_win: 0 } }; for (const d of D) { if (d.action === 'unblock') { if (d.nowOutcome === 'win') o.unblock.win++; else if (d.nowOutcome === 'loss') o.unblock.loss++; } else if (d.action === 'uphold') { if (d.nowOutcome === 'loss') o.uphold.avoided_loss++; else if (d.nowOutcome === 'win') o.uphold.missed_win++; } } return o; } catch (e) { return null; } })();
       const userText = 'Review this blocked candidate. Snapshot (JSON):\n' + JSON.stringify(snap);
       entryAgent.stats.calls++;
       const r = await entryAgentCall(model, userText, parseInt(process.env.ENTRY_AGENT_TIMEOUT_MS, 10) || 20000, GATE_AGENT_SYSTEM);
-      const dec = { id, kind: 'unblock', ts: now, time: etClock(now), sym, dir, detector: row.detector || '?', gate, model, short: entryAgentShort(model), price: +price.toFixed(2), atr: +atr.toFixed(2), rowTs: row.ts, ms: r.ms, inTok: (r.usage && r.usage.input_tokens) || 0, outTok: (r.usage && r.usage.output_tokens) || 0 };
+      const dec = { id, kind: 'unblock', ts: now, time: etClock(now), sym, dir, detector: row.detector || '?', gate, model, short: entryAgentShort(model), price: +price.toFixed(2), atr: +atr.toFixed(2), rowTs: row.ts, feat: row.feat || null, ms: r.ms, inTok: (r.usage && r.usage.input_tokens) || 0, outTok: (r.usage && r.usage.output_tokens) || 0 };
       entryAgent.stats.msSum += r.ms || 0; entryAgent.stats.inTok += dec.inTok; entryAgent.stats.outTok += dec.outTok;
       if (!r.ok) { entryAgent.stats.errors++; entryAgent.stats.lastErr = r.err; entryAgent.stats.lastErrTs = now; dec.err = r.err; entryAgent.decisions.push(dec); entryAgent.dirty = true; log(sym, '🤖 GATE-REVIEW ' + dec.short + ' ERROR after ' + r.ms + 'ms — ' + String(r.err).slice(0, 140)); return; }
       let j = null; for (const m of String(r.text || '').match(/\{[^{}]*\}/g) || []) { try { const c = JSON.parse(m); if (c && c.action) { j = c; break; } } catch (e) {} }
@@ -19830,6 +19860,85 @@ function gateAgentConsult(sym, s, row, msg) {
       log(sym, '🤖 GATE-REVIEW ' + dec.short + ' on ' + gate + ' ' + dir.toUpperCase() + ' @ $' + price.toFixed(2) + ' (' + r.ms + 'ms) → ' + action.toUpperCase() + (dec.confidence != null ? ' · conf ' + dec.confidence : '') + ' — "' + dec.reason.slice(0, 120) + '" [shadow; graded on the blocked row\'s bracket]');
     });
   } catch (e) { try { log(sym, '⚠️ GATE-REVIEW consult error: ' + String(e).slice(0, 120)); } catch (e2) {} }
+}
+
+// ===== LESSONS — THE AGENT LEARNS FROM ITS GRADED DECISIONS (2026-10-29, Jean: "can we make the AI agent learn from its
+// mistakes, give him the reasons why it was not the right call and not repeat them?") ===== No fine-tuning: reflection +
+// memory. Every graded decision (entry desk or gate review) that was WRONG — a fill that stopped, a skip that missed a
+// winner, a wait that never filled a winner or filled a loser, an uphold of a refusal that would have won, an unblock of
+// one that lost — is sent back to a cheap model with the decision, its own reasoning, the bucketed features at the time
+// and what the market did (outcome, MFE/MAE, minutes), and it writes ONE lesson as a rule for the next similar case plus
+// pattern tags from a fixed list. A sample of RIGHT decisions is reflected the same way as confirmations. Lessons are
+// clustered by tag set (count, net $/unit, latest wording) and the top clusters per symbol are put in front of the agent
+// on every consult (lessons_from_my_mistakes / what_has_worked), with an instruction to follow a matching lesson unless
+// it can say what is different this time. /agent?lessons=1 shows them. ENTRY_AGENT_REFLECT=0 kills it.
+const AGENT_LESSON_TAGS = ['chase-extended-leg', 'against-latch', 'against-ms-trend', 'with-trend', 'into-fresh-zone', 'inside-opposing-zone', 'old-tested-zone', 'clear-path', 'fading-momentum', 'accelerating-momentum', 'reversing-momentum', 'extreme-rsi', 'mid-range', 'at-session-extreme', 'thin-tape', 'thick-tape', 'asia', 'london', 'ny-am', 'ny-pm', 'news-window', 'range-regime', 'trend-regime', 'mixed-regime', 'with-trend-pullback', 'wait-never-filled', 'wait-filled-and-lost', 'gate-was-right', 'gate-was-wrong', 'liquidation-move', 'post-news-whipsaw'];
+const AGENT_REFLECT_SYSTEM = [
+  'You are reviewing ONE of your own past decisions on an intraday CFD scalping desk (XAUUSD / NAS100 / BTCUSD, brackets of about 1-2 ATR). You get: the decision and the reason you gave, the bucketed market features at that moment, the gate involved (for a gate review), and what the market then did on that bracket.',
+  'Write ONE lesson as a rule for the next similar case, in the form "When <2-4 concrete conditions taken from the features>, <do this> — because <what happened>". Max 220 characters. Be specific to the pattern (use the feature buckets: leg extension, latch, ms trend, zone age/touches/position, momentum accel, session, regime, RSI), not generic advice.',
+  'If the decision was WRONG, the lesson must change what you would do next time. If it was RIGHT, the lesson is a confirmation of what to keep doing.',
+  'Choose 2-4 tags from this fixed list that identify the pattern: ' + AGENT_LESSON_TAGS.join(', ') + '.',
+  'Answer with ONE JSON object and nothing else: {"lesson":"...","tags":["...","..."],"kind":"mistake"|"confirmation"}'
+].join('\n');
+function entryAgentDecisionVerdict(d) {
+  // right / wrong for any decision kind; null when not gradable yet
+  const o = d.nowOutcome;
+  if (d.kind === 'unblock') { if (!o || (o !== 'win' && o !== 'loss')) return null; return d.action === 'unblock' ? (o === 'win' ? 'right' : 'wrong') : (o === 'loss' ? 'right' : 'wrong'); }
+  if (d.action === 'fill') return o === 'win' ? 'right' : o === 'loss' ? 'wrong' : null;
+  if (d.action === 'skip') return o === 'loss' ? 'right' : o === 'win' ? 'wrong' : null;
+  if (d.action === 'wait') { if (/^filled/.test(d.waitResult || '')) return d.fillOutcome === 'win' ? 'right' : d.fillOutcome === 'loss' ? 'wrong' : null; if (d.waitResult) return o === 'loss' ? 'right' : o === 'win' ? 'wrong' : null; return null; }
+  return null;
+}
+function entryAgentQueueReflect(d, row) {
+  try {
+    if (process.env.ENTRY_AGENT_REFLECT === '0' || !entryAgentEnabled() || d.reflected || d.detector === 'HAND') return;
+    const v = entryAgentDecisionVerdict(d); if (!v) return;
+    if (v === 'right' && Math.random() > 0.3) { d.reflected = 'skipped-sample'; return; } // confirmations: a 30% sample is enough
+    d.reflected = 'queued'; entryAgent.reflectQ.push({ id: d.id, verdict: v, mfe: row && row.mfe, closedMin: (row && row.closedTs && row.ts) ? Math.round((row.closedTs - row.ts) / 60000) : null });
+    if (entryAgent.reflectQ.length > 60) entryAgent.reflectQ.shift();
+  } catch (e) {}
+}
+async function entryAgentReflectOne(q) {
+  const d = entryAgent.decisions.find(x => x.id === q.id); if (!d) return;
+  try {
+    const what = d.kind === 'unblock'
+      ? ('GATE REVIEW: the ' + d.gate + ' gate refused a ' + d.detector + ' ' + d.dir.toUpperCase() + ' @ $' + d.price + '; you said ' + String(d.action).toUpperCase() + ' (confidence ' + d.confidence + ') because: "' + (d.reason || '') + '". What happened on the refused candidate\'s bracket: ' + d.nowOutcome + (q.mfe != null ? ', ran at most $' + (+q.mfe).toFixed(2) + ' in its favour' : '') + (q.closedMin != null ? ', resolved in ' + q.closedMin + ' min' : '') + '. Your verdict was ' + q.verdict.toUpperCase() + '.')
+      : ('ENTRY DESK: a ' + d.detector + ' ' + d.dir.toUpperCase() + ' fired @ $' + d.price + ' (ATR ' + d.atr + ', stop $' + d.slDist + ', target $' + d.tpDist + '); the rule said ' + (d.rule ? d.rule.action + (d.rule.limit ? ' @ ' + d.rule.limit : '') : '?') + '; you said ' + String(d.action).toUpperCase() + (d.action === 'wait' ? ' @ ' + d.limit + ' for ' + d.windowSec + 's' : '') + ' (confidence ' + d.confidence + ') because: "' + (d.reason || '') + '". What happened: fill-now bracket → ' + d.nowOutcome + (d.waitResult ? '; your wait → ' + d.waitResult + (d.fillOutcome ? ' → ' + d.fillOutcome : '') : '') + (q.mfe != null ? '; ran at most $' + (+q.mfe).toFixed(2) + ' in its favour' : '') + (d.ruleOutcome ? '; the rule\'s own trade → ' + d.ruleOutcome : '') + '. Your decision was ' + q.verdict.toUpperCase() + '.');
+    const feat = d.feat ? Object.fromEntries(Object.entries(d.feat).filter(([k, v]) => v !== null && typeof v !== 'object')) : null;
+    const userText = what + '\nFeatures at the time (bucketed): ' + JSON.stringify(feat) + '\nSymbol ' + d.sym + ', ' + d.time + ' ET.';
+    const model = process.env.ENTRY_AGENT_REFLECT_MODEL || 'claude-haiku-5-5';
+    entryAgent.stats.calls++;
+    const r = await entryAgentCall(model, userText, 20000, AGENT_REFLECT_SYSTEM);
+    entryAgent.stats.msSum += r.ms || 0; entryAgent.stats.inTok += (r.usage && r.usage.input_tokens) || 0; entryAgent.stats.outTok += (r.usage && r.usage.output_tokens) || 0;
+    if (!r.ok) { entryAgent.stats.errors++; d.reflected = 'error'; return; }
+    let j = null; for (const m of String(r.text || '').match(/\{[^{}]*\}/g) || []) { try { const c = JSON.parse(m); if (c && c.lesson) { j = c; break; } } catch (e) {} }
+    if (!j) { d.reflected = 'unparsed'; return; }
+    const tags = (Array.isArray(j.tags) ? j.tags : []).map(t => String(t).toLowerCase().trim()).filter(t => AGENT_LESSON_TAGS.indexOf(t) >= 0).slice(0, 4).sort();
+    const L = { id: 'L-' + d.id, ts: Date.now(), decTs: d.ts, sym: d.sym, dir: d.dir, model: d.short, kind: (q.verdict === 'wrong' ? 'mistake' : 'confirmation'), where: d.kind === 'unblock' ? 'review' : 'entry', action: d.action, gate: d.gate || null, detector: String(d.detector || '').replace(/[⬆⬇]/g, ''), outcome: d.nowOutcome, mfe: q.mfe != null ? +(+q.mfe).toFixed(2) : null, tags, key: tags.join('|'), text: String(j.lesson || '').slice(0, 240), sess: d.feat && d.feat.sessB, regime: d.feat && d.feat.regime };
+    entryAgent.lessons.push(L); if (entryAgent.lessons.length > 400) entryAgent.lessons.shift();
+    entryAgent.stats.reflections = (entryAgent.stats.reflections || 0) + 1; d.reflected = 'done'; d.lessonId = L.id; entryAgent.dirty = true;
+    log(d.sym, '🧠 LESSON (' + L.kind + ', ' + L.where + ' ' + String(d.action).toUpperCase() + (L.gate ? ' on ' + L.gate : '') + ') — ' + L.text + ' [' + tags.join(', ') + ']');
+  } catch (e) { d.reflected = 'error'; }
+}
+setInterval(() => { try { if (!entryAgent.reflectQ.length || !entryAgentEnabled() || process.env.ENTRY_AGENT_REFLECT === '0') return; const batch = entryAgent.reflectQ.splice(0, 2); for (const q of batch) entryAgentReflectOne(q); } catch (e) {} }, 30000).unref();
+// the lessons a consult should see: per-symbol clusters first, then cross-symbol; mistakes weighted by count × recency
+function entryAgentLessonsFor(sym, dir) {
+  try {
+    const now = Date.now(), since = now - 30 * 86400000;
+    const L = entryAgent.lessons.filter(l => l.ts >= since && l.key);
+    const cl = {};
+    for (const l of L) {
+      const k = l.kind + '|' + l.key + '|' + (l.sym === sym ? 'own' : 'other');
+      const c = cl[k] = cl[k] || { kind: l.kind, tags: l.tags, own: l.sym === sym, n: 0, lastTs: 0, text: '', syms: new Set(), dirs: new Set(), netMfe: 0 };
+      c.n++; if (l.ts > c.lastTs) { c.lastTs = l.ts; c.text = l.text; } c.syms.add(l.sym); c.dirs.add(l.dir);
+    }
+    const score = c => c.n * (c.own ? 2 : 1) * (1 + Math.max(0, 1 - (now - c.lastTs) / (14 * 86400000)));
+    const fmt = c => (c.n + '× ' + (c.own ? '' : '(' + Array.from(c.syms).join('/') + ') ') + c.text + ' [' + c.tags.join(', ') + '; last ' + new Date(c.lastTs).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/New_York' }) + ']');
+    const M = Object.values(cl).filter(c => c.kind === 'mistake').sort((a, b) => score(b) - score(a)).slice(0, 8).map(fmt);
+    const C = Object.values(cl).filter(c => c.kind === 'confirmation').sort((a, b) => score(b) - score(a)).slice(0, 4).map(fmt);
+    if (!M.length && !C.length) return null;
+    return { lessons_from_my_mistakes: M, what_has_worked: C, note: 'rules written by you after grading your own past decisions (count × pattern); follow a matching lesson unless you can state what is different this time' };
+  } catch (e) { return null; }
 }
 
 // Per tick: resolve WAIT limit trackers (touch → open the fill bracket at the limit; leash/expiry → abandoned) and
@@ -19862,11 +19971,11 @@ function entryAgentTick(sym, s, price) {
       // GATE-REVIEW grading (2026-10-21): the verdict is graded on the blocked row's own bracket; one cohort bump per
       // model+verdict (AGENT-<MODEL>-UNBLOCK / -UPHOLD) and one per gate (…-UNBLOCK-ZONE-VETO) when it resolves
       if (d.kind === 'unblock') {
-        if (!d.nowOutcome) { const r = rows.find(b => b.ts === d.rowTs && b.type === d.dir); if (r && r.closed && r.outcome) { d.nowOutcome = r.outcome; entryAgent.dirty = true; if (r.outcome === 'win' || r.outcome === 'loss') { const _tok = 'AGENT-' + d.short + '-' + String(d.action).toUpperCase(); bumpCohortTally(sym, _tok, r.outcome); bumpCohortTally(sym, _tok + '-' + String(d.gate || '').replace(/[^A-Z0-9\-]/g, ''), r.outcome); } } }
+        if (!d.nowOutcome) { const r = rows.find(b => b.ts === d.rowTs && b.type === d.dir); if (r && r.closed && r.outcome) { d.nowOutcome = r.outcome; d.nowMfe = r.mfe || 0; entryAgent.dirty = true; if (r.outcome === 'win' || r.outcome === 'loss') { const _tok = 'AGENT-' + d.short + '-' + String(d.action).toUpperCase(); bumpCohortTally(sym, _tok, r.outcome); bumpCohortTally(sym, _tok + '-' + String(d.gate || '').replace(/[^A-Z0-9\-]/g, ''), r.outcome); entryAgentQueueReflect(d, r); } } }
         continue;
       }
-      if (!d.nowOutcome) { const r = rows.find(b => b.agentId === d.id); if (r && r.closed) { d.nowOutcome = r.outcome; d.nowMfe = r.mfe || 0; entryAgent.dirty = true; } }
-      if (d.waitResult && /^filled/.test(d.waitResult) && !d.fillOutcome) { const r = rows.find(b => b.agentId === d.id + '-fill'); if (r && r.closed) { d.fillOutcome = r.outcome; entryAgent.dirty = true; } }
+      if (!d.nowOutcome) { const r = rows.find(b => b.agentId === d.id); if (r && r.closed) { d.nowOutcome = r.outcome; d.nowMfe = r.mfe || 0; entryAgent.dirty = true; if (d.action !== 'wait' || d.waitResult) entryAgentQueueReflect(d, r); } }
+      if (d.waitResult && /^filled/.test(d.waitResult) && !d.fillOutcome) { const r = rows.find(b => b.agentId === d.id + '-fill'); if (r && r.closed) { d.fillOutcome = r.outcome; entryAgent.dirty = true; entryAgentQueueReflect(d, r); } }
       if (!d.ruleOutcome && d.histTs) { const h = signalHistory.find(x => x.ts === d.histTs && x.symbol === sym); if (h && h.outcomes) { if (h.outcomes.tp1Hit) d.ruleOutcome = 'win'; else if (h.outcomes.slHit) d.ruleOutcome = 'loss'; else if (typeof h.oteHold === 'string') d.ruleOutcome = 'cancelled:' + h.oteHold; if (d.ruleOutcome) { d.ruleVia = (h.oteHold && h.oteHold.via) || (typeof h.oteHold === 'string' ? h.oteHold : null); entryAgent.dirty = true; } } }
     }
   } catch (e) {}
@@ -19943,6 +20052,7 @@ app.get('/agent', (req, res) => {
     const st = entryAgent.stats;
     const cost = { calls: st.calls, errors: st.errors, avgMs: st.calls ? Math.round(st.msSum / st.calls) : 0, inTok: st.inTok, outTok: st.outTok, lastErr: st.lastErr, lastErrAt: st.lastErrTs ? new Date(st.lastErrTs).toISOString() : null };
     const _vs = agentVetoStats();
+    if (req.query.lessons) { const Ls = entryAgent.lessons.filter(l => !req.query.sym || l.sym === String(req.query.sym).toUpperCase()); return res.json({ count: entryAgent.lessons.length, reflections: entryAgent.stats.reflections || 0, queued: entryAgent.reflectQ.length, by_symbol: Object.fromEntries(['XAU', 'BTC', 'NAS100'].map(sy => [sy, entryAgentLessonsFor(sy, 'call')])), recent: Ls.slice(-40).reverse().map(l => ({ time: new Date(l.decTs).toISOString().slice(0, 16), sym: l.sym, dir: l.dir, model: l.model, kind: l.kind, where: l.where, action: l.action, gate: l.gate, outcome: l.outcome, mfe: l.mfe, tags: l.tags, lesson: l.text })) }); }
     res.json({ enabled: entryAgentEnabled(), mode: agentVetoArmed() ? 'VETO LIVE (consensus skip cancels/flattens live fires); entries still rule-based' : 'shadow', veto: { armed: agentVetoArmed(), right: _vs.right, wrong: _vs.wrong, pending: _vs.pending, pct: _vs.pct, bar: (Math.round((parseFloat(process.env.AGENT_VETO_BAR) || 0.70) * 100)) + '% over ' + (parseInt(process.env.AGENT_VETO_MIN, 10) || 15) + ' (rolling 30d)', force: process.env.AGENT_VETO_LIVE || null }, gateReview: { enabled: entryAgentEnabled() && process.env.AGENT_UNBLOCK !== '0', gates: GATE_AGENT_RE.source, minSec: parseInt(process.env.AGENT_UNBLOCK_MIN_SEC, 10) || 90, bar: 'UNBLOCK verdicts ≥60% winners over ≥25 resolved per gate, and UPHOLD verdicts at least as right as the gate itself (see /gate-score)' }, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', bar: 'agent beats the rule by ≥8 pts of W/(W+L) over ≥40 decisions, or ≥60% on its own', since: new Date(since).toISOString(), board, cost, waitsOpen: Object.fromEntries(Object.entries(entryAgent.waits).map(([k, v]) => [k, v.length])), recent: D.slice(-(parseInt(req.query.limit, 10) || 30)).reverse().map(d => ({ time: d.time, sym: d.sym, dir: d.dir, det: d.detector, kind: d.kind || 'entry', gate: d.gate || undefined, model: d.short, action: d.action, limit: d.limit, window: d.windowSec, conf: d.confidence, reason: d.reason, err: d.err || undefined, rule: d.rule, nowOutcome: d.nowOutcome || null, waitResult: d.waitResult || null, fillOutcome: d.fillOutcome || null, ruleOutcome: d.ruleOutcome || null, ms: d.ms })) });
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
@@ -20544,7 +20654,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.56-20261029-daycap-bot-only', // bump on each deploy — lets /state verify what's live
+    build: '7.59-20261029-agent-lessons', // bump on each deploy — lets /state verify what's live
     laneBench: global._laneBench || {}, // enforced live-lane bench state (2026-10-27)
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' /* RETIRED FROM LIVE 2026-10-28 (Jean: "always taking the call after the big leg happened"): live 1W/5L −$1,942 + the 10/28 05:16 call; shadow 0W/2S/4L (14d). The sampler keeps measuring; BTC_BIGLEG_LIVE=1 re-arms by hand */ ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
