@@ -1645,12 +1645,66 @@ app.post('/news/actual', (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
 // Dashboard feed: upcoming high-impact USD events, desk records, blackout state
+// ===== ECONOMIC CONTEXT FOR THE AGENT (2026-10-29, Jean: "give the news to the AI agent so he has a better view of the
+// economic context") ===== Three things the agent did not see: (1) the day's scheduled releases with actual vs forecast vs
+// previous (ForexFactory calendar + the actuals the EA posts) and the desk's T+10 reaction read; (2) market headlines of the
+// last hours (Finnhub market news: general, forex, crypto — the key the QQQ/SPY feed already uses; polled every 10 min,
+// kept 24 h, ranked per symbol by keyword relevance then recency); (3) the macro tape the conviction score reads (DXY,
+// TLT, SLV, GDX direction and 3-min ROC for gold; the 5-day regime). Context, not signals — the prompt says so.
+global._headlines = global._headlines || [];
+async function pollHeadlines() {
+  try {
+    if (!API) return;
+    for (const cat of ['general', 'forex', 'crypto']) {
+      try {
+        const r = await fetch('https://finnhub.io/api/v1/news?category=' + cat + '&token=' + API);
+        if (!r.ok) continue;
+        const arr = await r.json(); if (!Array.isArray(arr)) continue;
+        for (const it of arr) {
+          if (!it || !it.headline || !it.datetime) continue;
+          const id = String(it.id || (it.headline + '|' + it.datetime));
+          if (global._headlines.some(h => h.id === id)) continue;
+          global._headlines.push({ id, ts: it.datetime * 1000, headline: String(it.headline).slice(0, 160), source: String(it.source || '').slice(0, 30), cat, summary: String(it.summary || '').slice(0, 200) });
+        }
+      } catch (e1) {}
+    }
+    const cutoff = Date.now() - 24 * 3600000;
+    global._headlines = global._headlines.filter(h => h.ts >= cutoff).sort((a, b) => b.ts - a.ts).slice(0, 400);
+  } catch (e) {}
+}
+setTimeout(pollHeadlines, 15000);
+setInterval(pollHeadlines, 10 * 60 * 1000).unref();
+const HEADLINE_KW = {
+  XAU: /gold|bullion|fed\b|fomc|powell|rate cut|rate hike|interest rate|inflation|cpi|pce|treasury|yield|dollar|dxy|tariff|trade war|geopolit|war|missile|strike|safe.haven|jobs|payroll|nfp|unemployment|recession|central bank|ecb|boj|pboc|china|silver|metal/i,
+  NAS100: /nasdaq|s&p|stocks|wall street|tech|nvidia|apple|microsoft|amazon|alphabet|google|meta|tesla|earnings|fed\b|fomc|powell|rate|yield|tariff|trade war|chip|semiconductor|ai\b|vix|selloff|rally|futures/i,
+  BTC: /bitcoin|btc|crypto|ether|ethereum|etf|coinbase|binance|liquidat|sec\b|stablecoin|tether|blockchain|miner|halving|whale|fed\b|fomc|rate|dollar|risk/i
+};
+function economicContextFor(sym) {
+  try {
+    const now = Date.now();
+    const evs = (_econCalCache.events || []).filter(e => e.ts > now - 12 * 3600000 && e.ts < now + 24 * 3600000).slice(0, 10).map(e => {
+      let actual = null, read = null;
+      try { for (const k of Object.keys(global._newsDesk || {})) { const d = global._newsDesk[k]; if (Math.abs(d.ts - e.ts) > 60000) continue; const x = (d.events || []).find(v => v.event === e.event); if (x && x.actual != null) actual = x.actual; if (d.read) read = typeof d.read === 'string' ? d.read.slice(0, 120) : JSON.stringify(d.read).slice(0, 120); } } catch (e2) {}
+      const m = Math.round((e.ts - now) / 60000);
+      return { event: e.event, when: m >= 0 ? 'in ' + m + ' min' : Math.abs(m) + ' min ago', impact: e.impact, forecast: e.forecast || null, previous: e.previous || null, actual, surprise: (actual != null && e.forecast) ? (parseFloat(String(actual).replace(/[^0-9.\-]/g, '')) > parseFloat(String(e.forecast).replace(/[^0-9.\-]/g, '')) ? 'above forecast' : parseFloat(String(actual).replace(/[^0-9.\-]/g, '')) < parseFloat(String(e.forecast).replace(/[^0-9.\-]/g, '')) ? 'below forecast' : 'in line') : null, market_read_after_10min: read };
+    });
+    const kw = HEADLINE_KW[sym] || HEADLINE_KW.XAU;
+    const H = (global._headlines || []).filter(h => h.ts >= now - 8 * 3600000);
+    const scored = H.map(h => { const txt = h.headline + ' ' + h.summary; const hits = (txt.match(kw) || []).length; const m = txt.match(new RegExp(kw.source, 'gi')); return { h, hits: m ? m.length : 0, score: (m ? m.length : 0) * 2 + (sym === 'BTC' && h.cat === 'crypto' ? 2 : 0) + (sym !== 'BTC' && h.cat === 'forex' ? 1 : 0) + Math.max(0, 2 - (now - h.ts) / (4 * 3600000)) }; }).filter(x => x.hits >= 1).sort((a, b) => b.score - a.score).slice(0, 8);
+    const headlines = scored.map(x => ({ age: Math.round((now - x.h.ts) / 60000) + ' min ago', source: x.h.source, headline: x.h.headline }));
+    const tape = sym === 'XAU' ? { dxy: { dir: dxyDir, roc3_pct: +(+dxyRoc3).toFixed(3) }, tlt_bonds: { dir: tltDir, roc3_pct: +(+tltRoc3).toFixed(3), note: 'TLT up = yields falling = supportive for gold' }, slv_silver: { dir: slvDir, roc3_pct: +(+slvRoc3).toFixed(3) }, gdx_miners: { dir: gdxDir, roc3_pct: +(+gdxRoc3).toFixed(3) } }
+      : sym === 'NAS100' ? { qqq: S.QQQ ? { price: S.QQQ.lastPrice, session_chg_pct: (S.QQQ.sessionOpen > 0) ? +((S.QQQ.lastPrice - S.QQQ.sessionOpen) / S.QQQ.sessionOpen * 100).toFixed(2) : null } : null, spy: S.SPY ? { price: S.SPY.lastPrice } : null, dxy: { dir: dxyDir, roc3_pct: +(+dxyRoc3).toFixed(3) }, tlt_bonds: { dir: tltDir, roc3_pct: +(+tltRoc3).toFixed(3) } }
+      : { dxy: { dir: dxyDir, roc3_pct: +(+dxyRoc3).toFixed(3) }, qqq: S.QQQ ? { price: S.QQQ.lastPrice } : null };
+    const st = S[sym];
+    return { scheduled_releases_today: evs, headlines_last_8h: headlines.length ? headlines : (API ? 'none relevant' : 'headline feed off (no FINNHUB_API_KEY)'), macro_tape: tape, regime_5d: (st && st._lastRegime) ? { dir: st._lastRegime.dir, net_pct: st._lastRegime.netChgPct } : null, note: 'context for event risk and sentiment, not a signal: a high-impact release within 30 min, or a shock headline (tariffs, geopolitics, exchange outage, forced liquidation), raises the bar for FILL and favours SKIP/WAIT; an actual far from forecast explains a one-directional tape' };
+  } catch (e) { return null; }
+}
 app.get('/news', (req, res) => {
   try {
     const now = Date.now();
     const up = (_econCalCache.events || []).filter(e => e.ts > now - 180 * 60000 && e.ts < now + 3 * 86400000).map(e => ({ event: e.event, ts: e.ts, impact: e.impact, forecast: e.forecast, previous: e.previous, inMin: Math.round((e.ts - now) / 60000) }));
     const desk = Object.values(global._newsDesk).sort((a, b) => b.ts - a.ts).slice(0, 4).map(d => ({ ts: d.ts, label: d.label, events: d.events, read: d.read, armed: d.armed, textbook: d.textbook || null, minutesSince: Math.round((now - d.ts) / 60000), p0: d.p0, hi: d.hi, lo: d.lo }));
-    res.json({ ts: now, source: _econCalCache.source || null, lastFetchTs: _econCalCache.lastFetchTs || 0, events: up, desk, blackout: (S.XAU && S.XAU.newsBlackout) || null, lastHighImpactEvent, cohorts: { NEWS_FADE: Object.fromEntries(['XAU', 'NAS100', 'BTC'].map(sy => [sy, (cohortTally[sy] || {})['NEWS-FADE'] || null])), NEWS_CONT: Object.fromEntries(['XAU', 'NAS100', 'BTC'].map(sy => [sy, (cohortTally[sy] || {})['NEWS-CONT'] || null])) } });
+    res.json({ ts: now, source: _econCalCache.source || null, lastFetchTs: _econCalCache.lastFetchTs || 0, headlines: (global._headlines || []).slice(0, 40).map(h => ({ age_min: Math.round((now - h.ts) / 60000), cat: h.cat, source: h.source, headline: h.headline })), context: { XAU: economicContextFor('XAU'), NAS100: economicContextFor('NAS100'), BTC: economicContextFor('BTC') }, events: up, desk, blackout: (S.XAU && S.XAU.newsBlackout) || null, lastHighImpactEvent, cohorts: { NEWS_FADE: Object.fromEntries(['XAU', 'NAS100', 'BTC'].map(sy => [sy, (cohortTally[sy] || {})['NEWS-FADE'] || null])), NEWS_CONT: Object.fromEntries(['XAU', 'NAS100', 'BTC'].map(sy => [sy, (cohortTally[sy] || {})['NEWS-CONT'] || null])) } });
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 // Initial fetch and recurring schedule
@@ -19578,12 +19632,12 @@ const ENTRY_AGENT_SYSTEM = [
   '  • Read my_scoreboard_14d before deciding: if your WAITs are mostly unfilled-and-missed, you are too cautious for this tape; if your FILLs are losing, you are chasing. Adjust.',
   '  • Opposing zone (OB/FVG the other way) within 1 ATR ahead with grade S (strong) → the path is blocked: WAIT until price is through it or SKIP. Weak (W) or unknown zones matter less. No opposing zone within 2 ATR = clear path → favours FILL.',
   '  • Regime RANGE with a candidate that is NOT at a session extreme → low expectancy for continuation; prefer SKIP unless the path is clear and momentum is live. Regime TREND with-trend → FILL/shallow WAIT; counter-trend in TREND → SKIP unless at an extreme with a clean rejection.',
-  '  • News blackout active or a high-impact release within 10 minutes → SKIP.',
+  '  • News blackout active or a high-impact release within 10 minutes → SKIP. economic_context carries today\'s releases with actual vs forecast and the market\'s 10-minute read, the relevant headlines of the last hours, and the macro tape (dollar, bonds, silver, miners for gold; QQQ/SPY for NAS). Use it as context: a surprise print explains a one-directional tape (do not fade it), a shock headline or a release due within 30 min raises the bar for FILL, a quiet calendar and neutral tape favour the chart.',
   '  • Use lane_stats_7d: if this detector\'s market fills have been losing and its pullback fills winning, lean WAIT; and vice versa. Use my_recent_decisions to avoid repeating a graded mistake.',
   '  • my_lessons holds rules YOU wrote after grading your own past decisions (lessons_from_my_mistakes, what_has_worked), with how many times each pattern recurred. Check them FIRST: if the current candidate matches a lesson\'s conditions, follow it, and say so in your reason — unless you can state concretely what is different this time. Your FILL calls have lost far more often than they have won; the lessons exist to stop the same mistake a third time.',
   'What the zone ledger has learned about OB/FVG zones in THIS system (measured on 258 graded vetoes and ~1,500 zones, Oct 2026): a continuation that runs into an opposing zone within 1.2 ATR AHEAD wins only ~17-30% of the time, whatever the zone\'s grade — even "weak" zones that later break produce enough first-touch reaction to stop a 1 ATR bracket; being already INSIDE an opposing zone is less dangerous (~31%). Zone AGE matters most: zones younger than 4h stop candidates ~74% of the time, 4-12h-old zones ~57%, older ones less. Higher timeframes hold more (M15 order blocks ~45-52% hold rate, M10 ~35-45%, M5 zones ~25-30% = noise). Zones sitting AT the session extreme hold poorly (<25% on gold) — the level gets retested and run; the zone itself is not a reason to fade. No zone class holds more than ~52%, so a zone BEHIND you is modest support, not a wall. Use zone_ledger_buckets to read what a grade means today.',
   'Constraints for WAIT: limit must be on the pullback side of the current price (below it for a call, above it for a put), between 0.25 and 1.0 ATR away; window_sec 60–300; leash_atr 0.3–1.0.',
-  'Answer with ONE JSON object and nothing else: {"action":"fill"|"wait"|"skip","limit":<number or null>,"window_sec":<int or null>,"leash_atr":<number or null>,"confidence":<0..1>,"reason":"<max 160 chars, concrete: cite the numbers that decided it>"}'
+  'Answer with ONE JSON object and nothing else: {"action":"fill"|"wait"|"skip","limit":<number or null>,"window_sec":<int or null>,"leash_atr":<number or null>,"confidence":<0..1>,"reason":"<max 160 chars, concrete: cite the numbers that decided it>","counter_case":"<for FILL only: the single strongest reason NOT to fill, max 100 chars; if you cannot name one, lower your confidence>"}'
 ].join('\n');
 
 function entryAgentLaneStats(sym, detector) {
@@ -19634,6 +19688,7 @@ function entryAgentSnapshot(sym, s, ctx) {
     opposing_zones_ahead: ahead, inside_opposing_zone: inside, supporting_zones_behind: behind,
     m5_bars_last12_time_o_h_l_c: m5, m1_closes_last20: m1,
     news: { blackout: !!nb.active, next_event: nb.eventName ? (nb.eventName + ' in ' + nb.minutesUntil + ' min (' + (nb.impact || '?') + ')') : null },
+    economic_context: economicContextFor(sym), // calendar actuals, headlines, macro tape (2026-10-29)
     // the clearer picture (2026-10-27): the day so far, the trend's age, the higher timeframe, a 3-hour M15 view
     trend_context: { trend_day_latch: (s._tdLatch && (Date.now() - s._tdLatch.ts) < 600000) ? { dir: s._tdLatch.dir, with_candidate: s._tdLatch.dir === dir } : null, ms_trend_run: (s._msTrend && s._msTrendTs) ? { dir: s._msTrend, minutes: Math.round((Date.now() - s._msTrendTs) / 60000), travelled_atr: (s._msTrendP0 > 0 && atr > 0) ? +(Math.abs(price - s._msTrendP0) / atr).toFixed(1) : null } : null, h1_direction: s.htf1h_dir || null, day_regime_5d: s._lastRegime ? { dir: s._lastRegime.dir, net_pct: s._lastRegime.netChgPct } : null },
     session_story: (function () { try {
@@ -19681,7 +19736,7 @@ function entryAgentParse(text, snap) {
   if (!j) { const m2 = txt.match(/\{[\s\S]*\}/); if (m2) { try { j = JSON.parse(m2[0]); } catch (e) {} } }
   if (!j) return { err: txt.length ? 'json parse' : 'empty answer' };
   const action = String(j.action || '').toLowerCase(); if (!/^(fill|wait|skip)$/.test(action)) return { err: 'bad action ' + action };
-  const out = { action, confidence: isFinite(+j.confidence) ? Math.max(0, Math.min(1, +j.confidence)) : null, reason: String(j.reason || '').slice(0, 200), limit: null, windowSec: null, leashAtr: null, note: '' };
+  const out = { action, confidence: isFinite(+j.confidence) ? Math.max(0, Math.min(1, +j.confidence)) : null, reason: String(j.reason || '').slice(0, 200), counter: j.counter_case ? String(j.counter_case).slice(0, 120) : null, limit: null, windowSec: null, leashAtr: null, note: '' };
   if (action === 'wait') {
     const atr = snap.atr || 0, price = snap.price, isC = snap.direction === 'call';
     const lim = +j.limit; if (!isFinite(lim) || !(atr > 0)) return { err: 'wait without a valid limit' };
@@ -19716,7 +19771,7 @@ function entryAgentConsult(sym, s, ctx) {
       if (!r.ok) { entryAgent.stats.errors++; entryAgent.stats.lastErr = r.err; entryAgent.stats.lastErrTs = now; dec.err = r.err; entryAgent.decisions.push(dec); entryAgent.dirty = true; log(sym, '🤖 ENTRY-AGENT ' + dec.short + ' ERROR after ' + r.ms + 'ms — ' + String(r.err).slice(0, 140)); return; }
       const p = entryAgentParse(r.text, snap);
       if (p.err) { entryAgent.stats.errors++; entryAgent.stats.lastErr = p.err; entryAgent.stats.lastErrTs = now; dec.err = p.err; dec.raw = String(r.text || '').slice(0, 200); entryAgent.decisions.push(dec); entryAgent.dirty = true; log(sym, '🤖 ENTRY-AGENT ' + dec.short + ' unusable answer (' + p.err + ') — ' + String(r.text || '').slice(0, 120)); return; }
-      Object.assign(dec, { action: p.action, limit: p.limit, windowSec: p.windowSec, leashAtr: p.leashAtr, confidence: p.confidence, reason: p.reason, note: p.note });
+      Object.assign(dec, { action: p.action, limit: p.limit, windowSec: p.windowSec, leashAtr: p.leashAtr, confidence: p.confidence, reason: p.reason, counter: p.counter || undefined, note: p.note });
       // (1) the "fill now" bracket — graded for every decision (what the agent's FILL would do; what a SKIP gave up; what a WAIT risks missing)
       const isC = ctx.dir === 'call'; const px = +ctx.price;
       const tok = 'AGENT-' + dec.short + '-' + p.action.toUpperCase() + '-NOW';
@@ -19757,6 +19812,7 @@ const GATE_AGENT_SYSTEM = [
   'Your ONLY job: UNBLOCK (the system should fire this candidate at market now, with the stop/target bracket shown) or UPHOLD (the gate is right, no trade).',
   'How you are graded: on the candidate\'s own bracket from the current price — first target (TP1) before stop (SL) = the candidate would have won. UNBLOCK on a winner counts for you, UNBLOCK on a loser against you; UPHOLD on a loser counts for you (avoided loss), UPHOLD on a winner against you (missed win). The gates you review have been right 65–84% of the time, so UPHOLD is the default: UNBLOCK only when the evidence is specific and the ledger does not contradict you.',
   'Judgment to apply: a gate is usually right when the candidate runs into a FRESH (<4h) untested opposing zone, when momentum is fading or reversing (accel=fading/reversing), when the leg has already run ≥2 ATR, when the candidate is counter-trend (ms=CT) or against the trend-day latch, or in RANGE regime away from a session extreme. A gate is more often wrong when the opposing zone is OLD or already tested 2+ times, momentum is accelerating with the candidate (macdB with/strong-with, accel=accel), the leg is young (<1 ATR from pivot), the candidate is with-trend on a latched trend day, and the tape is thick. Weigh gate.ledger over these priors when it has ≥10 rows in a bucket.',
+  'economic_context: today\'s scheduled releases with actual vs forecast and the 10-minute market read, relevant headlines of the last hours, and the macro tape. A surprise print or shock headline that explains the move argues for UPHOLD on a counter-move candidate and against unblocking a chase; a quiet calendar and neutral tape leave the chart to decide.',
   'my_lessons (when present) holds rules you wrote after grading your own past reviews — patterns where your uphold or unblock was wrong, with recurrence counts. Check them first; follow a matching lesson unless you can say what is different now.',
   'Answer with ONE JSON object and nothing else: {"action":"unblock"|"uphold","confidence":<0..1>,"reason":"<max 160 chars, concrete: cite the numbers that decided it>"}'
 ].join('\n');
@@ -19929,12 +19985,17 @@ function entryAgentLessonsFor(sym, dir) {
     const cl = {};
     for (const l of L) {
       const k = l.kind + '|' + l.key + '|' + (l.sym === sym ? 'own' : 'other');
-      const c = cl[k] = cl[k] || { kind: l.kind, tags: l.tags, own: l.sym === sym, n: 0, lastTs: 0, text: '', syms: new Set(), dirs: new Set(), netMfe: 0 };
-      c.n++; if (l.ts > c.lastTs) { c.lastTs = l.ts; c.text = l.text; } c.syms.add(l.sym); c.dirs.add(l.dir);
+      const c = cl[k] = cl[k] || { kind: l.kind, key: l.key, tags: l.tags, own: l.sym === sym, n: 0, firstTs: l.ts, lastTs: 0, text: '', syms: new Set(), dirs: new Set(), netMfe: 0 };
+      c.n++; if (l.ts < c.firstTs) c.firstTs = l.ts; if (l.ts > c.lastTs) { c.lastTs = l.ts; c.text = l.text; } c.syms.add(l.sym); c.dirs.add(l.dir);
     }
+    // SELF-CHECK (2026-10-29): a lesson is only as good as its record. For each mistake cluster, count the confirmations of
+    // the SAME pattern written after the first mistake (the lesson held) and the mistakes repeated after it (it did not).
+    // Shown to the agent; a cluster whose later record contradicts it (held < repeats, ≥3 events) is dropped from the list.
+    const held = (c) => L.filter(l => l.kind === 'confirmation' && l.key === c.key && l.ts > c.firstTs).length;
+    const repeats = (c) => Math.max(0, c.n - 1);
     const score = c => c.n * (c.own ? 2 : 1) * (1 + Math.max(0, 1 - (now - c.lastTs) / (14 * 86400000)));
-    const fmt = c => (c.n + '× ' + (c.own ? '' : '(' + Array.from(c.syms).join('/') + ') ') + c.text + ' [' + c.tags.join(', ') + '; last ' + new Date(c.lastTs).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/New_York' }) + ']');
-    const M = Object.values(cl).filter(c => c.kind === 'mistake').sort((a, b) => score(b) - score(a)).slice(0, 8).map(fmt);
+    const fmt = c => (c.n + '× ' + (c.own ? '' : '(' + Array.from(c.syms).join('/') + ') ') + c.text + ' [' + c.tags.join(', ') + '; last ' + new Date(c.lastTs).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/New_York' }) + (c.kind === 'mistake' ? '; since written: held ' + held(c) + '×, repeated ' + repeats(c) + '×' : '') + ']');
+    const M = Object.values(cl).filter(c => c.kind === 'mistake').filter(c => { const h = held(c), r = repeats(c); return !(h + r >= 3 && h < r); }).sort((a, b) => score(b) - score(a)).slice(0, 8).map(fmt);
     const C = Object.values(cl).filter(c => c.kind === 'confirmation').sort((a, b) => score(b) - score(a)).slice(0, 4).map(fmt);
     if (!M.length && !C.length) return null;
     return { lessons_from_my_mistakes: M, what_has_worked: C, note: 'rules written by you after grading your own past decisions (count × pattern); follow a matching lesson unless you can state what is different this time' };
@@ -20654,7 +20715,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.59-20261029-agent-lessons', // bump on each deploy — lets /state verify what's live
+    build: '7.61-20261029-lesson-selfcheck', // bump on each deploy — lets /state verify what's live
     laneBench: global._laneBench || {}, // enforced live-lane bench state (2026-10-27)
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' /* RETIRED FROM LIVE 2026-10-28 (Jean: "always taking the call after the big leg happened"): live 1W/5L −$1,942 + the 10/28 05:16 call; shadow 0W/2S/4L (14d). The sampler keeps measuring; BTC_BIGLEG_LIVE=1 re-arms by hand */ ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
