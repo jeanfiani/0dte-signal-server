@@ -2360,6 +2360,7 @@ function cohortFor(reason) {
   { const _bl = reason.match(/\bBTC-BIGLEG-(CONT|LATCH)\b/); if (_bl) return _bl[0]; } // continuation / latch arms (2026-10-21) — before the plain BIGLEG matches
   { const _ag = reason.match(/\bAGENT-([A-Z0-9]+)-(FILL|WAIT|SKIP)-(NOW|FILL)\b/); if (_ag) return _ag[0]; } // entry agent shadow cohorts (2026-10-09)
   { const _agU = reason.match(/\bAGENT-([A-Z0-9]+)-(UNBLOCK|UPHOLD)(-[A-Z0-9\-]+)?\b/); if (_agU) return _agU[0]; } // gate-review shadow cohorts (2026-10-21): AGENT-<MODEL>-UNBLOCK[-<GATE>]
+  if (/\+LIQ\b/.test(reason)) return 'LIQ-REGIME'; // liquidation-regime fires (2026-10-30)
   if (/XAU-LIQ/.test(reason)) return 'XAU-LIQ'; // liquidation-day continuation lane, sampled always, fires with XAU_UNLOCK=1 (2026-10-30)
   if (/LATCH-RUNNER/.test(reason)) return 'LATCH-RUNNER'; // latch-day runner: remainder exit vs TP2 (2026-10-27)
   if (/TD-PULLBACK-(FILL|LEFT|EXPIRED)/.test(reason)) return reason.match(/TD-PULLBACK-(FILL|LEFT|EXPIRED)/)[0]; // latch-day pullback auction, shadow (2026-10-27)
@@ -4052,6 +4053,7 @@ function logSignal(sym, sig) {
     macdRelease: sig._macdRelease || undefined,
     manual: sig.manual || undefined, // MANUAL launch (2026-10-04): {note, mode, regime, msTrend}
     ctWaived: sig._ctWaived || undefined, // CT-VETO waived under LEG MODE (2026-10-02)
+    liq: sig.liq === true || undefined, // liquidation-regime fire: crest gates waived, market entry (2026-10-30)
     legMode: sig._legMode === true || undefined, // ZONE-VETO waived under LEG MODE (2026-10-02) // fired after a MACD-DEFER release (2026-10-02): {waitedSec, from, to, accel} — grades as its own class
     // ML-DIR learned-scorer probability (dormant, 2026-08-29) — grade fired rows by
     // p-bucket in the nightly report; promotion requires holdout AND live agreement.
@@ -6723,6 +6725,8 @@ function processPrice(sym, price, hi, lo) {
   // 0.4 bar + conv floor. DORMANT: signal still blocks. 3-min per-direction throttle.
   function enrichSig(sig) {
     const _esPassed = enrichSigCore(sig);
+    // LIQUIDATION REGIME tag (2026-10-30): the score gets '+LIQ' (cohort / bench / EA-visible, full lot) and the row liq:true
+    try { if (_esPassed && sig && sig._liq && sig.score && !/\+LIQ/.test(sig.score)) { sig.score = sig.score + '+LIQ'; sig.liq = true; } } catch (eLT) {}
     // Regime cache for latchAdvSource (2026-09-02) — fresh on every scored signal
     try { if (sig && sig._regime) s._lastRegime = { dir: sig._regime.dir, netChgPct: sig._regime.netChgPct, ts: Date.now() }; } catch (eRC) {}
     // BIG-LEG fire marker (2026-09-16): fired rows during an armed big leg carry
@@ -7283,7 +7287,7 @@ function processPrice(sym, price, hi, lo) {
       // The fade family (EXT-FLIP / LHF / LLF / VREV / ATH / ATL / CHoCH / INVERSAL) was never in
       // _isContMom and stays untouched — 4 of the last 5 EXT-FLIP fires had MACD against them,
       // including the 7/29 +$17.12 TP3.
-      if (isMT5 && _isContMom) {
+      if (isMT5 && _isContMom && !sig._liq) { // liquidation regime: no defer (2026-10-30)
         const _ml = parseFloat(sig.macd);
         if (!isNaN(_ml) && ((sig.type === 'call' && _ml < 0) || (sig.type === 'put' && _ml > 0))) {
           // ===== DEFER-AND-CONFIRM (2026-07-27, Jean) — don't reject outright, WAIT for the turn =====
@@ -7605,7 +7609,7 @@ function processPrice(sym, price, hi, lo) {
           sig._ctWaived = 'bigleg';
           log(sym, '🦵 ' + _ctTag + ' ' + sig.type.toUpperCase() + ' CT-VETO WAIVED — LEG MODE: BIG-LEG armed ' + sig.type + ' with a ≥1.5×ATR leg from pivot $' + (s._legPivot ? (+s._legPivot.ext).toFixed(2) : '?') + ' vs 5-day ' + sig._regime.dir.toUpperCase() + ' (s' + sig._regime.strength + '). BIGLEG-CT-WF earned it: 8W/5L/3S (promoted 2026-10-02; bench net-negative first 6).');
         }
-        if (_ctCont && _ctCounter && !_ctTrendExempt && !_ctLeg) {
+        if (_ctCont && _ctCounter && !_ctTrendExempt && !_ctLeg && !sig._liq) { // liquidation regime: a 60-min msTrend on a 6×ATR range outranks the 5-day label (2026-10-30; the 10/28 night's CT-VETO'd puts)
           if (_ctBigLeg) {
             const _ctWf = '🧵 ' + _ctTag + ' ' + sig.type.toUpperCase() + ' BIGLEG-CT-WF @ $' + price.toFixed(2) + ' — CT-VETO blocked a with-leg continuation while BIG-LEG was armed ' + sig.type + ' but the leg is still <1.5×ATR (5-day ' + sig._regime.dir.toUpperCase() + '); measured (2026-09-22; LEG MODE threshold 2026-10-02).';
             log(sym, _ctWf); trackBlockedOutcome(sym, _ctWf, true);
@@ -8093,8 +8097,8 @@ function processPrice(sym, price, hi, lo) {
               // marker); bench rule = BIG-LEG's own: net-negative first 6 → revert;
               // BIGLEG_DISABLED=1 kills the whole state machine including this ease.
               const _egBigLeg = s._bigLeg === sig.type && s._bigLegTier === 'FULL' && process.env.BIGLEG_DISABLED !== '1' && /RIDE|TREND|FAST|SUST|6\/6/.test(tagEarly || ''); // FULL tier only (TREND regime), 2026-09-28
-              if (_egEase || _egBigLeg) {
-                const _egEaseMsg = _egEase
+              if (_egEase || _egBigLeg || sig._liq) {
+                const _egEaseMsg = sig._liq ? ('🌊 LIQ-REGIME — ' + tagEarly + ' ' + sig.type.toUpperCase() + ' EXT-GUARD waived @ $' + price.toFixed(2) + ' (' + Math.round(_egPos * 100) + '% of $' + _egRange.toFixed(2) + ' impulse): liquidation regime, with-trend continuation (2026-10-30).') : _egEase
                   ? '📈 LATCH-ADV-EASE — ' + tagEarly + ' ' + sig.type.toUpperCase() + ' EXT-GUARD deferred @ $' + price.toFixed(2) + ' (' + Math.round(_egPos * 100) + '% of $' + _egRange.toFixed(2) + ' impulse): with-trend latch + session extreme advancing <15min — trend extending, not cresting (2026-09-01).'
                   : '🚀 BIGLEG-EG-EASE — ' + tagEarly + ' ' + sig.type.toUpperCase() + ' EXT-GUARD deferred @ $' + price.toFixed(2) + ' (' + Math.round(_egPos * 100) + '% of $' + _egRange.toFixed(2) + ' impulse): BIG-LEG armed ' + sig.type + ' — young one-sided leg, mid-leg entry is the thesis (2026-09-18, the 01:08-01:59 night-leg autopsy).';
                 log(sym, _egEaseMsg); trackBlockedOutcome(sym, _egEaseMsg, true);
@@ -8172,7 +8176,7 @@ function processPrice(sym, price, hi, lo) {
             // the next few seconds can be tagged as a BREAKOUT entry (time-stop below).
             s._lbWaiverTs = Date.now();
           }
-          if (_sePct < 0.05 && !_seLiveBreak) {
+          if (_sePct < 0.05 && !_seLiveBreak && !sig._liq) { // liquidation regime: selling the bottom IS the trade (2026-10-30)
             // Arm/refresh the opposite EXT-FLIP candidate (mirrors the EXT-GUARD arm) —
             // blocking the chase must not also lose the reversal. Re-blocks REFRESH the
             // extreme but keep the original armTs, so the 3-min stabilization clock isn't
@@ -8738,6 +8742,8 @@ function processPrice(sym, price, hi, lo) {
 
       // ── 2.0: Boot warm-up gate (2026-10-14) — no fire on a cold ATR / unloaded calendar
       { const _bw = bootWarm(sym, s); if (!_bw.ok) { Object.assign(s, _emitSnapshot); s._bwLogTs = s._bwLogTs || 0; if (Date.now() - s._bwLogTs > 60000) { s._bwLogTs = Date.now(); const _bwMsg = '🥶 ' + tagP2 + ' ' + sig.type.toUpperCase() + ' BLOCKED — BOOT-WARMUP: ' + _bw.why + '.'; log(sym, _bwMsg); } return false; } }
+      // LIQUIDATION REGIME flag (2026-10-30) — with-trend momentum candidates skip the crest/exhaustion gates below
+      try { sig._liq = /RIDE|TREND|FAST|SUST/.test(tagP2) && !/LHF|LLF|VREV|EXT-FLIP|OBREJ|OBMIT|INVERSAL|SWEEP|CHoCH|ATH|ATL|DIV/.test(tagP2) && liquidationRegime(s, sym, sig.type, atrVal); if (sig._liq && !s._liqLogTs || (sig._liq && Date.now() - s._liqLogTs > 300000)) { s._liqLogTs = Date.now(); log(sym, '🌊 LIQUIDATION REGIME — ' + sig.type.toUpperCase() + ' continuation candidates skip the crest gates: range $' + (s.sessionHigh - s.sessionLow).toFixed(2) + ' (' + ((s.sessionHigh - s.sessionLow) / Math.max(1e-9, atrVal)).toFixed(1) + '×ATR), msTrend ' + s._msTrend + ' ' + Math.round((Date.now() - s._msTrendTs) / 60000) + 'min (2026-10-30).'); } } catch (eLR) { sig._liq = false; }
       // ===== GATE HYSTERESIS (2026-10-27, Jean: "all the principles we've been working on have been forgotten") =====
       // The 10:13 XAU TREND call: EXT-GUARD refused it at 10:12:32 (leg 8 ATR from pivot, 95% of the range, momentum
       // fading — both agents upheld), MACD deferred it at 10:12:58, and at 10:13:10 the same candidate at the same price
@@ -8748,7 +8754,7 @@ function processPrice(sym, price, hi, lo) {
       // (MACD-DEFER release). Graded like any gate (GATE-HYST cohort: win = the refused candidate would have won).
       try {
         const _lbH = s._lastJudgBlock && s._lastJudgBlock[sig.type]; // judgment-only record (2026-10-29)
-        if (_lbH && _lbH.price > 0 && !sig._macdRelease && process.env.GATE_HYST !== '0' && /^(EXT-GUARD|SESS-EXTREME|MACD-DEFER|MOM-FLOOR|ZONE-VETO|ZONE-MICRO-WF|CT-VETO|FAST-PRE|CHOP|GRIND-RECLAIM|RSI)/.test(_lbH.gate || '')) {
+        if (_lbH && _lbH.price > 0 && !sig._macdRelease && !sig._liq && process.env.GATE_HYST !== '0' && /^(EXT-GUARD|SESS-EXTREME|MACD-DEFER|MOM-FLOOR|ZONE-VETO|ZONE-MICRO-WF|CT-VETO|FAST-PRE|CHOP|GRIND-RECLAIM|RSI)/.test(_lbH.gate || '')) {
           const _hAge = (Date.now() - _lbH.ts) / 1000, _hSec = parseInt(process.env.GATE_HYST_SEC, 10) || 180;
           const _hAtr = Math.max(s._atr || 0, 0) * (parseFloat(process.env.GATE_HYST_ATR) || 0.5);
           const _hMove = Math.abs(price - _lbH.price);
@@ -10076,7 +10082,7 @@ function processPrice(sym, price, hi, lo) {
     if (Array.isArray(s.recentFires)) {
       const tCap = Date.now();
       const sameDirRecent = s.recentFires.filter(f => f.type === sig.type && (tCap - f.ts) < SAME_DIR_CAP_MS);
-      if (sameDirRecent.length >= SAME_DIR_CAP) {
+      if (sameDirRecent.length >= SAME_DIR_CAP && !sig._liq) { // liquidation regime: continuation fires are the point (2026-10-30)
         Object.assign(s, _emitSnapshot);
         const oldestAge = Math.round((tCap - sameDirRecent[0].ts) / 60000);
         log(sym, '🚫 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — same-direction cap: already ' + sameDirRecent.length + ' ' + sig.type.toUpperCase() + ' fires in last ' + Math.round(SAME_DIR_CAP_MS / 60000) + 'min (oldest ' + oldestAge + 'min ago). Trend exhaustion likely — wait for retracement.');
@@ -10491,8 +10497,8 @@ function processPrice(sym, price, hi, lo) {
     // would-wins >=60% over >=15 resolved, or last week's trend-day winners start
     // getting refused (>=3 blocked winners on an s2 regime day) -> revert.
     try {
-      if (sym === 'XAU' && /RIDE|TREND|FAST|SUST|SQZ|6\/6/.test(tag) &&
-          !/LHF|LLF|VREV|EXT-FLIP|OBREJ|OBMIT|INVERSAL|SWEEP|CHoCH|ATH|ATL|DIV/.test(tag)) {
+      if (sym === 'XAU' && !sig._liq && /RIDE|TREND|FAST|SUST|SQZ|6\/6/.test(tag) &&
+          !/LHF|LLF|VREV|EXT-FLIP|OBREJ|OBMIT|INVERSAL|SWEEP|CHoCH|ATH|ATL|DIV/.test(tag)) { // liquidation regime: no floor (2026-10-30)
         const _mfMacd = parseFloat(sig.macd);
         const _mfOkM = isFinite(_mfMacd) && (sig.type === 'call' ? _mfMacd >= 0.10 : _mfMacd <= -0.10);
         const _mfOkR = sig.type === 'call' ? roc3 >= 0.05 : roc3 <= -0.05;
@@ -12413,6 +12419,12 @@ function processPrice(sym, price, hi, lo) {
         // OTE kill switch (2026-09-07, Jean's WR concern): set OTE_DISABLED=1 in
         // Railway env to release every fire at market instantly — no code push needed.
         if (process.env.OTE_DISABLED === '1' && s.trade && s.trade._oteVetted === false) s.trade._oteVetted = true;
+        if ((sym === 'XAU' || sym === 'NAS100') && s.trade && s.trade.active && s.trade._oteVetted === false && !s._invHold && !s._oteHold && s.lastHistEntry && s.lastHistEntry.symbol === sym && s.lastHistEntry.liq && s.lastHistEntry.type === s.trade.type) {
+          // LIQUIDATION REGIME (2026-10-30): no auction — a pullback hold's runaway cancel is the wrong rule on a slide; market, now
+          s.trade._oteVetted = true; s.trade._liq = true;
+          try { s.lastHistEntry.oteHold = { via: 'liquidation regime (market, no auction)', fill: +price.toFixed(2), sigPrice: +s.trade.ep, improve: 0, waitedSec: 0 }; } catch (eLV) {}
+          log(sym, '🌊 LIQ-REGIME — ' + s.trade.type.toUpperCase() + ' released at market @ $' + price.toFixed(2) + ' (no pullback auction on a liquidation day, 2026-10-30).');
+        }
         if ((sym === 'XAU' || sym === 'NAS100') && s.trade && s.trade.active && s.trade._oteVetted === false && !s._invHold && !s._oteHold) { // NAS added 2026-09-09 (Jean: "we need to work on NAS")
           const _ohT = s.trade;
           const _ohDir = _ohT.type;
@@ -15199,7 +15211,9 @@ function processPrice(sym, price, hi, lo) {
             }
           }
         } catch (eFP) {}
-        if (fmRecentTpSlOk && fmRsiOk && fmRocOk && fmMacdOk && fmGapOk && fmRoomOk && fmRoundOk && fmXauConvOk && fmXauConflOk && fmXauCandleOk && fmXauHtfOk && flipCoolFor(fmDir) && (winProtectDir === null || winProtectDir === fmDir)) {
+        const _fmLiq = liquidationRegime(s, sym, fmDir, atrVal); // liquidation regime (2026-10-30): the anti-chase pre-gates are the wrong rule on a $120 slide
+        if (_fmLiq && !(fmRecentTpSlOk && fmRsiOk && fmMacdOk && fmRoomOk && fmXauConvOk && fmXauHtfOk && flipCoolFor(fmDir))) log(sym, '🌊 LIQ-REGIME — FAST ' + fmDir.toUpperCase() + ' pre-gates waived @ $' + price.toFixed(2) + ' (rsi/chase/macd-dir/room/conv/htf/flip-cool), liquidation regime (2026-10-30).');
+        if ((_fmLiq || (fmRecentTpSlOk && fmRsiOk && fmMacdOk && fmRoomOk && fmXauConvOk && fmXauHtfOk && flipCoolFor(fmDir))) && fmRocOk && fmGapOk && fmRoundOk && fmXauConflOk && fmXauCandleOk && (winProtectDir === null || winProtectDir === fmDir)) {
           s.fastMoveLastTs = now2;
           s.fastLastDir = fmDir; // for 30-min opposite-direction flip-cool
           s.lastAT = fmDir; if (fmDir === 'call') s.nC++; else s.nP++; s.dailySignalCount++;
@@ -17227,6 +17241,34 @@ function computeAVWAP(s, dir) {
 // restriction (exhaustion fires at the staircase lows) is now handled by the extreme-pullback
 // hold (7.05), which is why this can be relaxed. Bench rule: BIG-LEG's (net-negative first 6
 // LEG-MODE fires → back to FULL tier). LEG_MODE=0 kills.
+// ===== LIQUIDATION REGIME (2026-10-30, Jean: "it's not possible that 0 puts have been taken while price went from
+// 4075 to 3890 — clearly something is wrong") ===== He is right about the mechanism: the gate stack is an anti-chase
+// design, and on a liquidation day every with-trend candidate is, by definition, a chase — so EXT-GUARD, SESS-EXTREME,
+// MACD-DEFER, MOM-FLOOR, FAST's RSI/chase pre-gates, the same-direction cap and the hysteresis refuse all of them. From
+// 17:00 ET 10/29 to 09:35 ET 10/30 they refused 150 XAU puts: 60 would have won (several +$30 to +$53), 53 lost $10,
+// 29 scratched. A $185 slide with zero bot puts. In this regime the stack flips: with-trend continuation candidates from
+// the momentum detectors (RIDE / TREND / FAST / SUST) skip the crest and exhaustion gates and fire through the normal
+// ladder ($10 stop, $5.24 TP1, latch-day runner), born vetted (market; a pullback hold's "runaway" cancel is exactly the
+// wrong rule here), with the agent consulted at birth and the veto applying when armed. The regime is narrow on purpose:
+//   • session range ≥ LIQ_RANGE_ATR (6) × ATR          (today: $120 on a ~$7 ATR)
+//   • msTrend in the candidate's direction for ≥ LIQ_MIN_RUN_MIN (60)
+//   • price in the leading third of the range (a put below sessionLow + 0.35 × range; a call above the mirror)
+// Fires stamp liq:true and the score gets "+LIQ" (cohort, EA-visible); enforced bench on the last 6 filled +LIQ fires.
+// LIQ_REGIME=0 kills; LIQ_SYMS (default "XAU") lists the symbols.
+function liquidationRegime(s, sym, dir, atr) {
+  try {
+    if (process.env.LIQ_REGIME === '0' || !s) return false;
+    if (String(process.env.LIQ_SYMS || 'XAU').split(',').map(x => x.trim()).indexOf(sym) < 0) return false;
+    const a = atr > 0 ? atr : (s._atr || 0); if (!(a > 0) || !isFinite(s.sessionHigh) || !isFinite(s.sessionLow) || !(s.lastPrice > 0)) return false;
+    const want = dir === 'put' ? 'down' : 'up';
+    if (s._msTrend !== want || !s._msTrendTs || (Date.now() - s._msTrendTs) < (parseFloat(process.env.LIQ_MIN_RUN_MIN) || 60) * 60000) return false;
+    const rng = s.sessionHigh - s.sessionLow; if (rng < (parseFloat(process.env.LIQ_RANGE_ATR) || 6) * a) return false;
+    const lead = dir === 'put' ? (s.lastPrice - s.sessionLow) / rng : (s.sessionHigh - s.lastPrice) / rng;
+    if (lead > 0.35) return false;
+    if (typeof liveLaneBenched === 'function' && liveLaneBenched(sym, /\+LIQ/, sym + '-LIQ-REGIME')) return false;
+    return true;
+  } catch (e) { return false; }
+}
 function legModeActive(s, sym, dir, atr) {
   try {
     if (process.env.LEG_MODE === '0' || !s || s._bigLeg !== dir || process.env.BIGLEG_DISABLED === '1') return false;
@@ -20787,7 +20829,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.63-20261030-xau-sessrej-crash-live', // bump on each deploy — lets /state verify what's live
+    build: '7.64-20261030-liquidation-regime', // bump on each deploy — lets /state verify what's live
     laneBench: global._laneBench || {}, // enforced live-lane bench state (2026-10-27)
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' /* RETIRED FROM LIVE 2026-10-28 (Jean: "always taking the call after the big leg happened"): live 1W/5L −$1,942 + the 10/28 05:16 call; shadow 0W/2S/4L (14d). The sampler keeps measuring; BTC_BIGLEG_LIVE=1 re-arms by hand */ ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
