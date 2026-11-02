@@ -2448,6 +2448,7 @@ function cohortFor(reason) {
   if (/LADDER-77/.test(reason)) return 'LADDER-77'; // proportional 7/7 ladder sim on live XAU fires (2026-09-28)
   if (/STALL-FILL-SHADOW/.test(reason)) return 'STALL-FILL-SHADOW'; // benched stall fills graded in shadow (2026-10-27)
   if (/TP1-GAP/.test(reason)) return 'TP1-GAP'; // fires that touched +$5.00 below a TP1 >$5 (2026-10-22): win = still reached TP1, loss = stopped (would have banked at $5)
+  if (/LADDER-ATR/.test(reason)) return 'LADDER-ATR'; // TP1 = clamp(1.5×ATR, 5.24, 12) vs −$10, shadow (2026-11-02)
   if (/LADDER-610/.test(reason)) return 'LADDER-610'; // TP1 $6 / stop $10 on the same fires (2026-10-22, Jean: "and if TP1 at 6$?")
   if (/LADDER-510/.test(reason)) return 'LADDER-510'; // current 5/10 ladder, same fires, same sequence rule
   { const _v2 = reason.match(/\b(XAU|BTC)-SESS-REJ-V2\b/); if (_v2) return _v2[0]; } // rejection v2 trigger (2026-10-15) — must precede the plain matches
@@ -4612,7 +4613,11 @@ function processPrice(sym, price, hi, lo) {
                 // fire only when the stop distance ≤ SESSREJ_MAX_R_ADR (0.35×ADR); TP1 is at least 1R.
                 const _R = Math.abs(price - sl);
                 if (_R > (parseFloat(process.env.SESSREJ_MAX_R_ADR) || 0.35) * _srAdr) { log(sym, '🎯 ' + sym + ' SESS-REJ ' + dir.toUpperCase() + ' NOT fired live — entry $' + price.toFixed(0) + ' sits $' + _R.toFixed(0) + ' from the structural stop $' + sl.toFixed(0) + ' (> 0.35×ADR $' + (0.35 * _srAdr).toFixed(0) + '): too far from the extreme for the lane\'s geometry (2026-10-07). Shadow row stands.'); return false; }
-                const _t1d = Math.max(0.25 * _srAdr, _R);
+                // XAU TP1 CLAMP (2026-11-02, Jean: "$25 is a bit too ambitious — 10/12 max is already a good TP1"): the 01:20 SESS-REJ
+                // put had TP1 $24.56 because 0.25×ADR on a crash-week ADR (~$98) is $25. On gold the first target is clamped to
+                // XAU_SESSREJ_TP1_MIN..XAU_SESSREJ_TP1_MAX (8..12); the structural stop is unchanged, so TP1 may be < 1R here —
+                // Jean's call, the same shape as the $5/$10 ladder. TP2 = the shadow target, TP3 = 0.5×ADR (runner). BTC keeps max(0.25×ADR, R).
+                const _t1d = sym === 'XAU' ? Math.min(Math.max(0.25 * _srAdr, parseFloat(process.env.XAU_SESSREJ_TP1_MIN) || 8), parseFloat(process.env.XAU_SESSREJ_TP1_MAX) || 12) : Math.max(0.25 * _srAdr, _R);
                 const _tp1 = isL ? price + _t1d : price - _t1d;
                 const _tp3 = isL ? price + Math.max(0.5 * _srAdr, 2 * _R) : price - Math.max(0.5 * _srAdr, 2 * _R);
                 const _tp2 = isL ? Math.max(tp, _tp1 + 0.01) : Math.min(tp, _tp1 - 0.01);
@@ -18006,12 +18011,16 @@ function checkExit(sym, price) {
     // over ≥20 fires. Sequence-exact, unlike MFE/MAE snapshots.
     try {
       if (sym === 'XAU' && t.ep > 0 && price > 0) {
-        t._lsim = t._lsim || { a: null, b: null, c: null };
+        t._lsim = t._lsim || { a: null, b: null, c: null, d: null };
         const _fav = iC ? price - t.ep : t.ep - price;
         if (!t._lsim.a) { if (_fav >= 7) t._lsim.a = 'win'; else if (_fav <= -7) t._lsim.a = 'loss'; if (t._lsim.a) { bumpCohortTally(sym, 'LADDER-77', t._lsim.a); log(sym, '📐 LADDER-SIM 7/7 → ' + t._lsim.a.toUpperCase() + ' (' + (_fav >= 0 ? '+' : '') + _fav.toFixed(2) + ' from entry $' + (+t.ep).toFixed(2) + ').'); } }
         if (!t._lsim.b) { if (_fav >= 5) t._lsim.b = 'win'; else if (_fav <= -10) t._lsim.b = 'loss'; if (t._lsim.b) bumpCohortTally(sym, 'LADDER-510', t._lsim.b); }
         // LADDER-610 (2026-10-22): $6 first leg vs the same −$10 stop. Pre-registered: TP1 → $6 when, over ≥25 resolved fires,
         // 6×WR610 − 10×(1−WR610) beats 5×WR510 − 10×(1−WR510) on the SAME fires (both cohorts read side by side).
+        // LADDER-ATR (2026-11-02, Jean: "TP1 shouldn't be $5 anymore" on a $7-10 ATR tape): TP1 = clamp(1.5×ATR, 5.24, 12) vs the same −$10 stop,
+        // tick-sequence exact like the others. Pre-registered: the first leg scales with ATR when, over ≥25 resolved fires, its
+        // expectancy beats LADDER-510's on the SAME fires. The target is frozen at the trade's birth ATR (t.atr).
+        if (!t._lsim.d) { const _tpA = Math.min(12, Math.max(5.24, 1.5 * (t.atr || 0))); if (_fav >= _tpA) t._lsim.d = 'win'; else if (_fav <= -10) t._lsim.d = 'loss'; if (t._lsim.d) { bumpCohortTally(sym, 'LADDER-ATR', t._lsim.d); log(sym, '📐 LADDER-SIM ATR (TP1 $' + _tpA.toFixed(2) + '/10) → ' + t._lsim.d.toUpperCase() + ' (' + (_fav >= 0 ? '+' : '') + _fav.toFixed(2) + ' from entry $' + (+t.ep).toFixed(2) + ').'); } }
         if (!t._lsim.c) { if (_fav >= 6) t._lsim.c = 'win'; else if (_fav <= -10) t._lsim.c = 'loss'; if (t._lsim.c) { bumpCohortTally(sym, 'LADDER-610', t._lsim.c); log(sym, '📐 LADDER-SIM 6/10 → ' + t._lsim.c.toUpperCase() + ' (' + (_fav >= 0 ? '+' : '') + _fav.toFixed(2) + ' from entry $' + (+t.ep).toFixed(2) + ').'); } }
       }
     } catch (eLS) {}
@@ -20829,7 +20838,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.64-20261030-liquidation-regime', // bump on each deploy — lets /state verify what's live
+    build: '7.65-20261102-sessrej-tp1-clamp', // bump on each deploy — lets /state verify what's live
     laneBench: global._laneBench || {}, // enforced live-lane bench state (2026-10-27)
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' /* RETIRED FROM LIVE 2026-10-28 (Jean: "always taking the call after the big leg happened"): live 1W/5L −$1,942 + the 10/28 05:16 call; shadow 0W/2S/4L (14d). The sampler keeps measuring; BTC_BIGLEG_LIVE=1 re-arms by hand */ ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
