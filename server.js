@@ -2739,6 +2739,29 @@ function fundedTotals() {
   const base = (fundedEpoch && fundedEpoch.base) || {};
   const t0 = todayDateET();
   let day = 0, tot = 0;
+  // BOT-ONLY (2026-11-02): the guard read the ledger, which books adopted HAND trades. By 11/02 the cumulative sat at
+  // −$29,119 — the bot's own share was a fraction of that — and FUNDED-GUARD had been killing every candidate that
+  // passed the judgment gates (the 08:49 TREND call among them) at the last gate, on all symbols. Same fix as the day
+  // cap: only bot rows (no manual field), closed on or after `since`, count. FUNDED_GUARD_ALL=1 restores the old sum;
+  // FUNDED_GUARD=0 disables the guard (demo account).
+  if (process.env.FUNDED_GUARD_ALL !== '1') {
+    try {
+      const n = Date.now(); const c = global._botFundedCache;
+      if (c && n - c.ts < 60000 && c.since === since) return c.v;
+      const sinceTs = Date.parse(since + 'T00:00:00-05:00') - 3600000; // ET day start (±DST hour)
+      for (const h of signalHistory) {
+        if (h.ts < sinceTs || h.manual || !h.outcomes || !/^(call|put)$/.test(h.type)) continue;
+        const o = h.outcomes; const closeTs = (o.eaClose && o.eaClose.ts) || o.slHitTs || o.tp3HitTs || null;
+        const closeDay = closeTs ? new Date(closeTs).toLocaleDateString('en-CA', { timeZone: 'America/New_York' }) : h.date;
+        if (closeDay < since) continue;
+        let v = null; if (o.eaClose && isFinite(o.eaClose.total)) v = +o.eaClose.total; else if ((o.slHit || o.tp3Hit || o.scalpExit || o.endedByEa) && isFinite(h.booked)) v = +h.booked;
+        if (v === null) continue;
+        tot += v; if (closeDay === t0) day += v;
+      }
+      const v = { day: +day.toFixed(2), total: +tot.toFixed(2), since, label: ((fundedEpoch && fundedEpoch.label) || 'bot-only'), resetAt: (fundedEpoch && fundedEpoch.sinceTs) || null, botOnly: true };
+      global._botFundedCache = { ts: n, since, v }; return v;
+    } catch (e) { /* fall through to the ledger sum */ }
+  }
   for (const d of Object.keys(pnlLedger)) {
     if (d < since) continue;
     for (const sym of Object.keys(pnlLedger[d])) {
@@ -10694,7 +10717,7 @@ function processPrice(sym, price, hi, lo) {
         let _fDay = 0, _fTot = 0, _fStart = process.env.FUNDED_START_DATE || '2026-09-21', _fEp = null;
         try { _fEp = fundedTotals(); _fDay = _fEp.day; _fTot = _fEp.total; _fStart = _fEp.since; } catch (eFD) {}
         global._fundedGuard = { day: +_fDay.toFixed(2), dayLimit: _fdLim, total: +_fTot.toFixed(2), totalLimit: _ftLim, since: _fStart, account: (_fEp && _fEp.label) || null, resetAt: (_fEp && _fEp.resetAt) || null };
-        if (_fDay <= -_fdLim || _fTot <= -_ftLim) {
+        if (process.env.FUNDED_GUARD !== '0' && (_fDay <= -_fdLim || _fTot <= -_ftLim)) { // FUNDED_GUARD=0 disables (demo, 2026-11-02)
           const _fMsg = '🏦 ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — FUNDED-GUARD: ' + (_fDay <= -_fdLim ? 'account day P&L $' + _fDay.toFixed(0) + ' ≤ -$' + _fdLim.toFixed(0) + ' (Neura 4%/day = $16K; guard at 75%)' : 'cumulative P&L $' + _fTot.toFixed(0) + ' since ' + _fStart + ' ≤ -$' + _ftLim.toFixed(0) + ' (Neura 8% total = $32K; guard at 75%)') + ' — no new fires. Virtual tracking continues (2026-09-20).';
           log(sym, _fMsg); trackBlockedOutcome(sym, _fMsg, true);
           try { sendPush('🏦 FUNDED-GUARD ACTIVE', 'Day $' + _fDay.toFixed(0) + ' / Total $' + _fTot.toFixed(0) + ' — firing stopped', 'alert'); } catch (eFP) {}
@@ -18450,7 +18473,11 @@ function checkExit(sym, price) {
         // PROTECT_MAX_STREAK straight stops, firing pauses PROTECT_PAUSE_MIN minutes
         // (signals keep stamping + virtual-tracking so the pause self-measures).
         try {
-          s._protSlStreak = (s._protSlStreak || 0) + 1;
+          // FILLED STOPS ONLY (2026-11-02): the 01:20 SESS-REJ put was never filled (EA init-skip) yet its server-graded stop
+          // was the third of "3 straight SLs" that paused XAU for 2 h on 11/02 — a trade the account never had must not pause
+          // the account. Hand trades never counted here (they book through adoption, not this path).
+          const _streakCounts = !!(t._fills && Object.keys(t._fills).length) || !t._eaFailed;
+          if (_streakCounts) s._protSlStreak = (s._protSlStreak || 0) + 1; else log(sym, '🛡️ PROTECT-STREAK — stop on an unfilled trade not counted (streak stays ' + (s._protSlStreak || 0) + ').');
           if (s._protSlStreak >= PROTECT_MAX_STREAK && !(s._protPauseUntil > now)) {
             s._protPauseUntil = now + PROTECT_PAUSE_MIN * 60000;
             log(sym, '🛡️ PROTECT-STREAK TRIPPED — ' + s._protSlStreak + ' straight SLs; firing paused ' + PROTECT_PAUSE_MIN + 'min (until ' + new Date(s._protPauseUntil).toISOString().slice(11, 16) + 'Z). Virtual tracking continues.');
@@ -20838,7 +20865,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.65-20261102-sessrej-tp1-clamp', // bump on each deploy — lets /state verify what's live
+    build: '7.67-20261102-guards-bot-only', // bump on each deploy — lets /state verify what's live
     laneBench: global._laneBench || {}, // enforced live-lane bench state (2026-10-27)
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' /* RETIRED FROM LIVE 2026-10-28 (Jean: "always taking the call after the big leg happened"): live 1W/5L −$1,942 + the 10/28 05:16 call; shadow 0W/2S/4L (14d). The sampler keeps measuring; BTC_BIGLEG_LIVE=1 re-arms by hand */ ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
