@@ -2452,6 +2452,7 @@ function cohortFor(reason) {
   if (/LADDER-77/.test(reason)) return 'LADDER-77'; // proportional 7/7 ladder sim on live XAU fires (2026-09-28)
   if (/STALL-FILL-SHADOW/.test(reason)) return 'STALL-FILL-SHADOW'; // benched stall fills graded in shadow (2026-10-27)
   if (/TP1-GAP/.test(reason)) return 'TP1-GAP'; // fires that touched +$5.00 below a TP1 >$5 (2026-10-22): win = still reached TP1, loss = stopped (would have banked at $5)
+  if (/EXTFLIP-OLDSTOP/.test(reason)) return 'EXTFLIP-OLDSTOP'; // would the pre-11/03 flip stop have been hit first (2026-11-03)
   if (/LADDER-ATR/.test(reason)) return 'LADDER-ATR'; // TP1 = clamp(1.5×ATR, 5.24, 12) vs −$10, shadow (2026-11-02)
   if (/LADDER-610/.test(reason)) return 'LADDER-610'; // TP1 $6 / stop $10 on the same fires (2026-10-22, Jean: "and if TP1 at 6$?")
   if (/LADDER-510/.test(reason)) return 'LADDER-510'; // current 5/10 ladder, same fires, same sequence rule
@@ -11381,7 +11382,15 @@ function processPrice(sym, price, hi, lo) {
         s.extFlip = null; // 15 min unfired — the moment has passed
       } else if (efAgeMs >= 180000) {
         const efAtr = (typeof atrVal === 'number' && atrVal > 0) ? atrVal : (EF.atr || 0);
-        const efSlBuf = Math.max(efAtr * 0.25, isXAU ? 0.5 : 0);
+        // OLD stop kept for the shadow comparison (EXTFLIP-OLDSTOP cohort, 2026-11-03)
+        const efSlBufOld = Math.max(efAtr * 0.25, isXAU ? 0.5 : 0);
+        let efSlDistOld = Math.abs(price - (efCall ? EF.extreme - efSlBufOld : EF.extreme + efSlBufOld)); efSlDistOld = Math.min(Math.max(efSlDistOld, efAtr * 0.75), efAtr * 1.5);
+        // WIDER STRUCTURAL STOP (2026-11-03, Jean: "the signal was right but it got very close to being SL'd — increase SL on
+        // FLIP"): the 11/02 13:07 XAU flip put had the stop 0.5 above the extreme (3,965.40); the high was swept by $0.60
+        // (3,965.51), the server stopped it by $0.11, then price fell $6 to the targets. A flip's stop must sit beyond the
+        // SWEEP of the extreme, not at it: buffer max(EF_SL_BUF_ATR 0.5×ATR, EF_SL_BUF_MIN $2 on gold), floor 1.0×ATR,
+        // cap 2.0×ATR (and $10 on gold via efSlCap). TP1 keeps its own cap, so R:R tightens — Jean's call, the $5/$10 shape.
+        const efSlBuf = Math.max(efAtr * (parseFloat(process.env.EF_SL_BUF_ATR) || 0.5), isXAU ? (parseFloat(process.env.EF_SL_BUF_MIN) || 2) : 0);
         // ===== SL CLAMP (2026-07-10, confirmed on the 7/06-7/10 13-sample ledger) =====
         // Floor 0.75×ATR — WIDEN, don't skip: NAS 7/09 14:45 died on a $6 noise stop in
         // 14s then hit TP1; skipping tiny-R flips would also have killed BTC 7/09 08:49
@@ -11389,7 +11398,8 @@ function processPrice(sym, price, hi, lo) {
         // Cap 1.5×ATR — BTC 7/09 11:21 risked 2.1×ATR (-$216), XAU 7/10 08:40 1.9×ATR:
         // every flip now risks ~1 comparable unit, leverage-agnostic per symbol.
         let efSlDist = Math.abs(price - (efCall ? EF.extreme - efSlBuf : EF.extreme + efSlBuf));
-        efSlDist = Math.min(Math.max(efSlDist, efAtr * 0.75), efAtr * 1.5);
+        efSlDist = Math.min(Math.max(efSlDist, efAtr * (parseFloat(process.env.EF_SL_MIN_ATR) || 1.0)), efAtr * (parseFloat(process.env.EF_SL_MAX_ATR) || 2.0));
+        if (isXAU) efSlDist = Math.min(efSlDist, 10); // gold: never past the $10 ladder stop
         const efSlPrice = efCall ? price - efSlDist : price + efSlDist;
         const efSlCap = isXAU ? 10 : efAtr * 2.5;
         // TIGHTENED 2026-07-14: was "must not fight BOTH HTFs" — the 'flat' loophole let
@@ -11555,6 +11565,7 @@ function processPrice(sym, price, hi, lo) {
           const efTp3 = efCall ? price + efSlDist * 5.0 : price - efSlDist * 5.0;
           s.trade = buildCfdTrade(EF.dir, price, efAtr, sym);
           s.trade.slPrice = +efSlPrice.toFixed(2);
+          s.trade._efOldSl = +(efCall ? price - efSlDistOld : price + efSlDistOld).toFixed(2); // shadow: where the pre-11/03 stop would have sat
           s.trade.tp1Price = +efTp1.toFixed(2);
           s.trade.tp2Price = +efTp2.toFixed(2);
           s.trade.tp3Price = +efTp3.toFixed(2);
@@ -18065,6 +18076,8 @@ function checkExit(sym, price) {
         // tick-sequence exact like the others. Pre-registered: the first leg scales with ATR when, over ≥25 resolved fires, its
         // expectancy beats LADDER-510's on the SAME fires. The target is frozen at the trade's birth ATR (t.atr).
         if (!t._lsim.d) { const _tpA = Math.min(12, Math.max(5.24, 1.5 * (t.atr || 0))); if (_fav >= _tpA) t._lsim.d = 'win'; else if (_fav <= -10) t._lsim.d = 'loss'; if (t._lsim.d) { bumpCohortTally(sym, 'LADDER-ATR', t._lsim.d); log(sym, '📐 LADDER-SIM ATR (TP1 $' + _tpA.toFixed(2) + '/10) → ' + t._lsim.d.toUpperCase() + ' (' + (_fav >= 0 ? '+' : '') + _fav.toFixed(2) + ' from entry $' + (+t.ep).toFixed(2) + ').'); } }
+        // EXTFLIP-OLDSTOP (2026-11-03): on EXT-FLIP trades, would the OLD (tighter) stop have been hit before TP1? win = TP1 first, loss = old stop first
+        try { if (t._efOldSl > 0 && !t._efOldSim) { const _oldHit = iC ? price <= t._efOldSl : price >= t._efOldSl; const _t1 = iC ? price >= t.tp1Price : price <= t.tp1Price; if (_oldHit) t._efOldSim = 'loss'; else if (_t1) t._efOldSim = 'win'; if (t._efOldSim) { bumpCohortTally(sym, 'EXTFLIP-OLDSTOP', t._efOldSim); log(sym, '📐 EXTFLIP-OLDSTOP → ' + t._efOldSim.toUpperCase() + ' (old stop $' + t._efOldSl.toFixed(2) + ' vs live $' + (+t.slPrice).toFixed(2) + ').'); } } } catch (eEO) {}
         if (!t._lsim.c) { if (_fav >= 6) t._lsim.c = 'win'; else if (_fav <= -10) t._lsim.c = 'loss'; if (t._lsim.c) { bumpCohortTally(sym, 'LADDER-610', t._lsim.c); log(sym, '📐 LADDER-SIM 6/10 → ' + t._lsim.c.toUpperCase() + ' (' + (_fav >= 0 ? '+' : '') + _fav.toFixed(2) + ' from entry $' + (+t.ep).toFixed(2) + ').'); } }
       }
     } catch (eLS) {}
@@ -20886,7 +20899,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.68-20261103-liq-speed', // bump on each deploy — lets /state verify what's live
+    build: '7.69-20261103-extflip-stop', // bump on each deploy — lets /state verify what's live
     laneBench: global._laneBench || {}, // enforced live-lane bench state (2026-10-27)
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' /* RETIRED FROM LIVE 2026-10-28 (Jean: "always taking the call after the big leg happened"): live 1W/5L −$1,942 + the 10/28 05:16 call; shadow 0W/2S/4L (14d). The sampler keeps measuring; BTC_BIGLEG_LIVE=1 re-arms by hand */ ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
