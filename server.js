@@ -2029,6 +2029,10 @@ function blockFeat(sym, s, type, price) {
     const posW = pos == null ? null : (type === 'call' ? pos : 1 - pos);
     f.posB = posW == null ? null : (posW < 0.33 ? 'fresh' : posW < 0.67 ? 'mid' : 'extended');
     f.rangeAtr = rng > 0 ? +(A(rng) || 0).toFixed(2) : null;
+    const rngPct = (rng > 0 && price > 0) ? rng / price * 100 : null; f.rangePct = rngPct == null ? null : +rngPct.toFixed(2);
+    f.dayB = rngPct == null ? null : (rngPct < 0.6 ? 'quiet' : rngPct < 1.2 ? 'normal' : rngPct < 2 ? 'big' : 'liquidation'); // session range as % of price (2026-11-03)
+    const hrPct = (typeof liqSpeed === 'function') ? liqSpeed(s, price) : 0; f.hourPct = +hrPct.toFixed(2);
+    f.hourB = hrPct < 0.25 ? 'slow' : hrPct < 0.75 ? 'moving' : 'flush'; // last-60-min range as % of price (2026-11-03)
     // zones: nearest opposing zone ahead (the ZONE-VETO object) + whether inside one
     const zones = Array.isArray(s._zoneObs) ? s._zoneObs : [];
     const opp = zones.filter(z => z && z.dir !== type);
@@ -2057,7 +2061,7 @@ function blockFeat(sym, s, type, price) {
 }
 // The factors /gate-score ranks (bucket keys on the stamp above). Pre-registered list — adding one later is a
 // new experiment, not a re-fit of this one.
-const GATE_SCORE_FACTORS = ['rsiB', 'macdB', 'momB', 'accel', 'regime', 'ms', 'msRunB', 'latch', 'legB', 'posB', 'zB', 'zAgeB', 'zTouchB', 'zGrade', 'tapeB', 'sessB', 'newsB'];
+const GATE_SCORE_FACTORS = ['rsiB', 'macdB', 'momB', 'accel', 'regime', 'ms', 'msRunB', 'latch', 'legB', 'posB', 'zB', 'zAgeB', 'zTouchB', 'zGrade', 'tapeB', 'sessB', 'newsB', 'dayB', 'hourB']; // dayB/hourB added 2026-11-03 (drift vs flush)
 
 function trackBlockedOutcome(sym, msg, force) {
   // force=true (added 2026-07-02): dormant-analysis detectors (V-REV) bypass the shared
@@ -12060,7 +12064,7 @@ function processPrice(sym, price, hi, lo) {
           const _lqDir = s._msTrend === 'down' ? 'put' : 'call';
           const _lqRun = s._msTrendTs ? (_lqNow - s._msTrendTs) / 60000 : 0;
           const _lqRange = s.sessionHigh - s.sessionLow;
-          const _lqRangeOk = _lqRange >= (parseFloat(process.env.LIQ_RANGE_ATR) || 6) * atrVal;
+          const _lqRangeOk = _lqRange >= (parseFloat(process.env.LIQ_RANGE_ATR) || 6) * atrVal && _lqRange / price * 100 >= (parseFloat(process.env.LIQ_RANGE_PCT) || 1.2) && liqSpeed(s, price) >= (parseFloat(process.env.LIQ_HOUR_PCT) || 0.75); // speed + pct floors (2026-11-03)
           const _lqExtTs = _lqDir === 'put' ? (s.sessionLowUpdateTs || 0) : (s.sessionHighUpdateTs || 0);
           const _lqFresh = _lqExtTs > 0 && (_lqNow - _lqExtTs) <= 90000;
           const _lqDist = _lqDir === 'put' ? price - s.sessionLow : s.sessionHigh - price;
@@ -17283,6 +17287,21 @@ function computeAVWAP(s, dir) {
 //   • price in the leading third of the range (a put below sessionLow + 0.35 × range; a call above the mirror)
 // Fires stamp liq:true and the score gets "+LIQ" (cohort, EA-visible); enforced bench on the last 6 filled +LIQ fires.
 // LIQ_REGIME=0 kills; LIQ_SYMS (default "XAU") lists the symbols.
+// SPEED, NOT SIZE (2026-11-03, Jean: "it could have fired anytime before — it chose the lowest point"): the 03:51 TREND put
+// fired at 3,897.68, the low of an 8-hour $60 drift (M5 bars $2-6), because a $34 session range on a $3 night ATR is
+// "6×ATR". That is a grind, not a liquidation, and the regime switched on only after the range had accumulated — late by
+// construction, the BIGLEG flaw again. A liquidation is FAST: the last 60 minutes must have travelled ≥ LIQ_HOUR_PCT
+// (0.75%) of price and the session range must be ≥ LIQ_RANGE_PCT (1.2%) of price, on top of the ATR test. 10/30 09:00-10:00
+// ($40 on 3,950, session $120) qualifies; the 10/28 22:00 flush ($50 in 35 min) qualifies; a $13 hour on a $34 night does not.
+function liqSpeed(s, price) {
+  try {
+    const M = Array.isArray(s._m5) ? s._m5 : []; const cut = Date.now() - 3600000;
+    let hi = -Infinity, lo = Infinity, n = 0;
+    for (let i = M.length - 1; i >= 0 && M[i].ts >= cut; i--) { const b = M[i]; if (b.h > hi) hi = b.h; if (b.l < lo) lo = b.l; n++; }
+    if (price > hi) hi = price; if (price < lo) lo = price;
+    return (n >= 3 && isFinite(hi) && isFinite(lo) && price > 0) ? (hi - lo) / price * 100 : 0;
+  } catch (e) { return 0; }
+}
 function liquidationRegime(s, sym, dir, atr) {
   try {
     if (process.env.LIQ_REGIME === '0' || !s) return false;
@@ -17291,6 +17310,8 @@ function liquidationRegime(s, sym, dir, atr) {
     const want = dir === 'put' ? 'down' : 'up';
     if (s._msTrend !== want || !s._msTrendTs || (Date.now() - s._msTrendTs) < (parseFloat(process.env.LIQ_MIN_RUN_MIN) || 60) * 60000) return false;
     const rng = s.sessionHigh - s.sessionLow; if (rng < (parseFloat(process.env.LIQ_RANGE_ATR) || 6) * a) return false;
+    if (rng / s.lastPrice * 100 < (parseFloat(process.env.LIQ_RANGE_PCT) || 1.2)) return false; // percentage floor (2026-11-03)
+    if (liqSpeed(s, s.lastPrice) < (parseFloat(process.env.LIQ_HOUR_PCT) || 0.75)) return false; // the last hour must be the flush, not a drift (2026-11-03)
     const lead = dir === 'put' ? (s.lastPrice - s.sessionLow) / rng : (s.sessionHigh - s.lastPrice) / rng;
     if (lead > 0.35) return false;
     if (typeof liveLaneBenched === 'function' && liveLaneBenched(sym, /\+LIQ/, sym + '-LIQ-REGIME')) return false;
@@ -20078,7 +20099,7 @@ function gateAgentConsult(sym, s, row, msg) {
 // clustered by tag set (count, net $/unit, latest wording) and the top clusters per symbol are put in front of the agent
 // on every consult (lessons_from_my_mistakes / what_has_worked), with an instruction to follow a matching lesson unless
 // it can say what is different this time. /agent?lessons=1 shows them. ENTRY_AGENT_REFLECT=0 kills it.
-const AGENT_LESSON_TAGS = ['chase-extended-leg', 'against-latch', 'against-ms-trend', 'with-trend', 'into-fresh-zone', 'inside-opposing-zone', 'old-tested-zone', 'clear-path', 'fading-momentum', 'accelerating-momentum', 'reversing-momentum', 'extreme-rsi', 'mid-range', 'at-session-extreme', 'thin-tape', 'thick-tape', 'asia', 'london', 'ny-am', 'ny-pm', 'news-window', 'range-regime', 'trend-regime', 'mixed-regime', 'with-trend-pullback', 'wait-never-filled', 'wait-filled-and-lost', 'gate-was-right', 'gate-was-wrong', 'liquidation-move', 'post-news-whipsaw'];
+const AGENT_LESSON_TAGS = ['chase-extended-leg', 'against-latch', 'against-ms-trend', 'with-trend', 'into-fresh-zone', 'inside-opposing-zone', 'old-tested-zone', 'clear-path', 'fading-momentum', 'accelerating-momentum', 'reversing-momentum', 'extreme-rsi', 'mid-range', 'at-session-extreme', 'thin-tape', 'thick-tape', 'asia', 'london', 'ny-am', 'ny-pm', 'news-window', 'range-regime', 'trend-regime', 'mixed-regime', 'with-trend-pullback', 'wait-never-filled', 'wait-filled-and-lost', 'gate-was-right', 'gate-was-wrong', 'liquidation-move', 'slow-drift', 'post-news-whipsaw'];
 const AGENT_REFLECT_SYSTEM = [
   'You are reviewing ONE of your own past decisions on an intraday CFD scalping desk (XAUUSD / NAS100 / BTCUSD, brackets of about 1-2 ATR). You get: the decision and the reason you gave, the bucketed market features at that moment, the gate involved (for a gate review), and what the market then did on that bracket.',
   'Write ONE lesson as a rule for the next similar case, in the form "When <2-4 concrete conditions taken from the features>, <do this> — because <what happened>". Max 220 characters. Be specific to the pattern (use the feature buckets: leg extension, latch, ms trend, zone age/touches/position, momentum accel, session, regime, RSI), not generic advice.',
@@ -20865,7 +20886,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.67-20261102-guards-bot-only', // bump on each deploy — lets /state verify what's live
+    build: '7.68-20261103-liq-speed', // bump on each deploy — lets /state verify what's live
     laneBench: global._laneBench || {}, // enforced live-lane bench state (2026-10-27)
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' /* RETIRED FROM LIVE 2026-10-28 (Jean: "always taking the call after the big leg happened"): live 1W/5L −$1,942 + the 10/28 05:16 call; shadow 0W/2S/4L (14d). The sampler keeps measuring; BTC_BIGLEG_LIVE=1 re-arms by hand */ ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
