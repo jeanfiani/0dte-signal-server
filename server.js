@@ -17988,6 +17988,13 @@ function checkCfdTracks(sym, price) {
       // Raw SL on this fire's own levels — no trailing/BE logic here by design:
       // the virtual track measures per-signal quality, not live trade management.
       tr.done = true;
+      // LIVE ROW GUARD (2026-11-04): the 11/03 NAS RIDE put's track carried the pre-fill stop (27,815.5); the live trade,
+      // re-levelled at the auction fill, had 27,823.2. A $4 spike hit the track's stop, stamped slHit on the row at 21:04
+      // while the trade was alive, TP1 came at 21:24 and the row then read "TP1 then stop" with the wrong stop time. While
+      // the live trade for this row is active, the track keeps its own verdict (tr.virtualSl) and leaves the row's live
+      // outcome fields to updateSignalOutcome.
+      const _liveRow = !!(s.trade && s.trade.active && s.lastHistEntry === e);
+      if (_liveRow) { tr.virtualSl = true; tr.virtualSlPrice = price; continue; }
       if (!o.slHit && !o.tp3Hit) { o.slHit = true; o.slHitTs = now; if (o.closePrice == null) o.closePrice = price; changed = true; }
     }
   }
@@ -20909,7 +20916,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.70-20261104-runner-noise-proof', // bump on each deploy — lets /state verify what's live
+    build: '7.71-20261104-runner-track-guard', // bump on each deploy — lets /state verify what's live
     laneBench: global._laneBench || {}, // enforced live-lane bench state (2026-10-27)
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' /* RETIRED FROM LIVE 2026-10-28 (Jean: "always taking the call after the big leg happened"): live 1W/5L −$1,942 + the 10/28 05:16 call; shadow 0W/2S/4L (14d). The sampler keeps measuring; BTC_BIGLEG_LIVE=1 re-arms by hand */ ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
