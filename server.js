@@ -2033,6 +2033,33 @@ function blockFeat(sym, s, type, price) {
     f.dayB = rngPct == null ? null : (rngPct < 0.6 ? 'quiet' : rngPct < 1.2 ? 'normal' : rngPct < 2 ? 'big' : 'liquidation'); // session range as % of price (2026-11-03)
     const hrPct = (typeof liqSpeed === 'function') ? liqSpeed(s, price) : 0; f.hourPct = +hrPct.toFixed(2);
     f.hourB = hrPct < 0.25 ? 'slow' : hrPct < 0.75 ? 'moving' : 'flush'; // last-60-min range as % of price (2026-11-03)
+    // ===== DAY STRUCTURE (2026-11-04, the two NAS fires of 11/04) ===== Both were halves of one V bought at the wrong
+    // end: the RIDE call bought the FIRST pullback of an 8.5×ATR open squeeze (the crest), the DIV call bought the
+    // first dip of the fresh reversal (two legs early). Nothing in the stamp said "where in today's move are we".
+    // Direction-relative: openAtr/rthAtr = how far price has ALREADY run the candidate's way from the 20:00 ET day
+    // open / the 09:30 ET RTH open, in ATR; sinceExtMin = minutes since the session extreme the candidate runs toward
+    // was printed; pullAtr = how far price has pulled back from that extreme. Pre-registered buckets; measurement only.
+    const _op = (s.openPrice > 0) ? s.openPrice : null;
+    const _openW = _op == null ? null : A(sgn * (price - _op));
+    f.openAtr = _openW == null ? null : +_openW.toFixed(2);
+    f.openB = B(_openW, [-1, 1, 3, 5], ['against', 'flat', '1-3', '3-5', '5+']);
+    const _ro = (s._rthOpen && s._rthOpen.px > 0 && s._rthOpen.date === todayDateET()) ? s._rthOpen.px : null;
+    const _rthW = _ro == null ? null : A(sgn * (price - _ro));
+    f.rthAtr = _rthW == null ? null : +_rthW.toFixed(2);
+    f.rthB = _ro == null ? 'pre-rth' : B(_rthW, [-1, 1, 3, 5], ['against', 'flat', '1-3', '3-5', '5+']);
+    const _exTs = type === 'call' ? s.sessionHighUpdateTs : s.sessionLowUpdateTs;
+    const _exPx = type === 'call' ? s.sessionHigh : s.sessionLow;
+    f.sinceExtMin = (_exTs > 0) ? Math.round((Date.now() - _exTs) / 60000) : null;
+    f.sinceExtB = B(f.sinceExtMin, [3, 15, 60], ['<3m', '3-15m', '15-60m', '60m+']);
+    const _pb = (isFinite(_exPx) && _exTs > 0) ? A(Math.abs(_exPx - price)) : null;
+    f.pullAtr = _pb == null ? null : +_pb.toFixed(2);
+    f.pullB = B(_pb, [0.3, 1, 2], ['<0.3', '0.3-1', '1-2', '2+']);
+    // the pre-registered cohort: ≥5 ATR already run from either open, the extreme printed <60 min ago, price 0.3-2 ATR
+    // off it = "first pullback after a vertical move" (the 11/04 RIDE: 8.5 ATR, top 2 min old, 0.4 ATR down at the
+    // signal, 0.95 ATR down at the fill). 'at-extreme' = within 0.3 ATR of the extreme after a ≥3 ATR run.
+    const _vert = Math.max(_openW == null ? -Infinity : _openW, _rthW == null ? -Infinity : _rthW);
+    f.dayStruct = (_vert >= 3 && _pb != null && _pb < 0.3) ? 'at-extreme'
+      : (_vert >= 5 && f.sinceExtMin != null && f.sinceExtMin < 60 && _pb != null && _pb >= 0.3 && _pb < 2) ? 'first-pullback-after-vertical' : null;
     // zones: nearest opposing zone ahead (the ZONE-VETO object) + whether inside one
     const zones = Array.isArray(s._zoneObs) ? s._zoneObs : [];
     const opp = zones.filter(z => z && z.dir !== type);
@@ -2061,7 +2088,7 @@ function blockFeat(sym, s, type, price) {
 }
 // The factors /gate-score ranks (bucket keys on the stamp above). Pre-registered list — adding one later is a
 // new experiment, not a re-fit of this one.
-const GATE_SCORE_FACTORS = ['rsiB', 'macdB', 'momB', 'accel', 'regime', 'ms', 'msRunB', 'latch', 'legB', 'posB', 'zB', 'zAgeB', 'zTouchB', 'zGrade', 'tapeB', 'sessB', 'newsB', 'dayB', 'hourB']; // dayB/hourB added 2026-11-03 (drift vs flush)
+const GATE_SCORE_FACTORS = ['rsiB', 'macdB', 'momB', 'accel', 'regime', 'ms', 'msRunB', 'latch', 'legB', 'posB', 'zB', 'zAgeB', 'zTouchB', 'zGrade', 'tapeB', 'sessB', 'newsB', 'dayB', 'hourB', 'openB', 'rthB', 'sinceExtB', 'pullB', 'dayStruct']; // dayB/hourB added 2026-11-03 (drift vs flush); openB/rthB/sinceExtB/pullB/dayStruct added 2026-11-04 (position in the day's move)
 
 function trackBlockedOutcome(sym, msg, force) {
   // force=true (added 2026-07-02): dormant-analysis detectors (V-REV) bypass the shared
@@ -2450,6 +2477,8 @@ function cohortFor(reason) {
   if (/ZONE-MICRO-WF/.test(reason)) return 'ZONE-MICRO-WF'; // inside-zone vetoes skipped because the zone was < 0.5×ATR tall (2026-09-28) — must precede ZONE-VETO
   if (/EOD-CONT-WF/.test(reason)) return 'EOD-CONT-WF'; // with-trend blocks in the last 90min of RTH (2026-09-28, Jean's end-of-session drift hypothesis) — must precede TREND-CONT-WF
   if (/LADDER-77/.test(reason)) return 'LADDER-77'; // proportional 7/7 ladder sim on live XAU fires (2026-09-28)
+  { const _fv = reason.match(/\bFILL-VIA-[A-Z-]+/); if (_fv) return _fv[0]; } // fill-path tally on live fires (2026-11-04) — must precede STALL-FILL-SHADOW
+  { const _ds = reason.match(/\bDAY-STRUCT-[A-Z-]+/); if (_ds) return _ds[0]; } // position-in-the-day's-move tally on live fires (2026-11-04)
   if (/STALL-FILL-SHADOW/.test(reason)) return 'STALL-FILL-SHADOW'; // benched stall fills graded in shadow (2026-10-27)
   if (/TP1-GAP/.test(reason)) return 'TP1-GAP'; // fires that touched +$5.00 below a TP1 >$5 (2026-10-22): win = still reached TP1, loss = stopped (would have banked at $5)
   if (/EXTFLIP-OLDSTOP/.test(reason)) return 'EXTFLIP-OLDSTOP'; // would the pre-11/03 flip stop have been hit first (2026-11-03)
@@ -2519,6 +2548,40 @@ setInterval(() => {
   _ctDirty = false;
   try { fs.writeFileSync(COHORT_TALLY_FILE, JSON.stringify(cohortTally)); } catch (e) {}
 }, 30000).unref();
+
+// ===== FIRE COHORTS AT RESOLUTION (2026-11-04, the two NAS fires of 11/04) ===== Two shadow tallies on every BOT fire,
+// graded once at TP1 (win) or at a stop before TP1 (loss): FILL-VIA-<path> — how the auction filled (TOUCH = limit at
+// the level, RESUMPTION = bought the bounce inside the pullback, AT-MARKET = price already beyond the OTE, FAST-LANE,
+// EXPIRY, RUNAWAY, MARKET = no auction) — and DAY-STRUCT-<label> — position in the day's move from blockFeat
+// (FIRST-PULLBACK-AFTER-VERTICAL, AT-EXTREME). On 11/04 both NAS losers were chase fills (RESUMPTION, AT-MARKET), both
+// NAS winners patient ones (TOUCH, FAST-LANE); N=5 proves nothing, the tally is how it gets to N=25. Hand trades excluded.
+function fillViaKey(via) {
+  const v = String(via || '').toLowerCase();
+  if (!v || /adopted|hand trade|admin/.test(v)) return null;
+  if (/resumption/.test(v)) return 'RESUMPTION';
+  if (/stall/.test(v)) return 'STALL';
+  if (/touch/.test(v)) return 'TOUCH';
+  if (/runaway/.test(v)) return 'RUNAWAY';
+  if (/expiry/.test(v)) return 'EXPIRY';
+  if (/fast-lane/.test(v)) return 'FAST-LANE';
+  if (/at-or-beyond/.test(v)) return 'AT-MARKET';
+  if (/no valid impulse/.test(v)) return 'NO-IMPULSE';
+  if (/liquidation/.test(v)) return 'LIQ';
+  if (/market/.test(v)) return 'MARKET';
+  return 'OTHER';
+}
+function fireCohortsOnResolve(sym, entry, outcome) {
+  try {
+    if (!entry || entry.manual || !entry.outcomes || entry.outcomes.fireCohorts || !outcome) return;
+    const names = [];
+    const fv = fillViaKey(entry.oteHold && entry.oteHold.via);
+    if (fv) names.push('FILL-VIA-' + fv);
+    const ds = entry.feat && entry.feat.dayStruct;
+    if (ds) names.push('DAY-STRUCT-' + String(ds).toUpperCase());
+    for (const n of names) bumpCohortTally(sym, n, outcome);
+    entry.outcomes.fireCohorts = { names, outcome };
+  } catch (e) { /* tally must never affect outcome stamping */ }
+}
 
 // ===== GEX ENGINE — QQQ DEALER GAMMA LEVELS (DORMANT, 2026-08-12, Jean) =====
 // Fetches CBOE delayed options chain every 15min, computes net dealer gamma by strike
@@ -4083,6 +4146,9 @@ function logSignal(sym, sig) {
     manual: sig.manual || undefined, // MANUAL launch (2026-10-04): {note, mode, regime, msTrend}
     ctWaived: sig._ctWaived || undefined, // CT-VETO waived under LEG MODE (2026-10-02)
     liq: sig.liq === true || undefined, // liquidation-regime fire: crest gates waived, market entry (2026-10-30)
+    // Same bucketed feature stamp the blocked rows carry (2026-11-04): fires and refusals now share one feature space,
+    // so /gate-score and the scorecard can grade a cohort (e.g. dayStruct = first-pullback-after-vertical) on BOTH sides.
+    feat: (sig.manual || sig.type === 'exit' || !/^(call|put)$/.test(String(sig.type))) ? undefined : (blockFeat(sym, S[sym], sig.type, +sig.price) || undefined),
     legMode: sig._legMode === true || undefined, // ZONE-VETO waived under LEG MODE (2026-10-02) // fired after a MACD-DEFER release (2026-10-02): {waitedSec, from, to, accel} — grades as its own class
     // ML-DIR learned-scorer probability (dormant, 2026-08-29) — grade fired rows by
     // p-bucket in the nightly report; promotion requires holdout AND live agreement.
@@ -4353,6 +4419,9 @@ function processPrice(sym, price, hi, lo) {
 
   if (price > s.sessionHigh) { s.sessionHigh = price; s.sessionHighUpdateTs = Date.now(); }
   if (price < s.sessionLow) { s.sessionLow = price; s.sessionLowUpdateTs = Date.now(); }
+  // RTH open reference (2026-11-04): first tick at/after 09:30 ET each day, every symbol. blockFeat's rthB reads how far
+  // the NY session has already run from its open — the 11/04 NAS RIDE bought the first pullback of an 8.5×ATR open squeeze.
+  try { if (gET() >= 570) { const _roD = todayDateET(); if (!s._rthOpen || s._rthOpen.date !== _roD) s._rthOpen = { date: _roD, px: price, ts: Date.now() }; } } catch (eRO) {}
 
   // ===== OTE-HOLD WATCHDOG (2026-09-07, the 18:48 MFLIP zombie) =====
   // The OTE vet/resolver lives inside the zone-map section, gated by atrVal > 0 —
@@ -17896,6 +17965,7 @@ function updateSignalOutcome(sym, finalPrice) {
   try { if (t.ts && now - t.ts < 12000 && !entry.outcomes.flash) entry.outcomes.flash = true; } catch (eFL) {}
   if (t.t1 && !entry.outcomes.tp1Hit) {
     entry.outcomes.tp1Hit = true; entry.outcomes.tp1HitTs = now;
+    fireCohortsOnResolve(sym, entry, 'win'); // FILL-VIA / DAY-STRUCT tallies (2026-11-04)
     if (t._tp1Gap) { try { bumpCohortTally(sym, 'TP1-GAP', 'win'); entry.outcomes.tp1Gap = 'reached'; } catch (eG1) {} }
     // book the realized TP1 half (2026-08-17)
     if (t.tp1Price > 0 && t.ep > 0) bookPnl(sym, 0.5 * Math.abs(t.tp1Price - t.ep) * pnlMultFor(sym, t), 't1');
@@ -17931,6 +18001,7 @@ function updateSignalOutcome(sym, finalPrice) {
       // Real stop loss (before TP2)
       try { if (t._latchRunner && entry.outcomes.tp2Hit) { const _lrD = +((t.type === 'call' ? finalPrice - t.tp2Price : t.tp2Price - finalPrice)).toFixed(2); entry.outcomes.latchRunnerDelta = _lrD; bumpCohortTally(sym, 'LATCH-RUNNER', _lrD > 0 ? 'win' : 'loss'); log(sym, '🏃 LATCH-RUNNER → stopped $' + finalPrice.toFixed(2) + ' vs TP2 $' + (+t.tp2Price).toFixed(2) + ' = ' + (_lrD >= 0 ? '+' : '') + '$' + _lrD.toFixed(2) + '/unit on the remainder (2026-10-27).'); } } catch (eLR2) {}
       if (t._tp1Gap && !entry.outcomes.tp1Hit) { try { bumpCohortTally(sym, 'TP1-GAP', 'loss'); entry.outcomes.tp1Gap = 'missed'; log(sym, '📏 TP1-GAP → LOSS — touched +$5.00, never reached TP1, stopped: the $5.00 target would have banked this one.'); } catch (eG2) {} }
+      if (!entry.outcomes.tp1Hit) fireCohortsOnResolve(sym, entry, 'loss'); // FILL-VIA / DAY-STRUCT tallies (2026-11-04)
       entry.outcomes.slHit = true; entry.outcomes.slHitTs = now;
       entry.outcomes.closePrice = finalPrice;
       if (t.ep > 0 && finalPrice > 0) bookPnl(sym, (entry.outcomes.tp1Hit ? 0.5 : 1.0) * (t.type === 'call' ? finalPrice - t.ep : t.ep - finalPrice) * pnlMultFor(sym, t), 'close');
@@ -19835,7 +19906,7 @@ const ENTRY_AGENT_SYSTEM = [
   '  • Regime RANGE with a candidate that is NOT at a session extreme → low expectancy for continuation; prefer SKIP unless the path is clear and momentum is live. Regime TREND with-trend → FILL/shallow WAIT; counter-trend in TREND → SKIP unless at an extreme with a clean rejection.',
   '  • News blackout active or a high-impact release within 10 minutes → SKIP. economic_context carries today\'s releases with actual vs forecast and the market\'s 10-minute read, the relevant headlines of the last hours, and the macro tape (dollar, bonds, silver, miners for gold; QQQ/SPY for NAS). Use it as context: a surprise print explains a one-directional tape (do not fade it), a shock headline or a release due within 30 min raises the bar for FILL, a quiet calendar and neutral tape favour the chart.',
   '  • Use lane_stats_7d: if this detector\'s market fills have been losing and its pullback fills winning, lean WAIT; and vice versa. Use my_recent_decisions to avoid repeating a graded mistake.',
-  '  • my_lessons holds rules YOU wrote after grading your own past decisions (lessons_from_my_mistakes, what_has_worked), with how many times each pattern recurred. Check them FIRST: if the current candidate matches a lesson\'s conditions, follow it, and say so in your reason — unless you can state concretely what is different this time. Your FILL calls have lost far more often than they have won; the lessons exist to stop the same mistake a third time.',
+  '  • my_lessons holds rules YOU wrote after grading your own past decisions (lessons_from_my_mistakes, what_has_worked), with how many times each pattern recurred. Check them FIRST: if the current candidate matches a lesson\'s conditions, follow it, and say so in your reason — unless you can state concretely what is different this time. Your FILL calls have lost far more often than they have won; the lessons exist to stop the same mistake a third time. Lessons are SESSION-BOUND: a "chase the extended leg / the gate was wrong" lesson earned in Asia or London does not transfer to the NY open — those appear under unproven_in_this_session (do not act on them alone) or are withheld in NY-AM (session_note). On a vertical open move (day_structure: 5+ ATR from the open, first pullback 3-60 min after the extreme) the first pullback is where the move ENDS; buying its resumption is a crest fill, not a trend fill.',
   'What the zone ledger has learned about OB/FVG zones in THIS system (measured on 258 graded vetoes and ~1,500 zones, Oct 2026): a continuation that runs into an opposing zone within 1.2 ATR AHEAD wins only ~17-30% of the time, whatever the zone\'s grade — even "weak" zones that later break produce enough first-touch reaction to stop a 1 ATR bracket; being already INSIDE an opposing zone is less dangerous (~31%). Zone AGE matters most: zones younger than 4h stop candidates ~74% of the time, 4-12h-old zones ~57%, older ones less. Higher timeframes hold more (M15 order blocks ~45-52% hold rate, M10 ~35-45%, M5 zones ~25-30% = noise). Zones sitting AT the session extreme hold poorly (<25% on gold) — the level gets retested and run; the zone itself is not a reason to fade. No zone class holds more than ~52%, so a zone BEHIND you is modest support, not a wall. Use zone_ledger_buckets to read what a grade means today.',
   'Constraints for WAIT: limit must be on the pullback side of the current price (below it for a call, above it for a put), between 0.25 and 1.0 ATR away; window_sec 60–300; leash_atr 0.3–1.0.',
   'Answer with ONE JSON object and nothing else: {"action":"fill"|"wait"|"skip","limit":<number or null>,"window_sec":<int or null>,"leash_atr":<number or null>,"confidence":<0..1>,"reason":"<max 160 chars, concrete: cite the numbers that decided it>","counter_case":"<for FILL only: the single strongest reason NOT to fill, max 100 chars; if you cannot name one, lower your confidence>"}'
@@ -19881,6 +19952,9 @@ function entryAgentSnapshot(sym, s, ctx) {
     regime: s._dayRegime ? { label: s._dayRegime.label, ker: s._dayRegime.ker, chop: s._dayRegime.chop, hurst: s._dayRegime.hurst } : null,
     ms_trend: s._msTrend || null,
     session: { high: isFinite(s.sessionHigh) ? +(+s.sessionHigh).toFixed(2) : null, low: isFinite(s.sessionLow) ? +(+s.sessionLow).toFixed(2) : null, range_atr: A(s.sessionHigh - s.sessionLow), dist_to_high_atr: A(s.sessionHigh - price), dist_to_low_atr: A(price - s.sessionLow) },
+    // where in today's move this candidate sits (2026-11-04): run from the day/RTH open in ATR (+ = already moved the
+    // candidate's way), minutes since the extreme it runs toward, pullback from it, and the pre-registered label
+    day_structure: (function () { try { const f = blockFeat(sym, s, dir, price); return f ? { run_from_day_open_atr: f.openAtr, run_from_rth_open_atr: f.rthAtr, minutes_since_extreme_in_my_direction: f.sinceExtMin, pullback_from_that_extreme_atr: f.pullAtr, label: f.dayStruct, note: f.dayStruct === 'first-pullback-after-vertical' ? 'the first pullback after a ≥5 ATR vertical run is where such moves usually END; a resumption fill here is a crest fill' : f.dayStruct === 'at-extreme' ? 'price is printing the day extreme right now after a ≥3 ATR run' : null } : null; } catch (e) { return null; } })(),
     indicators: { rsi: isFinite(ctx.rsi) ? +(+ctx.rsi).toFixed(1) : null, macd_line: isFinite(ctx.macdL) ? +(+ctx.macdL).toFixed(3) : null, roc_3min_pct: isFinite(ctx.roc3) ? +(+ctx.roc3).toFixed(3) : null, roc_6min_pct: isFinite(ctx.roc6) ? +(+ctx.roc6).toFixed(3) : null },
     leg: s._legPivot ? { trend: s._legPivot.trend, pivot: +(+s._legPivot.ext).toFixed(2), run_from_pivot_atr: A(Math.abs(price - s._legPivot.ext)), pivot_age_min: s._legPivot.ts ? Math.round((Date.now() - s._legPivot.ts) / 60000) : null } : null,
     impulse_ote: ctx.ote ? { impulse_lo: +(+ctx.ote.impulseLo).toFixed(2), impulse_hi: +(+ctx.ote.impulseHi).toFixed(2), ote_705_limit: +(+ctx.ote.limit).toFixed(2), dist_to_ote_atr: A(Math.abs(price - ctx.ote.limit)), price_already_beyond_ote: dir === 'call' ? price <= ctx.ote.limit : price >= ctx.ote.limit } : null,
@@ -20014,7 +20088,7 @@ const GATE_AGENT_SYSTEM = [
   'How you are graded: on the candidate\'s own bracket from the current price — first target (TP1) before stop (SL) = the candidate would have won. UNBLOCK on a winner counts for you, UNBLOCK on a loser against you; UPHOLD on a loser counts for you (avoided loss), UPHOLD on a winner against you (missed win). The gates you review have been right 65–84% of the time, so UPHOLD is the default: UNBLOCK only when the evidence is specific and the ledger does not contradict you.',
   'Judgment to apply: a gate is usually right when the candidate runs into a FRESH (<4h) untested opposing zone, when momentum is fading or reversing (accel=fading/reversing), when the leg has already run ≥2 ATR, when the candidate is counter-trend (ms=CT) or against the trend-day latch, or in RANGE regime away from a session extreme. A gate is more often wrong when the opposing zone is OLD or already tested 2+ times, momentum is accelerating with the candidate (macdB with/strong-with, accel=accel), the leg is young (<1 ATR from pivot), the candidate is with-trend on a latched trend day, and the tape is thick. Weigh gate.ledger over these priors when it has ≥10 rows in a bucket.',
   'economic_context: today\'s scheduled releases with actual vs forecast and the 10-minute market read, relevant headlines of the last hours, and the macro tape. A surprise print or shock headline that explains the move argues for UPHOLD on a counter-move candidate and against unblocking a chase; a quiet calendar and neutral tape leave the chart to decide.',
-  'my_lessons (when present) holds rules you wrote after grading your own past reviews — patterns where your uphold or unblock was wrong, with recurrence counts. Check them first; follow a matching lesson unless you can say what is different now.',
+  'my_lessons (when present) holds rules you wrote after grading your own past reviews — patterns where your uphold or unblock was wrong, with recurrence counts. Check them first; follow a matching lesson unless you can say what is different now. Lessons are SESSION-BOUND: "the gate was wrong / chase the extension" lessons earned in Asia or London are listed under unproven_in_this_session elsewhere (never a reason to UNBLOCK on their own) and withheld in NY-AM. day_structure tells you where in today\'s move the candidate sits: at the first pullback after a ≥5 ATR vertical run (label first-pullback-after-vertical) an extension gate is usually RIGHT — uphold.',
   'Answer with ONE JSON object and nothing else: {"action":"unblock"|"uphold","confidence":<0..1>,"reason":"<max 160 chars, concrete: cite the numbers that decided it>"}'
 ].join('\n');
 // ===== AGENT VETO — LIVE ON ITS PRE-REGISTERED BAR (2026-10-27, Jean: "the AI agent is the solution") =====
@@ -20179,27 +20253,48 @@ async function entryAgentReflectOne(q) {
 }
 setInterval(() => { try { if (!entryAgent.reflectQ.length || !entryAgentEnabled() || process.env.ENTRY_AGENT_REFLECT === '0') return; const batch = entryAgent.reflectQ.splice(0, 2); for (const q of batch) entryAgentReflectOne(q); } catch (e) {} }, 30000).unref();
 // the lessons a consult should see: per-symbol clusters first, then cross-symbol; mistakes weighted by count × recency
+// SESSION-BOUND LESSONS (2026-11-04, the 11/04 NAS RIDE at the crest of an 8.5×ATR open squeeze): overnight the agent
+// wrote six "don't uphold the extended-leg refusal, the ride kept running" lessons — all earned in Asia/London grinds —
+// then applied them at the NY open and both models said FILL at the top of the day. A chase/overturn lesson is a
+// property of the session that produced it: in a session where it has never been earned it is shown as UNPROVEN
+// (a separate short list, explicitly not to be applied on its own), and in NY-AM it is dropped until re-earned there.
+const AGENT_SESSION_BOUND_TAGS = ['chase-extended-leg', 'gate-was-wrong'];
+function sessBucketNow() {
+  try { const hr = +new Date().toLocaleTimeString('en-US', { hour: '2-digit', hour12: false, timeZone: 'America/New_York' }).slice(0, 2); return (hr >= 18 || hr < 3) ? 'asia' : hr < 8 ? 'london' : hr < 12 ? 'ny-am' : hr < 17 ? 'ny-pm' : 'close'; } catch (e) { return null; }
+}
 function entryAgentLessonsFor(sym, dir) {
   try {
     const now = Date.now(), since = now - 30 * 86400000;
+    const sess = sessBucketNow();
     const L = entryAgent.lessons.filter(l => l.ts >= since && l.key);
     const cl = {};
     for (const l of L) {
       const k = l.kind + '|' + l.key + '|' + (l.sym === sym ? 'own' : 'other');
-      const c = cl[k] = cl[k] || { kind: l.kind, key: l.key, tags: l.tags, own: l.sym === sym, n: 0, firstTs: l.ts, lastTs: 0, text: '', syms: new Set(), dirs: new Set(), netMfe: 0 };
+      const c = cl[k] = cl[k] || { kind: l.kind, key: l.key, tags: l.tags, own: l.sym === sym, n: 0, firstTs: l.ts, lastTs: 0, text: '', syms: new Set(), dirs: new Set(), netMfe: 0, sess: {} };
       c.n++; if (l.ts < c.firstTs) c.firstTs = l.ts; if (l.ts > c.lastTs) { c.lastTs = l.ts; c.text = l.text; } c.syms.add(l.sym); c.dirs.add(l.dir);
+      const ls = l.sess || 'unknown'; c.sess[ls] = (c.sess[ls] || 0) + 1;
     }
+    const sessBound = c => c.kind === 'mistake' && (c.tags || []).some(t => AGENT_SESSION_BOUND_TAGS.indexOf(t) >= 0);
+    const earnedHere = c => !sess || (c.sess[sess] || 0) > 0;
+    const sessNote = c => (sessBound(c) && !earnedHere(c)) ? '; learned in ' + Object.keys(c.sess).filter(k => k !== 'unknown').join('/') + ' only — UNPROVEN in ' + sess + ', do not act on it here by itself' : '';
     // SELF-CHECK (2026-10-29): a lesson is only as good as its record. For each mistake cluster, count the confirmations of
     // the SAME pattern written after the first mistake (the lesson held) and the mistakes repeated after it (it did not).
     // Shown to the agent; a cluster whose later record contradicts it (held < repeats, ≥3 events) is dropped from the list.
     const held = (c) => L.filter(l => l.kind === 'confirmation' && l.key === c.key && l.ts > c.firstTs).length;
     const repeats = (c) => Math.max(0, c.n - 1);
     const score = c => c.n * (c.own ? 2 : 1) * (1 + Math.max(0, 1 - (now - c.lastTs) / (14 * 86400000)));
-    const fmt = c => (c.n + '× ' + (c.own ? '' : '(' + Array.from(c.syms).join('/') + ') ') + c.text + ' [' + c.tags.join(', ') + '; last ' + new Date(c.lastTs).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/New_York' }) + (c.kind === 'mistake' ? '; since written: held ' + held(c) + '×, repeated ' + repeats(c) + '×' : '') + ']');
-    const M = Object.values(cl).filter(c => c.kind === 'mistake').filter(c => { const h = held(c), r = repeats(c); return !(h + r >= 3 && h < r); }).sort((a, b) => score(b) - score(a)).slice(0, 8).map(fmt);
+    const fmt = c => (c.n + '× ' + (c.own ? '' : '(' + Array.from(c.syms).join('/') + ') ') + c.text + ' [' + c.tags.join(', ') + '; last ' + new Date(c.lastTs).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/New_York' }) + (c.kind === 'mistake' ? '; since written: held ' + held(c) + '×, repeated ' + repeats(c) + '×' : '') + sessNote(c) + ']');
+    const Mall = Object.values(cl).filter(c => c.kind === 'mistake').filter(c => { const h = held(c), r = repeats(c); return !(h + r >= 3 && h < r); }).sort((a, b) => score(b) - score(a));
+    // session split: proven-here lessons stay in the main list; session-bound ones never earned in this session go to a
+    // demoted list (and in NY-AM are dropped outright — the open is where chasing the night's lesson cost the most)
+    const M = Mall.filter(c => !sessBound(c) || earnedHere(c)).slice(0, 8).map(fmt);
+    const U = (sess === 'ny-am') ? [] : Mall.filter(c => sessBound(c) && !earnedHere(c)).slice(0, 3).map(fmt);
     const C = Object.values(cl).filter(c => c.kind === 'confirmation').sort((a, b) => score(b) - score(a)).slice(0, 4).map(fmt);
-    if (!M.length && !C.length) return null;
-    return { lessons_from_my_mistakes: M, what_has_worked: C, note: 'rules written by you after grading your own past decisions (count × pattern); follow a matching lesson unless you can state what is different this time' };
+    if (!M.length && !C.length && !U.length) return null;
+    const out = { lessons_from_my_mistakes: M, what_has_worked: C, note: 'rules written by you after grading your own past decisions (count × pattern); follow a matching lesson unless you can state what is different this time' };
+    if (U.length) out.unproven_in_this_session = U; // demoted: learned elsewhere, never confirmed in the current session
+    if (sess === 'ny-am' && Mall.some(c => sessBound(c) && !earnedHere(c))) out.session_note = 'NY-AM: your chase / overturn-the-gate lessons were all earned in Asia or London and are withheld here until one is earned in NY-AM. The first pullback after a vertical open move is where those moves END, not where they continue.';
+    return out;
   } catch (e) { return null; }
 }
 
@@ -20916,7 +21011,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.71-20261104-runner-track-guard', // bump on each deploy — lets /state verify what's live
+    build: '7.72-20261104-day-structure', // bump on each deploy — lets /state verify what's live
     laneBench: global._laneBench || {}, // enforced live-lane bench state (2026-10-27)
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' /* RETIRED FROM LIVE 2026-10-28 (Jean: "always taking the call after the big leg happened"): live 1W/5L −$1,942 + the 10/28 05:16 call; shadow 0W/2S/4L (14d). The sampler keeps measuring; BTC_BIGLEG_LIVE=1 re-arms by hand */ ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
