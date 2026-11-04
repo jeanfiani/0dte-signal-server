@@ -18306,18 +18306,28 @@ function checkExit(sym, price) {
     // trailSl goes to the EA, which moves the broker SL (improve-only), so the protection holds even if the server dies.
     // RUNNER_TRAIL=0 kills it. TRAIL-SIM keeps measuring the 40% variant alongside.
     try {
-      if (t.t1 && !t.scalp && !t.sl && process.env.RUNNER_TRAIL !== '0' && t.ep > 0) {
+      // NOISE-PROOF TRAIL (2026-11-04, Jean: the 01:20 FAST+LIQ call — TP1 at +$7.5, the push said "SL stays original 5 min",
+      // the runner trail locked 50% of a $7.5 peak = +$3.77 and the $4 pullback took it out at 4,023; price is 4,036 an
+      // hour later). Two faults: (1) the trail ignored the FAST BE-delay window it had just announced; (2) 50% of a small
+      // peak is a stop 0.3×ATR behind price on a $12-ATR day — noise distance. Now: no trail changes inside the BE-delay
+      // window, and the give-back is at least RUNNER_TRAIL_MIN_ATR (1.0) × ATR, so the trail only locks profit once the
+      // peak is beyond ~2×ATR; below that the stop stays at the TP1 lock (breakeven on a latch-day runner, see below).
+      if (t.t1 && !t.scalp && !t.sl && process.env.RUNNER_TRAIL !== '0' && t.ep > 0 && !(t._beDelayUntil && now < t._beDelayUntil)) {
         const _rtFav = iC ? price - t.ep : t.ep - price;
         if (typeof t.bestPrice === 'number' && !t._rtPeak) { const _bp = iC ? t.bestPrice - t.ep : t.ep - t.bestPrice; if (_bp > 0) t._rtPeak = _bp; } // seed from the trade's own best price (a trade restored after a deploy keeps its peak)
         if (_rtFav > (t._rtPeak || 0)) t._rtPeak = _rtFav;
         const _rtPct = parseFloat(process.env.RUNNER_TRAIL_PCT) || 0.5;
         const _rtArm = (parseFloat(process.env.RUNNER_TRAIL_ARM_R) || 1.0) * Math.abs((t.tp1Price || t.ep) - t.ep);
         if ((t._rtPeak || 0) > 0 && t._rtPeak >= _rtArm) {
-          const _rtLock = +(iC ? t.ep + _rtPct * t._rtPeak : t.ep - _rtPct * t._rtPeak).toFixed(2);
+          const _rtGive = Math.max((1 - _rtPct) * t._rtPeak, (parseFloat(process.env.RUNNER_TRAIL_MIN_ATR) || 1.0) * (t.atr > 0 ? t.atr : 0)); // give-back ≥ 1×ATR (2026-11-04)
+          const _rtLockRaw = t._rtPeak - _rtGive; // profit locked, from entry
+          if (_rtLockRaw <= 0) { /* peak too small to trail: the TP1 lock holds */ } else {
+          const _rtLock = +(iC ? t.ep + _rtLockRaw : t.ep - _rtLockRaw).toFixed(2);
           if (!(t.trailSl > 0) || (iC ? _rtLock > t.trailSl : _rtLock < t.trailSl)) {
             const _rtPrev = t.trailSl || 0; t.trailSl = _rtLock;
             const _stepA = (typeof t.atr === 'number' && t.atr > 0) ? 0.2 * t.atr : 0;
-            if (!t._rtLogAt || Math.abs(_rtLock - t._rtLogAt) >= _stepA) { t._rtLogAt = _rtLock; log(sym, '🪜 RUNNER TRAIL — ' + t.type.toUpperCase() + ' @ $' + (+t.ep).toFixed(2) + ' peaked +$' + t._rtPeak.toFixed(2) + ' → stop ratcheted to $' + _rtLock.toFixed(2) + ' (locks ' + Math.round(_rtPct * 100) + '% of the peak' + (_rtPrev ? ', was $' + _rtPrev.toFixed(2) : '') + ') (2026-10-19).'); }
+            if (!t._rtLogAt || Math.abs(_rtLock - t._rtLogAt) >= _stepA) { t._rtLogAt = _rtLock; log(sym, '🪜 RUNNER TRAIL — ' + t.type.toUpperCase() + ' @ $' + (+t.ep).toFixed(2) + ' peaked +$' + t._rtPeak.toFixed(2) + ' → stop ratcheted to $' + _rtLock.toFixed(2) + ' (give-back $' + _rtGive.toFixed(2) + ' = max(' + Math.round((1 - _rtPct) * 100) + '% of peak, 1×ATR)' + (_rtPrev ? ', was $' + _rtPrev.toFixed(2) : '') + ') (2026-11-04).'); }
+          }
           }
         }
       }
@@ -18373,7 +18383,7 @@ function checkExit(sym, price) {
         sendPush('🎯 ' + sym + ' TP1 HIT (FAST)', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · SL stays original 5min — do NOT move to BE yet', 'signal');
         updateSignalOutcome(sym, price);
       } else {
-      const lockDist = (typeof t.atr === 'number' && isFinite(t.atr) && t.atr > 0) ? t.atr * 0.3 : 0;
+      const lockDist = (t._latchRunner) ? 0 : ((typeof t.atr === 'number' && isFinite(t.atr) && t.atr > 0) ? t.atr * 0.3 : 0); // latch-day runner: breakeven, not +0.3×ATR — on a $12-ATR trend day the +$3.6 lock is a noise stop (2026-11-04)
       t.t1 = true; t.trailSl = iC ? t.ep + lockDist : t.ep - lockDist; t.lastETs = now;
       log(sym, '🎯 TP1 HIT — $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2) + ' · SL → entry' + (lockDist > 0 ? (iC ? '+' : '-') + '$' + lockDist.toFixed(2) + ' (profit-lock)' : ' (BE)') + ' $' + t.trailSl.toFixed(2));
       sendPush('🎯 ' + sym + ' TP1 HIT', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · SL → entry' + (lockDist > 0 ? '±0.3ATR lock' : ' (BE)'), 'signal');
@@ -18407,7 +18417,7 @@ function checkExit(sym, price) {
     // FAST BE-delay expiry (2026-08-28, Jean): 5min after TP1 with no exit — the
     // burst had its breathing room; arm the normal entry±0.3ATR lock now.
     if (t.t1 && !t.sl && t._beDelayUntil && !(t.trailSl > 0) && now >= t._beDelayUntil) {
-      const _bdLock = (typeof t.atr === 'number' && isFinite(t.atr) && t.atr > 0) ? t.atr * 0.3 : 0;
+      const _bdLock = t._latchRunner ? 0 : ((typeof t.atr === 'number' && isFinite(t.atr) && t.atr > 0) ? t.atr * 0.3 : 0); // latch-day runner: breakeven (2026-11-04)
       t.trailSl = iC ? t.ep + _bdLock : t.ep - _bdLock;
       t._beDelayUntil = 0;
       log(sym, '⏱ FAST BE-DELAY expired — SL → entry' + (_bdLock > 0 ? '±$' + _bdLock.toFixed(2) + ' lock' : ' (BE)') + ' $' + t.trailSl.toFixed(2) + ' (5min window closed, Jean 2026-08-28).');
@@ -20899,7 +20909,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.69-20261103-extflip-stop', // bump on each deploy — lets /state verify what's live
+    build: '7.70-20261104-runner-noise-proof', // bump on each deploy — lets /state verify what's live
     laneBench: global._laneBench || {}, // enforced live-lane bench state (2026-10-27)
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' /* RETIRED FROM LIVE 2026-10-28 (Jean: "always taking the call after the big leg happened"): live 1W/5L −$1,942 + the 10/28 05:16 call; shadow 0W/2S/4L (14d). The sampler keeps measuring; BTC_BIGLEG_LIVE=1 re-arms by hand */ ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
