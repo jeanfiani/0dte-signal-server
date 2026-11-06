@@ -2387,6 +2387,7 @@ function nasRthBlocked(sym) {
   try { const m = gET(); return (m < 570 || m >= 960); } catch (e) { return false; }
 }
 function cohortFor(reason) {
+  { const _cb = reason.match(/LANE-COLD-BENCH ([A-Z0-9+_\/-]+)/); if (_cb) return 'COLD-' + _cb[1]; } // 0W/3L window bench rows per lane (2026-11-06) — first, so the lane name inside cannot be caught by another match
   { const _ex = reason.match(/\b(XAU|BTC|NAS100)-EXH-REV(-1ST)?\b/); if (_ex) return _ex[0]; } // exhaustion-reversal shadow lane (2026-10-21)
   { const _bl = reason.match(/\bBTC-BIGLEG-(CONT|LATCH)\b/); if (_bl) return _bl[0]; } // continuation / latch arms (2026-10-21) — before the plain BIGLEG matches
   { const _ag = reason.match(/\bAGENT-([A-Z0-9]+)-(FILL|WAIT|SKIP)-(NOW|FILL)\b/); if (_ag) return _ag[0]; } // entry agent shadow cohorts (2026-10-09)
@@ -2504,6 +2505,7 @@ function cohortFor(reason) {
   if (/BTC-RANGE5-BRK/.test(reason)) return 'BTC-RANGE5-BRK'; // range-EXPANSION arm: confirmed break of the prior 5-day extreme ridden with-trend (2026-09-18, Jean's "4K growth" chart) — must precede the -RT/plain matches
   // RANGE5-RT sub-cohorts (2026-09-21 routing fix: bumpCohortTally runs names through
   // cohortFor, so these MUST precede the plain -RT match or they collapse into it):
+  if (/RANGE5-RT-KNIFE/.test(reason)) return 'BTC-RANGE5-RT-KNIFE'; // first rejection close inside a flush, live fire held (2026-11-05, Jean: "it cannot fire right after a 3k flush") — must precede the plain -RT match
   if (/RANGE5-RT-TIGHT/.test(reason)) return (/^NAS|NAS-RANGE5/.test(reason) ? 'NAS' : 'BTC') + '-RANGE5-RT-TIGHT'; // $1,000-SL twin (2026-09-20)
   if (/RANGE5-RT-WKND/.test(reason)) return (/NAS-RANGE5/.test(reason) ? 'NAS' : 'BTC') + '-RANGE5-RT-WKND'; // weekend-armed retests (2026-09-20)
   if (/RANGE5-RT-RGT/.test(reason)) return (/NAS-RANGE5/.test(reason) ? 'NAS' : 'BTC') + '-RANGE5-RT-RGT'; // regime split: armed in TREND (2026-09-21)
@@ -3004,6 +3006,67 @@ function liveLaneBenched(sym, scoreRe, cohort) {
     if (prev !== benched) { const m = '🛏️ ' + cohort + ' live lane ' + (benched ? 'BENCHED' : 'RE-ARMED') + ' — last ' + last6.length + ' filled fires net ' + (net >= 0 ? '+' : '') + '$' + net.toFixed(0) + (shadow ? ' · shadow since bench ' + shadow.w + 'W/' + shadow.l + 'L' : '') + ' (enforced bench rule, 2026-10-27).'; log(sym, m); try { sendPush('🛏️ ' + cohort + ' ' + (benched ? 'benched' : 're-armed'), 'last 6 fills net $' + net.toFixed(0), 'alert'); } catch (e) {} }
     return benched;
   } catch (e) { return false; }
+}
+// ===== SESS-REJ-V2 AUTO-ARM (2026-11-06) ===== the pre-registered promotion, applied by the counter: live when the shadow
+// cohort <SYM>-SESS-REJ-V2 shows ≥60% W/(W+L) over ≥25 resolved (bar from 10/21: N>25). Cached 10 min; one log per change.
+// XAU_SESSREJ_V2_LIVE=0 kills, =1 forces (the 60% floor still applies when forced, like the agent veto).
+global._srV2Arm = global._srV2Arm || {};
+function sessRejV2Armed(sym) {
+  try {
+    const f = process.env[sym + '_SESSREJ_V2_LIVE'];
+    if (f === '0') return false;
+    const now = Date.now(), c = global._srV2Arm[sym];
+    if (c && now - c.ts < 600000) return c.armed;
+    const t = (cohortTally[sym] && cohortTally[sym][sym + '-SESS-REJ-V2']) || { win: 0, loss: 0 };
+    const n = (t.win || 0) + (t.loss || 0), pct = n ? t.win / n : 0;
+    const armed = f === '1' ? (n > 0 && pct >= 0.6) : (n >= 25 && pct >= 0.6);
+    const prev = c ? c.armed : null;
+    global._srV2Arm[sym] = { ts: now, armed, n, pct: Math.round(pct * 100), bar: '60% over 25', forced: f === '1' };
+    if (prev !== armed) { const m = '🎯 ' + sym + '-SESS-REJ-V2 ' + (armed ? 'ARMED LIVE' : 'DISARMED') + ' — shadow ' + (t.win || 0) + 'W/' + (t.loss || 0) + 'L (' + Math.round(pct * 100) + '% over ' + n + '; bar 60% over 25' + (f === '1' ? ', forced' : '') + ') (auto-arm 2026-11-06).'; log(sym, m); try { sendPush('🎯 ' + sym + ' SESS-REJ-V2 ' + (armed ? 'armed' : 'disarmed'), (t.win || 0) + 'W/' + (t.loss || 0) + 'L in shadow', 'alert'); } catch (e) {} }
+    return armed;
+  } catch (e) { return false; }
+}
+
+// ===== LANE COLD-START BENCH (2026-11-06, Jean: "let's try for more consistency") ===== A live lane whose first three
+// resolved bot fires of the test window (LANE_WINDOW_START, default 2026-10-29) are 0W/3L — W = reached TP1, L = stopped
+// before it, filled or not — goes to shadow: its fires are stamped as LANE-COLD-BENCH rows on the live ladder and graded,
+// and it re-arms by itself when those shadow rows show ≥60% over ≥25. After a re-arm the count restarts from the re-arm.
+// Generic: every lane that passes through enrichSig (TREND, EXT-FLIP, RIDE, FAST, LHF, INVERSAL_BREAK, DIV …); the lanes
+// with their own bench (SESS-REJ, LIQ, RANGE5) fire outside enrichSig and keep theirs. LANE_COLD_BENCH=0 disables.
+global._laneColdRearm = global._laneColdRearm || {};
+function laneColdBench(sym, lane) {
+  try {
+    if (process.env.LANE_COLD_BENCH === '0' || !lane) return null;
+    global._laneBench = global._laneBench || {};
+    const key = sym + '|COLD|' + lane, now = Date.now(), c = global._laneBench[key];
+    if (c && now - c.ts < 60000) return c;
+    const start = Math.max(Date.parse((process.env.LANE_WINDOW_START || '2026-10-29') + 'T00:00:00-04:00') || 0, global._laneColdRearm[key] || 0);
+    const fires = [];
+    for (const h of signalHistory) {
+      if (h.symbol !== sym || h.manual || !(h.ts >= start) || !/^(call|put)$/.test(h.type) || (h.conv && h.conv.enrichBlocked) || String(h.score || '').replace(/[⬆⬇]/g, '') !== lane || !h.outcomes) continue;
+      const o = h.outcomes; const win = !!(o.tp1Hit || o.scalpExit); const loss = !win && !!(o.slHit || o.endedByEa || (o.eaClose && isFinite(o.eaClose.total) && o.eaClose.total < 0));
+      if (!win && !loss) continue;
+      fires.push({ ts: h.ts, win });
+    }
+    fires.sort((a, b) => a.ts - b.ts);
+    const first = fires.slice(0, 3);
+    let benched = first.length >= 3 && first.every(f => !f.win);
+    const since = benched ? first[2].ts : 0; let shadow = null;
+    if (benched) {
+      const st = S[sym]; let w = 0, l = 0;
+      for (const b of (st && st.blockedOutcomes) || []) { if (b.ts <= since || !b.closed || b.coldLane !== lane) continue; if (b.outcome === 'win') w++; else if (b.outcome === 'loss') l++; }
+      shadow = { w, l };
+      if (w + l >= 25 && w / (w + l) >= 0.6) { benched = false; global._laneColdRearm[key] = now; }
+    }
+    const prev = c ? c.benched : null;
+    const rec = { ts: now, benched, since, n: fires.length, first: first.map(f => f.win ? 'W' : 'L').join('') || '-', shadow, cold: true, lane };
+    global._laneBench[key] = rec;
+    if (prev !== benched && (benched || prev === true)) {
+      const m = '🛏️ LANE-COLD-BENCH ' + sym + ' ' + lane + (benched ? ' BENCHED — first 3 resolved fires of the window were 0W/3L; fires go to shadow on the live ladder until 60% over 25 there' : ' RE-ARMED — shadow ' + (shadow ? shadow.w + 'W/' + shadow.l + 'L' : '?') + ' since the bench; the count restarts now') + ' (2026-11-06).';
+      log(sym, m); try { sendPush('🛏️ ' + sym + ' ' + lane + (benched ? ' benched' : ' re-armed'), benched ? 'first 3 fires 0W/3L — shadow until 60%/25' : 'shadow ' + shadow.w + 'W/' + shadow.l + 'L', 'alert'); } catch (e) {}
+    }
+    return rec;
+  } catch (e) { return null; }
 }
 function tdPullbackArm(sym, s, sig, price, gate) {
   try {
@@ -4146,6 +4209,7 @@ function logSignal(sym, sig) {
     manual: sig.manual || undefined, // MANUAL launch (2026-10-04): {note, mode, regime, msTrend}
     ctWaived: sig._ctWaived || undefined, // CT-VETO waived under LEG MODE (2026-10-02)
     liq: sig.liq === true || undefined, // liquidation-regime fire: crest gates waived, market entry (2026-10-30)
+    r5Knife: sig.r5Knife || undefined, // RANGE5-RT fire that waited out a flush under the knife guard (2026-11-05): {heldMin}
     // Same bucketed feature stamp the blocked rows carry (2026-11-04): fires and refusals now share one feature space,
     // so /gate-score and the scorecard can grade a cohort (e.g. dayStruct = first-pullback-after-vertical) on BOTH sides.
     feat: (sig.manual || sig.type === 'exit' || !/^(call|put)$/.test(String(sig.type))) ? undefined : (blockFeat(sym, S[sym], sig.type, +sig.price) || undefined),
@@ -4619,8 +4683,16 @@ function processPrice(sym, price, hi, lo) {
         for (let i = 0; i < _srW.length; i++) { if (_srW[i].h > _swH) { _swH = _srW[i].h; _swHi = i; } if (_srW[i].l < _swL) { _swL = _srW[i].l; _swLi = i; } }
         const _srAtr = s._atr || (_srAdr > 0 ? _srAdr / 20 : 0);
         const _srSwing = (_srAtr > 0 && isFinite(_swH) && isFinite(_swL)) ? (_swH - _swL) / _srAtr : 0;
-        const _crashDn = _srSwing >= 2.0 && _swLi > _swHi; // flushed down → bounce CALL context
-        const _crashUp = _srSwing >= 2.0 && _swHi > _swLi; // spiked up → fade PUT context
+        // CRASH-ARM FLOOR (2026-11-05, the 11/04 19:05 XAU put at the bottom): "≥2×ATR in 2h" has no absolute size, so on a
+        // $5.40 night ATR a $22 two-hour grind back to the day open counted as a 4×ATR "spike" and the lane faded a
+        // V-recovery high at the Asia open (−$4,984; both agents said skip). Same defect the LIQ regime had on 11/03 and got
+        // floors for. A flush must also be ≥ SESSREJ_CRASH_ADR×ADR (0.25) and ≥ SESSREJ_CRASH_PCT % of price (0.4): on
+        // 11/04 that is ≥$26.5 and ≥$16.3 — the $22 grind fails the ADR floor. Shadow stamps and live fire share it.
+        const _srSwAbs = (isFinite(_swH) && isFinite(_swL)) ? (_swH - _swL) : 0;
+        const _crashFloorOk = _srSwAbs >= (parseFloat(process.env.SESSREJ_CRASH_ADR) || 0.25) * _srAdr && (price > 0 ? _srSwAbs / price * 100 : 0) >= (parseFloat(process.env.SESSREJ_CRASH_PCT) || 0.4);
+        const _crashDn = _srSwing >= 2.0 && _crashFloorOk && _swLi > _swHi; // flushed down → bounce CALL context
+        const _crashUp = _srSwing >= 2.0 && _crashFloorOk && _swHi > _swLi; // spiked up → fade PUT context
+        if (_srSwing >= 2.0 && !_crashFloorOk && Date.now() - (s._srFloorLogTs || 0) > 1800000) { s._srFloorLogTs = Date.now(); log(sym, '🎯 ' + sym + ' SESS-REJ CRASH arm NOT armed — 2h swing $' + _srSwAbs.toFixed(2) + ' is ' + _srSwing.toFixed(1) + '×ATR but below the flush floor (needs ≥$' + ((parseFloat(process.env.SESSREJ_CRASH_ADR) || 0.25) * _srAdr).toFixed(2) + ' = 0.25×ADR and ≥' + (parseFloat(process.env.SESSREJ_CRASH_PCT) || 0.4) + '% of price): a grind on a small night ATR, not a flush (2026-11-05).'); }
         if (_srAdr > 0 && (_srRng || _crashDn || _crashUp)) {
           const _vp = s._vp || null;
           const _hiIn = _vp ? _vp.vah : s.sessionHigh - 0.05 * _srAdr; // "back inside" line for the high
@@ -4655,7 +4727,14 @@ function processPrice(sym, price, hi, lo) {
                 return { tags, v2: (N >= 2 || wick) && (disp || zone) && session, N, wick, disp, session, zone, withTrend };
               } catch (e) { return { tags: [], v2: false }; }
             };
-            const _push = (lane, dir, sl, tp, m) => { s.blockedOutcomes = s.blockedOutcomes || []; s.blockedOutcomes.push({ ts: Date.now(), time: ts(), symbol: sym, detector: lane, type: dir, price: price, virtualTp1: tp, virtualSl: sl, maxMin: 480, blockReason: m, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null }); log(sym, m); };
+            // SHADOW TARGET FLOOR (2026-11-05): the 11/04 19:05 put's virtual target was the POC $0.36 away, so the shadow row
+            // graded WIN on a tick while the live trade lost $4,984 — the cohort was being padded. A virtual target closer
+            // than 0.5×ATR is pushed out to 0.5×ATR and the row says so; the live wrapper's no-room guard is separate.
+            const _push = (lane, dir, sl, tp, m) => {
+              let _tpF = tp, _note = '';
+              try { const _fa = _srAtr > 0 ? _srAtr : _srAdr / 20; const _min = 0.5 * _fa; if (_fa > 0 && Math.abs(tp - price) < _min) { _tpF = +(dir === 'call' ? price + _min : price - _min).toFixed(2); _note = ' [target floored: POC $' + (+tp).toFixed(2) + ' was $' + Math.abs(tp - price).toFixed(2) + ' away → 0.5×ATR $' + _tpF.toFixed(2) + ']'; } } catch (eF) {}
+              s.blockedOutcomes = s.blockedOutcomes || []; s.blockedOutcomes.push({ ts: Date.now(), time: ts(), symbol: sym, detector: lane, type: dir, price: price, virtualTp1: _tpF, virtualSl: sl, maxMin: 480, blockReason: m + _note, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null }); log(sym, m + _note);
+            };
             // ===== SESS-REJ GOES LIVE (2026-10-05, Jean: "it should have earned its go-live from now") =====
             // Cohort BTC-SESS-REJ 9W/3L/5S = 75% W/(W+L) over 17 resolved — past the bar set on
             // 2026-09-22 (≥60% over ≥15). RNG arm only; the CRASH arm (2W/1L) stays shadow until it
@@ -4675,9 +4754,15 @@ function processPrice(sym, price, hi, lo) {
                 // to the CRASH arm (the first rejection after the flush IS the setup); the 2-strike side lock and the enforced
                 // 6-fire bench do. XAU_SESSREJ_LIVE=0 kills. The RNG / V2 / MULTI arms stay shadow.
                 const _isCrash = /-SESS-REJ-CRASH$/.test(lane);
+                const _isV2 = lane === 'XAU-SESS-REJ-V2';
                 const _btcOk = /^BTC-SESS-REJ(-MULTI)?$/.test(lane) && process.env.BTC_SESSREJ_LIVE !== '0';
                 const _xauOk = lane === 'XAU-SESS-REJ-CRASH' && process.env.XAU_SESSREJ_LIVE !== '0';
-                if (!_btcOk && !_xauOk) return false; // BTC RNG arm (single or multi-test) + XAU CRASH arm; everything else shadow
+                // XAU-SESS-REJ-V2 AUTO-ARM (2026-11-06, Jean: "more consistency" — the CRASH arm needs a flush, so it is quiet on
+                // normal weeks; V2 = rejection at a RETESTED level or on a WICK bar, with displacement or a zone, London/NY only,
+                // 12W/5L in shadow at 17 resolved). Live by itself when its own cohort shows ≥60% W/(W+L) over ≥25 resolved,
+                // benched by the same enforced rule (net-negative over 6 fills → shadow). XAU_SESSREJ_V2_LIVE=0 kills, =1 forces.
+                const _v2Ok = _isV2 && sessRejV2Armed('XAU');
+                if (!_btcOk && !_xauOk && !_v2Ok) return false; // BTC RNG arm (single or multi-test) + XAU CRASH arm + XAU V2 on its bar; everything else shadow
                 if ((s.trade && s.trade.active) || s._oteHold || s._invHold || s._macdHold) return false;
                 if (!bootWarm(sym, s).ok) return false; // cold ATR / unloaded calendar (2026-10-14)
                 // FRESH-EXTREME + COUNTER-TREND GUARD (2026-10-15, the night of 10/14: four SESS-REJ calls at 14:35, 16:35,
@@ -4688,9 +4773,22 @@ function processPrice(sym, price, hi, lo) {
                 // SESS-REJ stops on one side in a session lock that side until the session rolls.
                 const _srN = dir === 'call' ? (s._sr.loN || 1) : (s._sr.hiN || 1);
                 const _srWith = s._msTrend ? ((dir === 'call' && s._msTrend === 'up') || (dir === 'put' && s._msTrend === 'down')) : false;
-                if (_srN < 2 && !_srWith && !_isCrash && process.env.SESSREJ_FRESH_GUARD !== '0') { log(sym, '🎯 ' + sym + ' SESS-REJ ' + dir.toUpperCase() + ' NOT fired live — first test of a fresh session ' + (dir === 'call' ? 'low' : 'high') + ' against msTrend ' + (s._msTrend || '?') + ' (needs a re-test or a with-trend tape; 10/14 night 0W/4L on exactly this shape). Shadow row measured.'); return false; }
+                // The CRASH exemption from this guard is for the CALL side only (2026-11-05): the arm was built to buy the first
+                // rejection after a DOWN-flush ("find the buying point"). Its mirror — selling the first touch of a recovery
+                // high against a fresh msTrend up — is the 10/14-night shape with a different label (11/04 19:05, −$4,984).
+                // V2 is exempt too: its own trigger (retest OR wick bar, plus displacement or a zone) is the filter that was
+                // measured; the live lane must be the lane the shadow graded.
+                const _crashExempt = (_isCrash && dir === 'call') || _isV2;
+                if (_srN < 2 && !_srWith && !_crashExempt && process.env.SESSREJ_FRESH_GUARD !== '0') { log(sym, '🎯 ' + sym + ' SESS-REJ ' + dir.toUpperCase() + ' NOT fired live — first test of a fresh session ' + (dir === 'call' ? 'low' : 'high') + ' against msTrend ' + (s._msTrend || '?') + ' (needs a re-test or a with-trend tape; 10/14 night 0W/4L on exactly this shape' + (_isCrash ? '; CRASH-arm exemption is call-side only since 2026-11-05' : '') + '). Shadow row measured.'); return false; }
+                // NO-ROOM GUARD (2026-11-05): the lane's own target is the POC / 0.3×ADR. When that target sits < 1×ATR from the
+                // entry the value area says there is no room — on 11/04 the POC was $0.36 below the put's entry and the live
+                // wrapper replaced it with a fixed $12 TP1 under three support zones. No live fire; the shadow row stands.
+                { const _srRoom = Math.abs(tp - price), _srAtrR = s._atr || _srAdr / 20; if (_srAtrR > 0 && _srRoom < (parseFloat(process.env.SESSREJ_MIN_ROOM_ATR) || 1.0) * _srAtrR) { log(sym, '🎯 ' + sym + ' SESS-REJ ' + dir.toUpperCase() + ' NOT fired live — the lane\'s own target $' + tp.toFixed(2) + ' is only $' + _srRoom.toFixed(2) + ' from the entry (< 1×ATR $' + _srAtrR.toFixed(2) + '): the value area says no room (2026-11-05). Shadow row measured.'); return false; } }
+                // SESSION-ROLL HOUR (2026-11-05): 19:00-19:59 ET the "session" being rejected is 23h old and the Asia open has just
+                // started a new flow; the 11/04 put sold the day high 55 min before the reset while Asia was buying it.
+                { let _srHr = 12; try { _srHr = parseInt(new Date().toLocaleTimeString('en-US', { hour: '2-digit', hour12: false, timeZone: 'America/New_York' }), 10); } catch (eH2) {} if (_srHr === 19 && process.env.SESSREJ_ROLL_HOUR !== '0') { log(sym, '🎯 ' + sym + ' SESS-REJ ' + dir.toUpperCase() + ' NOT fired live — 19:00-20:00 ET is the session-roll hour (the extreme being rejected belongs to a day that resets in <60 min; Asia open flow). Shadow row measured (2026-11-05).'); return false; } }
                 s._srStrikes = { day: todayDateET(), call: 0, put: 0, callLogged: (s._srStrikes || {}).callLogged, putLogged: (s._srStrikes || {}).putLogged };
-                try { for (let i = signalHistory.length - 1; i >= 0; i--) { const h = signalHistory[i]; if (Date.now() - h.ts > 20 * 3600000) break; if (h.symbol !== sym || !/SESSREJ-RT/.test(h.score || '') || h.date !== todayDateET() || !h.outcomes) continue; if (h.outcomes.slHit && !h.outcomes.tp1Hit) s._srStrikes[h.type]++; } } catch (eSK) {}
+                try { for (let i = signalHistory.length - 1; i >= 0; i--) { const h = signalHistory[i]; if (Date.now() - h.ts > 20 * 3600000) break; if (h.symbol !== sym || !/SESSREJ-(RT|V2)/.test(h.score || '') || h.date !== todayDateET() || !h.outcomes) continue; if (h.outcomes.slHit && !h.outcomes.tp1Hit) s._srStrikes[h.type]++; } } catch (eSK) {} // V2 stops count toward the side lock too (2026-11-06)
                 if (s._srStrikes[dir] >= 2) { if (!s._srStrikes[dir + 'Logged']) { s._srStrikes[dir + 'Logged'] = true; log(sym, '🎯 BTC SESS-REJ ' + dir.toUpperCase() + ' side LOCKED for the session — two stops on this side already today (2026-10-15 two-strikes rule).'); } return false; }
                 // bench check (cached 10 min)
                 const _nowB = Date.now();
@@ -4702,7 +4800,8 @@ function processPrice(sym, price, hi, lo) {
                   global._srBenched = benched; global._srRec = { w, l };
                 }
                 if (sym === 'BTC' && global._srBenched) return false;
-                if (sym === 'XAU' && liveLaneBenched('XAU', /SESSREJ/, 'XAU-SESS-REJ-CRASH')) return false; // enforced bench (2026-10-30)
+                if (sym === 'XAU' && !_isV2 && liveLaneBenched('XAU', /SESSREJ-RT/, 'XAU-SESS-REJ-CRASH')) return false; // enforced bench (2026-10-30)
+                if (sym === 'XAU' && _isV2 && liveLaneBenched('XAU', /SESSREJ-V2/, 'XAU-SESS-REJ-V2')) return false; // V2 benched on its own fills (2026-11-06)
                 const isL = dir === 'call';
                 // GEOMETRY GUARD (2026-10-07, the 07:50 BTC call: entry 86,290, stop 84,564 = $1,726 risk
                 // against a $716 TP1 — R:R 0.4 on a live lane; XAU's two CRASH calls had the same shape).
@@ -4720,26 +4819,26 @@ function processPrice(sym, price, hi, lo) {
                 const _tp2 = isL ? Math.max(tp, _tp1 + 0.01) : Math.min(tp, _tp1 - 0.01);
                 if (isL ? (sl >= price || _tp1 <= price) : (sl <= price || _tp1 >= price)) return false;
                 s.dailySignalCount++;
-                const _sig = { type: dir, time: ts(), price: price.toFixed(2), score: (isL ? '⬆' : '⬇') + 'SESSREJ-RT', rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: sl.toFixed(2), tp1: _tp1.toFixed(2), tp2: _tp2.toFixed(2), tp3: _tp3.toFixed(2), regime: (s._dayRegime && s._dayRegime.label) || null, oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: 'sess-rej rejection close' } };
+                const _sig = { type: dir, time: ts(), price: price.toFixed(2), score: (isL ? '⬆' : '⬇') + (_isV2 ? 'SESSREJ-V2' : 'SESSREJ-RT'), rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: sl.toFixed(2), tp1: _tp1.toFixed(2), tp2: _tp2.toFixed(2), tp3: _tp3.toFixed(2), regime: (s._dayRegime && s._dayRegime.label) || null, oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: _isV2 ? 'sess-rej v2 rejection close' : 'sess-rej rejection close' } }; // V2 fires carry their own score so the scorecard, bench and strikes split them (2026-11-06)
                 s.signals.push(_sig); logSignal(sym, _sig);
                 s.trade = buildCfdTrade(dir, price, (s._atr || _srAdr / 20), sym);
                 s.trade._oteVetted = true; s.trade._sessLive = true;
                 s.trade.slPrice = +sl.toFixed(2); s.trade.tp1Price = +_tp1.toFixed(2); s.trade.tp2Price = +_tp2.toFixed(2); s.trade.tp3Price = +_tp3.toFixed(2);
                 try { entryAgentConsult(sym, s, { price, atr: s._atr || _srAdr / 20, dir, detector: 'SESSREJ-RT', trade: s.trade, rule: { action: 'fill', via: 'SESS-REJ live (market)' }, rsi: s._rsi, macdL: s._macdL, roc3: s._roc3, histTs: (s.lastHistEntry && s.lastHistEntry.symbol === sym) ? s.lastHistEntry.ts : null }); } catch (eAG) {}
-                log(sym, '🎯 BTC SESS-REJ ' + dir.toUpperCase() + ' LIVE FIRE @ $' + price.toFixed(0) + ' — session ' + (isL ? 'low' : 'high') + ' rejected (M5 closed back inside, regime RANGE) · SL $' + sl.toFixed(0) + ' (beyond the extreme) · TP1 $' + _tp1.toFixed(0) + ' · TP2 $' + _tp2.toFixed(0) + ' · TP3 $' + _tp3.toFixed(0) + ' · live record ' + ((global._srRec && global._srRec.w) || 0) + 'W/' + ((global._srRec && global._srRec.l) || 0) + 'L [promoted 2026-10-05 on 9W/3L/5S].');
-                sendPush('🎯 BTC SESS-REJ ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(0) + ' · SL $' + sl.toFixed(0) + ' · TP1 $' + _tp1.toFixed(0) + ' · session-extreme rejection', 'signal');
+                log(sym, '🎯 ' + sym + ' SESS-REJ' + (_isV2 ? '-V2' : _isCrash ? '-CRASH' : '') + ' ' + dir.toUpperCase() + ' LIVE FIRE @ $' + price.toFixed(0) + ' — session ' + (isL ? 'low' : 'high') + ' rejected (M5 closed back inside' + (_isV2 ? ', v2 trigger' : _isCrash ? ', CRASH arm' : ', regime RANGE') + ') · SL $' + sl.toFixed(0) + ' (beyond the extreme) · TP1 $' + _tp1.toFixed(0) + ' · TP2 $' + _tp2.toFixed(0) + ' · TP3 $' + _tp3.toFixed(0) + ' · live record ' + ((global._srRec && global._srRec.w) || 0) + 'W/' + ((global._srRec && global._srRec.l) || 0) + 'L [promoted 2026-10-05 on 9W/3L/5S].');
+                sendPush('🎯 ' + sym + ' SESS-REJ' + (_isV2 ? '-V2' : '') + ' ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(0) + ' · SL $' + sl.toFixed(0) + ' · TP1 $' + _tp1.toFixed(0) + ' · session-extreme rejection', 'signal');
                 return true;
               } catch (eSRL) { return false; }
             };
             // PUT side: needs RANGE regime or an up-spike flush (CRASH arm)
             if (_fresh(s._sr.hiTag) && _lc.c < _hiIn && Date.now() - s._sr.hiTs > 7200000 && (_srRng || _crashUp)) {
               s._sr.hiTs = Date.now(); const _lane = (_srRng ? sym + '-SESS-REJ' : sym + '-SESS-REJ-CRASH') + ((s._sr.hiN || 1) >= 2 && _srRng ? '-MULTI' : ''); const _sl = +(s.sessionHigh + 0.1 * _srAdr).toFixed(2), _tp = +((_vp && _vp.poc < price) ? _vp.poc : price - 0.3 * _srAdr).toFixed(2);
-              if (_tp < price) { _push(_lane, 'put', _sl, _tp, '🎯 ' + _lane + ' PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session high $' + s.sessionHigh.toFixed(0) + ' tagged (test #' + (s._sr.hiN || 1) + '), M5 closed back inside (' + (_vp ? 'VAH $' + _vp.vah.toFixed(0) : 'extreme −0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm: ' + _srSwing.toFixed(1) + '×ATR spike in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp ? ' (POC)' : ' (0.3×ADR)') + ' (2026-09-22; two arms 2026-09-24).' + (function () { const _f = _srFeat('put'); if (_f.v2) _push(sym + '-SESS-REJ-V2', 'put', _sl, _tp, '🎯 ' + sym + '-SESS-REJ-V2 PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — rejection v2 at the session high $' + s.sessionHigh.toFixed(0) + ' (' + _f.tags.join(' ') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + ' (2026-10-15).'); return _f.tags.length ? ' [' + _f.tags.join(' ') + ']' : ' [no-feature]'; })()); _srLiveFire('put', _sl, _tp, _lane); }
+              if (_tp < price) { let _v2P = false; _push(_lane, 'put', _sl, _tp, '🎯 ' + _lane + ' PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session high $' + s.sessionHigh.toFixed(0) + ' tagged (test #' + (s._sr.hiN || 1) + '), M5 closed back inside (' + (_vp ? 'VAH $' + _vp.vah.toFixed(0) : 'extreme −0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm: ' + _srSwing.toFixed(1) + '×ATR spike in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp ? ' (POC)' : ' (0.3×ADR)') + ' (2026-09-22; two arms 2026-09-24).' + (function () { const _f = _srFeat('put'); if (_f.v2) { _v2P = true; _push(sym + '-SESS-REJ-V2', 'put', _sl, _tp, '🎯 ' + sym + '-SESS-REJ-V2 PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — rejection v2 at the session high $' + s.sessionHigh.toFixed(0) + ' (' + _f.tags.join(' ') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + ' (2026-10-15).'); } return _f.tags.length ? ' [' + _f.tags.join(' ') + ']' : ' [no-feature]'; })()); if (!_srLiveFire('put', _sl, _tp, _lane) && _v2P && sym === 'XAU') _srLiveFire('put', _sl, _tp, 'XAU-SESS-REJ-V2'); } // V2 live attempt on its own bar (2026-11-06)
             }
             // CALL side: needs RANGE regime or a down-flush (CRASH arm = V-REC v2)
             if (_fresh(s._sr.loTag) && _lc.c > _loIn && Date.now() - s._sr.loTs > 7200000 && (_srRng || _crashDn)) {
               s._sr.loTs = Date.now(); const _lane = (_srRng ? sym + '-SESS-REJ' : sym + '-SESS-REJ-CRASH') + ((s._sr.loN || 1) >= 2 && _srRng ? '-MULTI' : ''); const _sl = +(s.sessionLow - 0.1 * _srAdr).toFixed(2), _tp = +((_vp && _vp.poc > price) ? _vp.poc : price + 0.3 * _srAdr).toFixed(2);
-              if (_tp > price) { _push(_lane, 'call', _sl, _tp, '🎯 ' + _lane + ' CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session low $' + s.sessionLow.toFixed(0) + ' tagged (test #' + (s._sr.loN || 1) + '), M5 closed back inside (' + (_vp ? 'VAL $' + _vp.val.toFixed(0) : 'extreme +0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm (V-REC v2): ' + _srSwing.toFixed(1) + '×ATR flush in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp ? ' (POC)' : ' (0.3×ADR)') + ' (the 82,879 ATL case, 2026-09-24).' + (function () { const _f = _srFeat('call'); if (_f.v2) _push(sym + '-SESS-REJ-V2', 'call', _sl, _tp, '🎯 ' + sym + '-SESS-REJ-V2 CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — rejection v2 at the session low $' + s.sessionLow.toFixed(0) + ' (' + _f.tags.join(' ') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + ' (2026-10-15).'); return _f.tags.length ? ' [' + _f.tags.join(' ') + ']' : ' [no-feature]'; })()); _srLiveFire('call', _sl, _tp, _lane); }
+              if (_tp > price) { let _v2C = false; _push(_lane, 'call', _sl, _tp, '🎯 ' + _lane + ' CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session low $' + s.sessionLow.toFixed(0) + ' tagged (test #' + (s._sr.loN || 1) + '), M5 closed back inside (' + (_vp ? 'VAL $' + _vp.val.toFixed(0) : 'extreme +0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm (V-REC v2): ' + _srSwing.toFixed(1) + '×ATR flush in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp ? ' (POC)' : ' (0.3×ADR)') + ' (the 82,879 ATL case, 2026-09-24).' + (function () { const _f = _srFeat('call'); if (_f.v2) { _v2C = true; _push(sym + '-SESS-REJ-V2', 'call', _sl, _tp, '🎯 ' + sym + '-SESS-REJ-V2 CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — rejection v2 at the session low $' + s.sessionLow.toFixed(0) + ' (' + _f.tags.join(' ') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + ' (2026-10-15).'); } return _f.tags.length ? ' [' + _f.tags.join(' ') + ']' : ' [no-feature]'; })()); if (!_srLiveFire('call', _sl, _tp, _lane) && _v2C && sym === 'XAU') _srLiveFire('call', _sl, _tp, 'XAU-SESS-REJ-V2'); } // V2 live attempt on its own bar (2026-11-06)
             }
           }
         }
@@ -5222,8 +5321,39 @@ function processPrice(sym, price, hi, lo) {
               const _sl = isL ? Math.max(s.rollingLow - 0.1 * _adr, v.lvl - 0.75 * _adr) : Math.min(s.rollingHigh + 0.1 * _adr, v.lvl + 0.75 * _adr);
               const _tp1 = isL ? price + 0.25 * _adr : price - 0.25 * _adr;
               if (isL ? (_sl >= price || _tp1 <= price) : (_sl <= price || _tp1 >= price)) return false; // degenerate geometry (price already past the extreme)
+              // ===== KNIFE GUARD (2026-11-05, Jean: "make it clever — it cannot fire right after a 3k flush") ===== The 11/05 10:20
+              // call bought the first M5 close back above 77,006 twelve minutes after a $2,500 flush (2h swing 0.75×ADR, last hour
+              // 3.1% of price); the first close back above a level inside a flush is a pause, not a rejection. A retest fire is
+              // refused while the tape is still a flush: the 2h swing INTO the level ≥ RANGE5_KNIFE_ADR×ADR (0.5) or the last-60-min
+              // range ≥ RANGE5_KNIFE_PCT % of price (1.0). The arm stays live-eligible; it fires on a LATER rejection close once the
+              // level has held ≥ RANGE5_KNIFE_COOL_MIN (30) min since the tag and the hour has cooled below the pct line — a level
+              // that holds through the flush and is re-confirmed is the setup; the first bounce in the flush is not. The refused
+              // first close is stamped as a RANGE5-RT-KNIFE shadow row on the live geometry, so the cell is graded either way.
+              try {
+                const _kAdr = parseFloat(process.env.RANGE5_KNIFE_ADR) || 0.5, _kPct = parseFloat(process.env.RANGE5_KNIFE_PCT) || 1.0, _kCool = parseInt(process.env.RANGE5_KNIFE_COOL_MIN, 10) || 30;
+                const _kW = Array.isArray(s._m5) ? s._m5.slice(-24) : []; let _kH = -Infinity, _kL = Infinity, _kHi = -1, _kLi = -1;
+                for (let i = 0; i < _kW.length; i++) { if (_kW[i].h > _kH) { _kH = _kW[i].h; _kHi = i; } if (_kW[i].l < _kL) { _kL = _kW[i].l; _kLi = i; } }
+                const _kSwing = (isFinite(_kH) && isFinite(_kL)) ? (_kH - _kL) : 0;
+                const _kInto = isL ? (_kLi > _kHi) : (_kHi > _kLi); // the 2h swing ran INTO the level (high first then low for a long)
+                const _kHour = liqSpeed(s, price);
+                const _kFlush = (_kInto && _adr > 0 && _kSwing >= _kAdr * _adr) || _kHour >= _kPct;
+                const _kSince = v.tagTs ? Math.round((Date.now() - v.tagTs) / 60000) : 0;
+                const _kCooled = _kSince >= _kCool && _kHour < _kPct;
+                if (_kFlush && !_kCooled && process.env.RANGE5_KNIFE !== '0') {
+                  if (!v.knifeTs) {
+                    v.knifeTs = Date.now();
+                    const _kM = '🔪 BTC-RANGE5-RT-KNIFE ' + (isL ? 'CALL' : 'PUT') + ' WOULD-FIRE @ $' + price.toFixed(0) + ' — first rejection close at $' + v.lvl.toFixed(0) + ' inside a flush (2h swing $' + _kSwing.toFixed(0) + ' = ' + (_adr > 0 ? (_kSwing / _adr).toFixed(2) : '?') + '×ADR into the level, last hour ' + _kHour.toFixed(2) + '% of price); live fire HELD until the level has held ' + _kCool + ' min and the hour cools below ' + _kPct + '% (2026-11-05). SL $' + _sl.toFixed(0) + ' · TP1 $' + _tp1.toFixed(0) + ' · BTC-RANGE5-RT-KNIFE';
+                    s.blockedOutcomes = s.blockedOutcomes || [];
+                    s.blockedOutcomes.push({ ts: Date.now(), time: ts(), symbol: sym, detector: 'BTC-RANGE5-RT-KNIFE', type: isL ? 'call' : 'put', price: +price.toFixed(2), virtualTp1: +_tp1.toFixed(2), virtualSl: +_sl.toFixed(2), maxMin: 720, blockReason: _kM, feat: blockFeat(sym, s, isL ? 'call' : 'put', price), snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+                    log(sym, _kM);
+                    sendPush('🔪 BTC RANGE5-RT ' + (isL ? 'CALL' : 'PUT') + ' held', '$' + price.toFixed(0) + ' — first close back above the level is inside a flush; waiting for the level to hold ' + _kCool + ' min', 'signal');
+                  }
+                  return false;
+                }
+                if (v.knifeTs) { v.knifeWaitedMin = _kSince; log(sym, '🔪 BTC-RANGE5-RT ' + (isL ? 'CALL' : 'PUT') + ' — knife guard released: level $' + v.lvl.toFixed(0) + ' has held ' + _kSince + ' min since the tag, last hour ' + _kHour.toFixed(2) + '% (< ' + _kPct + '%); this rejection close fires (2026-11-05).'); }
+              } catch (eKn) { /* guard must never crash the fire path */ }
               s.dailySignalCount++;
-              const _sig = { type: isL ? 'call' : 'put', time: ts(), price: price.toFixed(2), score: (isL ? '⬆' : '⬇') + 'RANGE5-RT', rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: _sl.toFixed(2), tp1: _tp1.toFixed(2), tp2: (+v.tp).toFixed(2), tp3: (+v.tpFar).toFixed(2), regime: v.regime || null, oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: Math.round((Date.now() - v.ts) / 1000), via: 'range5-rt rejection entry' } };
+              const _sig = { type: isL ? 'call' : 'put', time: ts(), price: price.toFixed(2), score: (isL ? '⬆' : '⬇') + 'RANGE5-RT', rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: _sl.toFixed(2), tp1: _tp1.toFixed(2), tp2: (+v.tp).toFixed(2), tp3: (+v.tpFar).toFixed(2), regime: v.regime || null, r5Knife: v.knifeTs ? { heldMin: v.knifeWaitedMin || 0 } : undefined, oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: Math.round((Date.now() - v.ts) / 1000), via: v.knifeTs ? 'range5-rt rejection entry (seasoned after a flush)' : 'range5-rt rejection entry' } };
               s.signals.push(_sig); logSignal(sym, _sig);
               s.trade = buildCfdTrade(isL ? 'call' : 'put', price, (s._atr || _adr / 20), sym);
               s.trade._oteVetted = true; s.trade._r5Live = true; s.trade._r5Regime = v.regime || null;
@@ -10809,6 +10939,28 @@ function processPrice(sym, price, hi, lo) {
           }
         } catch (eFW) {}
       }
+      // ===== LANE COLD-START BENCH (2026-11-06) — see laneColdBench(). Placed last: a benched lane's fire is still a fire
+      // the gates passed, stamped on the live ladder (XAU $5.24 / $10; other symbols the standard bracket) and graded.
+      try {
+        if (!sig.manual) {
+          const _cLane = String(sig.score || '').replace(/[⬆⬇]/g, '');
+          const _cb = laneColdBench(sym, _cLane);
+          if (_cb && _cb.benched) {
+            const _cm = '🛏️ ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — LANE-COLD-BENCH ' + _cLane + ': first 3 resolved fires of the window were 0W/3L; lane in shadow until 60% over 25 (shadow so far ' + (_cb.shadow ? _cb.shadow.w + 'W/' + _cb.shadow.l + 'L' : '0W/0L') + ') (2026-11-06).';
+            log(sym, _cm);
+            try {
+              const _cp = +sig.price || s.lastPrice; const _xau = sym === 'XAU';
+              const _ctp = _xau ? (parseFloat(process.env.XAU_TP1) || 5.24) : null, _csl = _xau ? (parseFloat(process.env.XAU_SL_BASE_FLOOR) || 10) : null;
+              if (_xau && _cp > 0) {
+                s.blockedOutcomes = s.blockedOutcomes || [];
+                s.blockedOutcomes.push({ ts: Date.now(), time: ts(), symbol: sym, detector: 'COLD-' + _cLane, type: sig.type, price: +_cp.toFixed(2), virtualTp1: +(sig.type === 'call' ? _cp + _ctp : _cp - _ctp).toFixed(2), virtualSl: +(sig.type === 'call' ? _cp - _csl : _cp + _csl).toFixed(2), maxMin: 240, coldLane: _cLane, blockReason: _cm, feat: blockFeat(sym, s, sig.type, _cp), snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+              } else { trackBlockedOutcome(sym, _cm, true); const _last = (s.blockedOutcomes || [])[(s.blockedOutcomes || []).length - 1]; if (_last && _last.blockReason === _cm.substring(0, 320)) _last.coldLane = _cLane; }
+            } catch (eCS) {}
+            Object.assign(s, _emitSnapshot);
+            return false;
+          }
+        }
+      } catch (eCB) { /* bench must never crash enrichment */ }
     } catch (ePR) { /* protections must never crash enrichment */ }
     return true;
   }
@@ -21011,8 +21163,9 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.72-20261104-day-structure', // bump on each deploy — lets /state verify what's live
-    laneBench: global._laneBench || {}, // enforced live-lane bench state (2026-10-27)
+    build: '7.75-20261106-consistency', // bump on each deploy — lets /state verify what's live
+    laneBench: global._laneBench || {}, // enforced live-lane bench state (2026-10-27); keys with |COLD| are the 0W/3L window bench (2026-11-06)
+    sessRejV2: (global._srV2Arm && global._srV2Arm[sym]) || null, // V2 auto-arm state (2026-11-06)
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' /* RETIRED FROM LIVE 2026-10-28 (Jean: "always taking the call after the big leg happened"): live 1W/5L −$1,942 + the 10/28 05:16 call; shadow 0W/2S/4L (14d). The sampler keeps measuring; BTC_BIGLEG_LIVE=1 re-arms by hand */ ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
