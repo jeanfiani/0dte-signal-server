@@ -2393,6 +2393,13 @@ function nasRthBlocked(sym) {
   try { const m = gET(); return (m < 570 || m >= 960); } catch (e) { return false; }
 }
 function cohortFor(reason) {
+  { const _mt = reason.match(/\bMACD-TURN-(?:FIRED|REF-[A-Z0-9-]+)/); if (_mt) return _mt[0]; } // shadow rows opened at the MACD turn (2026-11-09): FIRED = gates passed, REF-<GATE> = that gate refused after the turn — first, the text names other gates
+  { const _hw = reason.match(/\bHYST-WAIVED(?:-MACD)?\b/); if (_hw) return _hw[0]; } // live fires the removed hysteresis gate would have refused (2026-11-09)
+  { const _sw = reason.match(/\bSWING-(?:OLD-MARKET|EXPIRED|NOSTRUCT)\b/); if (_sw) return _sw[0]; } // swing-retrace entry (2026-11-10): OLD-MARKET = the same fires at market on their own ladder; EXPIRED / NOSTRUCT = counts of fires not taken
+  if (/MACD-HOLD-EXPIRED/.test(reason)) return 'MACD-HOLD-EXPIRED'; // parked candidates whose line never turned within the window (count only, 2026-11-09)
+  if (/GATE-HYSTERESIS: MACD-DEFER/.test(reason)) return 'GATE-HYST-MACD'; // hysteresis refusals whose remembered gate is MACD-DEFER (2026-11-09 split: the MACD rule is MEANT to flip within minutes — 3W/1L on the first look)
+  if (/MACD-RECOV-LIVE/.test(reason)) return 'MACD-RECOV-LIVE'; // live fires released by the recovery cell (2026-11-09)
+  if (/MACD-RECOV/.test(reason)) return 'MACD-RECOV'; // deferred candidates whose line recovered from ≤−1 to within 0.15 of zero — shadow (2026-11-09); first, so the detector tag inside cannot be caught by another match
   { const _cb = reason.match(/LANE-COLD-BENCH ([A-Z0-9+_\/-]+)/); if (_cb) return 'COLD-' + _cb[1]; } // 0W/3L window bench rows per lane (2026-11-06) — first, so the lane name inside cannot be caught by another match
   { const _ex = reason.match(/\b(XAU|BTC|NAS100)-EXH-REV(-1ST)?\b/); if (_ex) return _ex[0]; } // exhaustion-reversal shadow lane (2026-10-21)
   { const _bl = reason.match(/\bBTC-BIGLEG-(CONT|LATCH)\b/); if (_bl) return _bl[0]; } // continuation / latch arms (2026-10-21) — before the plain BIGLEG matches
@@ -2569,6 +2576,7 @@ setInterval(() => {
 function fillViaKey(via) {
   const v = String(via || '').toLowerCase();
   if (!v || /adopted|hand trade|admin/.test(v)) return null;
+  if (/swing/.test(v)) return 'SWING'; // swing-retrace entry (2026-11-10) — before the touch match
   if (/resumption/.test(v)) return 'RESUMPTION';
   if (/stall/.test(v)) return 'STALL';
   if (/touch/.test(v)) return 'TOUCH';
@@ -2591,6 +2599,8 @@ function fireCohortsOnResolve(sym, entry, outcome) {
     if (ds) names.push('DAY-STRUCT-' + String(ds).toUpperCase());
     const qb = entry.outcomes && entry.outcomes.entryQB;
     if (qb) names.push('ENTRYQ-' + String(qb).toUpperCase()); // fill quality inside the structural swing (2026-11-09)
+    if (entry.macdRelease && entry.macdRelease.recov) names.push('MACD-RECOV-LIVE'); // fired through the recovery cell (2026-11-09)
+    if (entry.hystWaived) names.push(/^MACD-DEFER/.test(String(entry.hystWaived.gate || '')) ? 'HYST-WAIVED-MACD' : 'HYST-WAIVED'); // fires that exist only because hysteresis is off (2026-11-09)
     for (const n of names) bumpCohortTally(sym, n, outcome);
     entry.outcomes.fireCohorts = { names, outcome };
   } catch (e) { /* tally must never affect outcome stamping */ }
@@ -3043,6 +3053,22 @@ function sessRejV2Armed(sym) {
     const prev = c ? c.armed : null;
     global._srV2Arm[sym] = { ts: now, armed, n, pct: Math.round(pct * 100), bar: always ? 'always active (Jean 2026-11-09); live bench only' : forced ? '60% floor (forced)' : '60% over 25', mode: always ? 'always' : forced ? 'forced' : 'counter' };
     if (prev !== armed) { const m = '🎯 ' + sym + '-SESS-REJ-V2 ' + (armed ? 'ARMED LIVE' : 'DISARMED') + ' — shadow ' + (t.win || 0) + 'W/' + (t.loss || 0) + 'L (' + Math.round(pct * 100) + '% over ' + n + '; ' + (always ? 'always active, live bench only' : forced ? 'forced live, 60% floor' : 'bar 60% over 25') + ') (auto-arm 2026-11-06' + (always ? ', always active 2026-11-09' : '') + ').'; log(sym, m); try { sendPush('🎯 ' + sym + ' SESS-REJ-V2 ' + (armed ? 'armed' : 'disarmed'), (t.win || 0) + 'W/' + (t.loss || 0) + 'L in shadow', 'alert'); } catch (e) {} }
+    return armed;
+  } catch (e) { return false; }
+}
+
+// ===== MACD-RECOV AUTO-ARM (2026-11-09) ===== the recovery cell goes live by itself when its shadow cohort shows ≥60%
+// W/(W+L) over ≥25 resolved; cached 10 min, one log per change. MACD_RECOV_LIVE=1 forces, =0 keeps it shadow.
+global._macdRecovArm = global._macdRecovArm || {};
+function macdRecovArmed(sym) {
+  try {
+    const now = Date.now(), c = global._macdRecovArm[sym];
+    if (c && now - c.ts < 600000) return c.armed;
+    const t = (cohortTally[sym] && cohortTally[sym]['MACD-RECOV']) || { win: 0, loss: 0 };
+    const n = (t.win || 0) + (t.loss || 0), pct = n ? t.win / n : 0, armed = n >= 25 && pct >= 0.6;
+    const prev = c ? c.armed : null;
+    global._macdRecovArm[sym] = { ts: now, armed, n, pct: Math.round(pct * 100), bar: '60% over 25' };
+    if (prev !== null && prev !== armed) { const m = '🔁 ' + sym + ' MACD-RECOV ' + (armed ? 'ARMED LIVE' : 'DISARMED') + ' — shadow ' + (t.win || 0) + 'W/' + (t.loss || 0) + 'L (' + Math.round(pct * 100) + '% over ' + n + '; bar 60% over 25) (2026-11-09).'; log(sym, m); try { sendPush('🔁 ' + sym + ' MACD-RECOV ' + (armed ? 'armed' : 'disarmed'), (t.win || 0) + 'W/' + (t.loss || 0) + 'L in shadow', 'alert'); } catch (e) {} }
     return armed;
   } catch (e) { return false; }
 }
@@ -3790,6 +3816,7 @@ function saveRuntimeState() {
           dir: s._oteHold.dir, ote: s._oteHold.ote, slPrice: s._oteHold.slPrice,
           runaway: s._oteHold.runaway, armTs: s._oteHold.armTs, expiry: s._oteHold.expiry,
           sigPrice: s._oteHold.sigPrice, trade: s._oteHold.trade,
+          swing: s._oteHold.swing || null, swingSl: s._oteHold.swingSl || null, ladderSl: s._oteHold.ladderSl || null, tp1D: s._oteHold.tp1D || null, limVia: s._oteHold.limVia || null, atrAtArm: s._oteHold.atrAtArm || null, // swing-entry fields must survive a restart — without them a restored limit would market-fill at expiry (2026-11-10)
           histTs: (s._oteHold.histRef && s._oteHold.histRef.ts) || null
         } : null,
         pendingSnaps: (s.pendingSnapshots || [])
@@ -3917,6 +3944,7 @@ function loadRuntimeState() {
         s._oteHold = { dir: d.oteHold.dir, ote: d.oteHold.ote, slPrice: d.oteHold.slPrice,
                        runaway: d.oteHold.runaway, armTs: d.oteHold.armTs, expiry: d.oteHold.expiry,
                        sigPrice: d.oteHold.sigPrice, trade: d.oteHold.trade,
+                       swing: d.oteHold.swing || undefined, swingSl: d.oteHold.swingSl || undefined, ladderSl: d.oteHold.ladderSl || undefined, tp1D: d.oteHold.tp1D || undefined, limVia: d.oteHold.limVia || undefined, atrAtArm: d.oteHold.atrAtArm || undefined, // 2026-11-10
                        sigRef: null, histRef: findHist(d.oteHold.histTs) || null };
         console.log('[' + ts() + '] ' + sym + ' — OTE-HOLD auction restored (' + d.oteHold.dir.toUpperCase() + ', target $' + (+d.oteHold.ote).toFixed(2) + ', ' + Math.round((d.oteHold.expiry - now) / 1000) + 's left).');
       }
@@ -4230,6 +4258,7 @@ function logSignal(sym, sig) {
     ctWaived: sig._ctWaived || undefined, // CT-VETO waived under LEG MODE (2026-10-02)
     liq: sig.liq === true || undefined, // liquidation-regime fire: crest gates waived, market entry (2026-10-30)
     r5Knife: sig.r5Knife || undefined, // RANGE5-RT fire that waited out a flush under the knife guard (2026-11-05): {heldMin}
+    hystWaived: sig._hystWaived || undefined, // fired although the (removed) hysteresis gate would have refused it (2026-11-09): {gate, ageSec, move}
     // Same bucketed feature stamp the blocked rows carry (2026-11-04): fires and refusals now share one feature space,
     // so /gate-score and the scorecard can grade a cohort (e.g. dayStruct = first-pullback-after-vertical) on BOTH sides.
     feat: (sig.manual || sig.type === 'exit' || !/^(call|put)$/.test(String(sig.type))) ? undefined : (blockFeat(sym, S[sym], sig.type, +sig.price) || undefined),
@@ -4783,7 +4812,7 @@ function processPrice(sym, price, hi, lo) {
                 // benched by the same enforced rule (net-negative over 6 fills → shadow). XAU_SESSREJ_V2_LIVE=0 kills, =1 forces.
                 const _v2Ok = _isV2 && sessRejV2Armed('XAU');
                 if (!_btcOk && !_xauOk && !_v2Ok) return false; // BTC RNG arm (single or multi-test) + XAU CRASH arm + XAU V2 on its bar; everything else shadow
-                if ((s.trade && s.trade.active) || s._oteHold || s._invHold || s._macdHold) return false;
+                if ((s.trade && s.trade.active) || (s._oteHold && !s._oteHold.swing) || s._invHold || s._macdHold) return false; // a pending SWING limit does not block this lane — it is cancelled at the fire below (2026-11-10)
                 if (!bootWarm(sym, s).ok) return false; // cold ATR / unloaded calendar (2026-10-14)
                 // FRESH-EXTREME + COUNTER-TREND GUARD (2026-10-15, the night of 10/14: four SESS-REJ calls at 14:35, 16:35,
                 // 18:35, 20:40 — each the FIRST test of a brand-new session low in a down-trending tape (msTrend down),
@@ -4838,6 +4867,7 @@ function processPrice(sym, price, hi, lo) {
                 const _tp3 = isL ? price + Math.max(0.5 * _srAdr, 2 * _R) : price - Math.max(0.5 * _srAdr, 2 * _R);
                 const _tp2 = isL ? Math.max(tp, _tp1 + 0.01) : Math.min(tp, _tp1 - 0.01);
                 if (isL ? (sl >= price || _tp1 <= price) : (sl <= price || _tp1 >= price)) return false;
+                if (s._oteHold && s._oteHold.swing) cancelSwingHold(sym, s, 'pre-empted by a SESS-REJ ' + dir.toUpperCase() + ' fire', 'swing-superseded'); // the rejection lane outranks a pending momentum limit (2026-11-10)
                 s.dailySignalCount++;
                 const _sig = { type: dir, time: ts(), price: price.toFixed(2), score: (isL ? '⬆' : '⬇') + (_isV2 ? 'SESSREJ-V2' : 'SESSREJ-RT'), rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: sl.toFixed(2), tp1: _tp1.toFixed(2), tp2: _tp2.toFixed(2), tp3: _tp3.toFixed(2), regime: (s._dayRegime && s._dayRegime.label) || null, oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: _isV2 ? 'sess-rej v2 rejection close' : 'sess-rej rejection close' } }; // V2 fires carry their own score so the scorecard, bench and strikes split them (2026-11-06)
                 s.signals.push(_sig); logSignal(sym, _sig);
@@ -5180,11 +5210,14 @@ function processPrice(sym, price, hi, lo) {
     // same decisions as the main vet (release at/beyond OTE, momentum fast-lane, or
     // ARM the auction with identical geometry). The main vet keeps the same-tick
     // fast path whenever its section is reachable.
+    // a newer unvetted fire while a swing limit is pending → the pending one is superseded (2026-11-10; same rule as the main vet)
+    try { if (isMT5 && (sym === 'XAU' || sym === 'NAS100') && s._oteHold && s._oteHold.swing && s.trade && s.trade.active && s.trade._oteVetted === false && s.trade !== s._oteHold.trade) cancelSwingHold(sym, s, 'superseded by a newer ' + String(s.trade.type).toUpperCase() + ' fire', 'swing-superseded'); } catch (eSS0) {}
     if (isMT5 && (sym === 'XAU' || sym === 'NAS100') && s.trade && s.trade.active && s.trade._oteVetted === false && s.trade.ts && Date.now() - s.trade.ts > 10000 && !s._invHold && !s._oteHold) {
       try {
         const _uvT = s.trade, _uvDir = _uvT.type;
         const _uvAge = Math.round((Date.now() - _uvT.ts) / 1000);
         if (process.env.OTE_DISABLED === '1') { _uvT._oteVetted = true; }
+        else if (swingEntryVet(sym, s, price, Math.max(s._atr || 0, _uvT.atr || 0), '[ungated vet, ' + _uvAge + 's after fire]')) { /* momentum-class fire handled by the swing-retrace entry (2026-11-10) — never the market releases below */ }
         else {
           let _uvOte = null; try { _uvOte = computeOTE(s, sym, _uvDir); } catch (eCO) {}
           const _uvRoc = s._roc3 || 0;
@@ -6535,6 +6568,9 @@ function processPrice(sym, price, hi, lo) {
   s._macdL = macdL;
   s._macdS = macdS;
   s._roc3 = roc3;
+  // MACD line ring (2026-11-09, MACD-RECOV): one sample per ≥20 s, kept MACD_RECOV_LOOKBACK_MIN (45) min — the defer
+  // gate reads the deepest reading against a candidate to tell "recovered from deep against" from "flat noise".
+  try { if (isFinite(macdL)) { const _mrN = Date.now(); const _mr = s._macdRing = s._macdRing || []; if (!_mr.length || _mrN - _mr[_mr.length - 1].ts >= 20000) { _mr.push({ ts: _mrN, v: +macdL }); const _mrCut = _mrN - (parseInt(process.env.MACD_RECOV_LOOKBACK_MIN, 10) || 45) * 60000; while (_mr.length && _mr[0].ts < _mrCut) _mr.shift(); } } } catch (eMR) {}
   // Breakout state for /prices exposure
   if (isMT5) {
     const bRange = s.breakHi > 0 && s.breakLo < Infinity ? +(s.breakHi - s.breakLo).toFixed(2) : 0;
@@ -6977,6 +7013,34 @@ function processPrice(sym, price, hi, lo) {
   // 0.4 bar + conv floor. DORMANT: signal still blocks. 3-min per-direction throttle.
   function enrichSig(sig) {
     const _esPassed = enrichSigCore(sig);
+    // ===== MACD-TURN MEASUREMENT (2026-11-09, Jean: "we need to check if the signal was successful if we let it pass
+    // without rechecking the gates") ===== Every time the MACD line turns for a deferred candidate — crossed zero on a new
+    // candidate, crossed while parked, or only improved ≥60 s while parked — a shadow row is opened at THAT tick on the live
+    // ladder (XAU $5.24 / $10; NAS $50 / max(1.5×ATR, $50); BTC 1.2×ATR both ways), first leg only, whatever the other
+    // gates then decide. Cohorts: MACD-TURN-FIRED (the gates let it through — the real trade exists too) and
+    // MACD-TURN-REF-<GATE> (the named gate refused it after the turn; REF-MACD-DEFER = line improving but still on the
+    // wrong side). Sum of the REF cohorts = "fire on the turn, no re-check". Pre-registered: at ≥60% over ≥25 a released
+    // candidate skips the judgment gates (safety breakers stay). One row per symbol+direction per 60 s.
+    try {
+      if (sig && sig._macdTurn && isMT5 && /^(call|put)$/.test(String(sig.type))) {
+        const _tN = Date.now(); s._macdTurnTs = s._macdTurnTs || {};
+        if (_tN - (s._macdTurnTs[sig.type] || 0) >= 60000) {
+          s._macdTurnTs[sig.type] = _tN;
+          const _tp0 = parseFloat(sig.price) || s.lastPrice, _tC = sig.type === 'call', _tA = s._atr > 0 ? s._atr : 0;
+          const _lb = (s._lastBlock && s._lastBlock[sig.type] && _tN - s._lastBlock[sig.type].ts < 3000) ? String(s._lastBlock[sig.type].gate || 'unmatched') : 'unnamed';
+          const _coh = _esPassed ? 'MACD-TURN-FIRED' : 'MACD-TURN-REF-' + _lb.toUpperCase().replace(/[^A-Z0-9]+/g, '-').replace(/^-|-$/g, '');
+          const _tpD = sym === 'XAU' ? (parseFloat(process.env.XAU_TP1) || 5.24) : sym === 'NAS100' ? 50 : Math.max(50, 1.2 * _tA);
+          const _slD = sym === 'XAU' ? (parseFloat(process.env.XAU_SL_BASE_FLOOR) || 10) : sym === 'NAS100' ? Math.max(1.5 * _tA, 50) : Math.max(50, 1.2 * _tA);
+          const _tag = String(sig.score || '').replace(/[⬆⬇]/g, '');
+          if (_tp0 > 0) {
+            const _tm = '🔀 ' + _coh + ' ' + _tag + ' ' + sig.type.toUpperCase() + ' @ $' + _tp0.toFixed(2) + ' — MACD line ' + (sig._macdTurn.from >= 0 ? '+' : '') + sig._macdTurn.from + ' → ' + (sig._macdTurn.to >= 0 ? '+' : '') + sig._macdTurn.to + ' after ' + sig._macdTurn.waitedSec + 's (' + sig._macdTurn.via + '); ' + (_esPassed ? 'the gates let it through' : 'then refused by ' + _lb) + '. Shadow row at the turn on the live ladder, first leg only (2026-11-09).';
+            s.blockedOutcomes = s.blockedOutcomes || [];
+            s.blockedOutcomes.push({ ts: _tN, time: ts(), symbol: sym, detector: 'MACD-TURN', type: sig.type, price: +_tp0.toFixed(2), virtualTp1: +(_tC ? _tp0 + _tpD : _tp0 - _tpD).toFixed(2), virtualSl: +(_tC ? _tp0 - _slD : _tp0 + _slD).toFixed(2), maxMin: 240, firstLegOnly: true, turnVia: sig._macdTurn.via, turnGate: _esPassed ? null : _lb, blockReason: _tm, feat: blockFeat(sym, s, sig.type, _tp0), snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+            log(sym, _tm);
+          }
+        }
+      }
+    } catch (eMTu) { /* measurement must never affect the fire path */ }
     // LIQUIDATION REGIME tag (2026-10-30): the score gets '+LIQ' (cohort / bench / EA-visible, full lot) and the row liq:true
     try { if (_esPassed && sig && sig._liq && sig.score && !/\+LIQ/.test(sig.score)) { sig.score = sig.score + '+LIQ'; sig.liq = true; } } catch (eLT) {}
     // Regime cache for latchAdvSource (2026-09-02) — fresh on every scored signal
@@ -7541,6 +7605,11 @@ function processPrice(sym, price, hi, lo) {
       // including the 7/29 +$17.12 TP3.
       if (isMT5 && _isContMom && !sig._liq) { // liquidation regime: no defer (2026-10-30)
         const _ml = parseFloat(sig.macd);
+        // NOTE (2026-11-09, found while answering Jean's "is it waiting for MACD to turn positive?"): the MACD-HOLD resolver
+        // also releases a parked candidate when the line has only IMPROVED for ≥60 s (still on the wrong side). That release
+        // re-enters this gate with no pending defer (the resolver just cleared it), so it is deferred again with a fresh
+        // clock — in practice only a full cross of zero fires, which is the rule as Jean states it. Left as is on purpose;
+        // the "improving" moment is now stamped as a MACD-TURN shadow row so the looser variant is measured, not assumed.
         if (!isNaN(_ml) && ((sig.type === 'call' && _ml < 0) || (sig.type === 'put' && _ml > 0))) {
           // ===== DEFER-AND-CONFIRM (2026-07-27, Jean) — don't reject outright, WAIT for the turn =====
           // A momentum-against entry is usually early, not wrong. Instead of killing the setup, park
@@ -7572,9 +7641,34 @@ function processPrice(sym, price, hi, lo) {
           const _turning = (sig.type === 'call' && macdAccel > 0) || (sig.type === 'put' && macdAccel < 0);
           const _improved = _md ? Math.abs(_ml) < Math.abs(_md.macd) : false;
           const _worse25 = _md ? Math.abs(_ml) >= 1.25 * Math.abs(_md.macd) : false;
-          if (_fresh && _improved && (_mdAge >= 60000 || _turning)) {
+          // ===== MACD-RECOV (2026-11-09, Jean: "if it was lower than −1 and goes back to less than −0.15 we can still let
+          // it fire") ===== XAU only (the numbers are gold's MACD scale). A candidate whose line is still on the wrong side
+          // but within MACD_RECOV_NEAR (0.15) of zero, after the line was at least MACD_RECOV_DEEP (1.0) against it inside
+          // the ring's lookback (45 min), is a recovery from deep-against, not a flat-noise reading. SHADOW by default:
+          // the deferral stands and a MACD-RECOV would-fire row is graded on the standard bracket; MACD_RECOV_LIVE=1 lets
+          // it through (row carries macdRelease.recov, cohort MACD-RECOV-LIVE). Evidence on 11/09: the two days in the
+          // ring hold 22 resolved XAU deferrals — near-zero 7W/8L, this exact cell 1W/2L — too few to call either way,
+          // hence the counter: live on its own record at ≥60% over ≥25. MACD_RECOV=0 disables the stamp too.
+          let _recov = null;
+          try {
+            if (sym === 'XAU' && process.env.MACD_RECOV !== '0') {
+              const _rvDeep = parseFloat(process.env.MACD_RECOV_DEEP) || 1.0, _rvNear = parseFloat(process.env.MACD_RECOV_NEAR) || 0.15;
+              const _sg = sig.type === 'call' ? 1 : -1, _lw = _sg * _ml; // negative = against the candidate
+              if (_lw >= -_rvNear) {
+                let _mn = Infinity, _mnTs = 0; for (const p of (s._macdRing || [])) { const w = _sg * p.v; if (w < _mn) { _mn = w; _mnTs = p.ts; } }
+                if (_mn <= -_rvDeep) _recov = { from: +(_sg * _mn).toFixed(3), to: +_ml.toFixed(3), minAgoMin: Math.round((_nowMd - _mnTs) / 60000) };
+              }
+            }
+          } catch (eRV) {}
+          const _recovLive = !!_recov && (process.env.MACD_RECOV_LIVE === '1' || (process.env.MACD_RECOV_LIVE !== '0' && macdRecovArmed(sym)));
+          if (_recovLive) {
+            s._macdDefer = null; s._macdHold = null;
+            sig._macdRelease = { waitedSec: 0, from: _recov.from, to: _recov.to, accel: +macdAccel.toFixed(3), recov: true, minAgoMin: _recov.minAgoMin };
+            log(sym, '🔁 ' + _tagX + ' ' + sig.type.toUpperCase() + ' MACD-RECOV RELEASED — line ' + (_recov.to >= 0 ? '+' : '') + _recov.to.toFixed(3) + ' is within ' + (parseFloat(process.env.MACD_RECOV_NEAR) || 0.15) + ' of zero after ' + (_recov.from >= 0 ? '+' : '') + _recov.from.toFixed(3) + ' ' + _recov.minAgoMin + ' min ago: recovered from deep-against (Jean 2026-11-09).');
+          } else if (_fresh && _improved && (_mdAge >= 60000 || _turning)) {
             s._macdDefer = null; s._macdHold = null;
             sig._macdRelease = { waitedSec: Math.round(_mdAge / 1000), from: +_md.macd.toFixed(3), to: +_ml.toFixed(3), accel: +macdAccel.toFixed(3) };
+            sig._macdTurn = { from: +_md.macd.toFixed(3), to: +_ml.toFixed(3), waitedSec: Math.round(_mdAge / 1000), via: 'improving' }; // MACD-TURN measurement (2026-11-09)
             log(sym, '⏱️ ' + _tagX + ' ' + sig.type.toUpperCase() + ' MACD-DEFER RELEASED — waited ' + Math.round(_mdAge / 1000) + 's, MACD line ' + (_md.macd >= 0 ? '+' : '') + _md.macd.toFixed(3) + ' → ' + (_ml >= 0 ? '+' : '') + _ml.toFixed(3) + ' (reversing toward ' + sig.type.toUpperCase() + (_turning ? ', accel ' + macdAccel.toFixed(3) : ', ≥60s of improvement') + '). Momentum turning — allowed (loosened 2026-10-02).');
           } else {
             const _restart = !_md || _mdAge > _mdWin || _worse25;
@@ -7585,7 +7679,7 @@ function processPrice(sym, price, hi, lo) {
             // the per-tick resolver fires it the moment the line turns (re-vetted through every
             // downstream gate first), without waiting for the detector to re-fire.
             try {
-              const _hk = Object.assign({}, sig); delete _hk.conv; delete _hk.ts; delete _hk.num; delete _hk._confScore; delete _hk._confClass; delete _hk._confBreakdown; delete _hk.pendingEntry; delete _hk.oteHold; delete _hk.entryActual;
+              const _hk = Object.assign({}, sig); delete _hk.conv; delete _hk.ts; delete _hk.num; delete _hk._confScore; delete _hk._confClass; delete _hk._confBreakdown; delete _hk.pendingEntry; delete _hk.oteHold; delete _hk.entryActual; delete _hk._macdTurn; delete _hk._macdRelease;
               const _prev = (s._macdHold && s._macdHold.dir === sig.type && !_restart) ? s._macdHold : null;
               s._macdHold = { sig: _hk, dir: sig.type, tag: _tagX, ts0: _prev ? _prev.ts0 : s._macdDefer.ts, macd0: _prev ? _prev.macd0 : s._macdDefer.macd, sigPrice: price, lastSeen: _nowMd };
             } catch (eMH) {}
@@ -7593,10 +7687,14 @@ function processPrice(sym, price, hi, lo) {
             const _waited = (!_restart && _md) ? Math.round(_mdAge / 1000) + 's waited' : (_md && _worse25 ? 'clock restarted (line ' + (_md.macd >= 0 ? '+' : '') + _md.macd.toFixed(3) + ' → ' + (_ml >= 0 ? '+' : '') + _ml.toFixed(3) + ', further against)' : 'clock started');
             const _m = '📉 ' + _tagX + ' ' + sig.type.toUpperCase() + ' DEFERRED — MACD line ' + (_ml >= 0 ? '+' : '') + _ml.toFixed(3) + ' against direction (need ' + (sig.type === 'call' ? '≥0' : '≤0') + '); ' + _waited + (_md && !_restart ? (_improved ? ', improving but <60s' : ', not reversing yet') : '') + ' (accel ' + macdAccel.toFixed(3) + '). Releases within 30s-' + Math.round(_mdWin / 60000) + 'min once the line reverses toward the trade (7/27 rule, loosened 2026-10-02).';
             log(sym, _m); trackBlockedOutcome(sym, _m, true);
+            if (_recov) { try { const _rm = '🔁 MACD-RECOV ' + _tagX + ' ' + sig.type.toUpperCase() + ' WOULD-FIRE @ $' + price.toFixed(2) + ' — line ' + (_recov.to >= 0 ? '+' : '') + _recov.to.toFixed(3) + ' within reach of zero after ' + (_recov.from >= 0 ? '+' : '') + _recov.from.toFixed(3) + ' ' + _recov.minAgoMin + ' min ago; the deferral stands, this row grades the recovery cell (shadow, 2026-11-09). MACD-RECOV'; log(sym, _rm); trackBlockedOutcome(sym, _rm, true); } catch (eRS) {} }
             try { tdPullbackArm(sym, s, sig, price, 'MACD-DEFER'); } catch (eTA) {}
             return false;
           }
         } else if (s._macdDefer && s._macdDefer.dir === sig.type) {
+          // the line crossed to the trade's side while a deferral was pending: this candidate IS the MACD turn (measured below
+          // in the enrichSig wrapper — 2026-11-09). Only within the defer window; an older record is just stale.
+          try { const _tAge = Date.now() - s._macdDefer.ts; if (_tAge <= (parseInt(process.env.MACD_DEFER_WIN_SEC, 10) || 300) * 1000 && isFinite(_ml)) sig._macdTurn = { from: +(+s._macdDefer.macd).toFixed(3), to: +_ml.toFixed(3), waitedSec: Math.round(_tAge / 1000), via: 'crossed' }; } catch (eMT) {}
           s._macdDefer = null; s._macdHold = null; // line fully aligned — clear any pending defer/hold (this candidate fires on its own)
         }
       }
@@ -9006,15 +9104,31 @@ function processPrice(sym, price, hi, lo) {
       // (MACD-DEFER release). Graded like any gate (GATE-HYST cohort: win = the refused candidate would have won).
       try {
         const _lbH = s._lastJudgBlock && s._lastJudgBlock[sig.type]; // judgment-only record (2026-10-29)
-        if (_lbH && _lbH.price > 0 && !sig._macdRelease && !sig._liq && process.env.GATE_HYST !== '0' && /^(EXT-GUARD|SESS-EXTREME|MACD-DEFER|MOM-FLOOR|ZONE-VETO|ZONE-MICRO-WF|CT-VETO|FAST-PRE|CHOP|GRIND-RECLAIM|RSI)/.test(_lbH.gate || '')) {
+        // 2026-11-09: Jean first asked to remove it ("hysteresis is the contrary of our rule" — it refuses MACD-turn candidates
+        // because MACD deferred them seconds earlier: 4 of the 8 post-turn refusals on XAU in two days, 3W/1L), then, seeing
+        // the whole gate's record (XAU 21 days: refused candidates 14W/28L = right two times in three), said "keep it shadow
+        // for now". So the gate STAYS LIVE by default and the removal is what is measured: the MACD-caused refusals have their
+        // own cohort (GATE-HYST-MACD) and the MACD-TURN-REF-GATE-HYST-MACD rows grade them on the live ladder. The switch is
+        // built: GATE_HYST=nomacd stops it blocking when the remembered gate is MACD-DEFER, GATE_HYST=0 stops it blocking
+        // at all; in both cases the waived candidate continues to the remaining gates, a would-have-refused shadow row is
+        // graded (same cohorts) and a fire carries hystWaived on its row (cohorts HYST-WAIVED / HYST-WAIVED-MACD).
+        const _hMode = process.env.GATE_HYST === '0' ? 'off' : process.env.GATE_HYST === 'nomacd' ? 'nomacd' : 'on';
+        if (_lbH && _lbH.price > 0 && !sig._macdRelease && !sig._liq && /^(EXT-GUARD|SESS-EXTREME|MACD-DEFER|MOM-FLOOR|ZONE-VETO|ZONE-MICRO-WF|CT-VETO|FAST-PRE|CHOP|GRIND-RECLAIM|RSI)/.test(_lbH.gate || '')) {
           const _hAge = (Date.now() - _lbH.ts) / 1000, _hSec = parseInt(process.env.GATE_HYST_SEC, 10) || 180;
           const _hAtr = Math.max(s._atr || 0, 0) * (parseFloat(process.env.GATE_HYST_ATR) || 0.5);
           const _hMove = Math.abs(price - _lbH.price);
           if (_hAge <= _hSec && _hAtr > 0 && _hMove < _hAtr) {
-            Object.assign(s, _emitSnapshot);
-            const _hMsg = '⏲️ ' + tagP2 + ' ' + sig.type.toUpperCase() + ' BLOCKED — GATE-HYSTERESIS: ' + _lbH.gate + ' refused this direction ' + Math.round(_hAge) + 's ago @ $' + _lbH.price.toFixed(2) + ' and price has moved only $' + _hMove.toFixed(2) + ' (< 0.5×ATR $' + _hAtr.toFixed(2) + ') — a gate does not flip in seconds (2026-10-27).';
-            log(sym, _hMsg); trackBlockedOutcome(sym, _hMsg, true);
-            return false;
+            const _hBlocks = _hMode === 'on' || (_hMode === 'nomacd' && !/^MACD-DEFER/.test(_lbH.gate || ''));
+            if (_hBlocks) {
+              Object.assign(s, _emitSnapshot);
+              const _hMsg = '⏲️ ' + tagP2 + ' ' + sig.type.toUpperCase() + ' BLOCKED — GATE-HYSTERESIS: ' + _lbH.gate + ' refused this direction ' + Math.round(_hAge) + 's ago @ $' + _lbH.price.toFixed(2) + ' and price has moved only $' + _hMove.toFixed(2) + ' (< 0.5×ATR $' + _hAtr.toFixed(2) + ') — a gate does not flip in seconds (2026-10-27).';
+              log(sym, _hMsg); trackBlockedOutcome(sym, _hMsg, true);
+              return false;
+            }
+            sig._hystWaived = { gate: String(_lbH.gate), ageSec: Math.round(_hAge), move: +_hMove.toFixed(2) };
+            const _hwMsg = '⏲️ ' + tagP2 + ' ' + sig.type.toUpperCase() + ' WOULD-FIRE past GATE-HYSTERESIS: ' + _lbH.gate + ' refused this direction ' + Math.round(_hAge) + 's ago @ $' + _lbH.price.toFixed(2) + ', price moved $' + _hMove.toFixed(2) + ' (< 0.5×ATR $' + _hAtr.toFixed(2) + ') — gate removed 2026-11-09, the candidate continues to the remaining gates; this row grades what hysteresis would have refused.';
+            s._hystLogTs = s._hystLogTs || {}; if (Date.now() - (s._hystLogTs[sig.type] || 0) > 30000) { s._hystLogTs[sig.type] = Date.now(); log(sym, _hwMsg); }
+            trackBlockedOutcome(sym, _hwMsg, true);
           }
         }
       } catch (eGH) {}
@@ -12335,13 +12449,14 @@ function processPrice(sym, price, hi, lo) {
             const _lqWhy = [];
             if (process.env.XAU_UNLOCK !== '1') _lqWhy.push('XAU_UNLOCK not set');
             if (s.trade && s.trade.active) _lqWhy.push('trade active');
-            if (s._oteHold || s._invHold || s._macdHold) _lqWhy.push('hold running');
+            if ((s._oteHold && !s._oteHold.swing) || s._invHold || s._macdHold) _lqWhy.push('hold running'); // a pending SWING limit is cancelled at the fire below instead (2026-11-10)
             if (s.newsBlackout && s.newsBlackout.active) _lqWhy.push('news blackout');
             if (!bootWarm(sym, s).ok) _lqWhy.push('boot warm-up');
             if (typeof cfdMarketOpenET === 'function' && !cfdMarketOpenET(_lqNow)) _lqWhy.push('market closed');
             if (liveLaneBenched('XAU', /\bLIQ\b/, 'XAU-LIQ')) _lqWhy.push('lane benched (last 6 fills net-negative)');
             if (_lqWhy.length) { if (process.env.XAU_UNLOCK === '1') log(sym, '🌊 XAU-LIQ ' + _lqDir.toUpperCase() + ' not fired — ' + _lqWhy.join(', ')); }
             else {
+              if (s._oteHold && s._oteHold.swing) cancelSwingHold(sym, s, 'pre-empted by an XAU-LIQ ' + _lqDir.toUpperCase() + ' fire', 'swing-superseded'); // 2026-11-10
               s.dailySignalCount++;
               const _lSig = { type: _lqDir, time: ts(), price: price.toFixed(2), score: (_lqDir === 'call' ? '⬆' : '⬇') + 'LIQ', rsi: isFinite(s._rsi) ? (+s._rsi).toFixed(1) : '', macd: (typeof s._macdL === 'number') ? s._macdL.toFixed(3) : '', roc: (typeof s._roc3 === 'number') ? ((s._roc3 >= 0 ? '+' : '') + s._roc3.toFixed(3) + '%') : '', num: s.dailySignalCount, liq: { note: _lqNote } };
               s.signals.push(_lSig); logSignal(sym, _lSig);
@@ -12709,6 +12824,8 @@ function processPrice(sym, price, hi, lo) {
           try { s.lastHistEntry.oteHold = { via: 'liquidation regime (market, no auction)', fill: +price.toFixed(2), sigPrice: +s.trade.ep, improve: 0, waitedSec: 0 }; } catch (eLV) {}
           log(sym, '🌊 LIQ-REGIME — ' + s.trade.type.toUpperCase() + ' released at market @ $' + price.toFixed(2) + ' (no pullback auction on a liquidation day, 2026-10-30).');
         }
+        // a newer unvetted fire while a swing limit is pending → the pending one is superseded (2026-11-10)
+        if ((sym === 'XAU' || sym === 'NAS100') && s._oteHold && s._oteHold.swing && s.trade && s.trade.active && s.trade._oteVetted === false && s.trade !== s._oteHold.trade) cancelSwingHold(sym, s, 'superseded by a newer ' + String(s.trade.type).toUpperCase() + ' fire', 'swing-superseded');
         if ((sym === 'XAU' || sym === 'NAS100') && s.trade && s.trade.active && s.trade._oteVetted === false && !s._invHold && !s._oteHold) { // NAS added 2026-09-09 (Jean: "we need to work on NAS")
           const _ohT = s.trade;
           const _ohDir = _ohT.type;
@@ -12717,7 +12834,10 @@ function processPrice(sym, price, hi, lo) {
           // release path (no impulse / at-or-beyond OTE / fast-lane) is off — hold for the pullback.
           const _ohPB = extPullbackZone(s, sym, _ohDir, price, atrVal > 0 ? atrVal : (_ohT.atr || 0));
           let _agRule = null, _agPick = null; // entry-agent shadow: what the rule decided here (2026-10-09)
-          if (!_ohPB.at && (!_ohOte || (_ohDir === 'call' ? price <= _ohOte.limit : price >= _ohOte.limit))) {
+          // SWING-RETRACE ENTRY (2026-11-10): momentum-class fires enter at the structural retrace or not at all — see swingEntryVet()
+          const _swR = swingEntryVet(sym, s, price, atrVal > 0 ? atrVal : (_ohT.atr || 0), '');
+          if (_swR) { _agRule = _swR.rule; _agPick = _swR.pick; }
+          else if (!_ohPB.at && (!_ohOte || (_ohDir === 'call' ? price <= _ohOte.limit : price >= _ohOte.limit))) {
             _ohT._oteVetted = true; // no valid impulse, or already at/beyond OTE → release to market now
             _agRule = { action: 'fill', via: _ohOte ? 'at-or-beyond OTE' : 'no valid impulse' };
             delete _ohT.oteLimit; delete _ohT.oteExpiry; delete _ohT.oteImpulseHi; delete _ohT.oteImpulseLo; // XAU: server-side hold supersedes the legacy EA-side limit — never send both
@@ -12801,6 +12921,7 @@ function processPrice(sym, price, hi, lo) {
           const _mhAge = _zNow - _mh.ts0;
           if (_mhAge > _mhWin) {
             s._macdHold = null;
+            try { bumpCohortTally(sym, 'MACD-HOLD-EXPIRED', 'no_resolve'); } catch (eHX) {} // how many parked candidates never saw the turn (2026-11-09)
             log(sym, '⏱️ MACD-HOLD ' + _mh.dir.toUpperCase() + ' (' + _mh.tag + ' @ $' + (+_mh.sigPrice).toFixed(2) + ') EXPIRED — line ' + (_mh.macd0 >= 0 ? '+' : '') + (+_mh.macd0).toFixed(3) + ' → ' + (macdL >= 0 ? '+' : '') + macdL.toFixed(3) + ' never turned within ' + Math.round(_mhWin / 60000) + 'min; no trade (2026-10-02).');
           } else if (_mhAge >= 30000) {
             const _mhC = _mh.dir === 'call';
@@ -12811,6 +12932,7 @@ function processPrice(sym, price, hi, lo) {
               s._macdHold = null; s._macdDefer = null;
               const _sig2 = Object.assign({}, _mh.sig, { time: ts(), price: price.toFixed(2), macd: macdL.toFixed(3) });
               _sig2._macdRelease = { waitedSec: Math.round(_mhAge / 1000), from: +(+_mh.macd0).toFixed(3), to: +macdL.toFixed(3), accel: +macdAccel.toFixed(3), hold: true, sigPrice: +(+_mh.sigPrice).toFixed(2) };
+              _sig2._macdTurn = { from: +(+_mh.macd0).toFixed(3), to: +macdL.toFixed(3), waitedSec: Math.round(_mhAge / 1000), via: _aligned ? 'hold-crossed' : 'hold-improving' }; // MACD-TURN measurement (2026-11-09)
               log(sym, '⏱️ MACD-HOLD ' + _mh.dir.toUpperCase() + ' (' + _mh.tag + ') RELEASED — waited ' + Math.round(_mhAge / 1000) + 's, MACD line ' + (_mh.macd0 >= 0 ? '+' : '') + (+_mh.macd0).toFixed(3) + ' → ' + (macdL >= 0 ? '+' : '') + macdL.toFixed(3) + (_aligned ? ' (crossed to the ' + _mh.dir + ' side)' : ' (reversing, accel ' + macdAccel.toFixed(3) + ')') + '; parked @ $' + (+_mh.sigPrice).toFixed(2) + ', now $' + price.toFixed(2) + ' — re-vetting through the remaining gates (2026-10-02).');
               if (enrichSig(_sig2)) {
                 s.dailySignalCount++; _sig2.num = s.dailySignalCount;
@@ -12829,7 +12951,9 @@ function processPrice(sym, price, hi, lo) {
       } catch (eMHR) { /* macd-hold must never crash the tick */ }
       // ===== OTE-HOLD RESOLVER (2026-08-26, Jean) =====
       try {
-        const _oh = s._oteHold;
+        let _oh = s._oteHold;
+        // a pending swing limit does not outlive another trade becoming active on the symbol (2026-11-10)
+        if (_oh && _oh.swing && s.trade && s.trade.active && s.trade !== _oh.trade) { cancelSwingHold(sym, s, 'another trade (' + String(s.trade.type).toUpperCase() + ') became active on ' + sym, 'swing-superseded'); _oh = null; }
         if (_oh && (sym === 'XAU' || sym === 'NAS100')) {
           const _ohC = _oh.dir === 'call';
           const _ohSlX = _oh.slPrice !== null && (_ohC ? price <= _oh.slPrice : price >= _oh.slPrice);
@@ -12865,7 +12989,7 @@ function processPrice(sym, price, hi, lo) {
           // Fallback at EXPIRY: an extreme-pullback hold that times out with price still within EXT_PB_EXPIRY_STALL_ATR
           // (0.5×ATR) of the fire fills the same way instead of cancelling. EXT_PB_STALL_FILL=0 kills both.
           let _ohStall = false, _ohStallWhy = '';
-          if (!_ohTouch && !_ohRun && !_ohSlX && process.env.EXT_PB_STALL_FILL !== '0') {
+          if (!_ohTouch && !_ohRun && !_ohSlX && !_oh.swing && process.env.EXT_PB_STALL_FILL !== '0') { // a swing limit never stall-fills (2026-11-10)
             try {
               const _a2 = Math.max(_oh.atrAtArm || 0, atrVal || 0, s._atr || 0);
               if (_a2 > 0) {
@@ -12923,6 +13047,13 @@ function processPrice(sym, price, hi, lo) {
             if (_oh.sigRef) { _oh.sigRef.oteHold = 'extreme-pullback-' + _pbWhy.toLowerCase(); } // pendingEntry stays true — never shown to the EA
             if (_oh.histRef) { _oh.histRef.oteHold = 'extreme-pullback-' + _pbWhy.toLowerCase(); _oh.histRef.pendingEntry = false; }
             sendPush('⏭️ ' + sym + ' ' + _oh.dir.toUpperCase() + ' not taken', (_ohRun ? 'signal left without a pullback' : 'no pullback in ' + Math.round((_zNow - _oh.armTs) / 60000) + 'min') + ' · fire was $' + _oh.sigPrice.toFixed(2), 'signal');
+          } else if (_oh.swing && !_ohTouch) {
+            // SWING ENTRY (2026-11-10): the only way in is the limit. Window over → no trade, never a market fill; the
+            // SWING-OLD-MARKET row opened at the fire grades what the skipped market entry would have done.
+            if (_ohExp) {
+              cancelSwingHold(sym, s, 'price never came back to the swing retrace within ' + Math.round((_zNow - _oh.armTs) / 60000) + ' min (now $' + price.toFixed(2) + ')', 'swing-expired');
+              try { bumpCohortTally(sym, 'SWING-EXPIRED', 'no_resolve'); sendPush('⏭️ ' + sym + ' ' + _oh.dir.toUpperCase() + ' not taken', 'no pullback to the swing entry $' + (+_oh.ote).toFixed(2) + ' in ' + Math.round((_zNow - _oh.armTs) / 60000) + 'min · fire was $' + (+_oh.sigPrice).toFixed(2), 'signal'); } catch (eSX) {}
+            }
           } else if ((_ohTouch || _ohRun || _ohExp) && !(s.trade && s.trade.active)) {
             s._oteHold = null;
             const _t = _oh.trade;
@@ -12963,8 +13094,19 @@ function processPrice(sym, price, hi, lo) {
             _t.bestPrice = price; _t.worstPrice = price; _t.ts = _zNow;
             delete _t.oteLimit; delete _t.oteExpiry; delete _t.oteImpulseHi; delete _t.oteImpulseLo; // server-side hold supersedes the legacy EA-side OTE limit on XAU
             _t._oteVetted = true;
+            // SWING ENTRY fill (2026-11-10): the stop goes beyond the structural swing (never tighter than the ladder's own
+            // distance or 1 ATR, never wider than 2× the first target unless the ladder already is); TP1 keeps its distance.
+            if (_oh.swing) {
+              try {
+                const _swA2 = Math.max(_oh.atrAtArm || 0, atrVal || 0, s._atr || 0);
+                const _swT1 = _oh.tp1D > 0 ? _oh.tp1D : Math.abs(_t.tp1Price - _t.ep);
+                _t.tp1Price = +(_ohC ? price + _swT1 : price - _swT1).toFixed(2);
+                _t.slPrice = swingStopFor(_oh.dir, price, +_oh.swingSl, _swA2, _swT1, +_oh.ladderSl || 0);
+                _t._swingEntry = { limit: +_oh.ote, hi: _oh.swing.hi, lo: _oh.swing.lo, mins: _oh.swing.mins, waitedSec: Math.round((_zNow - _oh.armTs) / 1000) };
+              } catch (eSF2) {}
+            }
             s.trade = _t;
-            const _ohWhy = _ohTouch ? (_ohStall ? (_oh.extPb ? 'extreme pullback ' : 'OTE ') + _ohStallWhy : _oh.extPb ? (_ohResume ? 'extreme pullback resumption' : 'extreme pullback ' + (_oh.limVia === 'AVWAP' ? 'AVWAP' : /PULLBACK/.test(_oh.limVia || '') ? 'capped-limit' : 'OTE') + ' touch') : (_oh.limVia === 'AVWAP' ? 'AVWAP touch' : 'OTE touch')) : _ohRun ? 'runaway ≥0.5×ATR' : 'window expiry'; // resumption / capped-limit added 2026-10-05
+            const _ohWhy = _oh.swing ? 'swing retrace touch' : _ohTouch ? (_ohStall ? (_oh.extPb ? 'extreme pullback ' : 'OTE ') + _ohStallWhy : _oh.extPb ? (_ohResume ? 'extreme pullback resumption' : 'extreme pullback ' + (_oh.limVia === 'AVWAP' ? 'AVWAP' : /PULLBACK/.test(_oh.limVia || '') ? 'capped-limit' : 'OTE') + ' touch') : (_oh.limVia === 'AVWAP' ? 'AVWAP touch' : 'OTE touch')) : _ohRun ? 'runaway ≥0.5×ATR' : 'window expiry'; // resumption / capped-limit added 2026-10-05
             const _ohInfo = { fill: +price.toFixed(2), sigPrice: +_oh.sigPrice.toFixed(2), improve: +_ohImp.toFixed(2), waitedSec: Math.round((_zNow - _oh.armTs) / 1000), via: _ohWhy, extPb: _oh.extPb === true || undefined };
             if (_oh.extPb) _t._extPb = true;
             if (_oh.sigRef) { _oh.sigRef.pendingEntry = false; _oh.sigRef.entryActual = _ohInfo.fill; _oh.sigRef.oteHold = _ohInfo; _oh.sigRef.price = price.toFixed(2); /* 2026-09-08: the EA anchors its chase-guard (and its dedupe key) on sig.price — a fill un-hiding a minutes-old row must present the FILL, not the stale signal price */ if (typeof _t.slPrice === 'number') { _oh.sigRef.sl = _t.slPrice.toFixed(2); _oh.sigRef.tp1 = _t.tp1Price.toFixed(2); _oh.sigRef.tp2 = _t.tp2Price.toFixed(2); _oh.sigRef.tp3 = _t.tp3Price.toFixed(2); } }
@@ -17602,6 +17744,124 @@ function extPullbackZone(s, sym, dir, price, atrHint) {
     return { at: dist !== null && dist <= zone, zone, dist };
   } catch (e) { return { at: false, zone: 0, dist: null }; }
 }
+// ===== SWING-RETRACE ENTRY (LIVE 2026-11-10, Jean: "the primary rule should be that all bots buy at a low price and sell
+// at a high price" / "let's just apply the correction on the 2 missed signals") ===== The two 11/09 losers were entry
+// errors, not signal errors: the NAS RIDE call filled at the 70.5% of a ONE-BAR, 0.9-ATR micro-impulse (27,860) with a
+// 1.07-ATR stop, went 2 ATR against, stopped, then reached its target; the XAU RIDE put was released at market by the
+// momentum fast-lane at the bottom of a $6 micro-leg with a $5 stop. Window record of the market releases (fast-lane,
+// at-or-beyond, window expiry): 1W/4L, −$15k. Rule, for the MOMENTUM class only (RIDE / TREND / FAST / SUST / 6-6 on XAU
+// and NAS; fades, SESS-REJ, LIQ, RANGE5, PATH, MANUAL keep their own entries):
+//   • the entry is the 70.5% retrace of the STRUCTURAL swing — the last 60 min of M5 (120 min if that swing is < 1.5 ATR),
+//     current price included;
+//   • price already at or through that level → fill now; otherwise a pending limit for SWING_OTE_WIN_MIN (30) min;
+//   • no fill in the window, or no structure ≥ 1.5 ATR in 2 h → NO TRADE (never a market release);
+//   • stop = 0.5 ATR beyond the swing extreme, never tighter than the trade's own ladder distance or 1 ATR, never wider
+//     than SWING_SL_MAX_RR (2.0) × the first target (unless the ladder's own stop already is);
+//   • TP1 keeps its distance from the fill; TP2 / TP3 keep their levels.
+// A newer fire, a SESS-REJ / LIQ fire or a MANUAL launch cancels a pending limit. Every momentum fire also opens a
+// SWING-OLD-MARKET shadow row (market at the fire tick, original ladder, first leg) so the old behaviour keeps a record
+// on the same fires. SWING_ENTRY=0 restores the old auction untouched; OTE_DISABLED=1 still releases everything at market.
+function swingEntryClass(tag, t, row) {
+  if (process.env.SWING_ENTRY === '0' || !t) return false;
+  if (t._manual || t._adopted || t._sessLive || t._r5Live || t._legLive || t._pathLive || t._liq) return false;
+  if (row && (row.manual || row.liq)) return false;
+  const g = String(tag || '');
+  return /RIDE|TREND|FAST|SUST|6\/6/.test(g) && !/LHF|LLF|VREV|EXT-FLIP|OBREJ|OBMIT|INVERSAL|SWEEP|CHoCH|ATH|ATL|DIV|MFLIP|STRUCT|RETEST|LIQ|MANUAL|SESSREJ|RANGE5|PATH|BIGLEG/.test(g);
+}
+function structSwing(s, atr, price, now) {
+  try {
+    const M = Array.isArray(s._m5) ? s._m5 : []; if (!(atr > 0)) return null;
+    const need = (parseFloat(process.env.SWING_MIN_ATR) || 1.5) * atr;
+    for (const mins of [60, 120]) {
+      const cut = now - mins * 60000; let hi = -Infinity, lo = Infinity, n = 0;
+      for (let i = M.length - 1; i >= 0 && M[i].ts >= cut; i--) { if (M[i].h > hi) hi = M[i].h; if (M[i].l < lo) lo = M[i].l; n++; }
+      if (price > 0) { if (price > hi) hi = price; if (price < lo) lo = price; }
+      if (n >= 3 && isFinite(hi) && isFinite(lo) && hi - lo >= need) return { hi: +hi.toFixed(2), lo: +lo.toFixed(2), mins, n };
+    }
+    return null;
+  } catch (e) { return null; }
+}
+function swingStopFor(dir, fill, swingSl, atr, tp1Dist, ladderDist) {
+  const C = dir === 'call';
+  const struct = C ? fill - swingSl : swingSl - fill;                               // 0.5 ATR beyond the swing extreme
+  const cap = (parseFloat(process.env.SWING_SL_MAX_RR) || 2.0) * (tp1Dist > 0 ? tp1Dist : 0);
+  const lad = ladderDist > 0 ? ladderDist : 0;
+  const floor = (parseFloat(process.env.SWING_SL_MIN_ATR) || 1.0) * (atr > 0 ? atr : 0);
+  const ceil = Math.max(cap, lad);                                                  // the widest the stop may be: 2× the first target, or the ladder's own stop if that is wider
+  let d = Math.max(0, struct);
+  if (ceil > 0) d = Math.min(d, ceil);                                              // structure, but reward stays proportional
+  d = Math.max(d, lad, ceil > 0 ? Math.min(floor, ceil) : floor);                   // never tighter than the ladder's own stop or 1 ATR
+  return +(C ? fill - d : fill + d).toFixed(2);
+}
+function cancelSwingHold(sym, s, why, mark) {
+  try {
+    const h = s._oteHold; if (!h || !h.swing) return false;
+    s._oteHold = null;
+    const m = mark || 'swing-cancelled';
+    if (h.sigRef) h.sigRef.oteHold = m;                                              // pendingEntry stays true — a cancelled row is never shown to the EA
+    if (h.histRef) { h.histRef.oteHold = m; h.histRef.pendingEntry = false; }
+    log(sym, '⏭️ SWING-ENTRY ' + String(h.dir).toUpperCase() + ' — pending limit $' + (+h.ote).toFixed(2) + ' CANCELLED: ' + why + ' (fire was $' + (+h.sigPrice).toFixed(2) + ', waited ' + Math.round((Date.now() - h.armTs) / 1000) + 's). No trade from that fire.');
+    return true;
+  } catch (e) { return false; }
+}
+// Runs in place of the old auction for a fresh unvetted momentum-class trade. Returns null when it does not apply (the
+// caller runs the old vet), else { rule, pick } after it has filled, armed or cancelled. All computation happens before
+// any state is touched, so an exception leaves the trade exactly as it was for the old path.
+function swingEntryVet(sym, s, price, atrIn, where) {
+  try {
+    if (sym !== 'XAU' && sym !== 'NAS100') return null;
+    const t = s.trade; if (!t || !t.active || t._oteVetted !== false || !(price > 0)) return null;
+    const dir = t.type, C = dir === 'call', now = Date.now();
+    const row = (s.lastHistEntry && s.lastHistEntry.symbol === sym && s.lastHistEntry.type === dir) ? s.lastHistEntry : null;
+    const tag = String((row && row.score) || '').replace(/[⬆⬇]/g, '');
+    if (!swingEntryClass(tag, t, row)) return null;
+    const sig = s.signals.length ? s.signals[s.signals.length - 1] : null;
+    const sigRef = (sig && sig.type === dir) ? sig : null;
+    const atr = Math.max(atrIn || 0, t.atr || 0, s._atr || 0);
+    const tp1D = (t.tp1Price > 0 && t.ep > 0) ? Math.abs(t.tp1Price - t.ep) : 0;
+    const ladD = (t.slPrice > 0 && t.ep > 0) ? Math.abs(t.ep - t.slPrice) : 0;
+    if (!(atr > 0) || !(tp1D > 0)) return null;                                      // nothing to anchor on → old path
+    const sw = structSwing(s, atr, price, now);
+    const L = sw ? +(C ? sw.hi - 0.705 * (sw.hi - sw.lo) : sw.lo + 0.705 * (sw.hi - sw.lo)).toFixed(2) : null;
+    const slS = sw ? +(C ? sw.lo - 0.5 * atr : sw.hi + 0.5 * atr).toFixed(2) : null;
+    const there = sw ? (C ? price <= L : price >= L) : false;
+    const winMs = (parseInt(process.env.SWING_OTE_WIN_MIN, 10) || 30) * 60000;
+    const stopNow = there ? swingStopFor(dir, price, slS, atr, tp1D, ladD) : null;
+    const oldRow = { ts: now, time: ts(), symbol: sym, detector: 'SWING-OLD-MARKET', type: dir, price: +price.toFixed(2), virtualTp1: +(C ? price + tp1D : price - tp1D).toFixed(2), virtualSl: +(C ? price - (ladD || tp1D) : price + (ladD || tp1D)).toFixed(2), maxMin: 240, firstLegOnly: true,
+      blockReason: '📐 SWING-OLD-MARKET ' + tag + ' ' + dir.toUpperCase() + ' @ $' + price.toFixed(2) + ' — what the fire would have done at market on its own ladder (TP1 $' + tp1D.toFixed(2) + ' / stop $' + (ladD || tp1D).toFixed(2) + '), first leg only; the live entry is the swing retrace' + (sw ? ' $' + L.toFixed(2) : ' (no structure)') + ' (2026-11-10).',
+      feat: blockFeat(sym, s, dir, price), snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null };
+    // ---- state changes from here on: plain assignments only ----
+    s.blockedOutcomes = s.blockedOutcomes || []; s.blockedOutcomes.push(oldRow);
+    delete t.oteLimit; delete t.oteExpiry; delete t.oteImpulseHi; delete t.oteImpulseLo;
+    if (!sw) {
+      s.trade = { active: false };
+      if (sigRef) { sigRef.pendingEntry = true; sigRef.oteHold = 'swing-no-structure'; }
+      if (row) { row.oteHold = 'swing-no-structure'; row.pendingEntry = false; }
+      try { bumpCohortTally(sym, 'SWING-NOSTRUCT', 'no_resolve'); log(sym, '⏭️ SWING-ENTRY ' + tag + ' ' + dir.toUpperCase() + ' @ $' + price.toFixed(2) + ' NOT TAKEN — no structural swing ≥ 1.5×ATR ($' + (1.5 * atr).toFixed(2) + ') in the last 2 h to buy low / sell high against; no market release (2026-11-10). ' + (where || '')); } catch (eL0) {}
+      return { rule: null, pick: null };
+    }
+    if (there) {
+      const info = { fill: +price.toFixed(2), sigPrice: +(+t.ep).toFixed(2), improve: +(C ? t.ep - price : price - t.ep).toFixed(2), waitedSec: 0, via: 'swing retrace (already there)', swing: { hi: sw.hi, lo: sw.lo, mins: sw.mins } };
+      t.ep = price; t.tp1Price = +(C ? price + tp1D : price - tp1D).toFixed(2); t.slPrice = stopNow;
+      t.bestPrice = price; t.worstPrice = price; t.ts = now; t._oteVetted = true; t._swingEntry = { limit: L, hi: sw.hi, lo: sw.lo, mins: sw.mins, waitedSec: 0 };
+      if (sigRef) { sigRef.pendingEntry = false; sigRef.entryActual = info.fill; sigRef.oteHold = info; sigRef.price = price.toFixed(2); sigRef.sl = t.slPrice.toFixed(2); sigRef.tp1 = t.tp1Price.toFixed(2); }
+      if (row) { row.pendingEntry = false; row.oteHold = info; row.sl = t.slPrice; row.tp1 = t.tp1Price; }
+      try { log(sym, '▶️ SWING-ENTRY ' + tag + ' ' + dir.toUpperCase() + ' FILLED @ $' + price.toFixed(2) + ' — already at/through the 70.5% retrace $' + L.toFixed(2) + ' of the ' + sw.mins + '-min swing $' + sw.lo.toFixed(2) + '–$' + sw.hi.toFixed(2) + ' · stop $' + t.slPrice.toFixed(2) + ' (structure $' + slS.toFixed(2) + ') · TP1 $' + t.tp1Price.toFixed(2) + ' (2026-11-10). ' + (where || '')); } catch (eL1) {}
+      return { rule: { action: 'fill', via: 'swing retrace (already there)' }, pick: { limit: L, via: 'SWING', avwap: null } };
+    }
+    if (sigRef) sigRef.pendingEntry = true;
+    if (row) row.pendingEntry = true;
+    s._oteHold = { dir, trade: t, sigRef, histRef: row, sigPrice: t.ep, ote: L, limVia: 'SWING', oteFib: null, avwap: null,
+                   swing: { hi: sw.hi, lo: sw.lo, mins: sw.mins }, swingSl: slS, ladderSl: ladD, tp1D, tag,
+                   extPb: false, extDist: null, extZone: null, atrAtArm: atr, slPrice: slS, runaway: 0, armTs: now, expiry: now + winMs };
+    s.trade = { active: false };
+    try {
+      log(sym, '⏳ SWING-ENTRY ' + tag + ' ' + dir.toUpperCase() + ' armed @ $' + price.toFixed(2) + ' — limit $' + L.toFixed(2) + ' = 70.5% retrace of the ' + sw.mins + '-min swing $' + sw.lo.toFixed(2) + '–$' + sw.hi.toFixed(2) + ' (' + ((sw.hi - sw.lo) / atr).toFixed(1) + ' ATR); fills only if price comes back within ' + Math.round(winMs / 60000) + ' min, stop beyond the swing $' + slS.toFixed(2) + '; no market release (2026-11-10). ' + (where || ''));
+      sendPush('⏳ ' + sym + ' ' + tag + ' ' + dir.toUpperCase() + ' — swing entry', 'limit $' + L.toFixed(2) + ' (now $' + price.toFixed(2) + ') · ≤' + Math.round(winMs / 60000) + 'min · no chase', 'signal');
+    } catch (eL2) {}
+    return { rule: { action: 'wait', limit: L, via: 'SWING 70.5%', windowSec: Math.round(winMs / 1000), leashAtr: 0, swing: true }, pick: { limit: L, via: 'SWING', avwap: null } };
+  } catch (e) { try { log(sym, '⚠️ SWING-ENTRY error — ' + String(e && e.message || e).slice(0, 120) + '; old auction used for this fire.'); } catch (e2) {} return null; }
+}
 function pickAuctionLimit(s, dir, price, oteLimit, atr) {
   const out = { limit: oteLimit, via: 'OTE', avwap: null };
   try {
@@ -18339,7 +18599,7 @@ function checkExit(sym, price) {
             const _e = s.lastHistEntry; if (_e && _e.symbol === sym && _e.outcomes) { _e.outcomes.entryQ = +_qc.toFixed(2); _e.outcomes.entryQB = _qb; _e.outcomes.swing = { lo: +_w.lo.toFixed(2), hi: +_w.hi.toFixed(2), atr: +((_w.hi - _w.lo) / t.atr).toFixed(1) }; }
           }
         } catch (eQ) {}
-        if (_w && (_w.hi - _w.lo) >= 1.5 * t.atr) {
+        if (_w && (_w.hi - _w.lo) >= 1.5 * t.atr && !t._swingEntry) { // a trade that already entered at the swing retrace needs no swing twin (2026-11-10)
           const _ote = iC ? _w.hi - 0.705 * (_w.hi - _w.lo) : _w.lo + 0.705 * (_w.hi - _w.lo);
           const _slS = iC ? _w.lo - 0.5 * t.atr : _w.hi + 0.5 * t.atr;
           const _already = iC ? price <= _ote : price >= _ote; // price is already at/through the swing OTE → fills now
@@ -20653,9 +20913,10 @@ app.post('/manual/fire', (req, res) => {
     const price = s.lastPrice;
     if (!(price > 0)) return res.status(409).json({ error: 'no live price for ' + sym });
     if (s.trade && s.trade.active) return res.status(409).json({ error: 'a trade is already active on ' + sym + ' (' + String(s.trade.type).toUpperCase() + ' @ $' + (+s.trade.ep).toFixed(2) + ') — close it first' });
-    if (s._oteHold || s._invHold || s._macdHold) return res.status(409).json({ error: 'an auction/hold is already running on ' + sym });
+    if ((s._oteHold && !s._oteHold.swing) || s._invHold || s._macdHold) return res.status(409).json({ error: 'an auction/hold is already running on ' + sym });
     const fg = global._fundedGuard || {};
     if ((fg.dayLimit && fg.day <= -fg.dayLimit) || (fg.totalLimit && fg.total <= -fg.totalLimit)) return res.status(409).json({ error: 'FUNDED-GUARD active (day $' + fg.day + ' / total $' + fg.total + ') — no manual fires' });
+    if (s._oteHold && s._oteHold.swing) cancelSwingHold(sym, s, 'pre-empted by a MANUAL ' + type.toUpperCase() + ' launch', 'swing-superseded'); // a 30-min pending limit must not lock the LAUNCH button (2026-11-10)
     const atr = s._atr || 0;
     s.dailySignalCount++;
     const sig = { type, time: ts(), price: price.toFixed(2), score: (type === 'call' ? '⬆' : '⬇') + 'MANUAL', rsi: '', macd: (typeof s._macdL === 'number') ? s._macdL.toFixed(3) : '', roc: (typeof s._roc3 === 'number') ? ((s._roc3 >= 0 ? '+' : '') + s._roc3.toFixed(3) + '%') : '', num: s.dailySignalCount, manual: { note: String(b.note || '').slice(0, 80), mode, regime: (s._dayRegime && s._dayRegime.label) || null, msTrend: s._msTrend || null } };
@@ -21226,7 +21487,8 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.79-20261109-entry-quality', // bump on each deploy — lets /state verify what's live
+    build: '7.84-20261110-swing-entry', // bump on each deploy — lets /state verify what's live
+    macdRecov: (global._macdRecovArm && global._macdRecovArm[sym]) || null, // MACD-RECOV auto-arm state (2026-11-09)
     laneBench: global._laneBench || {}, // enforced live-lane bench state (2026-10-27); keys with |COLD| are the 0W/3L window bench (2026-11-06)
     sessRejV2: (global._srV2Arm && global._srV2Arm[sym]) || null, // V2 auto-arm state (2026-11-06)
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
