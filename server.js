@@ -2047,6 +2047,12 @@ function blockFeat(sym, s, type, price) {
     const _rthW = _ro == null ? null : A(sgn * (price - _ro));
     f.rthAtr = _rthW == null ? null : +_rthW.toFixed(2);
     f.rthB = _ro == null ? 'pre-rth' : B(_rthW, [-1, 1, 3, 5], ['against', 'flat', '1-3', '3-5', '5+']);
+    // run from the OPPOSITE session extreme in the candidate's direction (2026-11-09, the NAS 12:35 call: a 37-ATR V-day
+    // from the Sunday-night low back to the open read openB 'flat' because the open sat mid-V; the rally itself was 36 ATR)
+    const _oppPx = type === 'call' ? s.sessionLow : s.sessionHigh;
+    const _runOpp = isFinite(_oppPx) ? A(sgn * (price - _oppPx)) : null;
+    f.runOppAtr = _runOpp == null ? null : +_runOpp.toFixed(1);
+    f.runOppB = B(_runOpp, [3, 6, 12], ['<3', '3-6', '6-12', '12+']);
     const _exTs = type === 'call' ? s.sessionHighUpdateTs : s.sessionLowUpdateTs;
     const _exPx = type === 'call' ? s.sessionHigh : s.sessionLow;
     f.sinceExtMin = (_exTs > 0) ? Math.round((Date.now() - _exTs) / 60000) : null;
@@ -2088,7 +2094,7 @@ function blockFeat(sym, s, type, price) {
 }
 // The factors /gate-score ranks (bucket keys on the stamp above). Pre-registered list — adding one later is a
 // new experiment, not a re-fit of this one.
-const GATE_SCORE_FACTORS = ['rsiB', 'macdB', 'momB', 'accel', 'regime', 'ms', 'msRunB', 'latch', 'legB', 'posB', 'zB', 'zAgeB', 'zTouchB', 'zGrade', 'tapeB', 'sessB', 'newsB', 'dayB', 'hourB', 'openB', 'rthB', 'sinceExtB', 'pullB', 'dayStruct']; // dayB/hourB added 2026-11-03 (drift vs flush); openB/rthB/sinceExtB/pullB/dayStruct added 2026-11-04 (position in the day's move)
+const GATE_SCORE_FACTORS = ['rsiB', 'macdB', 'momB', 'accel', 'regime', 'ms', 'msRunB', 'latch', 'legB', 'posB', 'zB', 'zAgeB', 'zTouchB', 'zGrade', 'tapeB', 'sessB', 'newsB', 'dayB', 'hourB', 'openB', 'rthB', 'sinceExtB', 'pullB', 'dayStruct', 'runOppB']; // dayB/hourB added 2026-11-03 (drift vs flush); openB/rthB/sinceExtB/pullB/dayStruct added 2026-11-04 (position in the day's move); runOppB 2026-11-09 (run from the opposite extreme — V-days)
 
 function trackBlockedOutcome(sym, msg, force) {
   // force=true (added 2026-07-02): dormant-analysis detectors (V-REV) bypass the shared
@@ -3010,19 +3016,28 @@ function liveLaneBenched(sym, scoreRe, cohort) {
 // ===== SESS-REJ-V2 AUTO-ARM (2026-11-06) ===== the pre-registered promotion, applied by the counter: live when the shadow
 // cohort <SYM>-SESS-REJ-V2 shows ≥60% W/(W+L) over ≥25 resolved (bar from 10/21: N>25). Cached 10 min; one log per change.
 // XAU_SESSREJ_V2_LIVE=0 kills, =1 forces (the 60% floor still applies when forced, like the agent veto).
+// XAU FORCED LIVE BY DEFAULT since 2026-11-09 (Jean: "ok go ahead make it live" — the 11/09 09:35 rejection @4124 was a
+// four-feature V2 row, shadow only because the regime label read RANGE while the identical 21:55 rejection read MIXED and
+// fired via the CRASH arm for +$4,396): on XAU the default is the forced mode (live while the shadow record holds ≥60%),
+// XAU_SESSREJ_V2_LIVE=bar reverts to the 25-row counter, =0 kills. BTC keeps the counter.
 global._srV2Arm = global._srV2Arm || {};
 function sessRejV2Armed(sym) {
   try {
     const f = process.env[sym + '_SESSREJ_V2_LIVE'];
     if (f === '0') return false;
+    // ALWAYS ACTIVE on XAU since 2026-11-09 (Jean: "keep the sess rej v2 always active"): no self-disarm on the shadow
+    // record. The enforced live bench (net-negative over 6 filled fires → shadow, re-earn at 60%/15) still applies — it is
+    // the standing rule for every live lane and reads real fills, not the shadow. =bar → 25-row counter, =1 → 60% floor, =0 → off.
+    const always = sym === 'XAU' && f !== 'bar' && f !== '1';
+    const forced = f === '1';
     const now = Date.now(), c = global._srV2Arm[sym];
     if (c && now - c.ts < 600000) return c.armed;
     const t = (cohortTally[sym] && cohortTally[sym][sym + '-SESS-REJ-V2']) || { win: 0, loss: 0 };
     const n = (t.win || 0) + (t.loss || 0), pct = n ? t.win / n : 0;
-    const armed = f === '1' ? (n > 0 && pct >= 0.6) : (n >= 25 && pct >= 0.6);
+    const armed = always ? true : forced ? (n > 0 && pct >= 0.6) : (n >= 25 && pct >= 0.6);
     const prev = c ? c.armed : null;
-    global._srV2Arm[sym] = { ts: now, armed, n, pct: Math.round(pct * 100), bar: '60% over 25', forced: f === '1' };
-    if (prev !== armed) { const m = '🎯 ' + sym + '-SESS-REJ-V2 ' + (armed ? 'ARMED LIVE' : 'DISARMED') + ' — shadow ' + (t.win || 0) + 'W/' + (t.loss || 0) + 'L (' + Math.round(pct * 100) + '% over ' + n + '; bar 60% over 25' + (f === '1' ? ', forced' : '') + ') (auto-arm 2026-11-06).'; log(sym, m); try { sendPush('🎯 ' + sym + ' SESS-REJ-V2 ' + (armed ? 'armed' : 'disarmed'), (t.win || 0) + 'W/' + (t.loss || 0) + 'L in shadow', 'alert'); } catch (e) {} }
+    global._srV2Arm[sym] = { ts: now, armed, n, pct: Math.round(pct * 100), bar: always ? 'always active (Jean 2026-11-09); live bench only' : forced ? '60% floor (forced)' : '60% over 25', mode: always ? 'always' : forced ? 'forced' : 'counter' };
+    if (prev !== armed) { const m = '🎯 ' + sym + '-SESS-REJ-V2 ' + (armed ? 'ARMED LIVE' : 'DISARMED') + ' — shadow ' + (t.win || 0) + 'W/' + (t.loss || 0) + 'L (' + Math.round(pct * 100) + '% over ' + n + '; ' + (always ? 'always active, live bench only' : forced ? 'forced live, 60% floor' : 'bar 60% over 25') + ') (auto-arm 2026-11-06' + (always ? ', always active 2026-11-09' : '') + ').'; log(sym, m); try { sendPush('🎯 ' + sym + ' SESS-REJ-V2 ' + (armed ? 'armed' : 'disarmed'), (t.win || 0) + 'W/' + (t.loss || 0) + 'L in shadow', 'alert'); } catch (e) {} }
     return armed;
   } catch (e) { return false; }
 }
@@ -20106,7 +20121,7 @@ function entryAgentSnapshot(sym, s, ctx) {
     session: { high: isFinite(s.sessionHigh) ? +(+s.sessionHigh).toFixed(2) : null, low: isFinite(s.sessionLow) ? +(+s.sessionLow).toFixed(2) : null, range_atr: A(s.sessionHigh - s.sessionLow), dist_to_high_atr: A(s.sessionHigh - price), dist_to_low_atr: A(price - s.sessionLow) },
     // where in today's move this candidate sits (2026-11-04): run from the day/RTH open in ATR (+ = already moved the
     // candidate's way), minutes since the extreme it runs toward, pullback from it, and the pre-registered label
-    day_structure: (function () { try { const f = blockFeat(sym, s, dir, price); return f ? { run_from_day_open_atr: f.openAtr, run_from_rth_open_atr: f.rthAtr, minutes_since_extreme_in_my_direction: f.sinceExtMin, pullback_from_that_extreme_atr: f.pullAtr, label: f.dayStruct, note: f.dayStruct === 'first-pullback-after-vertical' ? 'the first pullback after a ≥5 ATR vertical run is where such moves usually END; a resumption fill here is a crest fill' : f.dayStruct === 'at-extreme' ? 'price is printing the day extreme right now after a ≥3 ATR run' : null } : null; } catch (e) { return null; } })(),
+    day_structure: (function () { try { const f = blockFeat(sym, s, dir, price); return f ? { run_from_day_open_atr: f.openAtr, run_from_rth_open_atr: f.rthAtr, run_from_opposite_session_extreme_atr: f.runOppAtr, minutes_since_extreme_in_my_direction: f.sinceExtMin, pullback_from_that_extreme_atr: f.pullAtr, label: f.dayStruct, note: f.dayStruct === 'first-pullback-after-vertical' ? 'the first pullback after a ≥5 ATR vertical run is where such moves usually END; a resumption fill here is a crest fill' : f.dayStruct === 'at-extreme' ? 'price is printing the day extreme right now after a ≥3 ATR run' : null } : null; } catch (e) { return null; } })(),
     indicators: { rsi: isFinite(ctx.rsi) ? +(+ctx.rsi).toFixed(1) : null, macd_line: isFinite(ctx.macdL) ? +(+ctx.macdL).toFixed(3) : null, roc_3min_pct: isFinite(ctx.roc3) ? +(+ctx.roc3).toFixed(3) : null, roc_6min_pct: isFinite(ctx.roc6) ? +(+ctx.roc6).toFixed(3) : null },
     leg: s._legPivot ? { trend: s._legPivot.trend, pivot: +(+s._legPivot.ext).toFixed(2), run_from_pivot_atr: A(Math.abs(price - s._legPivot.ext)), pivot_age_min: s._legPivot.ts ? Math.round((Date.now() - s._legPivot.ts) / 60000) : null } : null,
     impulse_ote: ctx.ote ? { impulse_lo: +(+ctx.ote.impulseLo).toFixed(2), impulse_hi: +(+ctx.ote.impulseHi).toFixed(2), ote_705_limit: +(+ctx.ote.limit).toFixed(2), dist_to_ote_atr: A(Math.abs(price - ctx.ote.limit)), price_already_beyond_ote: dir === 'call' ? price <= ctx.ote.limit : price >= ctx.ote.limit } : null,
@@ -21163,7 +21178,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.75-20261106-consistency', // bump on each deploy — lets /state verify what's live
+    build: '7.77-20261109-v2-always', // bump on each deploy — lets /state verify what's live
     laneBench: global._laneBench || {}, // enforced live-lane bench state (2026-10-27); keys with |COLD| are the 0W/3L window bench (2026-11-06)
     sessRejV2: (global._srV2Arm && global._srV2Arm[sym]) || null, // V2 auto-arm state (2026-11-06)
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
