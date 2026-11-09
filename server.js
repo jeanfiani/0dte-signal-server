@@ -2486,9 +2486,12 @@ function cohortFor(reason) {
   if (/LADDER-77/.test(reason)) return 'LADDER-77'; // proportional 7/7 ladder sim on live XAU fires (2026-09-28)
   { const _fv = reason.match(/\bFILL-VIA-[A-Z-]+/); if (_fv) return _fv[0]; } // fill-path tally on live fires (2026-11-04) — must precede STALL-FILL-SHADOW
   { const _ds = reason.match(/\bDAY-STRUCT-[A-Z-]+/); if (_ds) return _ds[0]; } // position-in-the-day's-move tally on live fires (2026-11-04)
+  { const _eq = reason.match(/\bENTRYQ-[A-Z0-9.<+-]+/); if (_eq) return _eq[0]; } // fill quality inside the structural swing (2026-11-09): CHASE<0.25 / 0.25-0.5 / 0.5-0.75 / DEEP0.75+
   if (/STALL-FILL-SHADOW/.test(reason)) return 'STALL-FILL-SHADOW'; // benched stall fills graded in shadow (2026-10-27)
   if (/TP1-GAP/.test(reason)) return 'TP1-GAP'; // fires that touched +$5.00 below a TP1 >$5 (2026-10-22): win = still reached TP1, loss = stopped (would have banked at $5)
   if (/EXTFLIP-OLDSTOP/.test(reason)) return 'EXTFLIP-OLDSTOP'; // would the pre-11/03 flip stop have been hit first (2026-11-03)
+  if (/LADDER-2ATR/.test(reason)) return 'LADDER-2ATR'; // same entry/TP1, stop 2×ATR — first-leg twin on every live fire (2026-11-09)
+  if (/LADDER-SWING-OTE/.test(reason)) return 'LADDER-SWING-OTE'; // entry at the structural swing's 70.5% retrace, stop beyond the swing (2026-11-09)
   if (/LADDER-ATR/.test(reason)) return 'LADDER-ATR'; // TP1 = clamp(1.5×ATR, 5.24, 12) vs −$10, shadow (2026-11-02)
   if (/LADDER-610/.test(reason)) return 'LADDER-610'; // TP1 $6 / stop $10 on the same fires (2026-10-22, Jean: "and if TP1 at 6$?")
   if (/LADDER-510/.test(reason)) return 'LADDER-510'; // current 5/10 ladder, same fires, same sequence rule
@@ -2586,6 +2589,8 @@ function fireCohortsOnResolve(sym, entry, outcome) {
     if (fv) names.push('FILL-VIA-' + fv);
     const ds = entry.feat && entry.feat.dayStruct;
     if (ds) names.push('DAY-STRUCT-' + String(ds).toUpperCase());
+    const qb = entry.outcomes && entry.outcomes.entryQB;
+    if (qb) names.push('ENTRYQ-' + String(qb).toUpperCase()); // fill quality inside the structural swing (2026-11-09)
     for (const n of names) bumpCohortTally(sym, n, outcome);
     entry.outcomes.fireCohorts = { names, outcome };
   } catch (e) { /* tally must never affect outcome stamping */ }
@@ -3149,7 +3154,7 @@ function updateBlockedOutcomes(sym, price) {
     if (!b.tp1Hit && !b.slHit) {
       const tp1Reached = b.type === 'call' ? price >= b.virtualTp1 : price <= b.virtualTp1;
       const slReached  = b.type === 'call' ? price <= b.virtualSl  : price >= b.virtualSl;
-      if (tp1Reached) { b.tp1Hit = true; b.tp1HitTs = now; }
+      if (tp1Reached) { b.tp1Hit = true; b.tp1HitTs = now; if (b.firstLegOnly) { b.outcome = 'win'; b.closed = true; b.closedTs = now; try { bumpCohortTally(sym, b.blockReason || '', 'win'); } catch (eFL) {} continue; } } // firstLegOnly (2026-11-09): ladder twins grade the FIRST leg only — TP1 first = win, no BE-trail phase
       else if (slReached) { b.slHit = true; b.slHitTs = now; }
     } else if (b.tp1Hit && !b.slHit) {
       // After TP1: SL trails to entry (matches real signal BE-trail behavior). If price
@@ -18302,6 +18307,49 @@ function checkExit(sym, price) {
     if (iC && price < t.worstPrice) t.worstPrice = price;
     if (!iC && price > t.worstPrice) t.worstPrice = price;
 
+    // ===== ENTRY / STOP TWINS (2026-11-09, Jean on the NAS 12:35 call: "it reached TP1 after going down to 27,785 — the
+    // issue was the entry price, not the signal") ===== The live fill came from a 0.9-ATR micro-impulse OTE (27,860) with a
+    // 1.07-ATR stop; the day's pullback was 2.2 ATR and the 2.4-ATR structural swing's OTE sat at 27,832. Two shadow twins
+    // on every vetted live fire, graded first-leg-only by the blocked-outcomes tracker (independent of the live stop):
+    //   LADDER-2ATR      — same entry, same TP1, stop 2×ATR (floored at the live stop): does a wider stop convert the stops?
+    //   LADDER-SWING-OTE — entry at the 70.5% retrace of the last-60-min structural swing (≥1.5 ATR, else 2h), pending until
+    //                      touched (30 min), stop 0.5 ATR beyond the swing extreme, TP1 = the live TP1 distance from that entry.
+    // Pre-registered: either twin goes live when it beats the live ladder's first-leg record on the SAME fires over ≥25.
+    try {
+      if (!t._twins && t._oteVetted !== false && t.ep > 0 && t.atr > 0 && price > 0 && t.tp1Price > 0 && t.slPrice > 0 && !t._manual && !t._adopted) {
+        t._twins = true;
+        const _tpD = Math.abs(t.tp1Price - t.ep), _slLive = Math.abs(t.ep - t.slPrice), _sl2 = Math.max(2 * t.atr, _slLive);
+        const _det = String((s.lastHistEntry && s.lastHistEntry.symbol === sym && s.lastHistEntry.score) || t.type).replace(/[⬆⬇]/g, '');
+        s.blockedOutcomes = s.blockedOutcomes || [];
+        const _m2 = '📐 LADDER-2ATR ' + t.type.toUpperCase() + ' twin of the ' + _det + ' fire @ $' + (+t.ep).toFixed(2) + ' — stop 2×ATR $' + _sl2.toFixed(2) + ' (live $' + _slLive.toFixed(2) + '), TP1 $' + _tpD.toFixed(2) + ' (first leg only, 2026-11-09). LADDER-2ATR';
+        s.blockedOutcomes.push({ ts: now, time: ts(), symbol: sym, detector: 'LADDER-2ATR', type: t.type, price: +(+t.ep).toFixed(2), virtualTp1: +(iC ? t.ep + _tpD : t.ep - _tpD).toFixed(2), virtualSl: +(iC ? t.ep - _sl2 : t.ep + _sl2).toFixed(2), maxMin: 240, firstLegOnly: true, blockReason: _m2, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+        // structural swing: last 60 min of M5 (2h if the 60-min swing is < 1.5 ATR)
+        const _M = Array.isArray(s._m5) ? s._m5 : [];
+        const _sw = (mins) => { const cut = now - mins * 60000; let hi = -Infinity, lo = Infinity; for (let i = _M.length - 1; i >= 0 && _M[i].ts >= cut; i--) { if (_M[i].h > hi) hi = _M[i].h; if (_M[i].l < lo) lo = _M[i].l; } return (isFinite(hi) && isFinite(lo)) ? { hi, lo } : null; };
+        let _w = _sw(60); if (!_w || (_w.hi - _w.lo) < 1.5 * t.atr) _w = _sw(120);
+        // ENTRY QUALITY (2026-11-09, Jean: "the primary rule should be that all bots buy at a low price and sell at a high
+        // price"): where the ACTUAL fill sits inside the structural swing — 0 = bought the top / sold the bottom (a chase),
+        // 1 = bought the swing low / sold the swing high. Stamped on the row (outcomes.entryQ) and tallied at resolution as
+        // ENTRYQ-<bucket> so the scorecard reads W/L by price quality. Measurement first; the rule comes from the tally.
+        try {
+          if (_w && (_w.hi - _w.lo) > 0) {
+            const _q = iC ? (_w.hi - t.ep) / (_w.hi - _w.lo) : (t.ep - _w.lo) / (_w.hi - _w.lo);
+            const _qc = Math.max(-0.5, Math.min(1.5, _q));
+            const _qb = _qc < 0.25 ? 'chase<0.25' : _qc < 0.5 ? '0.25-0.5' : _qc < 0.75 ? '0.5-0.75' : 'deep0.75+';
+            const _e = s.lastHistEntry; if (_e && _e.symbol === sym && _e.outcomes) { _e.outcomes.entryQ = +_qc.toFixed(2); _e.outcomes.entryQB = _qb; _e.outcomes.swing = { lo: +_w.lo.toFixed(2), hi: +_w.hi.toFixed(2), atr: +((_w.hi - _w.lo) / t.atr).toFixed(1) }; }
+          }
+        } catch (eQ) {}
+        if (_w && (_w.hi - _w.lo) >= 1.5 * t.atr) {
+          const _ote = iC ? _w.hi - 0.705 * (_w.hi - _w.lo) : _w.lo + 0.705 * (_w.hi - _w.lo);
+          const _slS = iC ? _w.lo - 0.5 * t.atr : _w.hi + 0.5 * t.atr;
+          const _already = iC ? price <= _ote : price >= _ote; // price is already at/through the swing OTE → fills now
+          const _mS = '📐 LADDER-SWING-OTE ' + t.type.toUpperCase() + ' twin of the ' + _det + ' fire @ $' + (+t.ep).toFixed(2) + ' — swing $' + _w.lo.toFixed(2) + '–$' + _w.hi.toFixed(2) + ' (' + ((_w.hi - _w.lo) / t.atr).toFixed(1) + ' ATR), entry at the 70.5% retrace $' + _ote.toFixed(2) + (_already ? ' (already there)' : ' if touched within 30 min') + ', stop $' + _slS.toFixed(2) + ' (0.5 ATR beyond the swing), TP1 $' + _tpD.toFixed(2) + ' (first leg only, 2026-11-09). LADDER-SWING-OTE';
+          s.blockedOutcomes.push({ ts: now, time: ts(), symbol: sym, detector: 'LADDER-SWING-OTE', type: t.type, price: +_ote.toFixed(2), pendingFill: _already ? null : +_ote.toFixed(2), pendingExpiryMin: 30, virtualTp1: +(iC ? _ote + _tpD : _ote - _tpD).toFixed(2), virtualSl: +_slS.toFixed(2), maxMin: 240, firstLegOnly: true, blockReason: _mS, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+          log(sym, _mS);
+        }
+        log(sym, _m2);
+      }
+    } catch (eTw) { /* twins must never affect the live trade */ }
     // ===== LADDER-SIM — 7/7 vs 5/10 (2026-09-28, Jean: "we need to both increase TP1 and
     // SL then") ===== Every XAU trade is tracked tick-by-tick against the proportional
     // ladder (+$7 first-leg / −$7 stop) beside the live one (+$5 / −$10). First-leg
@@ -21178,7 +21226,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.77-20261109-v2-always', // bump on each deploy — lets /state verify what's live
+    build: '7.79-20261109-entry-quality', // bump on each deploy — lets /state verify what's live
     laneBench: global._laneBench || {}, // enforced live-lane bench state (2026-10-27); keys with |COLD| are the 0W/3L window bench (2026-11-06)
     sessRejV2: (global._srV2Arm && global._srV2Arm[sym]) || null, // V2 auto-arm state (2026-11-06)
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
