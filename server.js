@@ -2393,6 +2393,8 @@ function nasRthBlocked(sym) {
   try { const m = gET(); return (m < 570 || m >= 960); } catch (e) { return false; }
 }
 function cohortFor(reason) {
+  if (/BTC-CALL-BENCH/.test(reason)) return 'BTC-CALL-BENCH'; // BTC calls benched 2026-11-10: would-fire rows on the lane's own bracket — first, the text names the lane
+  { const _rr = reason.match(/\b(?:XAU|NAS100)-RETRACE-(?:REJ|TIGHT|LIMIT)\b/); if (_rr) return _rr[0]; } // lower-high / higher-low rejection lane and its blind-limit twin (2026-11-10) — first, the text names legs and gates
   { const _mt = reason.match(/\bMACD-TURN-(?:FIRED|REF-[A-Z0-9-]+)/); if (_mt) return _mt[0]; } // shadow rows opened at the MACD turn (2026-11-09): FIRED = gates passed, REF-<GATE> = that gate refused after the turn — first, the text names other gates
   { const _hw = reason.match(/\bHYST-WAIVED(?:-MACD)?\b/); if (_hw) return _hw[0]; } // live fires the removed hysteresis gate would have refused (2026-11-09)
   { const _sw = reason.match(/\bSWING-(?:OLD-MARKET|EXPIRED|NOSTRUCT)\b/); if (_sw) return _sw[0]; } // swing-retrace entry (2026-11-10): OLD-MARKET = the same fires at market on their own ladder; EXPIRED / NOSTRUCT = counts of fires not taken
@@ -2576,6 +2578,7 @@ setInterval(() => {
 function fillViaKey(via) {
   const v = String(via || '').toLowerCase();
   if (!v || /adopted|hand trade|admin/.test(v)) return null;
+  if (/retrace (rejection|limit)/.test(v)) return 'RETRACE'; // RETRACE-REJ / RETRACE-LIM live fires (2026-11-10) — before the swing / touch matches
   if (/swing/.test(v)) return 'SWING'; // swing-retrace entry (2026-11-10) — before the touch match
   if (/resumption/.test(v)) return 'RESUMPTION';
   if (/stall/.test(v)) return 'STALL';
@@ -3079,14 +3082,33 @@ function macdRecovArmed(sym) {
 // and it re-arms by itself when those shadow rows show ≥60% over ≥25. After a re-arm the count restarts from the re-arm.
 // Generic: every lane that passes through enrichSig (TREND, EXT-FLIP, RIDE, FAST, LHF, INVERSAL_BREAK, DIV …); the lanes
 // with their own bench (SESS-REJ, LIQ, RANGE5) fire outside enrichSig and keep theirs. LANE_COLD_BENCH=0 disables.
+// PERSISTENT + BY-HAND (2026-11-10, Jean "GO" on benching NAS EXT-FLIP): two holes closed. (1) The bench was recomputed
+// from signalHistory, which only keeps ~7 days — XAU EXT-FLIP's three window losses had already rolled out and its bench
+// had silently lapsed. A bench is now a stored fact (lane_bench.json on the data volume): once set it stands until the
+// shadow record re-arms it. (2) A lane can be benched by decision before the 0/3 rule trips: LANE_HAND_BENCH is a
+// comma list of SYM|LANE@date@reason; the default seeds XAU EXT-FLIP (the rule, 11/06) and NAS EXT-FLIP (0W/2L on NAS +
+// 0W/3L on XAU in the window; the 11/10 09:43 put −$3,865 against both agents). Re-arm reads the persistent cohort
+// COLD-<lane> counted from the moment of the bench. LANE_HAND_BENCH='' clears the seeds (stored benches remain).
 global._laneColdRearm = global._laneColdRearm || {};
+const LANE_BENCH_FILE = path.join(DATA_DIR, 'lane_bench.json');
+let laneBenchState = {};
+try { laneBenchState = JSON.parse(fs.readFileSync(LANE_BENCH_FILE, 'utf8')) || {}; } catch (e) { laneBenchState = {}; }
+function saveLaneBenchState() { try { fs.writeFileSync(LANE_BENCH_FILE, JSON.stringify(laneBenchState)); } catch (e) {} }
+const LANE_BENCH_SEED = (process.env.LANE_HAND_BENCH !== undefined ? process.env.LANE_HAND_BENCH : 'XAU|EXT-FLIP@2026-11-06@first 3 resolved fires of the window were 0W/3L,NAS100|EXT-FLIP@2026-11-10@benched by decision — 0W/2L on NAS and 0W/3L on XAU in the window').split(',').map(x => x.trim()).filter(Boolean);
+function laneBenchSeed(k2) {
+  for (const e of LANE_BENCH_SEED) { const p = e.split('@'); if (p[0] === k2) return { since: Date.parse((p[1] || '2026-11-10') + 'T00:00:00-05:00') || Date.now(), why: p.slice(2).join('@') || 'benched by decision', hand: true }; }
+  return null;
+}
 function laneColdBench(sym, lane) {
   try {
     if (process.env.LANE_COLD_BENCH === '0' || !lane) return null;
     global._laneBench = global._laneBench || {};
-    const key = sym + '|COLD|' + lane, now = Date.now(), c = global._laneBench[key];
+    const key = sym + '|COLD|' + lane, k2 = sym + '|' + lane, now = Date.now(), c = global._laneBench[key];
     if (c && now - c.ts < 60000) return c;
-    const start = Math.max(Date.parse((process.env.LANE_WINDOW_START || '2026-10-29') + 'T00:00:00-04:00') || 0, global._laneColdRearm[key] || 0);
+    const _tl = () => { const t = (cohortTally[sym] && cohortTally[sym]['COLD-' + lane]) || {}; return { w: t.win || 0, l: t.loss || 0 }; };
+    let st = laneBenchState[k2] || null;
+    if (!st) { const sd = laneBenchSeed(k2); if (sd) { st = laneBenchState[k2] = Object.assign(sd, { base: _tl() }); saveLaneBenchState(); } }
+    const start = Math.max(Date.parse((process.env.LANE_WINDOW_START || '2026-10-29') + 'T00:00:00-04:00') || 0, (st && st.rearmed) || 0);
     const fires = [];
     for (const h of signalHistory) {
       if (h.symbol !== sym || h.manual || !(h.ts >= start) || !/^(call|put)$/.test(h.type) || (h.conv && h.conv.enrichBlocked) || String(h.score || '').replace(/[⬆⬇]/g, '') !== lane || !h.outcomes) continue;
@@ -3096,20 +3118,22 @@ function laneColdBench(sym, lane) {
     }
     fires.sort((a, b) => a.ts - b.ts);
     const first = fires.slice(0, 3);
-    let benched = first.length >= 3 && first.every(f => !f.win);
-    const since = benched ? first[2].ts : 0; let shadow = null;
+    // the 0/3 rule sets a stored bench (once; after a re-arm only on three NEW losses)
+    if (first.length >= 3 && first.every(f => !f.win) && (!st || st.rearmed)) { st = laneBenchState[k2] = { since: first[2].ts, why: 'first 3 resolved fires of the window were 0W/3L', base: _tl() }; saveLaneBenchState(); }
+    let benched = !!(st && !st.rearmed);
+    const since = benched ? st.since : 0; let shadow = null;
     if (benched) {
-      const st = S[sym]; let w = 0, l = 0;
-      for (const b of (st && st.blockedOutcomes) || []) { if (b.ts <= since || !b.closed || b.coldLane !== lane) continue; if (b.outcome === 'win') w++; else if (b.outcome === 'loss') l++; }
+      const t = _tl(), b0 = st.base || { w: 0, l: 0 };
+      const w = Math.max(0, t.w - b0.w), l = Math.max(0, t.l - b0.l);              // shadow rows since THIS bench (persistent cohort COLD-<lane>)
       shadow = { w, l };
-      if (w + l >= 25 && w / (w + l) >= 0.6) { benched = false; global._laneColdRearm[key] = now; }
+      if (w + l >= 25 && w / (w + l) >= 0.6) { benched = false; st.rearmed = now; saveLaneBenchState(); global._laneColdRearm[key] = now; }
     }
     const prev = c ? c.benched : null;
-    const rec = { ts: now, benched, since, n: fires.length, first: first.map(f => f.win ? 'W' : 'L').join('') || '-', shadow, cold: true, lane };
+    const rec = { ts: now, benched, since, n: fires.length, first: first.map(f => f.win ? 'W' : 'L').join('') || '-', shadow, cold: true, lane, why: st ? st.why : null, hand: !!(st && st.hand) };
     global._laneBench[key] = rec;
     if (prev !== benched && (benched || prev === true)) {
-      const m = '🛏️ LANE-COLD-BENCH ' + sym + ' ' + lane + (benched ? ' BENCHED — first 3 resolved fires of the window were 0W/3L; fires go to shadow on the live ladder until 60% over 25 there' : ' RE-ARMED — shadow ' + (shadow ? shadow.w + 'W/' + shadow.l + 'L' : '?') + ' since the bench; the count restarts now') + ' (2026-11-06).';
-      log(sym, m); try { sendPush('🛏️ ' + sym + ' ' + lane + (benched ? ' benched' : ' re-armed'), benched ? 'first 3 fires 0W/3L — shadow until 60%/25' : 'shadow ' + shadow.w + 'W/' + shadow.l + 'L', 'alert'); } catch (e) {}
+      const m = '🛏️ LANE-COLD-BENCH ' + sym + ' ' + lane + (benched ? ' BENCHED — ' + (st.why || 'first 3 resolved fires of the window were 0W/3L') + '; fires go to shadow on the live ladder until 60% over 25 there' : ' RE-ARMED — shadow ' + (shadow ? shadow.w + 'W/' + shadow.l + 'L' : '?') + ' since the bench; the count restarts now') + ' (2026-11-06; stored + by-hand 2026-11-10).';
+      log(sym, m); try { sendPush('🛏️ ' + sym + ' ' + lane + (benched ? ' benched' : ' re-armed'), benched ? (st.hand ? 'benched by decision' : 'first 3 fires 0W/3L') + ' — shadow until 60%/25' : 'shadow ' + shadow.w + 'W/' + shadow.l + 'L', 'alert'); } catch (e) {}
     }
     return rec;
   } catch (e) { return null; }
@@ -4867,6 +4891,7 @@ function processPrice(sym, price, hi, lo) {
                 const _tp3 = isL ? price + Math.max(0.5 * _srAdr, 2 * _R) : price - Math.max(0.5 * _srAdr, 2 * _R);
                 const _tp2 = isL ? Math.max(tp, _tp1 + 0.01) : Math.min(tp, _tp1 - 0.01);
                 if (isL ? (sl >= price || _tp1 <= price) : (sl <= price || _tp1 >= price)) return false;
+                if (sym === 'BTC' && isL && btcCallBenchRefuse(s, 'SESS-REJ', price, sl, _tp1)) return false; // BTC calls benched (2026-11-10)
                 if (s._oteHold && s._oteHold.swing) cancelSwingHold(sym, s, 'pre-empted by a SESS-REJ ' + dir.toUpperCase() + ' fire', 'swing-superseded'); // the rejection lane outranks a pending momentum limit (2026-11-10)
                 s.dailySignalCount++;
                 const _sig = { type: dir, time: ts(), price: price.toFixed(2), score: (isL ? '⬆' : '⬇') + (_isV2 ? 'SESSREJ-V2' : 'SESSREJ-RT'), rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: sl.toFixed(2), tp1: _tp1.toFixed(2), tp2: _tp2.toFixed(2), tp3: _tp3.toFixed(2), regime: (s._dayRegime && s._dayRegime.label) || null, oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: _isV2 ? 'sess-rej v2 rejection close' : 'sess-rej rejection close' } }; // V2 fires carry their own score so the scorecard, bench and strikes split them (2026-11-06)
@@ -4894,6 +4919,8 @@ function processPrice(sym, price, hi, lo) {
         }
       }
     } catch (eSR) { /* shadow lane must never crash the tick */ }
+    // RETRACE-REJ — sell the lower high / buy the higher low (2026-11-10): see retraceRejTick()
+    try { if (isMT5 && (sym === 'XAU' || sym === 'NAS100') && cfdMarketOpenET(Date.now())) retraceRejTick(sym, s, price); } catch (eRT) {}
 
     // ===== LORENTZIAN CLASSIFICATION — SHADOW ENTRY SCORE (2026-09-21, Jean: "implement 3") =====
     // Port of Dehorty's kNN classifier (github.com/artificial-intelligence-edge/lorentzian-
@@ -5405,6 +5432,7 @@ function processPrice(sym, price, hi, lo) {
                 }
                 if (v.knifeTs) { v.knifeWaitedMin = _kSince; log(sym, '🔪 BTC-RANGE5-RT ' + (isL ? 'CALL' : 'PUT') + ' — knife guard released: level $' + v.lvl.toFixed(0) + ' has held ' + _kSince + ' min since the tag, last hour ' + _kHour.toFixed(2) + '% (< ' + _kPct + '%); this rejection close fires (2026-11-05).'); }
               } catch (eKn) { /* guard must never crash the fire path */ }
+              if (isL && btcCallBenchRefuse(s, 'RANGE5-RT', price, _sl, _tp1)) return false; // BTC calls benched (2026-11-10) — shadow row stamped, nothing sent to the EA
               s.dailySignalCount++;
               const _sig = { type: isL ? 'call' : 'put', time: ts(), price: price.toFixed(2), score: (isL ? '⬆' : '⬇') + 'RANGE5-RT', rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: _sl.toFixed(2), tp1: _tp1.toFixed(2), tp2: (+v.tp).toFixed(2), tp3: (+v.tpFar).toFixed(2), regime: v.regime || null, r5Knife: v.knifeTs ? { heldMin: v.knifeWaitedMin || 0 } : undefined, oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: Math.round((Date.now() - v.ts) / 1000), via: v.knifeTs ? 'range5-rt rejection entry (seasoned after a flush)' : 'range5-rt rejection entry' } };
               s.signals.push(_sig); logSignal(sym, _sig);
@@ -11080,7 +11108,7 @@ function processPrice(sym, price, hi, lo) {
           const _cLane = String(sig.score || '').replace(/[⬆⬇]/g, '');
           const _cb = laneColdBench(sym, _cLane);
           if (_cb && _cb.benched) {
-            const _cm = '🛏️ ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — LANE-COLD-BENCH ' + _cLane + ': first 3 resolved fires of the window were 0W/3L; lane in shadow until 60% over 25 (shadow so far ' + (_cb.shadow ? _cb.shadow.w + 'W/' + _cb.shadow.l + 'L' : '0W/0L') + ') (2026-11-06).';
+            const _cm = '🛏️ ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — LANE-COLD-BENCH ' + _cLane + ': ' + (_cb.why || 'first 3 resolved fires of the window were 0W/3L') + '; lane in shadow until 60% over 25 (shadow so far ' + (_cb.shadow ? _cb.shadow.w + 'W/' + _cb.shadow.l + 'L' : '0W/0L') + ') (2026-11-06).';
             log(sym, _cm);
             try {
               const _cp = +sig.price || s.lastPrice; const _xau = sym === 'XAU';
@@ -11883,6 +11911,21 @@ function processPrice(sym, price, hi, lo) {
         // flat when the flip PUT fired and overwrote its trade management — winProtect
         // only covers trades in profit, so a fresh flat position had no protection.
         else if (s.trade && s.trade.active && s.trade.ts && s.trade.type !== EF.dir && (now2 - s.trade.ts) < 600000) efReason = 'fresh opposite ' + s.trade.type.toUpperCase() + ' trade is only ' + Math.round((now2 - s.trade.ts) / 60000) + 'min old — flip would whipsaw our own fire (need 10min)';
+        // LANE BENCH (2026-11-10): EXT-FLIP builds its own trade and never passes enrichSig, so the 0W/3L bench written on
+        // 11/06 never reached it — the XAU "bench" did nothing and the NAS put of 11/10 09:43 (−$3,865) fired through. The
+        // bench is now checked HERE, last, so the shadow row is a fire every flip gate had passed, on the flip's own stop
+        // and first target (first leg only). XAU EXT-FLIP: 0W/3L in the window; NAS: 0W/2L, benched by decision.
+        if (!efReason) {
+          try {
+            const _efCB = laneColdBench(sym, 'EXT-FLIP');
+            if (_efCB && _efCB.benched) {
+              efReason = 'LANE-COLD-BENCH EXT-FLIP: ' + (_efCB.why || 'benched') + '; lane in shadow until 60% over 25 (shadow so far ' + (_efCB.shadow ? _efCB.shadow.w + 'W/' + _efCB.shadow.l + 'L' : '0W/0L') + ')';
+              const _cbT1 = Math.min(efSlDist * 1.5, efAtr * 1.25, sym === 'XAU' ? 5 : sym === 'BTC' ? 100 : sym === 'NAS100' ? 50 : 0.50);
+              s.blockedOutcomes = s.blockedOutcomes || [];
+              s.blockedOutcomes.push({ ts: Date.now(), time: ts(), symbol: sym, detector: 'COLD-EXT-FLIP', type: EF.dir, price: +price.toFixed(2), virtualTp1: +(efCall ? price + _cbT1 : price - _cbT1).toFixed(2), virtualSl: +efSlPrice.toFixed(2), maxMin: 240, firstLegOnly: true, coldLane: 'EXT-FLIP', blockReason: '🛏️ EXT-FLIP ' + EF.dir.toUpperCase() + ' BLOCKED — ' + efReason + ' · would-fire @ $' + price.toFixed(2) + ', SL $' + efSlPrice.toFixed(2) + ', TP1 $' + (efCall ? price + _cbT1 : price - _cbT1).toFixed(2) + ' (2026-11-10).', feat: blockFeat(sym, s, EF.dir, price), snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+            }
+          } catch (eCBF) {}
+        }
         if (efReason) {
           log(sym, '⏳ EXT-FLIP ' + EF.dir.toUpperCase() + ' BLOCKED — ' + efReason + ' (armed by ' + EF.src + ', extreme $' + EF.extreme.toFixed(2) + ' held ' + Math.round(efAgeMs / 60000) + 'min, burst ×' + (EF.burst || 0).toFixed(1) + ', RSI ' + rsiV.toFixed(1) + ').');
           s.extFlip = null; // gate 6: one evaluation per impulse
@@ -17761,6 +17804,186 @@ function extPullbackZone(s, sym, dir, price, atrHint) {
 // A newer fire, a SESS-REJ / LIQ fire or a MANUAL launch cancels a pending limit. Every momentum fire also opens a
 // SWING-OLD-MARKET shadow row (market at the fire tick, original ladder, first leg) so the old behaviour keeps a record
 // on the same fires. SWING_ENTRY=0 restores the old auction untouched; OTE_DISABLED=1 still releases everything at market.
+// ===== RETRACE-REJ — SELL THE LOWER HIGH / BUY THE HIGHER LOW (2026-11-10, Jean: "XAU went down to 4122 then back up to
+// 4140 then slid — this is where I would have fired the put") ===== The 11/10 01:25 GMT case: a 4146.48 → 4121.88 leg
+// (4.1 ATR), a bounce to 4141.33 (79% of it, origin unbroken), one M5 from 4140.27 to 4131.14, then 4110. At the top the
+// momentum detectors were producing CALLS; the rejection lane's trigger was met but refused by the two guards written
+// after the 11/04 loss (flush floor missed by $0.47; first test against a 30-min-old msTrend). Neither guard reads the one
+// thing that separates the two nights: on 11/04 the high was a NEW high after a full recovery, here it was a LOWER high.
+// A lane of its own, independent of the momentum detectors and of the regime label. Pre-registered:
+//   • leg: within the last RETRACE_LOOKBACK_BARS (36 M5 = 3 h) the window extreme (origin) and the opposite extreme after
+//     it are ≥ RETRACE_LEG_ATR (4) × ATR apart;
+//   • retrace: the counter-move after the leg's end reached 61.8%–88.6% of the leg, origin unbroken (the band was first
+//     quoted as 62–79%; the case that motivated the lane printed 79.1%, so the upper bound is the next fib, not 79);
+//   • rejection: the retrace extreme was made by the last or the previous closed M5, and the last closed M5 is against it —
+//     range ≥ 0.8×ATR, close in the far 40% of the bar, close beyond its open;
+//   • trade (market at that close): stop 0.25×ATR beyond the leg's ORIGIN (a lower high is only wrong when the origin
+//     breaks), TP1 = the distance back to the leg's end clamped to XAU $5.24–$12 / NAS $50–$120, TP2 = 38.2% extension,
+//     TP3 = 61.8%; needs ≥ 1 ATR of room to the leg's end and risk ≤ 2× TP1, else nothing is stamped. One per leg.
+// Cohorts <SYM>-RETRACE-REJ (first leg only: TP1 before the stop) and two measurement twins on the same setups:
+// <SYM>-RETRACE-TIGHT (same entry, stop 0.5×ATR beyond the retrace extreme) and <SYM>-RETRACE-LIMIT — the blind limit at
+// the 70.5% of the same leg (Jean's own 4140 entry), stop 0.25×ATR beyond the origin, the standard TP1.
+// SHADOW until its own record is ≥60% over ≥25 resolved, then live by itself (score ⬆/⬇RETRACE-REJ, full lot, enforced
+// 6-fill bench). XAU_RETRACE_LIVE=1 / NAS_RETRACE_LIVE=1 force it live now, =0 keeps it shadow; RETRACE_REJ=0 stops the lane.
+// ===== BTC CALLS BENCHED (2026-11-10, Jean: "let's stop the bleed on BTC and put calls on the bench") ===== BTC has
+// been fade-only since July, and in a week that took it from 80.7k to 72.8k the fades were all knife-catches: bot calls
+// in the window 1W/4L — 10/29 RANGE5 −$3,801, 11/02 RANGE5 TP1, 11/05 SESS-REJ −$1,494, 11/05 RANGE5 stopped (≈ −$4,900),
+// 11/10 RANGE5 −$4,105. Every BTC CALL from a live lane (RANGE5-RT, SESS-REJ) now goes to shadow: at the moment it
+// would have fired it is stamped as a BTC-CALL-BENCH row on the lane's own stop and first target (first leg only) and
+// nothing is sent to the EA. Puts are untouched. Re-arms by itself when those rows show ≥60% over ≥25; BTC_CALLS_LIVE=1
+// lifts the bench by hand, BTC_CALLS_LIVE=0 keeps it whatever the record.
+global._btcCallBench = global._btcCallBench || { ts: 0, benched: true, n: 0, pct: 0 };
+function btcCallsBenched() {
+  try {
+    const f = process.env.BTC_CALLS_LIVE;
+    if (f === '1') return false;
+    const now = Date.now(), c = global._btcCallBench;
+    if (c.ts && now - c.ts < 600000) return c.benched;
+    const t = (cohortTally.BTC && cohortTally.BTC['BTC-CALL-BENCH']) || { win: 0, loss: 0 };
+    const n = (t.win || 0) + (t.loss || 0), pct = n ? t.win / n : 0;
+    const benched = f === '0' ? true : !(n >= 25 && pct >= 0.6);
+    const prev = c.ts ? c.benched : null;
+    global._btcCallBench = { ts: now, benched, n, pct: Math.round(pct * 100), bar: 're-arm at 60% over 25 on BTC-CALL-BENCH' };
+    if (prev !== null && prev !== benched) { const m = '🛏️ BTC CALLS ' + (benched ? 'BENCHED' : 'RE-ARMED') + ' — shadow ' + (t.win || 0) + 'W/' + (t.loss || 0) + 'L (' + Math.round(pct * 100) + '% over ' + n + '; bar 60% over 25) (2026-11-10).'; log('BTC', m); try { sendPush('🛏️ BTC calls ' + (benched ? 'benched' : 're-armed'), (t.win || 0) + 'W/' + (t.loss || 0) + 'L in shadow', 'alert'); } catch (e) {} }
+    return benched;
+  } catch (e) { return true; }
+}
+// Called at the exact point a BTC call would fire live. Returns true when the fire must NOT happen (and stamps the row).
+function btcCallBenchRefuse(s, lane, price, sl, tp1) {
+  try {
+    if (!btcCallsBenched()) return false;
+    const now = Date.now();
+    if (now - (s._btcCallBenchTs || 0) >= 1800000 && price > 0 && sl > 0 && tp1 > price && sl < price) {   // one row per 30 min
+      s._btcCallBenchTs = now;
+      const m = '🛏️ BTC-CALL-BENCH ' + lane + ' CALL WOULD-FIRE @ $' + price.toFixed(0) + ' — BTC calls are benched (window 1W/4L, 80.7k → 72.8k); not sent to the EA. Graded on the lane\'s own bracket SL $' + (+sl).toFixed(0) + ' / TP1 $' + (+tp1).toFixed(0) + ', first leg only; re-arm at 60% over 25 (2026-11-10).';
+      s.blockedOutcomes = s.blockedOutcomes || [];
+      s.blockedOutcomes.push({ ts: now, time: ts(), symbol: 'BTC', detector: 'BTC-CALL-BENCH', type: 'call', price: +price.toFixed(2), virtualTp1: +(+tp1).toFixed(2), virtualSl: +(+sl).toFixed(2), maxMin: 720, firstLegOnly: true, benchLane: lane, blockReason: m, feat: blockFeat('BTC', s, 'call', price), snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+      log('BTC', m);
+      try { sendPush('🛏️ BTC ' + lane + ' CALL not taken', '$' + price.toFixed(0) + ' — BTC calls are benched; shadow-graded', 'signal'); } catch (eP) {}
+    }
+    return true;
+  } catch (e) { return true; }
+}
+// Both entries arm themselves, each on its own shadow record (≥60% over ≥25 resolved): kind 'REJ' = market at the rejection
+// close, kind 'LIMIT' = at the touch of the 70.5% level. The first 7-day replay on the M5 history (bar-level, 11/02–11/10)
+// read XAU LIMIT 31W/16L, XAU REJ 9W/9L, the tight stop 6W/13L, NAS no edge on either — hence both are counted, none assumed.
+// Env per symbol: <SYM>_RETRACE_LIVE (REJ) / <SYM>_RETRACE_LIMIT_LIVE (LIMIT) = 1 forces live, = 0 keeps shadow.
+global._retrArm = global._retrArm || {};
+function retraceRejArmed(sym, kind) {
+  try {
+    const K = kind === 'LIMIT' ? 'LIMIT' : 'REJ';
+    const f = process.env[(sym === 'NAS100' ? 'NAS' : sym) + (K === 'LIMIT' ? '_RETRACE_LIMIT_LIVE' : '_RETRACE_LIVE')];
+    if (f === '0') return false;
+    const key = sym + '|' + K, now = Date.now(), c = global._retrArm[key];
+    if (c && now - c.ts < 600000) return c.armed;
+    const t = (cohortTally[sym] && cohortTally[sym][sym + '-RETRACE-' + K]) || { win: 0, loss: 0 };
+    const n = (t.win || 0) + (t.loss || 0), pct = n ? t.win / n : 0;
+    const armed = f === '1' ? true : (n >= 25 && pct >= 0.6);
+    const prev = c ? c.armed : null;
+    global._retrArm[key] = { ts: now, armed, n, pct: Math.round(pct * 100), bar: f === '1' ? 'forced live (enforced 6-fill bench only)' : '60% over 25' };
+    if (prev !== null && prev !== armed) { const m = '↩️ ' + sym + '-RETRACE-' + K + ' ' + (armed ? 'ARMED LIVE' : 'DISARMED') + ' — shadow ' + (t.win || 0) + 'W/' + (t.loss || 0) + 'L (' + Math.round(pct * 100) + '% over ' + n + '; bar 60% over 25' + (f === '1' ? ', forced' : '') + ') (2026-11-10).'; log(sym, m); try { sendPush('↩️ ' + sym + ' RETRACE-' + K + ' ' + (armed ? 'armed' : 'disarmed'), (t.win || 0) + 'W/' + (t.loss || 0) + 'L in shadow', 'alert'); } catch (e) {} }
+    return armed;
+  } catch (e) { return false; }
+}
+function retraceLiveFire(sym, s, dir, price, sl, tp1, tp2, tp3, note, kind) {
+  try {
+    const K = kind === 'LIMIT' ? 'LIMIT' : 'REJ', _sc = K === 'LIMIT' ? 'RETRACE-LIM' : 'RETRACE-REJ';
+    if (!retraceRejArmed(sym, K)) return false;
+    if ((s.trade && s.trade.active) || (s._oteHold && !s._oteHold.swing) || s._invHold || s._macdHold) return false;
+    if (!bootWarm(sym, s).ok) return false;
+    if (s.newsBlackout && s.newsBlackout.active) return false;
+    if (typeof cfdMarketOpenET === 'function' && !cfdMarketOpenET(Date.now())) return false;
+    if (liveLaneBenched(sym, K === 'LIMIT' ? /RETRACE-LIM/ : /RETRACE-REJ/, sym + '-RETRACE-' + K)) return false;
+    const isL = dir === 'call';
+    if (isL ? (sl >= price || tp1 <= price) : (sl <= price || tp1 >= price)) return false;
+    if (s._oteHold && s._oteHold.swing) cancelSwingHold(sym, s, 'pre-empted by a ' + _sc + ' ' + dir.toUpperCase() + ' fire', 'swing-superseded');
+    const now = Date.now();
+    s.dailySignalCount++;
+    const _sig = { type: dir, time: ts(), price: price.toFixed(2), score: (isL ? '⬆' : '⬇') + _sc, rsi: isFinite(s._rsi) ? (+s._rsi).toFixed(1) : '', macd: (typeof s._macdL === 'number') ? s._macdL.toFixed(3) : '', roc: '', num: s.dailySignalCount, sl: sl.toFixed(2), tp1: tp1.toFixed(2), tp2: tp2.toFixed(2), tp3: tp3.toFixed(2), regime: (s._dayRegime && s._dayRegime.label) || null, oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: K === 'LIMIT' ? 'retrace limit touch' : 'retrace rejection close' } };
+    s.signals.push(_sig); logSignal(sym, _sig);
+    s.trade = buildCfdTrade(dir, price, s._atr || 0, sym);
+    s.trade._oteVetted = true; s.trade._sessLive = true; s.trade._retrLive = true; // _sessLive: keeps its own geometry (no TP1 cap, no RR-floor re-check, no swing auction)
+    delete s.trade.oteLimit; delete s.trade.oteExpiry;
+    s.trade.slPrice = +sl.toFixed(2); s.trade.tp1Price = +tp1.toFixed(2); s.trade.tp2Price = +tp2.toFixed(2); s.trade.tp3Price = +tp3.toFixed(2);
+    try { const h = s.lastHistEntry; if (h && h.symbol === sym && h.type === dir) { h.sl = s.trade.slPrice; h.tp1 = s.trade.tp1Price; h.tp2 = s.trade.tp2Price; h.tp3 = s.trade.tp3Price; } } catch (eH) {}
+    s.lastSignalDir = dir; s.lastSignalTs = now; s.lastNTs = now; s.lastAT = dir; if (isL) s.nC++; else s.nP++;
+    try { entryAgentConsult(sym, s, { price, atr: s._atr || 0, dir, detector: _sc, trade: s.trade, rule: { action: 'fill', via: _sc + ' live (market)' }, rsi: s._rsi, macdL: s._macdL, roc3: s._roc3, histTs: (s.lastHistEntry && s.lastHistEntry.symbol === sym) ? s.lastHistEntry.ts : null }); } catch (eAG) {}
+    log(sym, '↩️ ' + sym + ' ' + _sc + ' ' + dir.toUpperCase() + ' LIVE FIRE @ $' + price.toFixed(2) + ' — ' + note + ' · SL $' + sl.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' (2026-11-10).');
+    try { sendPush('↩️ ' + sym + ' ' + _sc + ' ' + dir.toUpperCase() + ' #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · SL $' + sl.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · ' + (isL ? 'higher low' : 'lower high') + ' rejected', 'signal'); } catch (eP) {}
+    return true;
+  } catch (e) { return false; }
+}
+function retraceRejTick(sym, s, price) {
+  try {
+    if ((sym !== 'XAU' && sym !== 'NAS100') || process.env.RETRACE_REJ === '0') return;
+    const M = Array.isArray(s._m5) ? s._m5 : [], atr = s._atr || 0;
+    if (M.length < 18 || !(atr > 0) || !(price > 0)) return;
+    const now = Date.now();
+    const R = s._retr = s._retr || { m5Ts: 0, legs: { put: null, call: null }, done: {}, last: { put: 0, call: 0 } };
+    const lc = M[M.length - 1];
+    const tpMin = sym === 'XAU' ? (parseFloat(process.env.XAU_TP1) || 5.24) : 50, tpMax = sym === 'XAU' ? 12 : 120;
+    const row = (det, dir, p, tp, sl, m) => ({ ts: now, time: ts(), symbol: sym, detector: det, type: dir, price: +p.toFixed(2), virtualTp1: +tp.toFixed(2), virtualSl: +sl.toFixed(2), maxMin: 240, firstLegOnly: true, blockReason: m, feat: blockFeat(sym, s, dir, p), snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+    if (lc.ts !== R.m5Ts) {
+      R.m5Ts = lc.ts;
+      const W = M.slice(-(parseInt(process.env.RETRACE_LOOKBACK_BARS, 10) || 36)), n = W.length;
+      const legMin = (parseFloat(process.env.RETRACE_LEG_ATR) || 4) * atr;
+      // down-leg from the window high (PUT side) / up-leg from the window low (CALL side)
+      let iH = 0; for (let i = 1; i < n; i++) if (W[i].h >= W[iH].h) iH = i;
+      let iL = -1; for (let i = iH + 1; i < n; i++) if (iL < 0 || W[i].l <= W[iL].l) iL = i;
+      R.legs.put = (iL > iH && W[iH].h - W[iL].l >= legMin) ? { o: W[iH].h, x: W[iL].l, leg: W[iH].h - W[iL].l, xi: iL, key: 'put|' + W[iH].h.toFixed(2) + '|' + W[iL].l.toFixed(2) } : null;
+      let jL = 0; for (let i = 1; i < n; i++) if (W[i].l <= W[jL].l) jL = i;
+      let jH = -1; for (let i = jL + 1; i < n; i++) if (jH < 0 || W[i].h >= W[jH].h) jH = i;
+      R.legs.call = (jH > jL && W[jH].h - W[jL].l >= legMin) ? { o: W[jL].l, x: W[jH].h, leg: W[jH].h - W[jL].l, xi: jH, key: 'call|' + W[jL].l.toFixed(2) + '|' + W[jH].h.toFixed(2) } : null;
+      for (const dir of ['put', 'call']) {
+        const g = R.legs[dir]; if (!g) continue;
+        const P = dir === 'put';
+        let r = null, ri = -1; for (let i = g.xi + 1; i < n; i++) { const v = P ? W[i].h : W[i].l; if (r === null || (P ? v >= r : v <= r)) { r = v; ri = i; } }
+        if (r === null) continue;
+        const f = P ? (r - g.x) / g.leg : (g.x - r) / g.leg;
+        const rng = lc.h - lc.l;
+        const rej = rng >= (parseFloat(process.env.RETRACE_REJ_BAR_ATR) || 0.8) * atr && (P ? (lc.c < lc.o && (lc.h - lc.c) >= 0.6 * rng) : (lc.c > lc.o && (lc.c - lc.l) >= 0.6 * rng));
+        if (!(f >= 0.618 && f <= 0.886) || ri < n - 2 || !rej) continue;
+        const key = 'REJ|' + g.key; if (R.done[key] || now - (R.last[dir] || 0) < 1800000) continue;
+        R.done[key] = now; R.last[dir] = now;
+        const room = P ? price - g.x : g.x - price;
+        const tp1D = Math.min(Math.max(room, tpMin), tpMax);
+        // STOP BEYOND THE ORIGIN (as proposed to Jean; the first build put it 0.5×ATR beyond the retrace extreme and the
+        // replay of the 11/10 case showed why that is wrong: the lane sold the FIRST rejection at 01:15 GMT @4132.13 (64%
+        // retrace), the bounce made a second push to 4141.33 and took a 4140.12 stop by $1.21 before the slide to 4110.
+        // A lower high is only wrong when the leg's origin breaks.) The tight variant keeps grading as <SYM>-RETRACE-TIGHT.
+        const slT = P ? r + 0.5 * atr : r - 0.5 * atr;
+        const sl = P ? g.o + 0.25 * atr : g.o - 0.25 * atr, risk = P ? sl - price : price - sl;
+        const tp1 = P ? price - tp1D : price + tp1D;
+        const tp2 = P ? Math.min(tp1 - 0.01, g.x - 0.382 * g.leg) : Math.max(tp1 + 0.01, g.x + 0.382 * g.leg);
+        const tp3 = P ? Math.min(tp2, g.x - 0.618 * g.leg) : Math.max(tp2, g.x + 0.618 * g.leg);
+        const note = (P ? 'lower high' : 'higher low') + ' $' + r.toFixed(2) + ' = ' + Math.round(f * 100) + '% retrace of the ' + (g.leg / atr).toFixed(1) + '-ATR leg $' + g.o.toFixed(2) + ' → $' + g.x.toFixed(2) + ', rejected by an M5 of $' + rng.toFixed(2) + ' closing $' + lc.c.toFixed(2);
+        if (!(room >= atr) || !(risk > 0) || risk > 2.0 * tp1D) { log(sym, '↩️ ' + sym + '-RETRACE-REJ ' + dir.toUpperCase() + ' @ $' + price.toFixed(2) + ' NOT stamped — ' + note + '; ' + (!(room >= atr) ? 'only $' + room.toFixed(2) + ' of room to the leg\'s end (< 1×ATR)' : 'risk $' + risk.toFixed(2) + ' > 2× the first target $' + tp1D.toFixed(2)) + ' (2026-11-10).'); continue; }
+        const m = '↩️ ' + sym + '-RETRACE-REJ ' + dir.toUpperCase() + ' @ $' + price.toFixed(2) + ' — ' + note + ' · SL $' + sl.toFixed(2) + ' (beyond the leg\'s origin) · TP1 $' + tp1.toFixed(2) + ' · first leg only' + (retraceRejArmed(sym, 'REJ') ? '' : ' · shadow until 60% over 25') + ' (2026-11-10).';
+        s.blockedOutcomes = s.blockedOutcomes || []; s.blockedOutcomes.push(row(sym + '-RETRACE-REJ', dir, price, tp1, sl, m)); log(sym, m);
+        if (P ? (slT > price) : (slT < price)) s.blockedOutcomes.push(row(sym + '-RETRACE-TIGHT', dir, price, tp1, slT, '↩️ ' + sym + '-RETRACE-TIGHT ' + dir.toUpperCase() + ' @ $' + price.toFixed(2) + ' — same entry and target as RETRACE-REJ, stop 0.5×ATR beyond the retrace extreme $' + slT.toFixed(2) + ' instead of beyond the origin (measurement twin, 2026-11-10).'));
+        retraceLiveFire(sym, s, dir, price, sl, tp1, tp2, tp3, note, 'REJ');
+      }
+      for (const k of Object.keys(R.done)) if (now - R.done[k] > 6 * 3600000) delete R.done[k];
+    }
+    // LIMIT twin (every tick): the blind limit at the 70.5% of the current leg, once per leg, only while price is AT the level
+    for (const dir of ['put', 'call']) {
+      const g = R.legs[dir]; if (!g) continue;
+      const P = dir === 'put', key = 'LIM|' + g.key; if (R.done[key]) continue;
+      const lim = P ? g.x + 0.705 * g.leg : g.x - 0.705 * g.leg;
+      const through = P ? price - lim : lim - price;
+      if (through < 0) continue;
+      R.done[key] = now;
+      if (through > 0.25 * atr) continue;                                              // first seen already well through the level — not a limit fill, not stamped
+      const sl = P ? g.o + 0.25 * atr : g.o - 0.25 * atr, risk = Math.abs(sl - price);
+      if (risk > 2.05 * tpMin) continue;
+      const m = '↩️ ' + sym + '-RETRACE-LIMIT ' + dir.toUpperCase() + ' @ $' + price.toFixed(2) + ' — blind limit at the 70.5% retrace $' + lim.toFixed(2) + ' of the ' + (g.leg / atr).toFixed(1) + '-ATR leg $' + g.o.toFixed(2) + ' → $' + g.x.toFixed(2) + ' · SL $' + sl.toFixed(2) + ' (beyond the origin) · TP1 $' + tpMin.toFixed(2) + ' · measurement twin of RETRACE-REJ (2026-11-10).';
+      s.blockedOutcomes = s.blockedOutcomes || []; s.blockedOutcomes.push(row(sym + '-RETRACE-LIMIT', dir, price, P ? price - tpMin : price + tpMin, sl, m)); log(sym, m);
+      // live on its own record (2026-11-10): TP1 the standard first target, TP2 the leg's end, TP3 the 38.2% extension
+      { const _t1 = P ? price - tpMin : price + tpMin, _t2 = P ? Math.min(_t1 - 0.01, g.x) : Math.max(_t1 + 0.01, g.x), _t3 = P ? Math.min(_t2, g.x - 0.382 * g.leg) : Math.max(_t2, g.x + 0.382 * g.leg);
+        retraceLiveFire(sym, s, dir, price, sl, _t1, _t2, _t3, 'limit at the 70.5% retrace $' + lim.toFixed(2) + ' of the ' + (g.leg / atr).toFixed(1) + '-ATR leg $' + g.o.toFixed(2) + ' → $' + g.x.toFixed(2), 'LIMIT'); }
+    }
+  } catch (e) { /* lane must never crash the tick */ }
+}
 function swingEntryClass(tag, t, row) {
   if (process.env.SWING_ENTRY === '0' || !t) return false;
   if (t._manual || t._adopted || t._sessLive || t._r5Live || t._legLive || t._pathLive || t._liq) return false;
@@ -18672,7 +18895,11 @@ function checkExit(sym, price) {
     // Jean set 8/24: ">$12.50 must never fire at top price"). Runs pre-TP1, once.
     if (!t.t1 && !t.sl && !t._capChecked && t.ep > 0) {
       t._capChecked = true;
-      const _capT = sym === 'XAU' ? (t._ladder === 'WIDE' ? (parseFloat(process.env.XAU_TP1_WIDE) || 7.5) : 5) : sym === 'BTC' ? 100 : sym === 'NAS100' ? (t._ladder === 'WIDE' ? 75 : 50) : 0; // regime-adaptive cap (2026-09-28): WIDE ladder keeps its larger TP1
+      // XAU CAP FOLLOWS XAU_TP1 (2026-11-10 fix): buildCfdTrade has set the first target to $5.24 since 10/22 (Jean: "we just
+      // need to raise tp1 to 5.24$" — the IC Markets round-trip cost), but this net still clamped anything above $5.01 back
+      // to $5.00, so every live XAU trade since then banked $5.00 (the 11/08 LIQ call 4124→4129, the 11/09 CHoCH fill
+      // 4120.21→4125.21 …). The cap is now the larger of $5 and XAU_TP1.
+      const _capT = sym === 'XAU' ? (t._ladder === 'WIDE' ? (parseFloat(process.env.XAU_TP1_WIDE) || 7.5) : Math.max(5, parseFloat(process.env.XAU_TP1) || 5.24)) : sym === 'BTC' ? 100 : sym === 'NAS100' ? (t._ladder === 'WIDE' ? 75 : 50) : 0; // regime-adaptive cap (2026-09-28): WIDE ladder keeps its larger TP1
       // RANGE5-LIVE EXEMPTION (2026-09-14, Jean: "get ready to make BTC-RANGE live"):
       // the thesis IS high SL + very wide TP (structural 0.75×ADR stop, 5-day-mid
       // target) — clamping it to the scalp caps would gut the design. _r5Live trades
@@ -21487,7 +21714,10 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.84-20261110-swing-entry', // bump on each deploy — lets /state verify what's live
+    build: '7.87-20261110-extflip-bench', // bump on each deploy — lets /state verify what's live
+    laneBenchStored: Object.fromEntries(Object.entries(laneBenchState).filter(([k]) => k.indexOf(sym + '|') === 0)), // stored lane benches for this symbol (2026-11-10): {since, why, hand, base, rearmed}
+    btcCallBench: sym === 'BTC' ? { benched: btcCallsBenched(), n: global._btcCallBench.n, pct: global._btcCallBench.pct, bar: 're-arm at 60% over 25 on BTC-CALL-BENCH; BTC_CALLS_LIVE=1 lifts it' } : undefined, // BTC calls benched (2026-11-10)
+    retraceRej: (global._retrArm && { rej: global._retrArm[sym + '|REJ'] || null, limit: global._retrArm[sym + '|LIMIT'] || null }) || null, // RETRACE-REJ / RETRACE-LIMIT auto-arm state (2026-11-10)
     macdRecov: (global._macdRecovArm && global._macdRecovArm[sym]) || null, // MACD-RECOV auto-arm state (2026-11-09)
     laneBench: global._laneBench || {}, // enforced live-lane bench state (2026-10-27); keys with |COLD| are the 0W/3L window bench (2026-11-06)
     sessRejV2: (global._srV2Arm && global._srV2Arm[sym]) || null, // V2 auto-arm state (2026-11-06)
