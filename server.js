@@ -2504,6 +2504,7 @@ function cohortFor(reason) {
   if (/LADDER-ATR/.test(reason)) return 'LADDER-ATR'; // TP1 = clamp(1.5×ATR, 5.24, 12) vs −$10, shadow (2026-11-02)
   if (/LADDER-610/.test(reason)) return 'LADDER-610'; // TP1 $6 / stop $10 on the same fires (2026-10-22, Jean: "and if TP1 at 6$?")
   if (/LADDER-510/.test(reason)) return 'LADDER-510'; // current 5/10 ladder, same fires, same sequence rule
+  { const _f1 = reason.match(/\b(XAU|BTC)-SESS-REJ-FAR[12]\b/); if (_f1) return _f1[0]; } // session-extreme rejections with the value area far away: FAR1 = first test, FAR2 = retest — both shadow (2026-11-10)
   { const _v2 = reason.match(/\b(XAU|BTC)-SESS-REJ-V2\b/); if (_v2) return _v2[0]; } // rejection v2 trigger (2026-10-15) — must precede the plain matches
   if (/XAU-SESS-REJ-MULTI/.test(reason)) return 'XAU-SESS-REJ-MULTI'; // XAU session-extreme rejection, extreme tested ≥2× (2026-10-05, the 4125 triple bottom)
   if (/XAU-SESS-REJ-CRASH/.test(reason)) return 'XAU-SESS-REJ-CRASH';
@@ -3094,11 +3095,22 @@ const LANE_BENCH_FILE = path.join(DATA_DIR, 'lane_bench.json');
 let laneBenchState = {};
 try { laneBenchState = JSON.parse(fs.readFileSync(LANE_BENCH_FILE, 'utf8')) || {}; } catch (e) { laneBenchState = {}; }
 function saveLaneBenchState() { try { fs.writeFileSync(LANE_BENCH_FILE, JSON.stringify(laneBenchState)); } catch (e) {} }
-const LANE_BENCH_SEED = (process.env.LANE_HAND_BENCH !== undefined ? process.env.LANE_HAND_BENCH : 'XAU|EXT-FLIP@2026-11-06@first 3 resolved fires of the window were 0W/3L,NAS100|EXT-FLIP@2026-11-10@benched by decision — 0W/2L on NAS and 0W/3L on XAU in the window').split(',').map(x => x.trim()).filter(Boolean);
+const LANE_BENCH_SEED = (process.env.LANE_HAND_BENCH !== undefined ? process.env.LANE_HAND_BENCH : 'XAU|EXT-FLIP@2026-11-06@first 3 resolved fires of the window were 0W/3L,NAS100|EXT-FLIP@2026-11-10@benched by decision — 0W/2L on NAS and 0W/3L on XAU in the window,XAU|TREND@2026-11-11@benched by decision (Jean 11/11: "another miss yesterday") — 0W/2L in the window: 11/03 call −$4077 and 11/10 20:15 put −$5702').split(',').map(x => x.trim()).filter(Boolean);
+// XAU TREND BENCHED (2026-11-11): the 11/10 20:15 TREND put fired @4027.60 fifteen minutes after the session roll, near
+// the low of a recovery that had already come back from 4013.85; the swing entry improved the fill to 4033.09 and the
+// stop sat at 4043.57 — taken by $0.44 (MAE $10.92) on the way to 4060. With the 11/03 09:38 call (−$4,077) that is
+// 0W/2L in the window, −$9,780. The liquidation-regime variant (row score TREND+LIQ, 1W/1L) is a different lane with its
+// own bench and is NOT covered: the bench gate names the lane with its +LIQ suffix.
 function laneBenchSeed(k2) {
   for (const e of LANE_BENCH_SEED) { const p = e.split('@'); if (p[0] === k2) return { since: Date.parse((p[1] || '2026-11-10') + 'T00:00:00-05:00') || Date.now(), why: p.slice(2).join('@') || 'benched by decision', hand: true }; }
   return null;
 }
+// seeds are stored at boot (not lazily on the lane's next candidate) so /state shows every bench from the first tick
+try {
+  let _sdN = 0;
+  for (const e of LANE_BENCH_SEED) { const k2 = e.split('@')[0]; if (!k2 || laneBenchState[k2]) continue; const sd = laneBenchSeed(k2); if (!sd) continue; const p = k2.split('|'); const t = (cohortTally[p[0]] && cohortTally[p[0]]['COLD-' + p.slice(1).join('|')]) || {}; laneBenchState[k2] = Object.assign(sd, { base: { w: t.win || 0, l: t.loss || 0 } }); _sdN++; }
+  if (_sdN) saveLaneBenchState();
+} catch (eSD) {}
 function laneColdBench(sym, lane) {
   try {
     if (process.env.LANE_COLD_BENCH === '0' || !lane) return null;
@@ -4768,12 +4780,35 @@ function processPrice(sym, price, hi, lo) {
         if (_srSwing >= 2.0 && !_crashFloorOk && Date.now() - (s._srFloorLogTs || 0) > 1800000) { s._srFloorLogTs = Date.now(); log(sym, '🎯 ' + sym + ' SESS-REJ CRASH arm NOT armed — 2h swing $' + _srSwAbs.toFixed(2) + ' is ' + _srSwing.toFixed(1) + '×ATR but below the flush floor (needs ≥$' + ((parseFloat(process.env.SESSREJ_CRASH_ADR) || 0.25) * _srAdr).toFixed(2) + ' = 0.25×ADR and ≥' + (parseFloat(process.env.SESSREJ_CRASH_PCT) || 0.4) + '% of price): a grind on a small night ATR, not a flush (2026-11-05).'); }
         if (_srAdr > 0 && (_srRng || _crashDn || _crashUp)) {
           const _vp = s._vp || null;
-          const _hiIn = _vp ? _vp.vah : s.sessionHigh - 0.05 * _srAdr; // "back inside" line for the high
-          const _loIn = _vp ? _vp.val : s.sessionLow + 0.05 * _srAdr;  // and for the low
+          // FAR FROM VALUE (2026-11-10, Jean: "XAU touched 3 times session low at 4034 and the bot didn't fire a call"): the
+          // "back inside" line was the value-area edge whenever a profile existed. On 11/10 the profile sat at $4110–$4132
+          // (Asia) while gold fell to $4033 — "inside" was $77 above the low, so the lane could not trigger at any price all
+          // day: not at the 09:40–09:50 lows (4034.01 / 4034.64 / 4033.13), not at the 10:50 retest (4034.65 → 4043). When
+          // the value-area edge is more than SESSREJ_FAR_ADR (0.15) × ADR away from the session extreme, the line is the
+          // price one (extreme ∓ 0.05×ADR) and the target 0.3×ADR. In that mode the value area no longer screens out a
+          // waterfall, so the lane needs a RETEST (the same extreme tested again ≥20 min later): replayed in price mode,
+          // 11/10 would have bought the first rejections at 04:05 @4099 and 08:50 @4059 — both stopped — and the two-strike
+          // lock would then have silenced the 10:50 retest. First tests in far mode are stamped <SYM>-SESS-REJ-FAR1 (shadow).
+          // SHADOW ONLY (same day, after the market answered): the 10:55 retest call this mode would have fired @4043.99
+          // (stop 4025.16) was stopped at 11:20 on the way to 4013.85 — −$18.83/oz, about −$9,400 at 5 lots — and Jean:
+          // "seeing the market after my message it was right not to take a call". The live lane therefore stays exactly as
+          // it was (no fire while the value area is far from the extreme); the far-mode triggers are stamped and graded as
+          // <SYM>-SESS-REJ-FAR1 (first test) and -FAR2 (retest). 11/10: FAR1 04:15 and 08:50 and FAR2 10:55 = 0W/3L.
+          // SESSREJ_FAR_LIVE=1 would let the retest fire; not before FAR2 shows ≥60% over ≥25.
+          const _farLive = process.env.SESSREJ_FAR_LIVE === '1';
+          const _farK = (parseFloat(process.env.SESSREJ_FAR_ADR) || 0.15) * _srAdr;
+          const _farHi = !!_vp && (s.sessionHigh - _vp.vah) > _farK, _farLo = !!_vp && (_vp.val - s.sessionLow) > _farK;
+          const _hiIn = (_vp && !_farHi) ? _vp.vah : s.sessionHigh - 0.05 * _srAdr; // "back inside" line for the high
+          const _loIn = (_vp && !_farLo) ? _vp.val : s.sessionLow + 0.05 * _srAdr;  // and for the low
           s._sr = s._sr || { hiTag: 0, loTag: 0, hiTs: 0, loTs: 0, m5Ts: 0, hiN: 0, loN: 0, hiLvl: 0, loLvl: 0 };
           // test counting (2026-10-05): a tag ≥20 min after the previous one at the same extreme (±0.05×ADR) is another TEST of it
-          if (price >= s.sessionHigh - 0.02 * _srAdr && (!_vp || price > _vp.vah)) { if (Date.now() - s._sr.hiTag > 1200000) { s._sr.hiN = (Math.abs(s.sessionHigh - (s._sr.hiLvl || 0)) <= 0.05 * _srAdr ? (s._sr.hiN || 0) : 0) + 1; s._sr.hiLvl = s.sessionHigh; } s._sr.hiTag = Date.now(); }
-          if (price <= s.sessionLow + 0.02 * _srAdr && (!_vp || price < _vp.val)) { if (Date.now() - s._sr.loTag > 1200000) { s._sr.loN = (Math.abs(s.sessionLow - (s._sr.loLvl || 0)) <= 0.05 * _srAdr ? (s._sr.loN || 0) : 0) + 1; s._sr.loLvl = s.sessionLow; } s._sr.loTag = Date.now(); }
+          // TEST COUNTER FIX (2026-11-10): the level was only re-anchored when the count incremented (a tag ≥20 min after the
+          // previous one). In a continuous slide every new low is a tag <20 min after the last, so the level stayed anchored
+          // far above — on 11/10 at $4049 while the low formed at $4033 — and the 10:50 retest of 4033 was counted as test #1
+          // of a "new" level. A tag whose extreme has moved > 0.05×ADR from the anchored level now starts test #1 of the new
+          // level immediately, so a retest ≥20 min later is test #2.
+          if (price >= s.sessionHigh - 0.02 * _srAdr && (!_vp || price > _vp.vah)) { const _mvH = Math.abs(s.sessionHigh - (s._sr.hiLvl || 0)) > 0.05 * _srAdr; if (Date.now() - s._sr.hiTag > 1200000) { s._sr.hiN = (_mvH ? 0 : (s._sr.hiN || 0)) + 1; s._sr.hiLvl = s.sessionHigh; } else if (_mvH) { s._sr.hiN = 1; s._sr.hiLvl = s.sessionHigh; } s._sr.hiTag = Date.now(); }
+          if (price <= s.sessionLow + 0.02 * _srAdr && (!_vp || price < _vp.val)) { const _mvL = Math.abs(s.sessionLow - (s._sr.loLvl || 0)) > 0.05 * _srAdr; if (Date.now() - s._sr.loTag > 1200000) { s._sr.loN = (_mvL ? 0 : (s._sr.loN || 0)) + 1; s._sr.loLvl = s.sessionLow; } else if (_mvL) { s._sr.loN = 1; s._sr.loLvl = s.sessionLow; } s._sr.loTag = Date.now(); }
           const _lc = (Array.isArray(s._m5) && s._m5.length) ? s._m5[s._m5.length - 1] : null;
           if (_lc && _lc.ts !== s._sr.m5Ts) {
             s._sr.m5Ts = _lc.ts;
@@ -4906,14 +4941,20 @@ function processPrice(sym, price, hi, lo) {
               } catch (eSRL) { return false; }
             };
             // PUT side: needs RANGE regime or an up-spike flush (CRASH arm)
-            if (_fresh(s._sr.hiTag) && _lc.c < _hiIn && Date.now() - s._sr.hiTs > 7200000 && (_srRng || _crashUp)) {
-              s._sr.hiTs = Date.now(); const _lane = (_srRng ? sym + '-SESS-REJ' : sym + '-SESS-REJ-CRASH') + ((s._sr.hiN || 1) >= 2 && _srRng ? '-MULTI' : ''); const _sl = +(s.sessionHigh + 0.1 * _srAdr).toFixed(2), _tp = +((_vp && _vp.poc < price) ? _vp.poc : price - 0.3 * _srAdr).toFixed(2);
-              if (_tp < price) { let _v2P = false; _push(_lane, 'put', _sl, _tp, '🎯 ' + _lane + ' PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session high $' + s.sessionHigh.toFixed(0) + ' tagged (test #' + (s._sr.hiN || 1) + '), M5 closed back inside (' + (_vp ? 'VAH $' + _vp.vah.toFixed(0) : 'extreme −0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm: ' + _srSwing.toFixed(1) + '×ATR spike in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp ? ' (POC)' : ' (0.3×ADR)') + ' (2026-09-22; two arms 2026-09-24).' + (function () { const _f = _srFeat('put'); if (_f.v2) { _v2P = true; _push(sym + '-SESS-REJ-V2', 'put', _sl, _tp, '🎯 ' + sym + '-SESS-REJ-V2 PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — rejection v2 at the session high $' + s.sessionHigh.toFixed(0) + ' (' + _f.tags.join(' ') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + ' (2026-10-15).'); } return _f.tags.length ? ' [' + _f.tags.join(' ') + ']' : ' [no-feature]'; })()); if (!_srLiveFire('put', _sl, _tp, _lane) && _v2P && sym === 'XAU') _srLiveFire('put', _sl, _tp, 'XAU-SESS-REJ-V2'); } // V2 live attempt on its own bar (2026-11-06)
+            if (_fresh(s._sr.hiTag) && _lc.c < _hiIn && Date.now() - s._sr.hiTs > 7200000 && (_srRng || _crashUp) && (!_farHi || (_farLive && (s._sr.hiN || 1) >= 2))) { // far from value: shadow only unless SESSREJ_FAR_LIVE=1 (then retest required) (2026-11-10)
+              s._sr.hiTs = Date.now(); const _lane = (_srRng ? sym + '-SESS-REJ' : sym + '-SESS-REJ-CRASH') + ((s._sr.hiN || 1) >= 2 && _srRng ? '-MULTI' : ''); const _sl = +(s.sessionHigh + 0.1 * _srAdr).toFixed(2), _tp = +((_vp && !_farHi && _vp.poc < price) ? _vp.poc : price - 0.3 * _srAdr).toFixed(2);
+              if (_tp < price) { let _v2P = false; _push(_lane, 'put', _sl, _tp, '🎯 ' + _lane + ' PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session high $' + s.sessionHigh.toFixed(0) + ' tagged (test #' + (s._sr.hiN || 1) + '), M5 closed back inside (' + (_vp && !_farHi ? 'VAH $' + _vp.vah.toFixed(0) : _farHi ? 'value area far below (VAH $' + _vp.vah.toFixed(0) + ') — price line extreme −0.05×ADR, retest' : 'extreme −0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm: ' + _srSwing.toFixed(1) + '×ATR spike in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp && !_farHi ? ' (POC)' : ' (0.3×ADR)') + ' (2026-09-22; two arms 2026-09-24).' + (function () { const _f = _srFeat('put'); if (_f.v2) { _v2P = true; _push(sym + '-SESS-REJ-V2', 'put', _sl, _tp, '🎯 ' + sym + '-SESS-REJ-V2 PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — rejection v2 at the session high $' + s.sessionHigh.toFixed(0) + ' (' + _f.tags.join(' ') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + ' (2026-10-15).'); } return _f.tags.length ? ' [' + _f.tags.join(' ') + ']' : ' [no-feature]'; })()); if (!_srLiveFire('put', _sl, _tp, _lane) && _v2P && sym === 'XAU') _srLiveFire('put', _sl, _tp, 'XAU-SESS-REJ-V2'); } // V2 live attempt on its own bar (2026-11-06)
+            } else if (_farHi && !(_farLive && (s._sr.hiN || 1) >= 2) && _fresh(s._sr.hiTag) && _lc.c < _hiIn && Date.now() - (s._sr[(s._sr.hiN || 1) >= 2 ? 'far2HiTs' : 'far1HiTs'] || 0) > 7200000 && (_srRng || _crashUp)) {
+              const _fk = (s._sr.hiN || 1) >= 2 ? '2' : '1'; s._sr['far' + _fk + 'HiTs'] = Date.now(); const _slF = +(s.sessionHigh + 0.1 * _srAdr).toFixed(2), _tpF = +(price - (parseFloat(process.env.XAU_SESSREJ_TP1_MAX) || 12) * (sym === 'XAU' ? 1 : _srAdr / 48)).toFixed(2);
+              _push(sym + '-SESS-REJ-FAR' + _fk, 'put', _slF, _tpF, '🎯 ' + sym + '-SESS-REJ-FAR' + _fk + ' PUT DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — ' + (_fk === '2' ? 'RETEST (test #' + s._sr.hiN + ')' : 'FIRST test') + ' of the session high $' + s.sessionHigh.toFixed(0) + ' with the value area far below it (VAH $' + _vp.vah.toFixed(0) + '): shadow only — the live lane does not fire far from value · SL $' + _slF.toFixed(0) + ' · TP $' + _tpF.toFixed(0) + ' (2026-11-10).');
             }
             // CALL side: needs RANGE regime or a down-flush (CRASH arm = V-REC v2)
-            if (_fresh(s._sr.loTag) && _lc.c > _loIn && Date.now() - s._sr.loTs > 7200000 && (_srRng || _crashDn)) {
-              s._sr.loTs = Date.now(); const _lane = (_srRng ? sym + '-SESS-REJ' : sym + '-SESS-REJ-CRASH') + ((s._sr.loN || 1) >= 2 && _srRng ? '-MULTI' : ''); const _sl = +(s.sessionLow - 0.1 * _srAdr).toFixed(2), _tp = +((_vp && _vp.poc > price) ? _vp.poc : price + 0.3 * _srAdr).toFixed(2);
-              if (_tp > price) { let _v2C = false; _push(_lane, 'call', _sl, _tp, '🎯 ' + _lane + ' CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session low $' + s.sessionLow.toFixed(0) + ' tagged (test #' + (s._sr.loN || 1) + '), M5 closed back inside (' + (_vp ? 'VAL $' + _vp.val.toFixed(0) : 'extreme +0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm (V-REC v2): ' + _srSwing.toFixed(1) + '×ATR flush in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp ? ' (POC)' : ' (0.3×ADR)') + ' (the 82,879 ATL case, 2026-09-24).' + (function () { const _f = _srFeat('call'); if (_f.v2) { _v2C = true; _push(sym + '-SESS-REJ-V2', 'call', _sl, _tp, '🎯 ' + sym + '-SESS-REJ-V2 CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — rejection v2 at the session low $' + s.sessionLow.toFixed(0) + ' (' + _f.tags.join(' ') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + ' (2026-10-15).'); } return _f.tags.length ? ' [' + _f.tags.join(' ') + ']' : ' [no-feature]'; })()); if (!_srLiveFire('call', _sl, _tp, _lane) && _v2C && sym === 'XAU') _srLiveFire('call', _sl, _tp, 'XAU-SESS-REJ-V2'); } // V2 live attempt on its own bar (2026-11-06)
+            if (_fresh(s._sr.loTag) && _lc.c > _loIn && Date.now() - s._sr.loTs > 7200000 && (_srRng || _crashDn) && (!_farLo || (_farLive && (s._sr.loN || 1) >= 2))) { // far from value: shadow only unless SESSREJ_FAR_LIVE=1 (then retest required) (2026-11-10)
+              s._sr.loTs = Date.now(); const _lane = (_srRng ? sym + '-SESS-REJ' : sym + '-SESS-REJ-CRASH') + ((s._sr.loN || 1) >= 2 && _srRng ? '-MULTI' : ''); const _sl = +(s.sessionLow - 0.1 * _srAdr).toFixed(2), _tp = +((_vp && !_farLo && _vp.poc > price) ? _vp.poc : price + 0.3 * _srAdr).toFixed(2);
+              if (_tp > price) { let _v2C = false; _push(_lane, 'call', _sl, _tp, '🎯 ' + _lane + ' CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session low $' + s.sessionLow.toFixed(0) + ' tagged (test #' + (s._sr.loN || 1) + '), M5 closed back inside (' + (_vp && !_farLo ? 'VAL $' + _vp.val.toFixed(0) : _farLo ? 'value area far above (VAL $' + _vp.val.toFixed(0) + ') — price line extreme +0.05×ADR, retest' : 'extreme +0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm (V-REC v2): ' + _srSwing.toFixed(1) + '×ATR flush in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp && !_farLo ? ' (POC)' : ' (0.3×ADR)') + ' (the 82,879 ATL case, 2026-09-24).' + (function () { const _f = _srFeat('call'); if (_f.v2) { _v2C = true; _push(sym + '-SESS-REJ-V2', 'call', _sl, _tp, '🎯 ' + sym + '-SESS-REJ-V2 CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — rejection v2 at the session low $' + s.sessionLow.toFixed(0) + ' (' + _f.tags.join(' ') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + ' (2026-10-15).'); } return _f.tags.length ? ' [' + _f.tags.join(' ') + ']' : ' [no-feature]'; })()); if (!_srLiveFire('call', _sl, _tp, _lane) && _v2C && sym === 'XAU') _srLiveFire('call', _sl, _tp, 'XAU-SESS-REJ-V2'); } // V2 live attempt on its own bar (2026-11-06)
+            } else if (_farLo && !(_farLive && (s._sr.loN || 1) >= 2) && _fresh(s._sr.loTag) && _lc.c > _loIn && Date.now() - (s._sr[(s._sr.loN || 1) >= 2 ? 'far2LoTs' : 'far1LoTs'] || 0) > 7200000 && (_srRng || _crashDn)) {
+              const _fk = (s._sr.loN || 1) >= 2 ? '2' : '1'; s._sr['far' + _fk + 'LoTs'] = Date.now(); const _slF = +(s.sessionLow - 0.1 * _srAdr).toFixed(2), _tpF = +(price + (parseFloat(process.env.XAU_SESSREJ_TP1_MAX) || 12) * (sym === 'XAU' ? 1 : _srAdr / 48)).toFixed(2);
+              _push(sym + '-SESS-REJ-FAR' + _fk, 'call', _slF, _tpF, '🎯 ' + sym + '-SESS-REJ-FAR' + _fk + ' CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — ' + (_fk === '2' ? 'RETEST (test #' + s._sr.loN + ')' : 'FIRST test') + ' of the session low $' + s.sessionLow.toFixed(0) + ' with the value area far above it (VAL $' + _vp.val.toFixed(0) + '): shadow only — the live lane does not fire far from value · SL $' + _slF.toFixed(0) + ' · TP $' + _tpF.toFixed(0) + ' (2026-11-10).');
             }
           }
         }
@@ -11105,7 +11146,7 @@ function processPrice(sym, price, hi, lo) {
       // the gates passed, stamped on the live ladder (XAU $5.24 / $10; other symbols the standard bracket) and graded.
       try {
         if (!sig.manual) {
-          const _cLane = String(sig.score || '').replace(/[⬆⬇]/g, '');
+          const _cLane = String(sig.score || '').replace(/[⬆⬇]/g, '') + ((sig._liq && !/\+LIQ/.test(String(sig.score || ''))) ? '+LIQ' : ''); // the row score gets its +LIQ suffix only after this gate — name the lane the way the row will (2026-11-11)
           const _cb = laneColdBench(sym, _cLane);
           if (_cb && _cb.benched) {
             const _cm = '🛏️ ' + tag + ' ' + sig.type.toUpperCase() + ' BLOCKED — LANE-COLD-BENCH ' + _cLane + ': ' + (_cb.why || 'first 3 resolved fires of the window were 0W/3L') + '; lane in shadow until 60% over 25 (shadow so far ' + (_cb.shadow ? _cb.shadow.w + 'W/' + _cb.shadow.l + 'L' : '0W/0L') + ') (2026-11-06).';
@@ -21714,7 +21755,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.87-20261110-extflip-bench', // bump on each deploy — lets /state verify what's live
+    build: '7.89-20261111-xau-trend-bench', // bump on each deploy — lets /state verify what's live
     laneBenchStored: Object.fromEntries(Object.entries(laneBenchState).filter(([k]) => k.indexOf(sym + '|') === 0)), // stored lane benches for this symbol (2026-11-10): {since, why, hand, base, rearmed}
     btcCallBench: sym === 'BTC' ? { benched: btcCallsBenched(), n: global._btcCallBench.n, pct: global._btcCallBench.pct, bar: 're-arm at 60% over 25 on BTC-CALL-BENCH; BTC_CALLS_LIVE=1 lifts it' } : undefined, // BTC calls benched (2026-11-10)
     retraceRej: (global._retrArm && { rej: global._retrArm[sym + '|REJ'] || null, limit: global._retrArm[sym + '|LIMIT'] || null }) || null, // RETRACE-REJ / RETRACE-LIMIT auto-arm state (2026-11-10)
