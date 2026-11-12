@@ -2504,7 +2504,7 @@ function cohortFor(reason) {
   if (/LADDER-ATR/.test(reason)) return 'LADDER-ATR'; // TP1 = clamp(1.5×ATR, 5.24, 12) vs −$10, shadow (2026-11-02)
   if (/LADDER-610/.test(reason)) return 'LADDER-610'; // TP1 $6 / stop $10 on the same fires (2026-10-22, Jean: "and if TP1 at 6$?")
   if (/LADDER-510/.test(reason)) return 'LADDER-510'; // current 5/10 ladder, same fires, same sequence rule
-  { const _f1 = reason.match(/\b(XAU|BTC)-SESS-REJ-FAR[12]\b/); if (_f1) return _f1[0]; } // session-extreme rejections with the value area far away: FAR1 = first test, FAR2 = retest — both shadow (2026-11-10)
+  { const _f1 = reason.match(/\b(XAU|BTC)-SESS-REJ-(?:FAR[12]|SCALE)\b/); if (_f1) return _f1[0]; } // session-extreme rejections with the value area far away: FAR1 = first test, FAR2 = retest — both shadow (2026-11-10)
   { const _v2 = reason.match(/\b(XAU|BTC)-SESS-REJ-V2\b/); if (_v2) return _v2[0]; } // rejection v2 trigger (2026-10-15) — must precede the plain matches
   if (/XAU-SESS-REJ-MULTI/.test(reason)) return 'XAU-SESS-REJ-MULTI'; // XAU session-extreme rejection, extreme tested ≥2× (2026-10-05, the 4125 triple bottom)
   if (/XAU-SESS-REJ-CRASH/.test(reason)) return 'XAU-SESS-REJ-CRASH';
@@ -3047,7 +3047,10 @@ function sessRejV2Armed(sym) {
     // ALWAYS ACTIVE on XAU since 2026-11-09 (Jean: "keep the sess rej v2 always active"): no self-disarm on the shadow
     // record. The enforced live bench (net-negative over 6 filled fires → shadow, re-earn at 60%/15) still applies — it is
     // the standing rule for every live lane and reads real fills, not the shadow. =bar → 25-row counter, =1 → 60% floor, =0 → off.
-    const always = sym === 'XAU' && f !== 'bar' && f !== '1';
+    // BACK ON THE COUNTER BY DEFAULT (2026-11-12, Jean: "ok go ahead"): always-active went 0W/2L live (11/11 06:50 −$5,947,
+    // 15:50 −$8,676) while the shadow record sat at 12W/7L — 19 resolved, short of the 25 the bar asks for. Default is the
+    // counter again (≥60% over ≥25); XAU_SESSREJ_V2_LIVE=always restores always-active, =1 the 60% floor, =0 off.
+    const always = sym === 'XAU' && f === 'always';
     const forced = f === '1';
     const now = Date.now(), c = global._srV2Arm[sym];
     if (c && now - c.ts < 600000) return c.armed;
@@ -3055,7 +3058,7 @@ function sessRejV2Armed(sym) {
     const n = (t.win || 0) + (t.loss || 0), pct = n ? t.win / n : 0;
     const armed = always ? true : forced ? (n > 0 && pct >= 0.6) : (n >= 25 && pct >= 0.6);
     const prev = c ? c.armed : null;
-    global._srV2Arm[sym] = { ts: now, armed, n, pct: Math.round(pct * 100), bar: always ? 'always active (Jean 2026-11-09); live bench only' : forced ? '60% floor (forced)' : '60% over 25', mode: always ? 'always' : forced ? 'forced' : 'counter' };
+    global._srV2Arm[sym] = { ts: now, armed, n, pct: Math.round(pct * 100), bar: always ? 'always active (XAU_SESSREJ_V2_LIVE=always); live bench only' : forced ? '60% floor (forced)' : '60% over 25', mode: always ? 'always' : forced ? 'forced' : 'counter' };
     if (prev !== armed) { const m = '🎯 ' + sym + '-SESS-REJ-V2 ' + (armed ? 'ARMED LIVE' : 'DISARMED') + ' — shadow ' + (t.win || 0) + 'W/' + (t.loss || 0) + 'L (' + Math.round(pct * 100) + '% over ' + n + '; ' + (always ? 'always active, live bench only' : forced ? 'forced live, 60% floor' : 'bar 60% over 25') + ') (auto-arm 2026-11-06' + (always ? ', always active 2026-11-09' : '') + ').'; log(sym, m); try { sendPush('🎯 ' + sym + ' SESS-REJ-V2 ' + (armed ? 'armed' : 'disarmed'), (t.win || 0) + 'W/' + (t.loss || 0) + 'L in shadow', 'alert'); } catch (e) {} }
     return armed;
   } catch (e) { return false; }
@@ -4923,6 +4926,24 @@ function processPrice(sym, price, hi, lo) {
                 // Jean's call, the same shape as the $5/$10 ladder. TP2 = the shadow target, TP3 = 0.5×ADR (runner). BTC keeps max(0.25×ADR, R).
                 const _t1d = sym === 'XAU' ? Math.min(Math.max(0.25 * _srAdr, parseFloat(process.env.XAU_SESSREJ_TP1_MIN) || 8), parseFloat(process.env.XAU_SESSREJ_TP1_MAX) || 12) : Math.max(0.25 * _srAdr, _R);
                 const _tp1 = isL ? price + _t1d : price - _t1d;
+                // SCALE GUARD (2026-11-12, Jean: "last three XAU signals were lost — see how we can not repeat them"). Every live
+                // XAU SESS-REJ fire so far, by how far the first target was in units of the tape's own ATR:
+                //   won:  11/05 08:40 2.4×ATR · 11/05 18:25 2.8× · 11/05 23:25 2.4× · 11/08 21:55 2.1×   (ATR $4.3–5.8, after a flush)
+                //   lost: 11/11 06:50 4.3×ATR (−$5,947) · 11/11 15:50 4.8× (−$8,676)                      (ATR $2.5–2.8, dead range)
+                // The $12 target and the 0.1×ADR stop are sized by a multi-day ADR that the crash week inflated to ~$100; in a
+                // $2.5-ATR drift they are a 4–5 ATR target behind a 4–6 ATR stop — a position bet, not a rejection scalp (the
+                // 06:50 target sat above the session HIGH of a $9 range). No live XAU fire when TP1 > SESSREJ_MAX_TP_ATR (3.0)
+                // × ATR; the refused fire is stamped XAU-SESS-REJ-SCALE on the live bracket (win = the guard was wrong).
+                if (sym === 'XAU') {
+                  const _scA = s._atr || 0, _scMax = parseFloat(process.env.SESSREJ_MAX_TP_ATR) || 3.0;
+                  if (_scA > 0 && _t1d > _scMax * _scA) {
+                    if (Date.now() - (s._sr.scaleTs || 0) > 300000) {
+                      s._sr.scaleTs = Date.now();
+                      _push(sym + '-SESS-REJ-SCALE', dir, +sl.toFixed(2), +_tp1.toFixed(2), '🎯 ' + sym + '-SESS-REJ-SCALE ' + dir.toUpperCase() + ' DORMANT-WOULD-FIRE @ $' + price.toFixed(2) + ' — ' + lane + ' NOT fired live: first target $' + _t1d.toFixed(2) + ' is ' + (_t1d / _scA).toFixed(1) + '×ATR ($' + _scA.toFixed(2) + ') away, stop $' + _R.toFixed(2) + ' (' + (_R / _scA).toFixed(1) + '×ATR) — out of scale for this tape (limit ' + _scMax + '×ATR; the four live wins were 2.1–2.8×, the two losses 4.3–4.8×) (2026-11-12).');
+                    }
+                    return false;
+                  }
+                }
                 const _tp3 = isL ? price + Math.max(0.5 * _srAdr, 2 * _R) : price - Math.max(0.5 * _srAdr, 2 * _R);
                 const _tp2 = isL ? Math.max(tp, _tp1 + 0.01) : Math.min(tp, _tp1 - 0.01);
                 if (isL ? (sl >= price || _tp1 <= price) : (sl <= price || _tp1 >= price)) return false;
@@ -17844,7 +17865,7 @@ function extPullbackZone(s, sym, dir, price, atrHint) {
 //   • TP1 keeps its distance from the fill; TP2 / TP3 keep their levels.
 // A newer fire, a SESS-REJ / LIQ fire or a MANUAL launch cancels a pending limit. Every momentum fire also opens a
 // SWING-OLD-MARKET shadow row (market at the fire tick, original ladder, first leg) so the old behaviour keeps a record
-// on the same fires. SWING_ENTRY=0 restores the old auction untouched; OTE_DISABLED=1 still releases everything at market.
+// on the same fires. OFF by default since 2026-11-12 (old auction restored); SWING_ENTRY=1 turns it on; OTE_DISABLED=1 still releases everything at market.
 // ===== RETRACE-REJ — SELL THE LOWER HIGH / BUY THE HIGHER LOW (2026-11-10, Jean: "XAU went down to 4122 then back up to
 // 4140 then slid — this is where I would have fired the put") ===== The 11/10 01:25 GMT case: a 4146.48 → 4121.88 leg
 // (4.1 ATR), a bounce to 4141.33 (79% of it, origin unbroken), one M5 from 4140.27 to 4131.14, then 4110. At the top the
@@ -18026,7 +18047,10 @@ function retraceRejTick(sym, s, price) {
   } catch (e) { /* lane must never crash the tick */ }
 }
 function swingEntryClass(tag, t, row) {
-  if (process.env.SWING_ENTRY === '0' || !t) return false;
+  // OFF BY DEFAULT since 2026-11-12 (Jean: "ok go ahead"): two days live = 1 fill, lost (XAU TREND put 11/10, −$5,702), and two
+  // limits never touched while the same fires won at market (NAS RIDE puts 11/10 12:21, 11/11 15:40). SWING_ENTRY=1 turns it
+  // back on. The swing limit keeps its record without it: every live fill still opens a LADDER-SWING-OTE twin in checkExit.
+  if (process.env.SWING_ENTRY !== '1' || !t) return false;
   if (t._manual || t._adopted || t._sessLive || t._r5Live || t._legLive || t._pathLive || t._liq) return false;
   if (row && (row.manual || row.liq)) return false;
   const g = String(tag || '');
@@ -18091,7 +18115,7 @@ function swingEntryVet(sym, s, price, atrIn, where) {
     const there = sw ? (C ? price <= L : price >= L) : false;
     const winMs = (parseInt(process.env.SWING_OTE_WIN_MIN, 10) || 30) * 60000;
     const stopNow = there ? swingStopFor(dir, price, slS, atr, tp1D, ladD) : null;
-    const oldRow = { ts: now, time: ts(), symbol: sym, detector: 'SWING-OLD-MARKET', type: dir, price: +price.toFixed(2), virtualTp1: +(C ? price + tp1D : price - tp1D).toFixed(2), virtualSl: +(C ? price - (ladD || tp1D) : price + (ladD || tp1D)).toFixed(2), maxMin: 240, firstLegOnly: true,
+    const oldRow = { ts: now, time: ts(), symbol: sym, detector: 'SWING-OLD-MARKET', type: dir, price: +price.toFixed(2), virtualTp1: +((t.tp1Price > 0 && (C ? t.tp1Price > price : t.tp1Price < price)) ? t.tp1Price : (C ? price + tp1D : price - tp1D)).toFixed(2), virtualSl: +((t.slPrice > 0 && (C ? t.slPrice < price : t.slPrice > price)) ? t.slPrice : (C ? price - (ladD || tp1D) : price + (ladD || tp1D))).toFixed(2), maxMin: 240, firstLegOnly: true, // ABSOLUTE levels (2026-11-11 fix): a market release keeps the stop and target the fire was built with — re-anchoring them to the vet tick moved the NAS 11/11 15:41 twin's stop $5.20 closer and graded a loss on a trade whose own levels survived by a few dollars and reached TP1
       blockReason: '📐 SWING-OLD-MARKET ' + tag + ' ' + dir.toUpperCase() + ' @ $' + price.toFixed(2) + ' — what the fire would have done at market on its own ladder (TP1 $' + tp1D.toFixed(2) + ' / stop $' + (ladD || tp1D).toFixed(2) + '), first leg only; the live entry is the swing retrace' + (sw ? ' $' + L.toFixed(2) : ' (no structure)') + ' (2026-11-10).',
       feat: blockFeat(sym, s, dir, price), snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null };
     // ---- state changes from here on: plain assignments only ----
@@ -21755,7 +21779,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.89-20261111-xau-trend-bench', // bump on each deploy — lets /state verify what's live
+    build: '7.92-20261112-v2-counter-swing-off', // bump on each deploy — lets /state verify what's live
     laneBenchStored: Object.fromEntries(Object.entries(laneBenchState).filter(([k]) => k.indexOf(sym + '|') === 0)), // stored lane benches for this symbol (2026-11-10): {since, why, hand, base, rearmed}
     btcCallBench: sym === 'BTC' ? { benched: btcCallsBenched(), n: global._btcCallBench.n, pct: global._btcCallBench.pct, bar: 're-arm at 60% over 25 on BTC-CALL-BENCH; BTC_CALLS_LIVE=1 lifts it' } : undefined, // BTC calls benched (2026-11-10)
     retraceRej: (global._retrArm && { rej: global._retrArm[sym + '|REJ'] || null, limit: global._retrArm[sym + '|LIMIT'] || null }) || null, // RETRACE-REJ / RETRACE-LIMIT auto-arm state (2026-11-10)
