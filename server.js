@@ -1507,6 +1507,44 @@ function textbookRead(eventName, actual, forecast) {
   if (/federal funds|fed funds|interest rate/.test(n)) return beat ? { gold: 'down', nas: 'down', why: 'tighter than expected' } : { gold: 'up', nas: 'up', why: 'easier than expected' };
   return null;
 }
+// ===== NEWS-FADE GOES LIVE ON XAU AND NAS (2026-11-17, Jean: "70% or less can fire without my approval from now on") =====
+// The on-time fade — spike >= 0.8 ATR on a high-impact release, 38.2–70% of it retraced, an M5 closing through the prior
+// bar, T+15 to T+180 — is 7W/0L across the lane's record (XAU 4, NAS 2, BTC 1); the same trigger above 70% retraced is
+// 2W/8L and is no longer advised (NEWS-FADE-LATE). From now the on-time fade fires by itself on XAU and NAS100 with the
+// geometry the shadow rows were graded on: stop 0.15× the spike beyond its extreme, TP1 = the release price (at least
+// 1×ATR), TP2 = 38.2% of the spike beyond the release price, TP3 = the full spike beyond it. It keeps its own geometry
+// (_sessLive: no TP1 cap, no auction) and deliberately ignores the post-news blackout — this IS the after-news lane.
+// Not fired while a trade or a hold is open (a hand trade included): the launch advice is pushed instead. BTC stays
+// advice-only (one on-time case; BTC calls are benched). Enforced bench as for every live lane: net-negative over the
+// last 6 fills → back to advice. NEWS_FADE_LIVE=0 kills; XAU_NEWS_FADE_LIVE=0 / NAS_NEWS_FADE_LIVE=0 per symbol.
+function newsFadeLiveFire(sym, s, dir, price, sl, tp1, tp2, tp3, note) {
+  try {
+    if (sym !== 'XAU' && sym !== 'NAS100') return false;
+    if (process.env.NEWS_FADE_LIVE === '0' || process.env[(sym === 'NAS100' ? 'NAS' : sym) + '_NEWS_FADE_LIVE'] === '0') return false;
+    if ((s.trade && s.trade.active) || (s._oteHold && !s._oteHold.swing) || s._invHold || s._macdHold) return false;
+    if (!bootWarm(sym, s).ok) return false;
+    if (typeof cfdMarketOpenET === 'function' && !cfdMarketOpenET(Date.now())) return false;
+    if (liveLaneBenched(sym, /NEWS-FADE/, 'NEWS-FADE')) return false;
+    const isL = dir === 'call';
+    if (![price, sl, tp1, tp2, tp3].every(v => isFinite(v) && v > 0)) return false;
+    if (isL ? (sl >= price || tp1 <= price) : (sl <= price || tp1 >= price)) return false;
+    if (s._oteHold && s._oteHold.swing) cancelSwingHold(sym, s, 'pre-empted by a NEWS-FADE ' + dir.toUpperCase() + ' fire', 'swing-superseded');
+    const now = Date.now();
+    s.dailySignalCount++;
+    const _sig = { type: dir, time: ts(), price: price.toFixed(2), score: (isL ? '⬆' : '⬇') + 'NEWS-FADE', rsi: isFinite(s._rsi) ? (+s._rsi).toFixed(1) : '', macd: (typeof s._macdL === 'number') ? s._macdL.toFixed(3) : '', roc: '', num: s.dailySignalCount, sl: sl.toFixed(2), tp1: tp1.toFixed(2), tp2: tp2.toFixed(2), tp3: tp3.toFixed(2), regime: (s._dayRegime && s._dayRegime.label) || null, oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: 'news fade' } };
+    s.signals.push(_sig); logSignal(sym, _sig);
+    s.trade = buildCfdTrade(dir, price, s._atr || 0, sym);
+    s.trade._oteVetted = true; s.trade._sessLive = true; s.trade._newsLive = true; // _sessLive: keeps its own geometry (no TP1 cap, no RR-floor re-check, no swing auction)
+    delete s.trade.oteLimit; delete s.trade.oteExpiry;
+    s.trade.slPrice = +sl.toFixed(2); s.trade.tp1Price = +tp1.toFixed(2); s.trade.tp2Price = +tp2.toFixed(2); s.trade.tp3Price = +tp3.toFixed(2);
+    try { const h = s.lastHistEntry; if (h && h.symbol === sym && h.type === dir) { h.sl = s.trade.slPrice; h.tp1 = s.trade.tp1Price; h.tp2 = s.trade.tp2Price; h.tp3 = s.trade.tp3Price; } } catch (eH) {}
+    s.lastSignalDir = dir; s.lastSignalTs = now; s.lastNTs = now; s.lastAT = dir; if (isL) s.nC++; else s.nP++;
+    try { entryAgentConsult(sym, s, { price, atr: s._atr || 0, dir, detector: 'NEWS-FADE', trade: s.trade, rule: { action: 'fill', via: 'NEWS-FADE live (market)' }, rsi: s._rsi, macdL: s._macdL, roc3: s._roc3, histTs: (s.lastHistEntry && s.lastHistEntry.symbol === sym) ? s.lastHistEntry.ts : null }); } catch (eAG) {}
+    log(sym, '📰 ' + sym + ' NEWS-FADE ' + dir.toUpperCase() + ' LIVE FIRE @ $' + price.toFixed(2) + ' — ' + note + ' · SL $' + sl.toFixed(2) + ' · TP1 $' + tp1.toFixed(2) + ' · TP2 $' + tp2.toFixed(2) + ' · TP3 $' + tp3.toFixed(2) + ' (live since 2026-11-17).');
+    try { sendPush('📰 ' + sym + ' NEWS-FADE ' + dir.toUpperCase() + ' LIVE #' + s.dailySignalCount, '$' + price.toFixed(2) + ' · SL ' + sl.toFixed(2) + ' · TP1 ' + tp1.toFixed(2) + ' — fired by the bot', 'signal'); } catch (eP) {}
+    return true;
+  } catch (e) { return false; }
+}
 function newsDeskTick() {
   try {
     const now = Date.now();
@@ -1554,7 +1592,7 @@ function newsDeskTick() {
           const rec = { sym, dir, size: +size.toFixed(2), ext: +ext.toFixed(2), p0: +p0.toFixed(2), now: +px.toFixed(2), retrace: +(100 * retr).toFixed(0), atrMult: atr > 0 ? +(size / atr).toFixed(1) : null, fadeLvl: +fadeLvl.toFixed(2) };
           d.read = d.read || {}; d.read[sym] = rec;
           const dec = sym === 'XAU' ? 2 : 0;
-          reads.push(sym + ': ' + (dir === 'up' ? '+' : '−') + '$' + size.toFixed(dec) + ' spike to ' + ext.toFixed(dec) + (rec.atrMult ? ' (' + rec.atrMult + '×ATR)' : '') + ', now ' + px.toFixed(dec) + ' (' + rec.retrace + '% retraced) → ' + (dir === 'up' ? 'FADE watch below ' + fadeLvl.toFixed(dec) + ' / CONT if > ' + ext.toFixed(dec) : 'FADE watch above ' + fadeLvl.toFixed(dec) + ' / CONT if < ' + ext.toFixed(dec)));
+          reads.push(sym + ': ' + (dir === 'up' ? '+' : '−') + '$' + size.toFixed(dec) + ' spike to ' + ext.toFixed(dec) + (rec.atrMult ? ' (' + rec.atrMult + '×ATR)' : '') + ', now ' + px.toFixed(dec) + ' (' + rec.retrace + '% retraced) → ' + (dir === 'up' ? 'FADE = PUT below ' + fadeLvl.toFixed(dec) + ' / CONT = CALL above ' + ext.toFixed(dec) : 'FADE = CALL above ' + fadeLvl.toFixed(dec) + ' / CONT = PUT below ' + ext.toFixed(dec)) /* side named (2026-11-17): "fade" of a down-spike is a CALL */);
         });
         const act = d.events.filter(e => e.actual != null).map(e => e.event.replace(/Non-Farm Employment Change/i, 'NFP') + ' ' + e.actual + (e.forecast ? ' vs ' + e.forecast : '')).join(' · ');
         // textbook line (needs an actual) + verdict vs the XAU spike
@@ -1594,11 +1632,26 @@ function newsDeskTick() {
             const sl = r.dir === 'up' ? ext + 0.15 * r.size : ext - 0.15 * r.size;
             const tpDist = Math.max(Math.abs(px - r.p0), 1.0 * atr);
             const tp1 = type === 'put' ? px - tpDist : px + tpDist;
-            const m = '📰 ' + sym + ' NEWS-FADE ' + type.toUpperCase() + ' @ $' + px.toFixed(2) + ' — ' + d.label + ' spike ' + (r.dir === 'up' ? '+' : '−') + '$' + r.size.toFixed(2) + ' to ' + ext.toFixed(2) + ' has retraced ' + Math.round(100 * retr) + '% and the last M5 closed through the prior bar; SL $' + sl.toFixed(2) + ' (beyond the extreme), TP1 $' + tp1.toFixed(2) + ' (release price / ≥1×ATR). Shadow lane, promotion ≥60% over ≥10 events (2026-10-04). NEWS-FADE';
+            // LATE-FADE CAP (2026-11-17, Jean: "news fade call for NAS got it wrong today — what made them give this advice?").
+            // The trigger had a minimum retrace (38.2%) and no maximum: on 11/17 09:00 NAS had already taken back 88% of the −$82
+            // Retail Sales spike, so the 'fade' call bought 27,312.90 — $14 under the pre-release price — with a $85 stop, 30 min
+            // before the cash open, and lost; gold's call the same morning was stamped at 55% retraced and won. The lane's whole
+            // record (17 resolved, three symbols): stamped at <=70% retraced 7W/0L, above 70% 2W/8L. Above NEWS_FADE_MAX_RETR
+            // (0.70) the fade has already happened: the row is stamped NEWS-FADE-LATE, graded apart, and no launch advice is pushed.
+            const _late = retr > (parseFloat(process.env.NEWS_FADE_MAX_RETR) || 0.70), _det = _late ? 'NEWS-FADE-LATE' : 'NEWS-FADE';
+            const m = '📰 ' + sym + ' ' + _det + ' ' + type.toUpperCase() + ' @ $' + px.toFixed(2) + ' — ' + d.label + ' spike ' + (r.dir === 'up' ? '+' : '−') + '$' + r.size.toFixed(2) + ' to ' + ext.toFixed(2) + ' has retraced ' + Math.round(100 * retr) + '% and the last M5 closed through the prior bar; SL $' + sl.toFixed(2) + ' (beyond the extreme), TP1 $' + tp1.toFixed(2) + ' (release price / ≥1×ATR). Shadow lane, promotion ≥60% over ≥10 events (2026-10-04).' + (_late ? ' LATE: more than 70% of the spike is already retraced — the fade has happened; not advised, graded apart (2026-11-17). ' : ' ') + _det;
             s.blockedOutcomes = s.blockedOutcomes || [];
-            s.blockedOutcomes.push({ ts: now, time: ts(), symbol: sym, detector: 'NEWS-FADE', type, price: px, virtualTp1: +tp1.toFixed(2), virtualSl: +sl.toFixed(2), maxMin: 180, blockReason: m, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+            s.blockedOutcomes.push({ ts: now, time: ts(), symbol: sym, detector: _det, type, price: px, virtualTp1: +tp1.toFixed(2), virtualSl: +sl.toFixed(2), maxMin: 180, blockReason: m, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
             log(sym, m);
-            try { sendPush('📰 ' + sym + ' NEWS-FADE ' + type.toUpperCase() + ' (shadow)', '$' + px.toFixed(2) + ' · SL ' + sl.toFixed(2) + ' · TP1 ' + tp1.toFixed(2) + ' — launch if you agree', 'signal'); } catch (e) {}
+            if (_late) { try { sendPush('📰 ' + sym + ' news fade — LATE, no advice', Math.round(100 * retr) + '% of the spike already retraced (limit 70%); a ' + type.toUpperCase() + ' here is chasing the bounce', 'alert'); } catch (e) {} }
+            else {
+              // on time (<= 70% retraced): fires by itself on XAU / NAS since 2026-11-17; the advice push is the fallback
+              const _nfC = type === 'call';
+              const _nfT2 = _nfC ? Math.max(tp1 + 0.01, r.p0 + 0.382 * r.size) : Math.min(tp1 - 0.01, r.p0 - 0.382 * r.size);
+              const _nfT3 = _nfC ? Math.max(_nfT2, r.p0 + r.size) : Math.min(_nfT2, r.p0 - r.size);
+              const _nfLive = newsFadeLiveFire(sym, s, type, px, sl, tp1, _nfT2, _nfT3, d.label + ' spike ' + (r.dir === 'up' ? '+' : '−') + '$' + r.size.toFixed(2) + ' to ' + ext.toFixed(2) + ', ' + Math.round(100 * retr) + '% retraced');
+              if (!_nfLive) { try { sendPush('📰 ' + sym + ' NEWS-FADE ' + type.toUpperCase() + ' (shadow)', '$' + px.toFixed(2) + ' · SL ' + sl.toFixed(2) + ' · TP1 ' + tp1.toFixed(2) + ' — launch if you agree', 'signal'); } catch (e) {} }
+            }
           }
           const brokeExt = r.dir === 'up' ? px > r.ext + 0.1 * r.size : px < r.ext - 0.1 * r.size;
           const msOk = r.dir === 'up' ? s._msTrend === 'up' : s._msTrend === 'down';
@@ -2424,6 +2477,7 @@ function cohortFor(reason) {
   { const _pb = reason.match(/\bEXT-PB-(LEFT|EXPIRED)\b/); if (_pb) return 'EXT-PB-' + _pb[1]; }
   { const _pt = reason.match(/\bPATH-(CLEAR|ZONED)-([TRM])\b/); if (_pt) return 'PATH-' + _pt[1] + '-' + _pt[2]; } // path sampler (2026-10-07)
   { const _zr = reason.match(/\bZONE-REACT(-MULTI)?\b/); if (_zr) return 'ZONE-REACT' + (_zr[1] || ''); } // zone reaction at the session extreme (2026-10-07)
+  { const _nl = reason.match(/\bNEWS-FADE-LATE\b/); if (_nl) return _nl[0]; } // fade stamped after >70% of the spike was already retraced — graded apart (2026-11-17)
   { const _nw = reason.match(/\bNEWS-(FADE|CONT)\b/); if (_nw) return 'NEWS-' + _nw[1]; } // news desk shadow lane (2026-10-04)
   { const _zt = reason.match(/\bZONE-VETO-(WT|CT)\b/); if (_zt) return 'ZONE-VETO-' + _zt[1]; } // live-direction split of the zone veto (2026-10-02)
   { const _ct = reason.match(/\bCT-VETO-S([12])([WC])\b/); if (_ct) return 'CT-VETO-S' + _ct[1] + _ct[2]; } // strength × live-direction split of the counter-trend veto (2026-10-02) // extreme-pullback hold cancellations (2026-10-01): win = waiting cost a winner, loss = the rule paid // trend-regime tracker (2026-10-01) — first: the row names its detector AND its gate, either would hijack it
@@ -21871,7 +21925,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.95-20261117-macd-turn-4h-split', // bump on each deploy — lets /state verify what's live
+    build: '7.97-20261117-news-fade-live', // bump on each deploy — lets /state verify what's live
     laneBenchStored: Object.fromEntries(Object.entries(laneBenchState).filter(([k]) => k.indexOf(sym + '|') === 0)), // stored lane benches for this symbol (2026-11-10): {since, why, hand, base, rearmed}
     btcCallBench: sym === 'BTC' ? { benched: btcCallsBenched(), n: global._btcCallBench.n, pct: global._btcCallBench.pct, bar: 're-arm at 60% over 25 on BTC-CALL-BENCH; BTC_CALLS_LIVE=1 lifts it' } : undefined, // BTC calls benched (2026-11-10)
     retraceRej: (global._retrArm && { rej: global._retrArm[sym + '|REJ'] || null, limit: global._retrArm[sym + '|LIMIT'] || null }) || null, // RETRACE-REJ / RETRACE-LIMIT auto-arm state (2026-11-10)
