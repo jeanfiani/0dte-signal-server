@@ -1638,12 +1638,26 @@ function newsDeskTick() {
             // before the cash open, and lost; gold's call the same morning was stamped at 55% retraced and won. The lane's whole
             // record (17 resolved, three symbols): stamped at <=70% retraced 7W/0L, above 70% 2W/8L. Above NEWS_FADE_MAX_RETR
             // (0.70) the fade has already happened: the row is stamped NEWS-FADE-LATE, graded apart, and no launch advice is pushed.
-            const _late = retr > (parseFloat(process.env.NEWS_FADE_MAX_RETR) || 0.70), _det = _late ? 'NEWS-FADE-LATE' : 'NEWS-FADE';
-            const m = '📰 ' + sym + ' ' + _det + ' ' + type.toUpperCase() + ' @ $' + px.toFixed(2) + ' — ' + d.label + ' spike ' + (r.dir === 'up' ? '+' : '−') + '$' + r.size.toFixed(2) + ' to ' + ext.toFixed(2) + ' has retraced ' + Math.round(100 * retr) + '% and the last M5 closed through the prior bar; SL $' + sl.toFixed(2) + ' (beyond the extreme), TP1 $' + tp1.toFixed(2) + ' (release price / ≥1×ATR). Shadow lane, promotion ≥60% over ≥10 events (2026-10-04).' + (_late ? ' LATE: more than 70% of the spike is already retraced — the fade has happened; not advised, graded apart (2026-11-17). ' : ' ') + _det;
+            // HELD BACK WHILE ANOTHER MARKET IS STILL RUNNING WITH THE NEWS (2026-11-18, Jean: "it is sure it was a bad trade — analyze
+            // why the 7 others won and this one lost"). 11/18 14:25 the first live fade bought NAS 27,112.95 after the FOMC minutes
+            // (-$144.50, 49% retraced). In all seven on-time wins no continuation signal from the same event was alive on any
+            // market when the fade triggered (on 11/06 two had fired and both were already stopped). On 11/18 gold had broken its
+            // spike low at 14:16 — NEWS-CONT put, not stopped, on its way to target: one market was saying the move was not over.
+            // A fade that triggers while a NEWS-CONT row of the same event is alive (not stopped) on ANY of the three markets is
+            // stamped NEWS-FADE-XCONT: graded apart, not fired, not advised. The hold withdraws itself when that cohort is
+            // net-positive over >= 3 resolved (all symbols). NEWS_FADE_XCONT_GUARD=0 turns it off (rows keep the label).
+            let _xc = null;
+            try { for (const o of NEWS_DESK_SYMS) { const _ca = d.armed[o] && d.armed[o].cont; if (!_ca) continue; const _cr = ((S[o] && S[o].blockedOutcomes) || []).find(b => b && b.detector === 'NEWS-CONT' && Math.abs(b.ts - _ca) < 5000); if (_cr && !_cr.slHit) { _xc = { sym: o, type: _cr.type, ts: _ca, hit: !!_cr.tp1Hit }; break; } } } catch (eXC) {}
+            let _xcOn = !!_xc && process.env.NEWS_FADE_XCONT_GUARD !== '0';
+            if (_xcOn) { try { let _w = 0, _l = 0; for (const o of NEWS_DESK_SYMS) { const t = (cohortTally[o] && cohortTally[o]['NEWS-FADE-XCONT']) || {}; _w += t.win || 0; _l += t.loss || 0; } if ((_w + _l) >= 3 && _w > _l) _xcOn = false; } catch (eXW) {} }
+            const _xcAt = _xc ? new Date(_xc.ts).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'America/New_York' }) : '';
+            const _late = retr > (parseFloat(process.env.NEWS_FADE_MAX_RETR) || 0.70), _det = _late ? 'NEWS-FADE-LATE' : _xc ? 'NEWS-FADE-XCONT' : 'NEWS-FADE';
+            const m = '📰 ' + sym + ' ' + _det + ' ' + type.toUpperCase() + ' @ $' + px.toFixed(2) + ' — ' + d.label + ' spike ' + (r.dir === 'up' ? '+' : '−') + '$' + r.size.toFixed(2) + ' to ' + ext.toFixed(2) + ' has retraced ' + Math.round(100 * retr) + '% and the last M5 closed through the prior bar; SL $' + sl.toFixed(2) + ' (beyond the extreme), TP1 $' + tp1.toFixed(2) + ' (release price / ≥1×ATR). Shadow lane, promotion ≥60% over ≥10 events (2026-10-04).' + (_late ? ' LATE: more than 70% of the spike is already retraced — the fade has happened; not advised, graded apart (2026-11-17). ' : _xc ? ' ' + (_xcOn ? 'HELD BACK' : 'XCONT (hold withdrawn — fired as usual)') + ': ' + _xc.sym + ' is still running with the news (NEWS-CONT ' + _xc.type.toUpperCase() + ' since ' + _xcAt + ', not stopped' + (_xc.hit ? ', target already hit' : '') + ') — the move is not over on every market; graded apart (2026-11-18). ' : ' ') + _det;
             s.blockedOutcomes = s.blockedOutcomes || [];
             s.blockedOutcomes.push({ ts: now, time: ts(), symbol: sym, detector: _det, type, price: px, virtualTp1: +tp1.toFixed(2), virtualSl: +sl.toFixed(2), maxMin: 180, blockReason: m, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
             log(sym, m);
             if (_late) { try { sendPush('📰 ' + sym + ' news fade — LATE, no advice', Math.round(100 * retr) + '% of the spike already retraced (limit 70%); a ' + type.toUpperCase() + ' here is chasing the bounce', 'alert'); } catch (e) {} }
+            else if (_xc && _xcOn) { try { sendPush('📰 ' + sym + ' news fade — held back, no advice', _xc.sym + ' is still running with the news (' + _xc.type.toUpperCase() + ' since ' + _xcAt + '); a ' + type.toUpperCase() + ' here fades a move that is not over', 'alert'); } catch (e) {} }
             else {
               // on time (<= 70% retraced): fires by itself on XAU / NAS since 2026-11-17; the advice push is the fallback
               const _nfC = type === 'call';
@@ -2447,7 +2461,7 @@ function nasRthBlocked(sym) {
 }
 function cohortFor(reason) {
   if (/BTC-CALL-BENCH/.test(reason)) return 'BTC-CALL-BENCH'; // BTC calls benched 2026-11-10: would-fire rows on the lane's own bracket — first, the text names the lane
-  { const _px = reason.match(/\b(?:XAU|NAS100)-(?:RETRACE-PSX-SKIP|PSX-FRONT|PSX-AT)\b/); if (_px) return _px[0]; } // prior-session magnet beyond a retrace stop: the skipped entry and the two fade-the-level twins (2026-11-17)
+  { const _px = reason.match(/\b(?:XAU|NAS100)-(?:RETRACE-PSX-SKIP|RETRACE-FAST-SKIP|PSX-FRONT|PSX-AT)\b/); if (_px) return _px[0]; } // prior-session magnet beyond a retrace stop: the skipped entry and the two fade-the-level twins (2026-11-17)
   { const _me = reason.match(/\bMACD-TURN-EP1(?:-(?:WITH4H|AGAINST4H))?\b/); if (_me) return _me[0]; } // one row per MACD-turn episode, and its with/against-the-4-hour-move split (2026-11-17)
   { const _rr = reason.match(/\b(?:XAU|NAS100)-RETRACE-(?:REJ|TIGHT|LIMIT)\b/); if (_rr) return _rr[0]; } // lower-high / higher-low rejection lane and its blind-limit twin (2026-11-10) — first, the text names legs and gates
   { const _mt = reason.match(/\bMACD-TURN-(?:FIRED|REF-[A-Z0-9-]+)/); if (_mt) return _mt[0]; } // shadow rows opened at the MACD turn (2026-11-09): FIRED = gates passed, REF-<GATE> = that gate refused after the turn — first, the text names other gates
@@ -2477,7 +2491,7 @@ function cohortFor(reason) {
   { const _pb = reason.match(/\bEXT-PB-(LEFT|EXPIRED)\b/); if (_pb) return 'EXT-PB-' + _pb[1]; }
   { const _pt = reason.match(/\bPATH-(CLEAR|ZONED)-([TRM])\b/); if (_pt) return 'PATH-' + _pt[1] + '-' + _pt[2]; } // path sampler (2026-10-07)
   { const _zr = reason.match(/\bZONE-REACT(-MULTI)?\b/); if (_zr) return 'ZONE-REACT' + (_zr[1] || ''); } // zone reaction at the session extreme (2026-10-07)
-  { const _nl = reason.match(/\bNEWS-FADE-LATE\b/); if (_nl) return _nl[0]; } // fade stamped after >70% of the spike was already retraced — graded apart (2026-11-17)
+  { const _nl = reason.match(/\bNEWS-FADE-(?:LATE|XCONT)\b/); if (_nl) return _nl[0]; } // fade stamped after >70% of the spike was already retraced — graded apart (2026-11-17)
   { const _nw = reason.match(/\bNEWS-(FADE|CONT)\b/); if (_nw) return 'NEWS-' + _nw[1]; } // news desk shadow lane (2026-10-04)
   { const _zt = reason.match(/\bZONE-VETO-(WT|CT)\b/); if (_zt) return 'ZONE-VETO-' + _zt[1]; } // live-direction split of the zone veto (2026-10-02)
   { const _ct = reason.match(/\bCT-VETO-S([12])([WC])\b/); if (_ct) return 'CT-VETO-S' + _ct[1] + _ct[2]; } // strength × live-direction split of the counter-trend veto (2026-10-02) // extreme-pullback hold cancellations (2026-10-01): win = waiting cost a winner, loss = the rule paid // trend-regime tracker (2026-10-01) — first: the row names its detector AND its gate, either would hijack it
@@ -2497,6 +2511,12 @@ function cohortFor(reason) {
   if (/TREND-CONT-WF-M/.test(reason)) return 'TREND-CONT-WF-M'; // classifier said MIXED
   if (/TREND-CONT-WF/.test(reason)) return 'TREND-CONT-WF'; // ALL-gates with-trend continuation blocks (2026-09-16) — the complete measurement of the missed-leg class; before detector-tag matches (pre-split tally frozen 2026-09-20 at 25W/53L)
   if (/EXTFLIP-C3/.test(reason)) return 'EXTFLIP-C3'; // benched XAU conv-3 EXT-FLIP tier (2026-09-15) — before EXT-FLIP/[NIGHT] matches
+  // SESS-REJ CRASH rows by side (2026-11-18): the CALL text says "CRASH arm (V-REC v2)", so the /V-REC/ match below was
+  // taking every CRASH call into the V-REC cohort — the <SYM>-SESS-REJ-CRASH record (13W/5L on 11/17) was the PUT side
+  // only, while the calls were 4W/7L in the ring. Calls now have their own cohort; puts keep the existing one.
+  { const _cc = reason.match(/\b(?:XAU|BTC)-CRASH-CALL-(?:FIRST-LDNNY|FIRST-ASIA|REPEAT|HL)\b/); if (_cc) return _cc[0]; } // rebound-call splits and the higher-low twin (2026-11-18)
+  { const _sx = reason.match(/\b(XAU|BTC)-SESS-REJ-(?:FAR[12]|SCALE)\b/); if (_sx) return _sx[0]; }
+  { const _cr = reason.match(/\b(XAU|BTC)-SESS-REJ-CRASH (CALL|PUT)\b/); if (_cr) return _cr[1] + '-SESS-REJ-CRASH' + (_cr[2] === 'CALL' ? '-CALL' : ''); }
   if (/V-REC BENCHED/.test(reason)) return 'BTC-VREC-BENCH'; // benched V-REC would-fires (2026-09-09) — must precede any V-REC/detector matches
   if (/SLPAD-SIM/.test(reason)) return 'SLPAD-SIM'; // wick-pad shadow on real stops: SAVE rows' bracket outcome = pad-world verdict; DEEP rows = pad pure cost (2026-09-03)
   if (/CREST-INV/.test(reason)) return 'CREST-INV'; // inverted twin of continuation fires at their own session extreme (2026-09-07, Jean's 19:45 specimen) — split by regime before promoting
@@ -3156,7 +3176,7 @@ const LANE_BENCH_FILE = path.join(DATA_DIR, 'lane_bench.json');
 let laneBenchState = {};
 try { laneBenchState = JSON.parse(fs.readFileSync(LANE_BENCH_FILE, 'utf8')) || {}; } catch (e) { laneBenchState = {}; }
 function saveLaneBenchState() { try { fs.writeFileSync(LANE_BENCH_FILE, JSON.stringify(laneBenchState)); } catch (e) {} }
-const LANE_BENCH_SEED = (process.env.LANE_HAND_BENCH !== undefined ? process.env.LANE_HAND_BENCH : 'XAU|EXT-FLIP@2026-11-06@first 3 resolved fires of the window were 0W/3L,NAS100|EXT-FLIP@2026-11-10@benched by decision — 0W/2L on NAS and 0W/3L on XAU in the window,XAU|TREND@2026-11-11@benched by decision (Jean 11/11: "another miss yesterday") — 0W/2L in the window: 11/03 call −$4077 and 11/10 20:15 put −$5702').split(',').map(x => x.trim()).filter(Boolean);
+const LANE_BENCH_SEED = (process.env.LANE_HAND_BENCH !== undefined ? process.env.LANE_HAND_BENCH : 'XAU|EXT-FLIP@2026-11-06@first 3 resolved fires of the window were 0W/3L,NAS100|EXT-FLIP@2026-11-10@benched by decision — 0W/2L on NAS and 0W/3L on XAU in the window,XAU|TREND@2026-11-11@benched by decision (Jean 11/11: "another miss yesterday") — 0W/2L in the window: 11/03 call −$4077 and 11/10 20:15 put −$5702,XAU|SESSREJ-CRASH-CALL@2026-11-18@benched by decision (Jean 11/18) — three calls into the 11/17–18 waterfall (3818 / 3794 / 3772) on first tests of fresh lows against the trend; the call side is 4W/7L in shadow').split(',').map(x => x.trim()).filter(Boolean);
 // XAU TREND BENCHED (2026-11-11): the 11/10 20:15 TREND put fired @4027.60 fifteen minutes after the session roll, near
 // the low of a recovery that had already come back from 4013.85; the swing entry improved the fill to 4033.09 and the
 // stop sat at 4043.57 — taken by $0.44 (MAE $10.92) on the way to 4060. With the 11/03 09:38 call (−$4,077) that is
@@ -3305,6 +3325,7 @@ function updateBlockedOutcomes(sym, price) {
       b.closed = true;
       b.closedTs = now;
       bumpCohortTally(b.symbol || sym, b.blockReason, b.outcome); // persistent cohort score (2026-07-31)
+      if (b.ccSplit) bumpCohortTally(b.symbol || sym, (b.symbol || sym) + '-CRASH-CALL-' + b.ccSplit, b.outcome); // rebound-call split (2026-11-18)
       if (b.turnEp) { bumpCohortTally(b.symbol || sym, 'MACD-TURN-EP1', b.outcome); if (b.turn4h) bumpCohortTally(b.symbol || sym, 'MACD-TURN-EP1-' + b.turn4h, b.outcome); } // episode-level MACD-turn tally + 4-hour split (2026-11-17)
       // TREND-REGIME TRACKER ring (2026-10-01): resolved TREND-WT / TREND-CT rows keep their
       // detector, gate and outcome for 7 days so the win rate can be read by day/detector/gate.
@@ -4824,6 +4845,8 @@ function processPrice(sym, price, hi, lo) {
       const _srSym = sym === 'BTC' || sym === 'XAU';
       const _srOpen = sym === 'BTC' ? !btcWeekendClosed() : cfdMarketOpenET(Date.now());
       if (isMT5 && _srSym && _srOpen && isFinite(s.sessionHigh) && isFinite(s.sessionLow) && Array.isArray(s._m5) && s._m5.length >= 12) {
+        // one-time per boot: seed <SYM>-SESS-REJ-CRASH-CALL from the ring's graded call rows (they had been tallied as V-REC) (2026-11-18)
+        try { global._srCcBf = global._srCcBf || {}; if (!global._srCcBf[sym]) { global._srCcBf[sym] = true; const _ck = sym + '-SESS-REJ-CRASH-CALL'; cohortTally[sym] = cohortTally[sym] || {}; if (!cohortTally[sym][_ck]) { let _w = 0, _l = 0; for (const b of (s.blockedOutcomes || [])) { if (b.detector !== sym + '-SESS-REJ-CRASH' || b.type !== 'call' || !b.closed) continue; if (b.outcome === 'win') _w++; else if (b.outcome === 'loss') _l++; } cohortTally[sym][_ck] = { win: _w, loss: _l, scratch: 0, no_resolve: 0, lastTs: Date.now() }; _ctDirty = true; log(sym, '🎯 ' + _ck + ' cohort seeded from the ring: ' + _w + 'W/' + _l + 'L (call rows had been tallied as V-REC; 2026-11-18).'); } } } catch (eBF) {}
         const _srDl = Array.isArray(s.dailyLevels) ? s.dailyLevels : [];
         const _srAdr = _srDl.length >= 3 ? _srDl.reduce((a, d0) => a + (d0.high - d0.low), 0) / _srDl.length : 0;
         const _srRng = !!(s._dayRegime && s._dayRegime.label === 'RANGE');
@@ -4841,6 +4864,52 @@ function processPrice(sym, price, hi, lo) {
         const _crashDn = _srSwing >= 2.0 && _crashFloorOk && _swLi > _swHi; // flushed down → bounce CALL context
         const _crashUp = _srSwing >= 2.0 && _crashFloorOk && _swHi > _swLi; // spiked up → fade PUT context
         if (_srSwing >= 2.0 && !_crashFloorOk && Date.now() - (s._srFloorLogTs || 0) > 1800000) { s._srFloorLogTs = Date.now(); log(sym, '🎯 ' + sym + ' SESS-REJ CRASH arm NOT armed — 2h swing $' + _srSwAbs.toFixed(2) + ' is ' + _srSwing.toFixed(1) + '×ATR but below the flush floor (needs ≥$' + ((parseFloat(process.env.SESSREJ_CRASH_ADR) || 0.25) * _srAdr).toFixed(2) + ' = 0.25×ADR and ≥' + (parseFloat(process.env.SESSREJ_CRASH_PCT) || 0.4) + '% of price): a grind on a small night ATR, not a flush (2026-11-05).'); }
+        // ===== REBOUND AFTER A HIGHER LOW — shadow twin <SYM>-CRASH-CALL-HL (2026-11-18, Jean: "we need to be sure about it,
+        // otherwise it's going to be costly"; re-anchored the same day: "yes let's re-anchor on new lows") ===== The CRASH call
+        // buys the FIRST bounce off a flush low. The twin waits for the proof instead — low, bounce, a pullback that HOLDS, a
+        // reclaim:
+        //   L  = the low (starts as the session low at the CRASH call trigger). If price breaks it (by > 0.02×ADR) the twin
+        //        does not give up: L moves to the new low and the structure starts again — it follows the slide down.
+        //   B  = the bounce high off L (must be >= 1×ATR above L).
+        //   pb = the pullback low after B: it must give back at least half of the bounce while L holds (a higher low, or an
+        //        equal low inside the tolerance).
+        //   entry = the first up M5 that CLOSES above B after that. Stop 0.25×ATR under the pullback low; the lane's usual
+        //        first target; one entry per CRASH trigger. No structure within 3 h of the last new low → no trade.
+        // 11/18: the live call bought 3771.74 at 02:55 with a 3756.93 stop and survived by $1.02. The twin lets the 3764.83 low
+        // break, re-anchors at 3758.46, and buys the 03:20 M5 close back above the 3763.80 bounce high — about 3766 with the
+        // stop under 3757.95. Shadow, first leg only; live at 60% over 25.
+        try {
+          const _hl = s._sr && s._sr.hl;
+          if (_hl && _srAdr > 0 && _srAtr > 0 && price > 0) {
+            const _hNow = Date.now(), _hEps = 0.02 * _srAdr;
+            if (price < _hl.L - _hEps) {                                                   // the low broke → follow it
+              _hl.L = price; _hl.Lts = _hNow; _hl.B = price; _hl.pb = price; _hl.ret = false; _hl.n = (_hl.n || 0) + 1;
+              if (_hNow - (_hl.logTs || 0) > 600000) { _hl.logTs = _hNow; log(sym, '🎯 ' + sym + '-CRASH-CALL-HL — low broke, re-anchored on the new low $' + price.toFixed(2) + ' (re-anchor #' + _hl.n + '); still waiting for a bounce, a pullback that holds and a reclaim (shadow twin, 2026-11-18).'); }
+            } else if (_hNow - _hl.Lts > 3 * 3600000 || _hNow - _hl.ts0 > 8 * 3600000) {
+              log(sym, '🎯 ' + sym + '-CRASH-CALL-HL — no trade: no bounce / higher low / reclaim formed within 3 h of the last low $' + _hl.L.toFixed(2) + ' (shadow twin, 2026-11-18).'); bumpCohortTally(sym, sym + '-CRASH-CALL-HL', 'no_resolve'); s._sr.hl = null;
+            } else {
+              if (!_hl.ret) {
+                if (price > _hl.B) { _hl.B = price; _hl.pb = price; } else if (price < _hl.pb) _hl.pb = price;
+                if (_hl.B - _hl.L >= (parseFloat(process.env.HL_MIN_BOUNCE_ATR) || 1.0) * _srAtr && _hl.pb <= _hl.L + 0.5 * (_hl.B - _hl.L)) _hl.ret = true; // gave back half of a real bounce and the low is holding
+              } else if (price < _hl.pb) _hl.pb = price;
+              const _hB = s._m5[s._m5.length - 1];
+              if (_hB && _hB.ts !== _hl.m5) {
+                _hl.m5 = _hB.ts;
+                if (_hl.ret && _hB.c > _hl.B && _hB.c > _hB.o && price > _hl.pb) {
+                  const _hSl = +(_hl.pb - 0.25 * _srAtr).toFixed(2), _hR = price - _hSl;
+                  const _hT = sym === 'XAU' ? Math.min(Math.max(0.25 * _srAdr, parseFloat(process.env.XAU_SESSREJ_TP1_MIN) || 8), parseFloat(process.env.XAU_SESSREJ_TP1_MAX) || 12) : Math.max(0.25 * _srAdr, _hR);
+                  if (_hR > 0 && _hR <= 0.35 * _srAdr) {
+                    const _hM = '🎯 ' + sym + '-CRASH-CALL-HL CALL WOULD-FIRE @ $' + price.toFixed(2) + ' — rebound after a low that held: low $' + _hl.L.toFixed(2) + (_hl.n ? ' (re-anchored ' + _hl.n + '× on new lows)' : '') + ', bounce to $' + _hl.B.toFixed(2) + ', pullback held at $' + _hl.pb.toFixed(2) + ', M5 closed $' + _hB.c.toFixed(2) + ' back above the bounce high, ' + Math.round((_hNow - _hl.ts0) / 60000) + ' min after the first bounce · SL $' + _hSl.toFixed(2) + ' (under the pullback low) · TP1 $' + (price + _hT).toFixed(2) + ' · shadow, first leg only, 60% over 25 (2026-11-18).';
+                    s.blockedOutcomes = s.blockedOutcomes || [];
+                    s.blockedOutcomes.push({ ts: _hNow, time: ts(), symbol: sym, detector: sym + '-CRASH-CALL-HL', type: 'call', price: +price.toFixed(2), virtualTp1: +(price + _hT).toFixed(2), virtualSl: _hSl, maxMin: 240, firstLegOnly: true, hlAnchors: _hl.n || 0, blockReason: _hM, feat: blockFeat(sym, s, 'call', price), snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+                    log(sym, _hM);
+                    s._sr.hl = null;
+                  } else { _hl.ret = false; _hl.B = price; _hl.pb = price; }             // stop too wide for the lane → wait for a tighter structure
+                }
+              }
+            }
+          }
+        } catch (eHL) { /* twin must never touch the lane */ }
         if (_srAdr > 0 && (_srRng || _crashDn || _crashUp)) {
           const _vp = s._vp || null;
           // FAR FROM VALUE (2026-11-10, Jean: "XAU touched 3 times session low at 4034 and the bot didn't fire a call"): the
@@ -4978,9 +5047,13 @@ function processPrice(sym, price, hi, lo) {
                 // SESSION-ROLL HOUR (2026-11-05): 19:00-19:59 ET the "session" being rejected is 23h old and the Asia open has just
                 // started a new flow; the 11/04 put sold the day high 55 min before the reset while Asia was buying it.
                 { let _srHr = 12; try { _srHr = parseInt(new Date().toLocaleTimeString('en-US', { hour: '2-digit', hour12: false, timeZone: 'America/New_York' }), 10); } catch (eH2) {} if (_srHr === 19 && process.env.SESSREJ_ROLL_HOUR !== '0') { log(sym, '🎯 ' + sym + ' SESS-REJ ' + dir.toUpperCase() + ' NOT fired live — 19:00-20:00 ET is the session-roll hour (the extreme being rejected belongs to a day that resets in <60 min; Asia open flow). Shadow row measured (2026-11-05).'); return false; } }
-                s._srStrikes = { day: todayDateET(), call: 0, put: 0, callLogged: (s._srStrikes || {}).callLogged, putLogged: (s._srStrikes || {}).putLogged };
-                try { for (let i = signalHistory.length - 1; i >= 0; i--) { const h = signalHistory[i]; if (Date.now() - h.ts > 20 * 3600000) break; if (h.symbol !== sym || !/SESSREJ-(RT|V2)/.test(h.score || '') || h.date !== todayDateET() || !h.outcomes) continue; if (h.outcomes.slHit && !h.outcomes.tp1Hit) s._srStrikes[h.type]++; } } catch (eSK) {} // V2 stops count toward the side lock too (2026-11-06)
-                if (s._srStrikes[dir] >= 2) { if (!s._srStrikes[dir + 'Logged']) { s._srStrikes[dir + 'Logged'] = true; log(sym, '🎯 BTC SESS-REJ ' + dir.toUpperCase() + ' side LOCKED for the session — two stops on this side already today (2026-10-15 two-strikes rule).'); } return false; }
+                // TWO-STRIKE LOCK BY SESSION (2026-11-18): strikes were counted on rows dated todayDateET(), a CALENDAR date, so the
+                // count reset at midnight ET in the middle of the 20:00→20:00 session — on 11/17–18 the calls stopped at 21:02 and
+                // 01:18 did not lock the 02:55 call. Strikes are now every SESS-REJ stop since the last 20:00 ET roll.
+                let _srSess = 0; try { const _e = new Date(new Date(Date.now()).toLocaleString('en-US', { timeZone: 'America/New_York' })); _srSess = Date.now() - ((((_e.getHours() - 20 + 24) % 24) * 3600 + _e.getMinutes() * 60 + _e.getSeconds()) * 1000); } catch (eSS) { _srSess = Date.now() - 24 * 3600000; }
+                { const _pv = s._srStrikes || {}, _same = _pv.sess && Math.abs(_pv.sess - _srSess) < 120000; s._srStrikes = { day: todayDateET(), sess: _same ? _pv.sess : _srSess, call: 0, put: 0, callLogged: _same ? _pv.callLogged : false, putLogged: _same ? _pv.putLogged : false }; }
+                try { for (let i = signalHistory.length - 1; i >= 0; i--) { const h = signalHistory[i]; if (h.ts < _srSess) break; if (h.symbol !== sym || !/SESSREJ-(RT|V2)/.test(h.score || '') || !h.outcomes) continue; if (h.outcomes.slHit && !h.outcomes.tp1Hit) s._srStrikes[h.type]++; } } catch (eSK) {} // V2 stops count toward the side lock too (2026-11-06)
+                if (s._srStrikes[dir] >= 2) { if (!s._srStrikes[dir + 'Logged']) { s._srStrikes[dir + 'Logged'] = true; log(sym, '🎯 ' + sym + ' SESS-REJ ' + dir.toUpperCase() + ' side LOCKED for the session — two stops on this side since the 20:00 ET roll (2026-10-15 two-strikes rule; by session since 2026-11-18).'); } return false; }
                 // bench check (cached 10 min)
                 const _nowB = Date.now();
                 if (!global._srBenchTs || _nowB - global._srBenchTs > 600000) {
@@ -5028,6 +5101,18 @@ function processPrice(sym, price, hi, lo) {
                 const _tp2 = isL ? Math.max(tp, _tp1 + 0.01) : Math.min(tp, _tp1 - 0.01);
                 if (isL ? (sl >= price || _tp1 <= price) : (sl <= price || _tp1 >= price)) return false;
                 if (sym === 'BTC' && isL && btcCallBenchRefuse(s, 'SESS-REJ', price, sl, _tp1)) return false; // BTC calls benched (2026-11-10)
+                // XAU CRASH-ARM CALLS BENCHED (2026-11-18, Jean: "last 3 signals are clear loss and need to be benched"). 11/17 20:40
+                // @3817.98, 22:45 @3794.07 and 11/18 02:55 @3771.74: three first tests of fresh session lows in a $97 waterfall,
+                // msTrend down, both agents SKIP on all three. The arm went live on a record that turns out to be its PUT side
+                // (see cohortFor); the calls are 4W/7L in the ring. Calls go to shadow on the live bracket (cohort
+                // COLD-SESSREJ-CRASH-CALL) until 60% over 25 there; the put side (5W/2L) stays live. LANE_HAND_BENCH overrides.
+                if (sym === 'XAU' && _isCrash && isL) { const _ccb = laneColdBench('XAU', 'SESSREJ-CRASH-CALL'); if (_ccb && _ccb.benched) { _push('COLD-SESSREJ-CRASH-CALL', dir, +sl.toFixed(2), +_tp1.toFixed(2), '🛏️ XAU SESS-REJ-CRASH CALL NOT fired live — LANE-COLD-BENCH SESSREJ-CRASH-CALL: ' + (_ccb.why || 'benched by decision') + '; shadow until 60% over 25 (so far ' + (_ccb.shadow ? _ccb.shadow.w + 'W/' + _ccb.shadow.l + 'L' : '0W/0L') + ') · WOULD-FIRE @ $' + price.toFixed(2) + ', SL $' + sl.toFixed(2) + ', TP1 $' + _tp1.toFixed(2) + ' (2026-11-18).');
+                  // REBOUND-CALL SPLITS (2026-11-18, Jean: "catching the rebound is a good idea but we need to be sure about it"). The 11
+                  // graded calls: a further try after one had already failed in the same session 0W/4L; first try of a session
+                  // 3W/3L — London/NY hours 3W/1L, Asia 0W/2L. Each benched would-fire is also tallied as <SYM>-CRASH-CALL-REPEAT,
+                  // -FIRST-LDNNY or -FIRST-ASIA (same live bracket), so the lane can come back on the version that reaches 60%/25.
+                  try { const _cRow = s.blockedOutcomes[s.blockedOutcomes.length - 1], _cNow = Date.now(); if (_cRow && _cRow.detector === 'COLD-SESSREJ-CRASH-CALL') { const _prior = s.blockedOutcomes.some(b => b && b.detector === sym + '-SESS-REJ-CRASH' && b.type === 'call' && b.ts >= _srSess && b.ts < _cNow - 60000 && !b.tp1Hit); let _cHr = 12; try { _cHr = parseInt(new Date(_cNow).toLocaleTimeString('en-US', { hour: '2-digit', hour12: false, timeZone: 'America/New_York' }), 10); } catch (eH3) {} _cRow.ccSplit = _prior ? 'REPEAT' : (_cHr >= 3 && _cHr < 16 ? 'FIRST-LDNNY' : 'FIRST-ASIA'); } } catch (eCS) {}
+                  return false; } }
                 if (s._oteHold && s._oteHold.swing) cancelSwingHold(sym, s, 'pre-empted by a SESS-REJ ' + dir.toUpperCase() + ' fire', 'swing-superseded'); // the rejection lane outranks a pending momentum limit (2026-11-10)
                 s.dailySignalCount++;
                 const _sig = { type: dir, time: ts(), price: price.toFixed(2), score: (isL ? '⬆' : '⬇') + (_isV2 ? 'SESSREJ-V2' : 'SESSREJ-RT'), rsi: '', macd: '', roc: '', num: s.dailySignalCount, sl: sl.toFixed(2), tp1: _tp1.toFixed(2), tp2: _tp2.toFixed(2), tp3: _tp3.toFixed(2), regime: (s._dayRegime && s._dayRegime.label) || null, oteHold: { fill: +price.toFixed(2), sigPrice: +price.toFixed(2), improve: 0, waitedSec: 0, via: _isV2 ? 'sess-rej v2 rejection close' : 'sess-rej rejection close' }, _srWaived: _srWaive.length ? _srWaive.slice() : undefined }; // V2 fires carry their own score so the scorecard, bench and strikes split them (2026-11-06)
@@ -5051,7 +5136,7 @@ function processPrice(sym, price, hi, lo) {
             }
             // CALL side: needs RANGE regime or a down-flush (CRASH arm = V-REC v2)
             if (_fresh(s._sr.loTag) && _lc.c > _loIn && Date.now() - s._sr.loTs > 7200000 && (_srRng || _crashDn) && (!_farLo || (_farLive && (s._sr.loN || 1) >= 2))) { // far from value: shadow only unless SESSREJ_FAR_LIVE=1 (then retest required) (2026-11-10)
-              s._sr.loTs = Date.now(); const _lane = (_srRng ? sym + '-SESS-REJ' : sym + '-SESS-REJ-CRASH') + ((s._sr.loN || 1) >= 2 && _srRng ? '-MULTI' : ''); const _sl = +(s.sessionLow - 0.1 * _srAdr).toFixed(2), _tp = +((_vp && !_farLo && _vp.poc > price) ? _vp.poc : price + 0.3 * _srAdr).toFixed(2);
+              s._sr.loTs = Date.now(); if (!_srRng && !s._sr.hl) s._sr.hl = { L: s.sessionLow, Lts: Date.now(), B: price, pb: price, ret: false, ts0: Date.now(), m5: _lc.ts, n: 0 }; /* higher-low twin armed (2026-11-18) */ const _lane = (_srRng ? sym + '-SESS-REJ' : sym + '-SESS-REJ-CRASH') + ((s._sr.loN || 1) >= 2 && _srRng ? '-MULTI' : ''); const _sl = +(s.sessionLow - 0.1 * _srAdr).toFixed(2), _tp = +((_vp && !_farLo && _vp.poc > price) ? _vp.poc : price + 0.3 * _srAdr).toFixed(2);
               if (_tp > price) { let _v2C = false; _push(_lane, 'call', _sl, _tp, '🎯 ' + _lane + ' CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — session low $' + s.sessionLow.toFixed(0) + ' tagged (test #' + (s._sr.loN || 1) + '), M5 closed back inside (' + (_vp && !_farLo ? 'VAL $' + _vp.val.toFixed(0) : _farLo ? 'value area far above (VAL $' + _vp.val.toFixed(0) + ') — price line extreme +0.05×ADR, retest' : 'extreme +0.05×ADR, no profile') + '; ' + (_srRng ? 'regime RANGE' : 'CRASH arm (V-REC v2): ' + _srSwing.toFixed(1) + '×ATR flush in 2h') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + (_vp && !_farLo ? ' (POC)' : ' (0.3×ADR)') + ' (the 82,879 ATL case, 2026-09-24).' + (function () { const _f = _srFeat('call'); if (_f.v2) { _v2C = true; _push(sym + '-SESS-REJ-V2', 'call', _sl, _tp, '🎯 ' + sym + '-SESS-REJ-V2 CALL DORMANT-WOULD-FIRE @ $' + price.toFixed(0) + ' — rejection v2 at the session low $' + s.sessionLow.toFixed(0) + ' (' + _f.tags.join(' ') + ') · SL $' + _sl.toFixed(0) + ' · TP $' + _tp.toFixed(0) + ' (2026-10-15).'); } return _f.tags.length ? ' [' + _f.tags.join(' ') + ']' : ' [no-feature]'; })()); if (!_srLiveFire('call', _sl, _tp, _lane) && _v2C && sym === 'XAU') _srLiveFire('call', _sl, _tp, 'XAU-SESS-REJ-V2'); } // V2 live attempt on its own bar (2026-11-06)
             } else if (_farLo && !(_farLive && (s._sr.loN || 1) >= 2) && _fresh(s._sr.loTag) && _lc.c > _loIn && Date.now() - (s._sr[(s._sr.loN || 1) >= 2 ? 'far2LoTs' : 'far1LoTs'] || 0) > 7200000 && (_srRng || _crashDn)) {
               const _fk = (s._sr.loN || 1) >= 2 ? '2' : '1'; s._sr['far' + _fk + 'LoTs'] = Date.now(); const _slF = +(s.sessionLow - 0.1 * _srAdr).toFixed(2), _tpF = +(price + (parseFloat(process.env.XAU_SESSREJ_TP1_MAX) || 12) * (sym === 'XAU' ? 1 : _srAdr / 48)).toFixed(2);
@@ -18092,6 +18177,27 @@ function retracePsxStamp(sym, s, R, dir, kind, price, sl, tp1, atr, tpMin, px) {
     return on;
   } catch (e) { return false; }
 }
+// ===== FAST V-RETRACE (2026-11-18, Jean: "analyze the last signals and check the wrong ones") ===== 11/18 08:10 ET, XAU
+// RETRACE-LIMIT put @3765.07: gold had flushed 3774 → 3742.92, then came straight back — $22 in two M5 bars — and reached
+// the 70.5% limit only 15 minutes after the low. It did not stop there: 3781 at 08:30 (stop 3775.62), 3790 at 08:50.
+// A retrace that takes back 70% of the leg within minutes is a reversal, not a correction. The lane's own gold record by
+// time between the leg's extreme and the limit touch: <= 45 min 2W/7L, > 45 min 24W/7L (40 resolved). NAS does not show
+// it (10W/5L vs 14W/10L), so on NAS the row is stamped for measurement only.
+//   • XAU: a limit touched within RETRACE_MIN_AGE_MIN (45) of the leg's extreme is NOT taken live; stamped
+//     XAU-RETRACE-FAST-SKIP on the same bracket (win = the skip was wrong); the skip withdraws itself when that cohort
+//     is net-positive over >= 3 resolved. RETRACE_FAST_GUARD=0 turns it off (rows keep stamping).
+function retraceFastStamp(sym, s, dir, price, sl, tp1, ageMin, g, atr) {
+  try {
+    let on = sym === 'XAU' && process.env.RETRACE_FAST_GUARD !== '0';
+    if (on) { const t = (cohortTally[sym] && cohortTally[sym][sym + '-RETRACE-FAST-SKIP']) || {}; const w = t.win || 0, l = t.loss || 0; if ((w + l) >= 3 && w > l) on = false; }
+    const now = Date.now();
+    const m = '⚡ ' + sym + '-RETRACE-FAST-SKIP ' + dir.toUpperCase() + ' @ $' + price.toFixed(2) + ' — RETRACE-LIMIT entry ' + (on ? 'NOT taken live' : 'taken (measurement only)') + ': the 70.5% level was reached ' + Math.round(ageMin) + ' min after the leg\'s extreme $' + g.x.toFixed(2) + ' (' + (g.leg / atr).toFixed(1) + '-ATR leg) — a V-retrace, not a correction (limit ' + (parseFloat(process.env.RETRACE_MIN_AGE_MIN) || 45) + ' min). Row graded on the same bracket, first leg (2026-11-18).';
+    s.blockedOutcomes = s.blockedOutcomes || [];
+    s.blockedOutcomes.push({ ts: now, time: ts(), symbol: sym, detector: sym + '-RETRACE-FAST-SKIP', type: dir, price: +price.toFixed(2), virtualTp1: +tp1.toFixed(2), virtualSl: +sl.toFixed(2), maxMin: 240, firstLegOnly: true, blockReason: m, feat: blockFeat(sym, s, dir, price), snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+    log(sym, m);
+    return on;
+  } catch (e) { return false; }
+}
 function retraceLiveFire(sym, s, dir, price, sl, tp1, tp2, tp3, note, kind) {
   try {
     const K = kind === 'LIMIT' ? 'LIMIT' : 'REJ', _sc = K === 'LIMIT' ? 'RETRACE-LIM' : 'RETRACE-REJ';
@@ -18137,10 +18243,10 @@ function retraceRejTick(sym, s, price) {
       // down-leg from the window high (PUT side) / up-leg from the window low (CALL side)
       let iH = 0; for (let i = 1; i < n; i++) if (W[i].h >= W[iH].h) iH = i;
       let iL = -1; for (let i = iH + 1; i < n; i++) if (iL < 0 || W[i].l <= W[iL].l) iL = i;
-      R.legs.put = (iL > iH && W[iH].h - W[iL].l >= legMin) ? { o: W[iH].h, x: W[iL].l, leg: W[iH].h - W[iL].l, xi: iL, key: 'put|' + W[iH].h.toFixed(2) + '|' + W[iL].l.toFixed(2) } : null;
+      R.legs.put = (iL > iH && W[iH].h - W[iL].l >= legMin) ? { o: W[iH].h, x: W[iL].l, leg: W[iH].h - W[iL].l, xi: iL, xTs: W[iL].ts, key: 'put|' + W[iH].h.toFixed(2) + '|' + W[iL].l.toFixed(2) } : null;
       let jL = 0; for (let i = 1; i < n; i++) if (W[i].l <= W[jL].l) jL = i;
       let jH = -1; for (let i = jL + 1; i < n; i++) if (jH < 0 || W[i].h >= W[jH].h) jH = i;
-      R.legs.call = (jH > jL && W[jH].h - W[jL].l >= legMin) ? { o: W[jL].l, x: W[jH].h, leg: W[jH].h - W[jL].l, xi: jH, key: 'call|' + W[jL].l.toFixed(2) + '|' + W[jH].h.toFixed(2) } : null;
+      R.legs.call = (jH > jL && W[jH].h - W[jL].l >= legMin) ? { o: W[jL].l, x: W[jH].h, leg: W[jH].h - W[jL].l, xi: jH, xTs: W[jH].ts, key: 'call|' + W[jL].l.toFixed(2) + '|' + W[jH].h.toFixed(2) } : null;
       for (const dir of ['put', 'call']) {
         const g = R.legs[dir]; if (!g) continue;
         const P = dir === 'put';
@@ -18188,7 +18294,10 @@ function retraceRejTick(sym, s, price) {
       // live on its own record (2026-11-10): TP1 the standard first target, TP2 the leg's end, TP3 the 38.2% extension
       { const _t1 = P ? price - tpMin : price + tpMin, _t2 = P ? Math.min(_t1 - 0.01, g.x) : Math.max(_t1 + 0.01, g.x), _t3 = P ? Math.min(_t2, g.x - 0.382 * g.leg) : Math.max(_t2, g.x + 0.382 * g.leg);
         const _px = retracePsx(sym, s, dir, sl, atr); // prior-session magnet beyond the stop → not taken live (2026-11-17)
-        if (!(_px && retracePsxStamp(sym, s, R, dir, 'LIMIT', price, sl, _t1, atr, tpMin, _px))) retraceLiveFire(sym, s, dir, price, sl, _t1, _t2, _t3, 'limit at the 70.5% retrace $' + lim.toFixed(2) + ' of the ' + (g.leg / atr).toFixed(1) + '-ATR leg $' + g.o.toFixed(2) + ' → $' + g.x.toFixed(2), 'LIMIT'); }
+        const _ageMin = g.xTs ? (now - g.xTs) / 60000 : null;                              // minutes between the leg's extreme and this touch
+        const _skF = (_ageMin != null && _ageMin <= (parseFloat(process.env.RETRACE_MIN_AGE_MIN) || 45)) ? retraceFastStamp(sym, s, dir, price, sl, _t1, _ageMin, g, atr) : false; // V-retrace (2026-11-18)
+        const _skP = _px ? retracePsxStamp(sym, s, R, dir, 'LIMIT', price, sl, _t1, atr, tpMin, _px) : false;
+        if (!_skF && !_skP) retraceLiveFire(sym, s, dir, price, sl, _t1, _t2, _t3, 'limit at the 70.5% retrace $' + lim.toFixed(2) + ' of the ' + (g.leg / atr).toFixed(1) + '-ATR leg $' + g.o.toFixed(2) + ' → $' + g.x.toFixed(2), 'LIMIT'); }
     }
   } catch (e) { /* lane must never crash the tick */ }
 }
@@ -20799,9 +20908,14 @@ try { if (fs.existsSync(ENTRY_AGENT_FILE)) { const _j = JSON.parse(fs.readFileSy
 setInterval(() => { if (!entryAgent.dirty) return; entryAgent.dirty = false; try { fs.writeFileSync(ENTRY_AGENT_FILE, JSON.stringify({ decisions: entryAgent.decisions.slice(-3000), lessons: entryAgent.lessons.slice(-400), stats: entryAgent.stats })); } catch (e) {} }, 60000);
 function entryAgentEnabled() { return process.env.ENTRY_AGENT !== '0' && !!process.env.ANTHROPIC_API_KEY; }
 function entryAgentModels() { const m = process.env.ENTRY_AGENT_MODELS || (process.env.ENTRY_AGENT_MODEL ? process.env.ENTRY_AGENT_MODEL + ',claude-haiku-5-5' : 'claude-opus-5-5,claude-haiku-5-5'); return Array.from(new Set(m.split(',').map(x => x.trim()).filter(Boolean))); }
+// GATE REVIEW ON HAIKU ONLY (2026-11-18, Jean: "leave the gate review to haiku only"). Since 11/04 the two models reviewed
+// 2,768 blocked candidates and unblocked 9 of them (Opus 1 of 1,482); the upheld blocks were right 65% of the time, the
+// gates' own accuracy — and the reviews were ~90% of the desk's token usage. Entry consults on live fires (and the veto
+// count built on them) still use every model. GATE_REVIEW_MODELS=<comma list> overrides.
+function gateReviewModels() { const g = (process.env.GATE_REVIEW_MODELS || '').split(',').map(x => x.trim()).filter(Boolean); if (g.length) return Array.from(new Set(g)); const h = entryAgentModels().filter(m => /haiku/i.test(m)); return h.length ? h : ['claude-haiku-5-5']; }
 function entryAgentShort(m) { return /opus/i.test(m) ? 'OPUS' : /haiku/i.test(m) ? 'HAIKU' : /sonnet/i.test(m) ? 'SONNET' : /fable/i.test(m) ? 'FABLE' : String(m).replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 8); }
 function etClock(ms) { try { return new Date(ms).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'America/New_York' }); } catch (e) { return ''; } }
-console.log('[' + ts() + '] ENTRY AGENT (shadow): ' + (entryAgentEnabled() ? 'ON — models ' + entryAgentModels().join(' + ') + ', effort ' + (process.env.ENTRY_AGENT_EFFORT || 'low') : (process.env.ENTRY_AGENT === '0' ? 'OFF (ENTRY_AGENT=0)' : 'OFF — ANTHROPIC_API_KEY missing')));
+console.log('[' + ts() + '] ENTRY AGENT (shadow): ' + (entryAgentEnabled() ? 'ON — models ' + entryAgentModels().join(' + ') + ' (gate review: ' + gateReviewModels().join(' + ') + '), effort ' + (process.env.ENTRY_AGENT_EFFORT || 'low') : (process.env.ENTRY_AGENT === '0' ? 'OFF (ENTRY_AGENT=0)' : 'OFF — ANTHROPIC_API_KEY missing')));
 
 const ENTRY_AGENT_SYSTEM = [
   'You are the ENTRY DESK of an intraday CFD scalping system trading XAUUSD (gold), NAS100 and BTCUSD on 1-second ticks.',
@@ -21080,7 +21194,7 @@ function gateAgentConsult(sym, s, row, msg) {
     s._agUnblockTs2[row.type] = { ts: now, price: +row.price };
     const price = +row.price, dir = row.type, atr = s._atr || 0;
     const fake = { ep: price, slPrice: row.virtualSl, tp1Price: row.virtualTp1, tp2Price: row.virtualTp1, tp3Price: row.virtualTp1, scalp: true };
-    const models = entryAgentModels();
+    const models = gateReviewModels(); // Haiku only since 2026-11-18
     row.agentReview = row.agentReview || {};
     models.forEach(async (model) => {
       const id = sym + '-gate-' + now + '-' + entryAgentShort(model);
@@ -21323,7 +21437,7 @@ app.get('/agent', (req, res) => {
     const cost = { calls: st.calls, errors: st.errors, avgMs: st.calls ? Math.round(st.msSum / st.calls) : 0, inTok: st.inTok, outTok: st.outTok, lastErr: st.lastErr, lastErrAt: st.lastErrTs ? new Date(st.lastErrTs).toISOString() : null };
     const _vs = agentVetoStats();
     if (req.query.lessons) { const Ls = entryAgent.lessons.filter(l => !req.query.sym || l.sym === String(req.query.sym).toUpperCase()); return res.json({ count: entryAgent.lessons.length, reflections: entryAgent.stats.reflections || 0, queued: entryAgent.reflectQ.length, by_symbol: Object.fromEntries(['XAU', 'BTC', 'NAS100'].map(sy => [sy, entryAgentLessonsFor(sy, 'call')])), recent: Ls.slice(-40).reverse().map(l => ({ time: new Date(l.decTs).toISOString().slice(0, 16), sym: l.sym, dir: l.dir, model: l.model, kind: l.kind, where: l.where, action: l.action, gate: l.gate, outcome: l.outcome, mfe: l.mfe, tags: l.tags, lesson: l.text })) }); }
-    res.json({ enabled: entryAgentEnabled(), mode: agentVetoArmed() ? 'VETO LIVE (consensus skip cancels/flattens live fires); entries still rule-based' : 'shadow', veto: { armed: agentVetoArmed(), right: _vs.right, wrong: _vs.wrong, pending: _vs.pending, pct: _vs.pct, bar: (Math.round((parseFloat(process.env.AGENT_VETO_BAR) || 0.70) * 100)) + '% over ' + (parseInt(process.env.AGENT_VETO_MIN, 10) || 15) + ' (rolling 30d)', force: process.env.AGENT_VETO_LIVE || null }, gateReview: { enabled: entryAgentEnabled() && process.env.AGENT_UNBLOCK !== '0', gates: GATE_AGENT_RE.source, minSec: parseInt(process.env.AGENT_UNBLOCK_MIN_SEC, 10) || 90, bar: 'UNBLOCK verdicts ≥60% winners over ≥25 resolved per gate, and UPHOLD verdicts at least as right as the gate itself (see /gate-score)' }, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', bar: 'agent beats the rule by ≥8 pts of W/(W+L) over ≥40 decisions, or ≥60% on its own', since: new Date(since).toISOString(), board, cost, waitsOpen: Object.fromEntries(Object.entries(entryAgent.waits).map(([k, v]) => [k, v.length])), recent: D.slice(-(parseInt(req.query.limit, 10) || 30)).reverse().map(d => ({ time: d.time, sym: d.sym, dir: d.dir, det: d.detector, kind: d.kind || 'entry', gate: d.gate || undefined, model: d.short, action: d.action, limit: d.limit, window: d.windowSec, conf: d.confidence, reason: d.reason, err: d.err || undefined, rule: d.rule, nowOutcome: d.nowOutcome || null, waitResult: d.waitResult || null, fillOutcome: d.fillOutcome || null, ruleOutcome: d.ruleOutcome || null, ms: d.ms })) });
+    res.json({ enabled: entryAgentEnabled(), mode: agentVetoArmed() ? 'VETO LIVE (consensus skip cancels/flattens live fires); entries still rule-based' : 'shadow', veto: { armed: agentVetoArmed(), right: _vs.right, wrong: _vs.wrong, pending: _vs.pending, pct: _vs.pct, bar: (Math.round((parseFloat(process.env.AGENT_VETO_BAR) || 0.70) * 100)) + '% over ' + (parseInt(process.env.AGENT_VETO_MIN, 10) || 15) + ' (rolling 30d)', force: process.env.AGENT_VETO_LIVE || null }, gateReview: { enabled: entryAgentEnabled() && process.env.AGENT_UNBLOCK !== '0', models: gateReviewModels(), gates: GATE_AGENT_RE.source, minSec: parseInt(process.env.AGENT_UNBLOCK_MIN_SEC, 10) || 90, bar: 'UNBLOCK verdicts ≥60% winners over ≥25 resolved per gate, and UPHOLD verdicts at least as right as the gate itself (see /gate-score)' }, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', bar: 'agent beats the rule by ≥8 pts of W/(W+L) over ≥40 decisions, or ≥60% on its own', since: new Date(since).toISOString(), board, cost, waitsOpen: Object.fromEntries(Object.entries(entryAgent.waits).map(([k, v]) => [k, v.length])), recent: D.slice(-(parseInt(req.query.limit, 10) || 30)).reverse().map(d => ({ time: d.time, sym: d.sym, dir: d.dir, det: d.detector, kind: d.kind || 'entry', gate: d.gate || undefined, model: d.short, action: d.action, limit: d.limit, window: d.windowSec, conf: d.confidence, reason: d.reason, err: d.err || undefined, rule: d.rule, nowOutcome: d.nowOutcome || null, waitResult: d.waitResult || null, fillOutcome: d.fillOutcome || null, ruleOutcome: d.ruleOutcome || null, ms: d.ms })) });
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
@@ -21925,7 +22039,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '7.97-20261117-news-fade-live', // bump on each deploy — lets /state verify what's live
+    build: '8.03-20261118-gate-review-haiku', // bump on each deploy — lets /state verify what's live
     laneBenchStored: Object.fromEntries(Object.entries(laneBenchState).filter(([k]) => k.indexOf(sym + '|') === 0)), // stored lane benches for this symbol (2026-11-10): {since, why, hand, base, rearmed}
     btcCallBench: sym === 'BTC' ? { benched: btcCallsBenched(), n: global._btcCallBench.n, pct: global._btcCallBench.pct, bar: 're-arm at 60% over 25 on BTC-CALL-BENCH; BTC_CALLS_LIVE=1 lifts it' } : undefined, // BTC calls benched (2026-11-10)
     retraceRej: (global._retrArm && { rej: global._retrArm[sym + '|REJ'] || null, limit: global._retrArm[sym + '|LIMIT'] || null }) || null, // RETRACE-REJ / RETRACE-LIMIT auto-arm state (2026-11-10)
