@@ -2514,6 +2514,7 @@ function cohortFor(reason) {
   // SESS-REJ CRASH rows by side (2026-11-18): the CALL text says "CRASH arm (V-REC v2)", so the /V-REC/ match below was
   // taking every CRASH call into the V-REC cohort — the <SYM>-SESS-REJ-CRASH record (13W/5L on 11/17) was the PUT side
   // only, while the calls were 4W/7L in the ring. Calls now have their own cohort; puts keep the existing one.
+  { const _m5 = reason.match(/\bNAS100-MOM5D-(?:LONG|SHORT)\b/); if (_m5) return _m5[0]; } // momentum entries against the multi-day trend, refused and graded (2026-11-20)
   { const _tn = reason.match(/\b(?:XAU|NAS100)-TP3-NEAR\b/); if (_tn) return _tn[0]; } // runner taken just short of TP3: win = TP3 was reached anyway, loss = it fell back to TP2 first (2026-11-20)
   { const _cc = reason.match(/\b(?:XAU|BTC)-CRASH-CALL-(?:FIRST-LDNNY|FIRST-ASIA|REPEAT|HL)\b/); if (_cc) return _cc[0]; } // rebound-call splits and the higher-low twin (2026-11-18)
   { const _sx = reason.match(/\b(XAU|BTC)-SESS-REJ-(?:FAR[12]|SCALE)\b/); if (_sx) return _sx[0]; }
@@ -11339,6 +11340,8 @@ function processPrice(sym, price, hi, lo) {
           }
         } catch (eFW) {}
       }
+      // momentum against the multi-day trend on NAS (2026-11-20) — see mom5dRefuse()
+      try { if (mom5dRefuse(sym, s, sig, tag)) { Object.assign(s, _emitSnapshot); return false; } } catch (eM5) {}
       // ===== LANE COLD-START BENCH (2026-11-06) — see laneColdBench(). Placed last: a benched lane's fire is still a fire
       // the gates passed, stamped on the live ladder (XAU $5.24 / $10; other symbols the standard bracket) and graded.
       try {
@@ -18137,6 +18140,35 @@ function retraceRejArmed(sym, kind) {
 //     only, standard first target. On 11/16–17 FRONT sells 3885.55 at 00:30, stop 3890.14, target 3880.31 hit at 00:40;
 //     AT never fills (the high was $2.01 short). Live at >=60% over >=25, like every lane.
 // RETRACE_PSX_GUARD=0 turns the skip off (rows keep stamping); RETRACE_PSX_ATR (4) is the reach.
+// ===== MOMENTUM AGAINST THE MULTI-DAY TREND — NAS (2026-11-20, Jean: "the NAS long that SL'd … it doesn't consider the
+// reversal possibility" → "ok for your recommendation and do the same for SHORT") ===== 11/20 10:04 a RIDE call bought
+// ~26,300 four minutes after a $340 / 15-min spike to the session high, in a tape that was −7.8% over five days; stopped
+// in nine minutes, NAS −$900 after. NAS momentum calls are 1W/3L live in two weeks, and on the week's candidates (standard
+// ladder, 60% needed) RIDE calls were 47% against RIDE puts 64%: a momentum entry AGAINST the multi-day trend is buying
+// the top of a bounce (or selling the bottom of a dip). Rule, NAS only, momentum class only (RIDE / TREND / FAST / SUST /
+// 6-6 — the lanes that enter at an extreme, retrace limits, news fades, rejections, CHoCH, DIV, LIQ, are untouched):
+//   • multi-day regime BEAR → no momentum LONG;   • multi-day regime BULL → no momentum SHORT;   • neutral → no effect.
+// Each refusal is graded on the standard bracket, one row per direction per 30 min, as NAS100-MOM5D-LONG / -SHORT; a side
+// is released again when its own cohort shows >= 60% over >= 25. MOM5D_GATE=0 turns the rule off.
+function mom5dRefuse(sym, s, sig, tag) {
+  try {
+    if (sym !== 'NAS100' || process.env.MOM5D_GATE === '0' || !sig || sig.manual || sig._liq || !sig._regime) return false;
+    const rd = sig._regime.dir; if (rd !== 'bear' && rd !== 'bull') return false;
+    if (!/^(call|put)$/.test(String(sig.type))) return false;
+    const g = String(sig.score || tag || '').replace(/[⬆⬇]/g, '');
+    const mom = /RIDE|TREND|FAST|SUST|6\/6/.test(g) && !/LHF|LLF|VREV|EXT-FLIP|OBREJ|OBMIT|INVERSAL|SWEEP|CHoCH|ATH|ATL|DIV|MFLIP|STRUCT|RETEST|LIQ|MANUAL|SESSREJ|RANGE5|PATH|BIGLEG|RETRACE|NEWS/.test(g);
+    if (!mom) return false;
+    const against = (sig.type === 'call' && rd === 'bear') || (sig.type === 'put' && rd === 'bull');
+    if (!against) return false;
+    const coh = sym + '-MOM5D-' + (sig.type === 'call' ? 'LONG' : 'SHORT');
+    const t = (cohortTally[sym] && cohortTally[sym][coh]) || {}; const w = t.win || 0, l = t.loss || 0;
+    if ((w + l) >= 25 && w / (w + l) >= 0.6) return false;                               // this side has earned its way back
+    const now = Date.now(); s._m5dTs = s._m5dTs || {};
+    const m = '🧭 ' + g + ' ' + sig.type.toUpperCase() + ' REFUSED — ' + coh + ': momentum ' + (sig.type === 'call' ? 'long' : 'short') + ' against the multi-day trend (' + rd.toUpperCase() + ', ' + (sig._regime.netChgPct >= 0 ? '+' : '') + sig._regime.netChgPct + '% ' + (sig._regime.window || '') + ') — a ' + (sig.type === 'call' ? 'bounce bought near its top' : 'dip sold near its bottom') + ' is the usual result; graded, released at 60% over 25 (so far ' + w + 'W/' + l + 'L) (2026-11-20).';
+    if (now - (s._m5dTs[sig.type] || 0) >= 1800000) { s._m5dTs[sig.type] = now; log(sym, m); try { trackBlockedOutcome(sym, m, true); } catch (eT) {} }
+    return true;
+  } catch (e) { return false; }
+}
 function retracePsx(sym, s, dir, sl, atr) {
   try {
     const dl = Array.isArray(s.dailyLevels) ? s.dailyLevels : []; const pd = dl.length ? dl[dl.length - 1] : null;
@@ -22067,7 +22099,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '8.04-20261120-tp3-near-take', // bump on each deploy — lets /state verify what's live
+    build: '8.05-20261120-nas-mom-vs-5d', // bump on each deploy — lets /state verify what's live
     laneBenchStored: Object.fromEntries(Object.entries(laneBenchState).filter(([k]) => k.indexOf(sym + '|') === 0)), // stored lane benches for this symbol (2026-11-10): {since, why, hand, base, rearmed}
     btcCallBench: sym === 'BTC' ? { benched: btcCallsBenched(), n: global._btcCallBench.n, pct: global._btcCallBench.pct, bar: 're-arm at 60% over 25 on BTC-CALL-BENCH; BTC_CALLS_LIVE=1 lifts it' } : undefined, // BTC calls benched (2026-11-10)
     retraceRej: (global._retrArm && { rej: global._retrArm[sym + '|REJ'] || null, limit: global._retrArm[sym + '|LIMIT'] || null }) || null, // RETRACE-REJ / RETRACE-LIMIT auto-arm state (2026-11-10)
