@@ -2514,6 +2514,7 @@ function cohortFor(reason) {
   // SESS-REJ CRASH rows by side (2026-11-18): the CALL text says "CRASH arm (V-REC v2)", so the /V-REC/ match below was
   // taking every CRASH call into the V-REC cohort — the <SYM>-SESS-REJ-CRASH record (13W/5L on 11/17) was the PUT side
   // only, while the calls were 4W/7L in the ring. Calls now have their own cohort; puts keep the existing one.
+  { const _tn = reason.match(/\b(?:XAU|NAS100)-TP3-NEAR\b/); if (_tn) return _tn[0]; } // runner taken just short of TP3: win = TP3 was reached anyway, loss = it fell back to TP2 first (2026-11-20)
   { const _cc = reason.match(/\b(?:XAU|BTC)-CRASH-CALL-(?:FIRST-LDNNY|FIRST-ASIA|REPEAT|HL)\b/); if (_cc) return _cc[0]; } // rebound-call splits and the higher-low twin (2026-11-18)
   { const _sx = reason.match(/\b(XAU|BTC)-SESS-REJ-(?:FAR[12]|SCALE)\b/); if (_sx) return _sx[0]; }
   { const _cr = reason.match(/\b(XAU|BTC)-SESS-REJ-CRASH (CALL|PUT)\b/); if (_cr) return _cr[1] + '-SESS-REJ-CRASH' + (_cr[2] === 'CALL' ? '-CALL' : ''); }
@@ -19497,9 +19498,36 @@ function checkExit(sym, price) {
       sendPush('🎯 ' + sym + ' TP2 HIT', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · SL → TP1', 'signal');
       updateSignalOutcome(sym, price);
     }
-    // TP3 hit → full exit
-    if (!t.sl && ((iC && price >= t.tp3Price) || (!iC && price <= t.tp3Price))) {
+    // NEAR-TP3 TAKE (2026-11-20, Jean: "last XAU call passed $1 from TP3 and then closed … should we do something when price is
+    // 0.3 ATR to TP3 — don't let him go down"). 11/20 05:18 call: TP3 3596.25, high 3595.22, the runner then gave back $9.23
+    // to its trail at 3585.99. Measured on a week of entries (5-min bars, ladder in ATR units): of the runners that come
+    // within this distance of TP3 about 3 in 4 go on to reach it (XAU 77/97, NAS 72/99), but the ones that miss give back
+    // ~2 ATR, so taking the runner at the zone is worth more on average on both (XAU 3.80 vs 3.69 ATR, NAS 3.80 vs 3.56).
+    // After TP2, on XAU and NAS, the remainder is closed when price comes within TP3_NEAR_ATR (0.3) × ATR of TP3 — only when
+    // the TP2→TP3 gap is more than twice that distance. Each take opens a <SYM>-TP3-NEAR shadow row from the take price:
+    // win = TP3 was reached anyway (the take cost the last 0.3 ATR), loss = it fell back to TP2 first (the take saved it).
+    // TP3_NEAR_ATR=0 turns it off.
+    let _nearTake = false, _nearLvl = 0;
+    try {
+      const _nzK = process.env.TP3_NEAR_ATR !== undefined ? parseFloat(process.env.TP3_NEAR_ATR) : 0.3;
+      const _nz = (_nzK > 0 && t.atr > 0) ? _nzK * t.atr : 0;
+      if (_nz > 0 && !t.sl && t.t2 && (sym === 'XAU' || sym === 'NAS100') && t.tp3Price > 0 && t.tp2Price > 0 && Math.abs(t.tp3Price - t.tp2Price) > 2 * _nz) {
+        _nearLvl = iC ? t.tp3Price - _nz : t.tp3Price + _nz;
+        if ((iC && price >= _nearLvl && price < t.tp3Price) || (!iC && price <= _nearLvl && price > t.tp3Price)) _nearTake = true;
+      }
+    } catch (eNT) {}
+    // TP3 hit (or taken just short of it) → full exit
+    if (!t.sl && (_nearTake || (iC && price >= t.tp3Price) || (!iC && price <= t.tp3Price))) {
       t.sl = true; t.lastETs = now;
+      if (_nearTake) {
+        try {
+          const _e = s.lastHistEntry; if (_e && _e.symbol === sym && _e.outcomes) _e.outcomes.tp3Near = { at: +price.toFixed(2), tp3: +(+t.tp3Price).toFixed(2), atr: +(+t.atr).toFixed(2) };
+          const _nm = '🏁 ' + sym + '-TP3-NEAR ' + String(t.type).toUpperCase() + ' — runner taken @ $' + price.toFixed(2) + ', ' + Math.abs(t.tp3Price - price).toFixed(2) + ' short of TP3 $' + (+t.tp3Price).toFixed(2) + ' (within 0.3×ATR $' + (+t.atr).toFixed(2) + '). This row: TP3 reached anyway = win (the take cost that last stretch), back to TP2 $' + (+t.tp2Price).toFixed(2) + ' first = loss (the take saved the give-back) (2026-11-20).';
+          s.blockedOutcomes = s.blockedOutcomes || [];
+          s.blockedOutcomes.push({ ts: now, time: ts(), symbol: sym, detector: sym + '-TP3-NEAR', type: t.type, price: +price.toFixed(2), virtualTp1: +(+t.tp3Price).toFixed(2), virtualSl: +(+t.tp2Price).toFixed(2), maxMin: 240, firstLegOnly: true, blockReason: _nm, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+          log(sym, _nm);
+        } catch (eNR) {}
+      }
       // TRAIL-SIM comparison at TP3 (2026-08-28): did the trailing close cut a full winner short?
       try {
         if (t._tcPeak) {
@@ -19508,8 +19536,8 @@ function checkExit(sym, price) {
           if (s.lastHistEntry && s.lastHistEntry.symbol === sym) s.lastHistEntry.trailSim = { exitPnl: +_tcExitPnl3.toFixed(2), actualPnl: +pnl.toFixed(2), peak: +t._tcPeak.toFixed(2) };
         }
       } catch (eTC3) {}
-      log(sym, '🏆 TP3 FULL TARGET — $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2));
-      sendPush('🏆 ' + sym + ' TP3 — FULL TARGET', '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · close trade', 'signal');
+      log(sym, (_nearTake ? '🏁 TP3 NEAR-TAKE (runner closed within 0.3×ATR of TP3 $' + (+t.tp3Price).toFixed(2) + ')' : '🏆 TP3 FULL TARGET') + ' — $' + price.toFixed(2) + ' · P&L $' + pnl.toFixed(2));
+      sendPush((_nearTake ? '🏁 ' + sym + ' runner taken near TP3' : '🏆 ' + sym + ' TP3 — FULL TARGET'), '$' + price.toFixed(2) + ' · +$' + pnl.toFixed(2) + ' · close trade', 'signal');
       updateSignalOutcome(sym, price); // capture TP3 outcome BEFORE clearing trade
       s.trade = { active: false };
       return;
@@ -22039,7 +22067,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '8.03-20261118-gate-review-haiku', // bump on each deploy — lets /state verify what's live
+    build: '8.04-20261120-tp3-near-take', // bump on each deploy — lets /state verify what's live
     laneBenchStored: Object.fromEntries(Object.entries(laneBenchState).filter(([k]) => k.indexOf(sym + '|') === 0)), // stored lane benches for this symbol (2026-11-10): {since, why, hand, base, rearmed}
     btcCallBench: sym === 'BTC' ? { benched: btcCallsBenched(), n: global._btcCallBench.n, pct: global._btcCallBench.pct, bar: 're-arm at 60% over 25 on BTC-CALL-BENCH; BTC_CALLS_LIVE=1 lifts it' } : undefined, // BTC calls benched (2026-11-10)
     retraceRej: (global._retrArm && { rej: global._retrArm[sym + '|REJ'] || null, limit: global._retrArm[sym + '|LIMIT'] || null }) || null, // RETRACE-REJ / RETRACE-LIMIT auto-arm state (2026-11-10)
