@@ -4852,16 +4852,25 @@ function processPrice(sym, price, hi, lo) {
         const _srDl = Array.isArray(s.dailyLevels) ? s.dailyLevels : [];
         const _srAdr = _srDl.length >= 3 ? _srDl.reduce((a, d0) => a + (d0.high - d0.low), 0) / _srDl.length : 0;
         const _srRng = !!(s._dayRegime && s._dayRegime.label === 'RANGE');
-        const _srW = s._m5.slice(-24); let _swH = -Infinity, _swL = Infinity, _swHi = -1, _swLi = -1;
+        // REAL BARS ONLY (2026-11-23, Jean: "analyze last 2 trades"). The window was "the last 24 M5 bars". The ring is filled
+        // with flat bars while the market is closed, so on Sunday 11/22 18:25 ET the window was 22 flat weekend bars at
+        // Friday's close 3537.3 plus ten minutes of Sunday: the $39 weekend gap read as a "6.7×ATR spike in 2h", the lane sold
+        // the first rejection of the open (put @3576.72, stop 3604.52) and gold went on to 3630. A weekend gap is not a spike.
+        // The window is now the bars of the last 2 h of clock time that are from an open market and have a range; fewer than
+        // 6 of them (30 min) → no CRASH arm at all.
+        const _srT0 = Date.now() - 130 * 60000;
+        const _srW = s._m5.slice(-26).filter(b => b && b.ts >= _srT0 && b.h > b.l && (sym === 'BTC' || cfdMarketOpenET(b.ts)));
+        const _srWinOk = _srW.length >= 6;
+        let _swH = -Infinity, _swL = Infinity, _swHi = -1, _swLi = -1;
         for (let i = 0; i < _srW.length; i++) { if (_srW[i].h > _swH) { _swH = _srW[i].h; _swHi = i; } if (_srW[i].l < _swL) { _swL = _srW[i].l; _swLi = i; } }
         const _srAtr = s._atr || (_srAdr > 0 ? _srAdr / 20 : 0);
-        const _srSwing = (_srAtr > 0 && isFinite(_swH) && isFinite(_swL)) ? (_swH - _swL) / _srAtr : 0;
+        const _srSwing = (_srWinOk && _srAtr > 0 && isFinite(_swH) && isFinite(_swL)) ? (_swH - _swL) / _srAtr : 0;
         // CRASH-ARM FLOOR (2026-11-05, the 11/04 19:05 XAU put at the bottom): "≥2×ATR in 2h" has no absolute size, so on a
         // $5.40 night ATR a $22 two-hour grind back to the day open counted as a 4×ATR "spike" and the lane faded a
         // V-recovery high at the Asia open (−$4,984; both agents said skip). Same defect the LIQ regime had on 11/03 and got
         // floors for. A flush must also be ≥ SESSREJ_CRASH_ADR×ADR (0.25) and ≥ SESSREJ_CRASH_PCT % of price (0.4): on
         // 11/04 that is ≥$26.5 and ≥$16.3 — the $22 grind fails the ADR floor. Shadow stamps and live fire share it.
-        const _srSwAbs = (isFinite(_swH) && isFinite(_swL)) ? (_swH - _swL) : 0;
+        const _srSwAbs = (_srWinOk && isFinite(_swH) && isFinite(_swL)) ? (_swH - _swL) : 0;
         const _crashFloorOk = _srSwAbs >= (parseFloat(process.env.SESSREJ_CRASH_ADR) || 0.25) * _srAdr && (price > 0 ? _srSwAbs / price * 100 : 0) >= (parseFloat(process.env.SESSREJ_CRASH_PCT) || 0.4);
         const _crashDn = _srSwing >= 2.0 && _crashFloorOk && _swLi > _swHi; // flushed down → bounce CALL context
         const _crashUp = _srSwing >= 2.0 && _crashFloorOk && _swHi > _swLi; // spiked up → fade PUT context
@@ -5033,7 +5042,7 @@ function processPrice(sym, price, hi, lo) {
                 // when its own cohort is net-negative over >=3 resolved (enforced, like every bench).
                 // SESSREJ_GUARD_FRESHPUT=1 / SESSREJ_GUARD_POCNEAR=1 put a guard back by hand.
                 const _srWaive = [];
-                const _wvOn = (name) => { try { if (process.env['SESSREJ_GUARD_' + name] === '1') return false; const t = (cohortTally[sym] && cohortTally[sym]['SESSREJ-WAIVED-' + name]) || {}; const w = t.win || 0, l = t.loss || 0; return !((w + l) >= 3 && l > w); } catch (eW) { return false; } };
+                const _wvOn = (name) => { try { if (process.env['SESSREJ_GUARD_' + name] === '1') return false; const t = (cohortTally[sym] && cohortTally[sym]['SESSREJ-WAIVED-' + name]) || {}; const w = t.win || 0, l = t.loss || 0; return !((w + l) >= 2 && l > w); } catch (eW) { return false; } }; // two resolved and net-negative → withdrawn (was three; both waivers stood at 0W/1L on 2026-11-23)
                 const _freshPutWv = _isCrash && dir === 'put' && _srN < 2 && !_srWith && _wvOn('FRESHPUT');
                 if (_freshPutWv) _srWaive.push('FRESHPUT');
                 const _crashExempt = (_isCrash && (dir === 'call' || _freshPutWv)) || _isV2;
@@ -18271,7 +18280,10 @@ function retraceRejTick(sym, s, price) {
     const row = (det, dir, p, tp, sl, m) => ({ ts: now, time: ts(), symbol: sym, detector: det, type: dir, price: +p.toFixed(2), virtualTp1: +tp.toFixed(2), virtualSl: +sl.toFixed(2), maxMin: 240, firstLegOnly: true, blockReason: m, feat: blockFeat(sym, s, dir, p), snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
     if (lc.ts !== R.m5Ts) {
       R.m5Ts = lc.ts;
-      const W = M.slice(-(parseInt(process.env.RETRACE_LOOKBACK_BARS, 10) || 36)), n = W.length;
+      // real, open-market bars inside the lookback's clock time only — a leg must not be a weekend gap (2026-11-23)
+      const _rLb = parseInt(process.env.RETRACE_LOOKBACK_BARS, 10) || 36, _rT0 = now - (_rLb + 1) * 300000;
+      let W = M.slice(-_rLb).filter(b => b && b.ts >= _rT0 && b.h > b.l && cfdMarketOpenET(b.ts)); if (!W.length) W = [lc];
+      const n = W.length;
       const legMin = (parseFloat(process.env.RETRACE_LEG_ATR) || 4) * atr;
       // down-leg from the window high (PUT side) / up-leg from the window low (CALL side)
       let iH = 0; for (let i = 1; i < n; i++) if (W[i].h >= W[iH].h) iH = i;
@@ -22099,7 +22111,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '8.05-20261120-nas-mom-vs-5d', // bump on each deploy — lets /state verify what's live
+    build: '8.06-20261123-real-bars-window', // bump on each deploy — lets /state verify what's live
     laneBenchStored: Object.fromEntries(Object.entries(laneBenchState).filter(([k]) => k.indexOf(sym + '|') === 0)), // stored lane benches for this symbol (2026-11-10): {since, why, hand, base, rearmed}
     btcCallBench: sym === 'BTC' ? { benched: btcCallsBenched(), n: global._btcCallBench.n, pct: global._btcCallBench.pct, bar: 're-arm at 60% over 25 on BTC-CALL-BENCH; BTC_CALLS_LIVE=1 lifts it' } : undefined, // BTC calls benched (2026-11-10)
     retraceRej: (global._retrArm && { rej: global._retrArm[sym + '|REJ'] || null, limit: global._retrArm[sym + '|LIMIT'] || null }) || null, // RETRACE-REJ / RETRACE-LIMIT auto-arm state (2026-11-10)
