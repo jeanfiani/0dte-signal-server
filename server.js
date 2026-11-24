@@ -2163,6 +2163,36 @@ function blockFeat(sym, s, type, price) {
 // new experiment, not a re-fit of this one.
 const GATE_SCORE_FACTORS = ['rsiB', 'macdB', 'momB', 'accel', 'regime', 'ms', 'msRunB', 'latch', 'legB', 'posB', 'zB', 'zAgeB', 'zTouchB', 'zGrade', 'tapeB', 'sessB', 'newsB', 'dayB', 'hourB', 'openB', 'rthB', 'sinceExtB', 'pullB', 'dayStruct', 'runOppB']; // dayB/hourB added 2026-11-03 (drift vs flush); openB/rthB/sinceExtB/pullB/dayStruct added 2026-11-04 (position in the day's move); runOppB 2026-11-09 (run from the opposite extreme — V-days)
 
+// ===== ZONE VETO, COUNTER-TREND, ON QUIET / RANGE DAYS — SHADOW RELEASE RULE (2026-11-25, Jean: "what did we do about the
+// zone veto on trend days?" → "ok build it now") ===== The nightly digest read the zone vetoes as wrong on trend days. Three
+// weeks of blocked rows say otherwise for the with-trend veto (gold 117W/206L; liquidation days 37W/73L) — and point at
+// the opposite case: the COUNTER-TREND veto on days that are going nowhere. Gold, ZONE-VETO-CT, 11/03→11/24: when the day
+// is quiet (session range < 0.6% of price) or the regime reads RANGE, and it is not a liquidation day, the refused
+// signals went 69W/33L (24W/16L counted once per move); every other refusal 67W/123L (21W/53L per move). NAS does not show
+// it (9W/13L). Those figures are on the blocked rows' even $5 bracket. This stamps the rule on the LIVE ladder instead
+// (gold $5.24 / $10, NAS $50 / max(1.5×ATR, $50)), first leg only, one row per direction per 30 min, as
+// <SYM>-ZVCT-RANGE. Nothing is released: the veto stands. 60% over 25 earns a live test; ZVCT_RANGE=0 stops the stamp.
+function zvctRangeStamp(sym, s, type, msg) {
+  try {
+    if ((sym !== 'XAU' && sym !== 'NAS100') || process.env.ZVCT_RANGE === '0' || !s) return false;
+    if (type !== 'call' && type !== 'put') return false;
+    const now = Date.now(); s._zvctTs = s._zvctTs || {};
+    if (now - (s._zvctTs[type] || 0) < 1800000) return false;
+    const price = +(s.lastPrice || 0); if (!(price > 0)) return false;
+    const f = blockFeat(sym, s, type, price) || {};
+    const quiet = f.dayB === 'quiet', range = f.regime === 'RANGE', liq = f.dayB === 'liquidation';
+    if (!((quiet || range) && !liq)) return false;
+    s._zvctTs[type] = now;
+    const C = type === 'call', atr = s._atr > 0 ? s._atr : 0;
+    const tpD = sym === 'XAU' ? (parseFloat(process.env.XAU_TP1) || 5.24) : 50;
+    const slD = sym === 'XAU' ? (parseFloat(process.env.XAU_SL_BASE_FLOOR) || 10) : Math.max(1.5 * atr, 50);
+    const m = '🧱 ' + sym + '-ZVCT-RANGE ' + type.toUpperCase() + ' WOULD-FIRE @ $' + price.toFixed(2) + ' — counter-trend signal held back by the zone veto on a ' + (quiet ? 'quiet day' : 'range-regime day') + ' (day ' + (f.dayB || '?') + ', regime ' + (f.regime || '?') + '): the release rule under test, live ladder TP1 $' + tpD.toFixed(2) + ' / SL $' + slD.toFixed(2) + ', first leg only; the veto stands, 60% over 25 earns a live test (2026-11-25).';
+    s.blockedOutcomes = s.blockedOutcomes || [];
+    s.blockedOutcomes.push({ ts: now, time: ts(), symbol: sym, detector: sym + '-ZVCT-RANGE', type, price: +price.toFixed(2), virtualTp1: +(C ? price + tpD : price - tpD).toFixed(2), virtualSl: +(C ? price - slD : price + slD).toFixed(2), maxMin: 240, firstLegOnly: true, blockReason: m, feat: f, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+    console.log('[' + ts() + '] ' + sym + ': ' + m);
+    return true;
+  } catch (e) { return false; }
+}
 function trackBlockedOutcome(sym, msg, force) {
   // force=true (added 2026-07-02): dormant-analysis detectors (V-REV) bypass the shared
   // 35-min sampling cooldown — every dormant trigger is tracked, and forced entries do
@@ -2195,6 +2225,7 @@ function trackBlockedOutcome(sym, msg, force) {
       const _gj = s._gateJournal = s._gateJournal || [];
       const _det = (msg.match(/[⬆⬇]\s*([A-Z0-9_\-\/+]+)/) || [])[1] || (msg.match(/^[^A-Za-z]*([A-Z][A-Z0-9_\-\/]{2,})/) || [])[1] || '?';
       const _gate = String(cohortFor(msg) || 'unmatched');
+      try { if (_gate === 'ZONE-VETO-CT') zvctRangeStamp(sym, s, type, msg); } catch (eZQ) {} // shadow release rule for quiet / range days (2026-11-25)
       // 1 row per gate+dir per minute (scan the last 12 rows — gates interleave on a tick stream)
       let _dup = false;
       for (let _k = _gj.length - 1; _k >= 0 && _k >= _gj.length - 12; _k--) { const _e = _gj[_k]; if (now - _e.ts > 60000) break; if (_e.g === _gate && _e.d === type) { _dup = true; break; } }
@@ -2514,6 +2545,7 @@ function cohortFor(reason) {
   // SESS-REJ CRASH rows by side (2026-11-18): the CALL text says "CRASH arm (V-REC v2)", so the /V-REC/ match below was
   // taking every CRASH call into the V-REC cohort — the <SYM>-SESS-REJ-CRASH record (13W/5L on 11/17) was the PUT side
   // only, while the calls were 4W/7L in the ring. Calls now have their own cohort; puts keep the existing one.
+  { const _zq = reason.match(/\b(?:XAU|NAS100)-ZVCT-RANGE\b/); if (_zq) return _zq[0]; } // counter-trend signals the zone veto refuses on quiet / range days — the release rule under test (2026-11-25)
   { const _m5 = reason.match(/\bNAS100-MOM5D-(?:LONG|SHORT)\b/); if (_m5) return _m5[0]; } // momentum entries against the multi-day trend, refused and graded (2026-11-20)
   { const _tn = reason.match(/\b(?:XAU|NAS100)-TP3-NEAR\b/); if (_tn) return _tn[0]; } // runner taken just short of TP3: win = TP3 was reached anyway, loss = it fell back to TP2 first (2026-11-20)
   { const _cc = reason.match(/\b(?:XAU|BTC)-CRASH-CALL-(?:FIRST-LDNNY|FIRST-ASIA|REPEAT|HL)\b/); if (_cc) return _cc[0]; } // rebound-call splits and the higher-low twin (2026-11-18)
@@ -22195,7 +22227,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '8.09-20261124-undo-clear-close-mt5',
+    build: '8.10-20261125-zone-veto-ct-range-shadow',
     clearedTrade: clearedTradeInfo(sym, s), // a manually cleared trade that can still be put back / closed in MT5 (2026-11-24) // bump on each deploy — lets /state verify what's live
     laneBenchStored: Object.fromEntries(Object.entries(laneBenchState).filter(([k]) => k.indexOf(sym + '|') === 0)), // stored lane benches for this symbol (2026-11-10): {since, why, hand, base, rearmed}
     btcCallBench: sym === 'BTC' ? { benched: btcCallsBenched(), n: global._btcCallBench.n, pct: global._btcCallBench.pct, bar: 're-arm at 60% over 25 on BTC-CALL-BENCH; BTC_CALLS_LIVE=1 lifts it' } : undefined, // BTC calls benched (2026-11-10)
