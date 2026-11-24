@@ -2493,6 +2493,7 @@ function nasRthBlocked(sym) {
 function cohortFor(reason) {
   if (/BTC-CALL-BENCH/.test(reason)) return 'BTC-CALL-BENCH'; // BTC calls benched 2026-11-10: would-fire rows on the lane's own bracket — first, the text names the lane
   { const _px = reason.match(/\b(?:XAU|NAS100|BTC)-(?:RETRACE-PSX-SKIP|RETRACE-FAST-SKIP|RETRACE-EDGE-SKIP|PSX-FRONT|PSX-AT)\b/); if (_px) return _px[0]; } // prior-session magnet beyond a retrace stop: the skipped entry and the two fade-the-level twins (2026-11-17)
+  { const _ma = reason.match(/\bMACD-TURN-AG-[A-Z0-9]+(?:-[A-Z]+)?\b/); if (_ma) return _ma[0]; } // MACD turn + the agent's entry call (2026-11-25)
   { const _me = reason.match(/\bMACD-TURN-EP1(?:-(?:WITH4H|AGAINST4H))?\b/); if (_me) return _me[0]; } // one row per MACD-turn episode, and its with/against-the-4-hour-move split (2026-11-17)
   { const _rr = reason.match(/\b(?:XAU|NAS100|BTC)-RETRACE-(?:REJ|TIGHT|LIMIT)\b/); if (_rr) return _rr[0]; } // lower-high / higher-low rejection lane and its blind-limit twin (2026-11-10) — first, the text names legs and gates
   { const _mt = reason.match(/\bMACD-TURN-(?:FIRED|REF-[A-Z0-9-]+)/); if (_mt) return _mt[0]; } // shadow rows opened at the MACD turn (2026-11-09): FIRED = gates passed, REF-<GATE> = that gate refused after the turn — first, the text names other gates
@@ -3331,7 +3332,7 @@ function updateBlockedOutcomes(sym, price) {
     if (!b.tp1Hit && !b.slHit) {
       const tp1Reached = b.type === 'call' ? price >= b.virtualTp1 : price <= b.virtualTp1;
       const slReached  = b.type === 'call' ? price <= b.virtualSl  : price >= b.virtualSl;
-      if (tp1Reached) { b.tp1Hit = true; b.tp1HitTs = now; if (b.firstLegOnly) { b.outcome = 'win'; b.closed = true; b.closedTs = now; try { bumpCohortTally(sym, b.blockReason || '', 'win'); if (b.turnEp) { bumpCohortTally(sym, 'MACD-TURN-EP1', 'win'); if (b.turn4h) bumpCohortTally(sym, 'MACD-TURN-EP1-' + b.turn4h, 'win'); } } catch (eFL) {} continue; } } // firstLegOnly (2026-11-09): ladder twins grade the FIRST leg only — TP1 first = win, no BE-trail phase
+      if (tp1Reached) { b.tp1Hit = true; b.tp1HitTs = now; if (b.firstLegOnly) { b.outcome = 'win'; b.closed = true; b.closedTs = now; try { bumpCohortTally(sym, b.blockReason || '', 'win'); if (b.turnEp) { bumpCohortTally(sym, 'MACD-TURN-EP1', 'win'); if (b.turn4h) bumpCohortTally(sym, 'MACD-TURN-EP1-' + b.turn4h, 'win'); } macdTurnAgentTally(sym, b, 'win'); } catch (eFL) {} continue; } } // firstLegOnly (2026-11-09): ladder twins grade the FIRST leg only — TP1 first = win, no BE-trail phase
       else if (slReached) { b.slHit = true; b.slHitTs = now; }
     } else if (b.tp1Hit && !b.slHit) {
       // After TP1: SL trails to entry (matches real signal BE-trail behavior). If price
@@ -3361,6 +3362,7 @@ function updateBlockedOutcomes(sym, price) {
       bumpCohortTally(b.symbol || sym, b.blockReason, b.outcome); // persistent cohort score (2026-07-31)
       if (b.ccSplit) bumpCohortTally(b.symbol || sym, (b.symbol || sym) + '-CRASH-CALL-' + b.ccSplit, b.outcome); // rebound-call split (2026-11-18)
       if (b.turnEp) { bumpCohortTally(b.symbol || sym, 'MACD-TURN-EP1', b.outcome); if (b.turn4h) bumpCohortTally(b.symbol || sym, 'MACD-TURN-EP1-' + b.turn4h, b.outcome); } // episode-level MACD-turn tally + 4-hour split (2026-11-17)
+      macdTurnAgentTally(b.symbol || sym, b, b.outcome); // MACD turn + agent verdict (2026-11-25)
       // TREND-REGIME TRACKER ring (2026-10-01): resolved TREND-WT / TREND-CT rows keep their
       // detector, gate and outcome for 7 days so the win rate can be read by day/detector/gate.
       try {
@@ -7345,6 +7347,7 @@ function processPrice(sym, price, hi, lo) {
             s.blockedOutcomes = s.blockedOutcomes || [];
             s.blockedOutcomes.push({ ts: _tN, time: ts(), symbol: sym, detector: 'MACD-TURN', type: sig.type, price: +_tp0.toFixed(2), virtualTp1: +(_tC ? _tp0 + _tpD : _tp0 - _tpD).toFixed(2), virtualSl: +(_tC ? _tp0 - _slD : _tp0 + _slD).toFixed(2), maxMin: 240, firstLegOnly: true, turnEp: _tEp || undefined, turn4h: _t4 || undefined, turnVia: sig._macdTurn.via, turnGate: _esPassed ? null : _lb, blockReason: _tm, feat: blockFeat(sym, s, sig.type, _tp0), snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
             log(sym, _tm);
+            if (_tEp) { try { macdTurnAgentAsk(sym, s, s.blockedOutcomes[s.blockedOutcomes.length - 1], sig.type, _tp0); } catch (eMA) {} } // MACD turn + agent (2026-11-25)
           }
         }
       }
@@ -21240,6 +21243,52 @@ function entryAgentParse(text, snap) {
   return out;
 }
 // One consult per decision point (throttled 45s per symbol+direction so a vet re-run doesn't double-ask).
+// ===== MACD TURN + THE AGENT'S ENTRY CALL — SHADOW (2026-11-25, Jean: "what if we mix the MACD rule and the AI agent, would
+// that make us reach 70-80%?" → "yes go") ===== Gold's MACD-turn moves are 51W/28L (65%) per move — about break-even on the
+// $5.24 / $10 ladder. The agent has only ever been asked the BLOCK question on them ("lift this gate?") and upheld every
+// one of 114 reviewed turns, winners included. It has never been asked the ENTRY question at the turn. Now, at the first
+// stamp of each turn move on XAU and NAS, every entry model is asked FILL / WAIT / SKIP for that candidate on the live
+// ladder; the answer is written on the MACD-TURN row (turnAgent) and tallied when the row resolves:
+//   MACD-TURN-AG-<MODEL>-FILL / -WAIT / -SKIP   and   MACD-TURN-AG-BOTH-FILL / -SPLIT / -NONE-FILL.
+// The test of Jean's idea: "turn + agent says FILL" at >= 70% over >= 25 moves. Nothing trades from this, and these calls
+// are kept out of the agent's own scoreboard, veto count and lessons. MACD_TURN_AGENT=0 stops the calls.
+function macdTurnAgentTally(sym, b, outcome) {
+  try {
+    if (!b || !b.turnAgent || !(outcome === 'win' || outcome === 'loss')) return;
+    b.turnAgentTallied = b.turnAgentTallied || {};
+    const ks = Object.keys(b.turnAgent);
+    for (const k of ks) { if (b.turnAgentTallied[k]) continue; b.turnAgentTallied[k] = true; bumpCohortTally(sym, 'MACD-TURN-AG-' + k + '-' + String(b.turnAgent[k]).toUpperCase(), outcome); }
+    if (!b.turnAgentTallied._ALL && ks.length >= 2 && ks.length >= entryAgentModels().length) {
+      b.turnAgentTallied._ALL = true;
+      const allFill = ks.every(k => b.turnAgent[k] === 'fill'), anyFill = ks.some(k => b.turnAgent[k] === 'fill');
+      bumpCohortTally(sym, 'MACD-TURN-AG-' + (allFill ? 'BOTH-FILL' : anyFill ? 'SPLIT' : 'NONE-FILL'), outcome);
+    }
+  } catch (e) { /* tally must never affect outcome stamping */ }
+}
+function macdTurnAgentAsk(sym, s, row, dir, price) {
+  try {
+    if (!entryAgentEnabled() || process.env.MACD_TURN_AGENT === '0' || !row || row.detector !== 'MACD-TURN') return;
+    if ((sym !== 'XAU' && sym !== 'NAS100') || !(price > 0) || (dir !== 'call' && dir !== 'put')) return;
+    const fake = { ep: price, slPrice: row.virtualSl, tp1Price: row.virtualTp1, tp2Price: row.virtualTp1, tp3Price: row.virtualTp1, scalp: true };
+    const ctx = { price, atr: s._atr || 0, dir, detector: 'MACD-TURN', trade: fake, rule: { action: 'fill', via: 'MACD line has just turned toward this trade (shadow candidate: market entry on the live ladder)' }, rsi: s._rsi, macdL: s._macdL, roc3: s._roc3, roc6: s._roc6 };
+    row.turnAgent = row.turnAgent || {};
+    entryAgentModels().forEach(async (model) => {
+      try {
+        const short = entryAgentShort(model);
+        const snap = entryAgentSnapshot(sym, s, Object.assign({}, ctx, { _model: model }));
+        entryAgent.stats.calls++;
+        const r = await entryAgentCall(model, 'Decide the entry for this signal. Snapshot (JSON):\n' + JSON.stringify(snap), parseInt(process.env.ENTRY_AGENT_TIMEOUT_MS, 10) || 20000);
+        entryAgent.stats.msSum += r.ms || 0; entryAgent.stats.inTok += (r.usage && r.usage.input_tokens) || 0; entryAgent.stats.outTok += (r.usage && r.usage.output_tokens) || 0; entryAgent.dirty = true;
+        if (!r.ok) { entryAgent.stats.errors++; entryAgent.stats.lastErr = r.err; entryAgent.stats.lastErrTs = Date.now(); return; }
+        const p = entryAgentParse(r.text, snap);
+        if (p.err || !/^(fill|wait|skip)$/.test(String(p.action))) { entryAgent.stats.errors++; entryAgent.stats.lastErr = p.err || 'no action'; entryAgent.stats.lastErrTs = Date.now(); return; }
+        row.turnAgent[short] = p.action;
+        log(sym, '🤖 MACD-TURN + AGENT ' + short + ' → ' + String(p.action).toUpperCase() + ' on the ' + dir.toUpperCase() + ' turn @ $' + (+price).toFixed(2) + (p.confidence != null ? ' (conf ' + p.confidence + ')' : '') + ' — "' + String(p.reason || '').slice(0, 120) + '" [shadow, tallied when the turn row resolves]');
+        if (row.closed) macdTurnAgentTally(sym, row, row.outcome); // the row resolved before the answer came back
+      } catch (eOne) {}
+    });
+  } catch (e) {}
+}
 function entryAgentConsult(sym, s, ctx) {
   try {
     if (!entryAgentEnabled() || !s || !(ctx && ctx.price > 0)) return;
@@ -22227,7 +22276,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '8.10-20261125-zone-veto-ct-range-shadow',
+    build: '8.11-20261125-macd-turn-agent-shadow',
     clearedTrade: clearedTradeInfo(sym, s), // a manually cleared trade that can still be put back / closed in MT5 (2026-11-24) // bump on each deploy — lets /state verify what's live
     laneBenchStored: Object.fromEntries(Object.entries(laneBenchState).filter(([k]) => k.indexOf(sym + '|') === 0)), // stored lane benches for this symbol (2026-11-10): {since, why, hand, base, rearmed}
     btcCallBench: sym === 'BTC' ? { benched: btcCallsBenched(), n: global._btcCallBench.n, pct: global._btcCallBench.pct, bar: 're-arm at 60% over 25 on BTC-CALL-BENCH; BTC_CALLS_LIVE=1 lifts it' } : undefined, // BTC calls benched (2026-11-10)
