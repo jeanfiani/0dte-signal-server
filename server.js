@@ -2507,6 +2507,7 @@ function cohortFor(reason) {
   { const _cb = reason.match(/LANE-COLD-BENCH ([A-Z0-9+_\/-]+)/); if (_cb) return 'COLD-' + _cb[1]; } // 0W/3L window bench rows per lane (2026-11-06) — first, so the lane name inside cannot be caught by another match
   { const _ex = reason.match(/\b(XAU|BTC|NAS100)-EXH-REV(-1ST)?\b/); if (_ex) return _ex[0]; } // exhaustion-reversal shadow lane (2026-10-21)
   { const _bl = reason.match(/\bBTC-BIGLEG-(CONT|LATCH)\b/); if (_bl) return _bl[0]; } // continuation / latch arms (2026-10-21) — before the plain BIGLEG matches
+  { const _agR = reason.match(/\bAGENT-([A-Z0-9]+)-REFUSED-(FILL|WAIT|SKIP)(-[A-Z0-9\-]+)?\b/); if (_agR) return _agR[0]; } // entry question on refused candidates (2026-11-25): AGENT-<MODEL>-REFUSED-<ACTION>[-<GATE>], and …-REFUSED-WAIT-FILL for a wait that filled
   { const _ag = reason.match(/\bAGENT-([A-Z0-9]+)-(FILL|WAIT|SKIP)-(NOW|FILL)\b/); if (_ag) return _ag[0]; } // entry agent shadow cohorts (2026-10-09)
   { const _agU = reason.match(/\bAGENT-([A-Z0-9]+)-(UNBLOCK|UPHOLD)(-[A-Z0-9\-]+)?\b/); if (_agU) return _agU[0]; } // gate-review shadow cohorts (2026-10-21): AGENT-<MODEL>-UNBLOCK[-<GATE>]
   if (/\+LIQ\b/.test(reason)) return 'LIQ-REGIME'; // liquidation-regime fires (2026-10-30)
@@ -21103,7 +21104,11 @@ function entryAgentModels() { const m = process.env.ENTRY_AGENT_MODELS || (proce
 // 2,768 blocked candidates and unblocked 9 of them (Opus 1 of 1,482); the upheld blocks were right 65% of the time, the
 // gates' own accuracy — and the reviews were ~90% of the desk's token usage. Entry consults on live fires (and the veto
 // count built on them) still use every model. GATE_REVIEW_MODELS=<comma list> overrides.
-function gateReviewModels() { const g = (process.env.GATE_REVIEW_MODELS || '').split(',').map(x => x.trim()).filter(Boolean); if (g.length) return Array.from(new Set(g)); const h = entryAgentModels().filter(m => /haiku/i.test(m)); return h.length ? h : ['claude-haiku-5-5']; }
+// BOTH MODELS ON THE ENTRY QUESTION (2026-11-25, Jean: "set them both for now"): now that refused candidates get the
+// fill / wait / skip question, Opus — the model with the 5W/1L fill record on live fires — answers it too. The Haiku-only
+// default still applies to the legacy unblock/uphold review (AGENT_BLOCK_QUESTION=review). GATE_REVIEW_MODELS=claude-haiku-5-5
+// puts refused candidates back on Haiku alone.
+function gateReviewModels() { const g = (process.env.GATE_REVIEW_MODELS || '').split(',').map(x => x.trim()).filter(Boolean); if (g.length) return Array.from(new Set(g)); if (process.env.AGENT_BLOCK_QUESTION !== 'review') return entryAgentModels(); const h = entryAgentModels().filter(m => /haiku/i.test(m)); return h.length ? h : ['claude-haiku-5-5']; }
 function entryAgentShort(m) { return /opus/i.test(m) ? 'OPUS' : /haiku/i.test(m) ? 'HAIKU' : /sonnet/i.test(m) ? 'SONNET' : /fable/i.test(m) ? 'FABLE' : String(m).replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 8); }
 function etClock(ms) { try { return new Date(ms).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'America/New_York' }); } catch (e) { return ''; } }
 console.log('[' + ts() + '] ENTRY AGENT (shadow): ' + (entryAgentEnabled() ? 'ON — models ' + entryAgentModels().join(' + ') + ' (gate review: ' + gateReviewModels().join(' + ') + '), effort ' + (process.env.ENTRY_AGENT_EFFORT || 'low') : (process.env.ENTRY_AGENT === '0' ? 'OFF (ENTRY_AGENT=0)' : 'OFF — ANTHROPIC_API_KEY missing')));
@@ -21162,7 +21167,8 @@ function entryAgentSnapshot(sym, s, ctx) {
   const behind = own.filter(z => dir === 'call' ? z.hi <= price : z.lo >= price).map(z => Object.assign({ kind: z.kind, tf: z.tf, lo: +(+z.lo).toFixed(2), hi: +(+z.hi).toFixed(2), dist_atr: A(dir === 'call' ? price - z.hi : z.lo - price), grade: zoneGrade(sym, z) }, zx(z))).sort((a, b) => a.dist_atr - b.dist_atr).slice(0, 3);
   const m5 = (Array.isArray(s._m5) ? s._m5.slice(-12) : []).map(b => [etClock(b.ts), +(+b.o).toFixed(2), +(+b.h).toFixed(2), +(+b.l).toFixed(2), +(+b.c).toFixed(2)]);
   let m1 = []; try { const P = s.prices || []; const step = 60; for (let i = P.length - 1, n = 0; i >= 0 && n < 20; i -= step, n++) m1.unshift(+(+P[i]).toFixed(2)); } catch (e) {}
-  const recent = entryAgent.decisions.filter(d => d.sym === sym && d.model === ctx._model && !d.err).slice(-8).map(d => ({ time: d.time, dir: d.dir, action: d.action, reason: d.reason, graded: d.nowOutcome ? ('fill-now would have been a ' + d.nowOutcome + (d.waitResult ? '; wait ' + d.waitResult + (d.fillOutcome ? ' → ' + d.fillOutcome : '') : '')) : 'pending' }));
+  const _mineK = (d) => ctx._kind ? d.kind === ctx._kind : d.kind !== 'refused'; // refused-candidate decisions keep their own record (2026-11-25)
+  const recent = entryAgent.decisions.filter(d => d.sym === sym && d.model === ctx._model && !d.err && _mineK(d)).slice(-8).map(d => ({ time: d.time, dir: d.dir, action: d.action, reason: d.reason, graded: d.nowOutcome ? ('fill-now would have been a ' + d.nowOutcome + (d.waitResult ? '; wait ' + d.waitResult + (d.fillOutcome ? ' → ' + d.fillOutcome : '') : '')) : 'pending' }));
   const nb = s.newsBlackout || {};
   return {
     symbol: sym, direction: dir, detector: ctx.detector || '?', time_et: etClock(Date.now()), weekday: new Date().toLocaleDateString('en-US', { weekday: 'short', timeZone: 'America/New_York' }),
@@ -21198,7 +21204,7 @@ function entryAgentSnapshot(sym, s, ctx) {
     rule_decision: ctx.rule || null,
     my_recent_decisions: recent,
     my_lessons: entryAgentLessonsFor(sym, dir), // reflection memory (2026-10-29)
-    my_scoreboard_14d: (function () { try { const D = entryAgent.decisions.filter(d => d.sym === sym && d.model === ctx._model && !d.err && Date.now() - d.ts < 14 * 86400000); const o = { decisions: D.length, fill: { win: 0, loss: 0 }, wait: { filled: 0, filled_win: 0, filled_loss: 0, unfilled: 0, unfilled_missed_win: 0, unfilled_avoided_loss: 0 }, skip: { avoided_loss: 0, missed_win: 0 }, rule_on_same_decisions: { win: 0, loss: 0 } }; for (const d of D) { const r = d.nowOutcome; if (d.action === 'fill') { if (r === 'win') o.fill.win++; else if (r === 'loss') o.fill.loss++; } else if (d.action === 'skip') { if (r === 'win') o.skip.missed_win++; else if (r === 'loss') o.skip.avoided_loss++; } else if (d.action === 'wait') { if (/^filled/.test(d.waitResult || '')) { o.wait.filled++; if (d.fillOutcome === 'win') o.wait.filled_win++; else if (d.fillOutcome === 'loss') o.wait.filled_loss++; } else if (d.waitResult) { o.wait.unfilled++; if (r === 'win') o.wait.unfilled_missed_win++; else if (r === 'loss') o.wait.unfilled_avoided_loss++; } } if (d.ruleOutcome === 'win') o.rule_on_same_decisions.win++; else if (d.ruleOutcome === 'loss') o.rule_on_same_decisions.loss++; } return o; } catch (e) { return null; } })()
+    my_scoreboard_14d: (function () { try { const D = entryAgent.decisions.filter(d => d.sym === sym && d.model === ctx._model && !d.err && _mineK(d) && Date.now() - d.ts < 14 * 86400000); const o = { decisions: D.length, fill: { win: 0, loss: 0 }, wait: { filled: 0, filled_win: 0, filled_loss: 0, unfilled: 0, unfilled_missed_win: 0, unfilled_avoided_loss: 0 }, skip: { avoided_loss: 0, missed_win: 0 }, rule_on_same_decisions: { win: 0, loss: 0 } }; for (const d of D) { const r = d.nowOutcome; if (d.action === 'fill') { if (r === 'win') o.fill.win++; else if (r === 'loss') o.fill.loss++; } else if (d.action === 'skip') { if (r === 'win') o.skip.missed_win++; else if (r === 'loss') o.skip.avoided_loss++; } else if (d.action === 'wait') { if (/^filled/.test(d.waitResult || '')) { o.wait.filled++; if (d.fillOutcome === 'win') o.wait.filled_win++; else if (d.fillOutcome === 'loss') o.wait.filled_loss++; } else if (d.waitResult) { o.wait.unfilled++; if (r === 'win') o.wait.unfilled_missed_win++; else if (r === 'loss') o.wait.unfilled_avoided_loss++; } } if (d.ruleOutcome === 'win') o.rule_on_same_decisions.win++; else if (d.ruleOutcome === 'loss') o.rule_on_same_decisions.loss++; } return o; } catch (e) { return null; } })()
   };
 }
 function entryAgentCall(model, userText, timeoutMs, systemText) {
@@ -21270,7 +21276,7 @@ function macdTurnAgentAsk(sym, s, row, dir, price) {
     if (!entryAgentEnabled() || process.env.MACD_TURN_AGENT === '0' || !row || row.detector !== 'MACD-TURN') return;
     if ((sym !== 'XAU' && sym !== 'NAS100') || !(price > 0) || (dir !== 'call' && dir !== 'put')) return;
     const fake = { ep: price, slPrice: row.virtualSl, tp1Price: row.virtualTp1, tp2Price: row.virtualTp1, tp3Price: row.virtualTp1, scalp: true };
-    const ctx = { price, atr: s._atr || 0, dir, detector: 'MACD-TURN', trade: fake, rule: { action: 'fill', via: 'MACD line has just turned toward this trade (shadow candidate: market entry on the live ladder)' }, rsi: s._rsi, macdL: s._macdL, roc3: s._roc3, roc6: s._roc6 };
+    const ctx = { price, atr: s._atr || 0, dir, detector: 'MACD-TURN', trade: fake, rule: null, rsi: s._rsi, macdL: s._macdL, roc3: s._roc3, roc6: s._roc6 };
     row.turnAgent = row.turnAgent || {};
     entryAgentModels().forEach(async (model) => {
       try {
@@ -21325,7 +21331,7 @@ function entryAgentConsult(sym, s, ctx) {
       // weekly review can measure the veto's precision on real trades (10/14 night: both-skip = 4 losers avoided / 1 winner
       // missed). Shadow only — AGENT_VETO_LIVE is the future switch; nothing changes execution here.
       try {
-        const _peers = entryAgent.decisions.filter(x => x.ts === now && x.sym === sym && x.dir === ctx.dir && !x.err);
+        const _peers = entryAgent.decisions.filter(x => x.ts === now && x.sym === sym && x.dir === ctx.dir && !x.err && !x.kind);
         if (_peers.length >= models.length && _peers.every(x => x.action === 'skip')) {
           const _hv = ctx.histTs ? signalHistory.find(x => x.ts === ctx.histTs && x.symbol === sym) : null;
           if (_hv) { _hv.outcomes = _hv.outcomes || {}; _hv.outcomes.agentWouldVeto = _peers.map(x => x.short).join('+'); }
@@ -21418,6 +21424,44 @@ function gateLedgerFor(sym, gate, feat) {
     return out;
   } catch (e) { return null; }
 }
+// ===== REFUSED CANDIDATES GET THE ENTRY QUESTION (2026-11-25, Jean: "the AI agent test should also be tested as entry
+// question (fill, wait or skip), the rest is not useful") ===== The gate review asked "lift this gate?" with the gate's
+// name, its reason and its ledger on the table and "UPHOLD is the default" in the brief — and the agent upheld nearly
+// everything, winners included (114 of 114 reviewed MACD-turn moves). That measured obedience to the gate, not entry
+// judgment. From this build a candidate refused by a judgment gate is put to the agent exactly like a live fire:
+// FILL / WAIT / SKIP on the candidate's own bracket, with no gate name, reason or ledger in the snapshot and no rule
+// decision shown. Graded like the entry desk: FILL = the refused row's bracket; SKIP right when that bracket lost;
+// WAIT = a virtual limit, graded on its own bracket when it fills and against the refused row when it does not.
+// Decisions carry kind:'refused' — they have their own section on /agent (refusedEntry), their own cohorts
+// (AGENT-<MODEL>-REFUSED-FILL / -SKIP / -WAIT, per gate too, and -REFUSED-WAIT-FILL), and never enter the live-fire
+// board, the veto count or a veto. Same throttle and gates as the old review; every entry model answers (Opus + Haiku,
+// gateReviewModels()). Bar, set before any data: FILL >= 70% winners over >= 25 resolved.
+// AGENT_BLOCK_QUESTION=review restores the old unblock/uphold question; AGENT_UNBLOCK=0 still stops both.
+function refusedEntryConsult(sym, s, row, gate, models, now) {
+  const price = +row.price, dir = row.type, atr = s._atr || 0;
+  const slD = Math.abs(price - (+row.virtualSl)), tpD = Math.abs(price - (+row.virtualTp1));
+  if (!(price > 0 && slD > 0 && tpD > 0) || (dir !== 'call' && dir !== 'put')) return;
+  const fake = { ep: price, slPrice: row.virtualSl, tp1Price: row.virtualTp1, tp2Price: row.virtualTp1, tp3Price: row.virtualTp1, scalp: true };
+  row.agentEntry = row.agentEntry || {};
+  models.forEach(async (model) => {
+    try {
+      const short = entryAgentShort(model), id = sym + '-ref-' + now + '-' + short;
+      const snap = entryAgentSnapshot(sym, s, { price, atr, dir, detector: row.detector, trade: fake, rule: null, rsi: s._rsi, macdL: s._macdL, roc3: s._roc3, roc6: s._roc6, _model: model, _kind: 'refused' });
+      entryAgent.stats.calls++;
+      const r = await entryAgentCall(model, 'Decide the entry for this signal. Snapshot (JSON):\n' + JSON.stringify(snap), parseInt(process.env.ENTRY_AGENT_TIMEOUT_MS, 10) || 20000);
+      const dec = { id, kind: 'refused', ts: now, time: etClock(now), sym, dir, detector: row.detector || '?', gate, model, short, price: +price.toFixed(2), atr: +(+snap.atr).toFixed(2), slDist: +slD.toFixed(2), tpDist: +tpD.toFixed(2), rowTs: row.ts, feat: row.feat || null, ms: r.ms, inTok: (r.usage && r.usage.input_tokens) || 0, outTok: (r.usage && r.usage.output_tokens) || 0 };
+      entryAgent.stats.msSum += r.ms || 0; entryAgent.stats.inTok += dec.inTok; entryAgent.stats.outTok += dec.outTok;
+      if (!r.ok) { entryAgent.stats.errors++; entryAgent.stats.lastErr = r.err; entryAgent.stats.lastErrTs = now; dec.err = r.err; entryAgent.decisions.push(dec); entryAgent.dirty = true; log(sym, '🤖 REFUSED-ENTRY ' + short + ' ERROR after ' + r.ms + 'ms — ' + String(r.err).slice(0, 140)); return; }
+      const p = entryAgentParse(r.text, snap);
+      if (p.err) { entryAgent.stats.errors++; entryAgent.stats.lastErr = p.err; entryAgent.stats.lastErrTs = now; dec.err = p.err; dec.raw = String(r.text || '').slice(0, 200); entryAgent.decisions.push(dec); entryAgent.dirty = true; log(sym, '🤖 REFUSED-ENTRY ' + short + ' unusable answer (' + p.err + ') — ' + String(r.text || '').slice(0, 120)); return; }
+      Object.assign(dec, { action: p.action, limit: p.limit, windowSec: p.windowSec, leashAtr: p.leashAtr, confidence: p.confidence, reason: p.reason, counter: p.counter || undefined, note: p.note });
+      row.agentEntry[short] = p.action;
+      if (p.action === 'wait') { entryAgent.waits[sym] = entryAgent.waits[sym] || []; entryAgent.waits[sym].push({ id, model: short, dir, limit: p.limit, armPrice: price, slD, tpD, leash: p.leashAtr * (snap.atr || 0), expiry: now + p.windowSec * 1000, ts: now, tok: 'AGENT-' + short + '-REFUSED-WAIT-FILL' }); }
+      entryAgent.decisions.push(dec); if (entryAgent.decisions.length > 3000) entryAgent.decisions.shift(); entryAgent.dirty = true;
+      log(sym, '🤖 REFUSED-ENTRY ' + short + ' on a ' + String(row.detector || '?').replace(/[⬆⬇]/g, '') + ' ' + dir.toUpperCase() + ' @ $' + price.toFixed(2) + ' the rules refused (' + gate + ', ' + r.ms + 'ms) → ' + p.action.toUpperCase() + (p.action === 'wait' ? ' @ $' + p.limit + ' for ' + p.windowSec + 's' : '') + (p.confidence != null ? ' · conf ' + p.confidence : '') + ' — "' + String(p.reason || '').slice(0, 120) + '" [shadow; graded on the refused row\'s bracket]');
+    } catch (eOne) { try { log(sym, '⚠️ REFUSED-ENTRY consult error: ' + String(eOne).slice(0, 120)); } catch (e2) {} }
+  });
+}
 function gateAgentConsult(sym, s, row, msg) {
   try {
     if (!entryAgentEnabled() || process.env.AGENT_UNBLOCK === '0' || !s || !row) return;
@@ -21431,7 +21475,8 @@ function gateAgentConsult(sym, s, row, msg) {
     s._agUnblockTs2[row.type] = { ts: now, price: +row.price };
     const price = +row.price, dir = row.type, atr = s._atr || 0;
     const fake = { ep: price, slPrice: row.virtualSl, tp1Price: row.virtualTp1, tp2Price: row.virtualTp1, tp3Price: row.virtualTp1, scalp: true };
-    const models = gateReviewModels(); // Haiku only since 2026-11-18
+    const models = gateReviewModels(); // every entry model on the entry question (2026-11-25); Haiku only on the legacy review
+    if (process.env.AGENT_BLOCK_QUESTION !== 'review') { refusedEntryConsult(sym, s, row, gate, models, now); return; } // the entry question replaces unblock/uphold (2026-11-25)
     row.agentReview = row.agentReview || {};
     models.forEach(async (model) => {
       const id = sym + '-gate-' + now + '-' + entryAgentShort(model);
@@ -21498,7 +21543,7 @@ async function entryAgentReflectOne(q) {
   try {
     const what = d.kind === 'unblock'
       ? ('GATE REVIEW: the ' + d.gate + ' gate refused a ' + d.detector + ' ' + d.dir.toUpperCase() + ' @ $' + d.price + '; you said ' + String(d.action).toUpperCase() + ' (confidence ' + d.confidence + ') because: "' + (d.reason || '') + '". What happened on the refused candidate\'s bracket: ' + d.nowOutcome + (q.mfe != null ? ', ran at most $' + (+q.mfe).toFixed(2) + ' in its favour' : '') + (q.closedMin != null ? ', resolved in ' + q.closedMin + ' min' : '') + '. Your verdict was ' + q.verdict.toUpperCase() + '.')
-      : ('ENTRY DESK: a ' + d.detector + ' ' + d.dir.toUpperCase() + ' fired @ $' + d.price + ' (ATR ' + d.atr + ', stop $' + d.slDist + ', target $' + d.tpDist + '); the rule said ' + (d.rule ? d.rule.action + (d.rule.limit ? ' @ ' + d.rule.limit : '') : '?') + '; you said ' + String(d.action).toUpperCase() + (d.action === 'wait' ? ' @ ' + d.limit + ' for ' + d.windowSec + 's' : '') + ' (confidence ' + d.confidence + ') because: "' + (d.reason || '') + '". What happened: fill-now bracket → ' + d.nowOutcome + (d.waitResult ? '; your wait → ' + d.waitResult + (d.fillOutcome ? ' → ' + d.fillOutcome : '') : '') + (q.mfe != null ? '; ran at most $' + (+q.mfe).toFixed(2) + ' in its favour' : '') + (d.ruleOutcome ? '; the rule\'s own trade → ' + d.ruleOutcome : '') + '. Your decision was ' + q.verdict.toUpperCase() + '.');
+      : ('ENTRY DESK' + (d.kind === 'refused' ? ' (shadow candidate)' : '') + ': a ' + d.detector + ' ' + d.dir.toUpperCase() + ' fired @ $' + d.price + ' (ATR ' + d.atr + ', stop $' + d.slDist + ', target $' + d.tpDist + '); the rule ' + (d.kind === 'refused' ? 'did not trade it' : 'said ' + (d.rule ? d.rule.action + (d.rule.limit ? ' @ ' + d.rule.limit : '') : '?')) + '; you said ' + String(d.action).toUpperCase() + (d.action === 'wait' ? ' @ ' + d.limit + ' for ' + d.windowSec + 's' : '') + ' (confidence ' + d.confidence + ') because: "' + (d.reason || '') + '". What happened: fill-now bracket → ' + d.nowOutcome + (d.waitResult ? '; your wait → ' + d.waitResult + (d.fillOutcome ? ' → ' + d.fillOutcome : '') : '') + (q.mfe != null ? '; ran at most $' + (+q.mfe).toFixed(2) + ' in its favour' : '') + (d.ruleOutcome ? '; the rule\'s own trade → ' + d.ruleOutcome : '') + '. Your decision was ' + q.verdict.toUpperCase() + '.');
     const feat = d.feat ? Object.fromEntries(Object.entries(d.feat).filter(([k, v]) => v !== null && typeof v !== 'object')) : null;
     const userText = what + '\nFeatures at the time (bucketed): ' + JSON.stringify(feat) + '\nSymbol ' + d.sym + ', ' + d.time + ' ET.';
     const model = process.env.ENTRY_AGENT_REFLECT_MODEL || 'claude-haiku-5-5';
@@ -21574,7 +21619,7 @@ function entryAgentTick(sym, s, price) {
         const ran = isC ? price - w.armPrice >= w.leash : w.armPrice - price >= w.leash;
         const d = entryAgent.decisions.find(x => x.id === w.id);
         if (touched) {
-          const tok = 'AGENT-' + w.model + '-WAIT-FILL';
+          const tok = w.tok || ('AGENT-' + w.model + '-WAIT-FILL');
           s.blockedOutcomes = s.blockedOutcomes || [];
           s.blockedOutcomes.push({ ts: now, time: ts(), symbol: sym, detector: 'AGENT-' + w.model, type: w.dir, price: +w.limit, virtualTp1: +(isC ? w.limit + w.tpD : w.limit - w.tpD).toFixed(2), virtualSl: +(isC ? w.limit - w.slD : w.limit + w.slD).toFixed(2), maxMin: 240, agentId: w.id + '-fill', blockReason: '🤖 ' + tok + ' ' + w.dir.toUpperCase() + ' filled @ $' + (+w.limit).toFixed(2) + ' after ' + Math.round((now - w.ts) / 1000) + 's (armed @ $' + w.armPrice.toFixed(2) + ') · ' + tok, snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
           if (d) { d.waitResult = 'filled @ $' + (+w.limit).toFixed(2) + ' after ' + Math.round((now - w.ts) / 1000) + 's'; entryAgent.dirty = true; }
@@ -21591,6 +21636,13 @@ function entryAgentTick(sym, s, price) {
       if (d.sym !== sym || d.err) continue;
       // GATE-REVIEW grading (2026-10-21): the verdict is graded on the blocked row's own bracket; one cohort bump per
       // model+verdict (AGENT-<MODEL>-UNBLOCK / -UPHOLD) and one per gate (…-UNBLOCK-ZONE-VETO) when it resolves
+      // ENTRY QUESTION ON A REFUSED CANDIDATE (2026-11-25): graded on the refused row's own bracket; a WAIT that filled is
+      // graded on the bracket opened at its limit. One cohort bump per model+action and one per gate.
+      if (d.kind === 'refused') {
+        if (!d.nowOutcome) { const r = rows.find(b => b.ts === d.rowTs && b.type === d.dir && !b.agentId && (b.detector || '?') === d.detector); if (r && r.closed && r.outcome) { d.nowOutcome = r.outcome; d.nowMfe = r.mfe || 0; entryAgent.dirty = true; if (r.outcome === 'win' || r.outcome === 'loss') { const _tok = 'AGENT-' + d.short + '-REFUSED-' + String(d.action).toUpperCase(); bumpCohortTally(sym, _tok, r.outcome); const _g = String(d.gate || '').replace(/[^A-Z0-9\-]/g, ''); if (_g) bumpCohortTally(sym, _tok + '-' + _g, r.outcome); } if (d.action !== 'wait' || d.waitResult) entryAgentQueueReflect(d, r); } }
+        if (d.waitResult && /^filled/.test(d.waitResult) && !d.fillOutcome) { const r = rows.find(b => b.agentId === d.id + '-fill'); if (r && r.closed) { d.fillOutcome = r.outcome; entryAgent.dirty = true; entryAgentQueueReflect(d, r); } }
+        continue;
+      }
       if (d.kind === 'unblock') {
         if (!d.nowOutcome) { const r = rows.find(b => b.ts === d.rowTs && b.type === d.dir); if (r && r.closed && r.outcome) { d.nowOutcome = r.outcome; d.nowMfe = r.mfe || 0; entryAgent.dirty = true; if (r.outcome === 'win' || r.outcome === 'loss') { const _tok = 'AGENT-' + d.short + '-' + String(d.action).toUpperCase(); bumpCohortTally(sym, _tok, r.outcome); bumpCohortTally(sym, _tok + '-' + String(d.gate || '').replace(/[^A-Z0-9\-]/g, ''), r.outcome); entryAgentQueueReflect(d, r); } } }
         continue;
@@ -21655,6 +21707,16 @@ app.get('/agent', (req, res) => {
       b.decisions++; b._ms += d.ms || 0; if (d.err) { b.errors++; continue; }
       const o = d.nowOutcome;
       // GATE-REVIEW (2026-10-21): the unblock/uphold shadow, scored on the blocked row's bracket, kept apart from the entry desk
+      // ENTRY QUESTION ON REFUSED CANDIDATES (2026-11-25) — kept apart from the live-fire board above
+      if (d.kind === 'refused') {
+        const u = b.refusedEntry = b.refusedEntry || { decisions: 0, fill: { n: 0, win: 0, loss: 0, scratch: 0, pending: 0 }, skip: { n: 0, avoided_loss: 0, missed_win: 0, scratch: 0, pending: 0 }, wait: { n: 0, filled: 0, filled_win: 0, filled_loss: 0, unfilled: 0, unfilled_missed_win: 0, unfilled_avoided_loss: 0, pending: 0 }, byGate: {} };
+        u.decisions++;
+        const g = u.byGate[d.gate] = u.byGate[d.gate] || { fill: 0, fill_win: 0, fill_loss: 0, skip: 0, skip_avoided_loss: 0, skip_missed_win: 0, wait: 0 };
+        if (d.action === 'fill') { u.fill.n++; g.fill++; if (o === 'win') { u.fill.win++; g.fill_win++; } else if (o === 'loss') { u.fill.loss++; g.fill_loss++; } else if (o) u.fill.scratch++; else u.fill.pending++; }
+        else if (d.action === 'skip') { u.skip.n++; g.skip++; if (o === 'loss') { u.skip.avoided_loss++; g.skip_avoided_loss++; } else if (o === 'win') { u.skip.missed_win++; g.skip_missed_win++; } else if (o) u.skip.scratch++; else u.skip.pending++; }
+        else if (d.action === 'wait') { u.wait.n++; g.wait++; const wr = d.waitResult || ''; if (/^filled/.test(wr)) { u.wait.filled++; if (d.fillOutcome === 'win') u.wait.filled_win++; else if (d.fillOutcome === 'loss') u.wait.filled_loss++; else if (!d.fillOutcome) u.wait.pending++; } else if (wr) { u.wait.unfilled++; if (o === 'win') u.wait.unfilled_missed_win++; else if (o === 'loss') u.wait.unfilled_avoided_loss++; else if (!o) u.wait.pending++; } else u.wait.pending++; }
+        continue;
+      }
       if (d.kind === 'unblock') {
         const u = b.gateReview = b.gateReview || { reviews: 0, unblock: { n: 0, win: 0, loss: 0, scratch: 0, pending: 0 }, uphold: { n: 0, avoided_loss: 0, missed_win: 0, scratch: 0, pending: 0 }, byGate: {} };
         u.reviews++;
@@ -21674,7 +21736,7 @@ app.get('/agent', (req, res) => {
     const cost = { calls: st.calls, errors: st.errors, avgMs: st.calls ? Math.round(st.msSum / st.calls) : 0, inTok: st.inTok, outTok: st.outTok, lastErr: st.lastErr, lastErrAt: st.lastErrTs ? new Date(st.lastErrTs).toISOString() : null };
     const _vs = agentVetoStats();
     if (req.query.lessons) { const Ls = entryAgent.lessons.filter(l => !req.query.sym || l.sym === String(req.query.sym).toUpperCase()); return res.json({ count: entryAgent.lessons.length, reflections: entryAgent.stats.reflections || 0, queued: entryAgent.reflectQ.length, by_symbol: Object.fromEntries(['XAU', 'BTC', 'NAS100'].map(sy => [sy, entryAgentLessonsFor(sy, 'call')])), recent: Ls.slice(-40).reverse().map(l => ({ time: new Date(l.decTs).toISOString().slice(0, 16), sym: l.sym, dir: l.dir, model: l.model, kind: l.kind, where: l.where, action: l.action, gate: l.gate, outcome: l.outcome, mfe: l.mfe, tags: l.tags, lesson: l.text })) }); }
-    res.json({ enabled: entryAgentEnabled(), mode: agentVetoArmed() ? 'VETO LIVE (consensus skip cancels/flattens live fires); entries still rule-based' : 'shadow', veto: { armed: agentVetoArmed(), right: _vs.right, wrong: _vs.wrong, pending: _vs.pending, pct: _vs.pct, bar: (Math.round((parseFloat(process.env.AGENT_VETO_BAR) || 0.70) * 100)) + '% over ' + (parseInt(process.env.AGENT_VETO_MIN, 10) || 15) + ' (rolling 30d)', force: process.env.AGENT_VETO_LIVE || null }, gateReview: { enabled: entryAgentEnabled() && process.env.AGENT_UNBLOCK !== '0', models: gateReviewModels(), gates: GATE_AGENT_RE.source, minSec: parseInt(process.env.AGENT_UNBLOCK_MIN_SEC, 10) || 90, bar: 'UNBLOCK verdicts ≥60% winners over ≥25 resolved per gate, and UPHOLD verdicts at least as right as the gate itself (see /gate-score)' }, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', bar: 'agent beats the rule by ≥8 pts of W/(W+L) over ≥40 decisions, or ≥60% on its own', since: new Date(since).toISOString(), board, cost, waitsOpen: Object.fromEntries(Object.entries(entryAgent.waits).map(([k, v]) => [k, v.length])), recent: D.slice(-(parseInt(req.query.limit, 10) || 30)).reverse().map(d => ({ time: d.time, sym: d.sym, dir: d.dir, det: d.detector, kind: d.kind || 'entry', gate: d.gate || undefined, model: d.short, action: d.action, limit: d.limit, window: d.windowSec, conf: d.confidence, reason: d.reason, err: d.err || undefined, rule: d.rule, nowOutcome: d.nowOutcome || null, waitResult: d.waitResult || null, fillOutcome: d.fillOutcome || null, ruleOutcome: d.ruleOutcome || null, ms: d.ms })) });
+    res.json({ enabled: entryAgentEnabled(), mode: agentVetoArmed() ? 'VETO LIVE (consensus skip cancels/flattens live fires); entries still rule-based' : 'shadow', veto: { armed: agentVetoArmed(), right: _vs.right, wrong: _vs.wrong, pending: _vs.pending, pct: _vs.pct, bar: (Math.round((parseFloat(process.env.AGENT_VETO_BAR) || 0.70) * 100)) + '% over ' + (parseInt(process.env.AGENT_VETO_MIN, 10) || 15) + ' (rolling 30d)', force: process.env.AGENT_VETO_LIVE || null }, refusedEntry: { question: process.env.AGENT_BLOCK_QUESTION === 'review' ? 'unblock / uphold (legacy review, AGENT_BLOCK_QUESTION=review)' : 'entry: fill / wait / skip — the same question as a live fire, on the refused candidate\'s own bracket, with no gate shown', bar: 'FILL verdicts ≥70% winners over ≥25 resolved (per model; per gate in the cohort tally AGENT-<MODEL>-REFUSED-FILL-<GATE>)', macdTurn: 'MACD-TURN-AG-<MODEL>-FILL / -BOTH-FILL in the cohort tally, same bar' }, gateReview: { enabled: entryAgentEnabled() && process.env.AGENT_UNBLOCK !== '0', models: gateReviewModels(), gates: GATE_AGENT_RE.source, minSec: parseInt(process.env.AGENT_UNBLOCK_MIN_SEC, 10) || 90, bar: 'UNBLOCK verdicts ≥60% winners over ≥25 resolved per gate, and UPHOLD verdicts at least as right as the gate itself (see /gate-score)' }, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', bar: 'agent beats the rule by ≥8 pts of W/(W+L) over ≥40 decisions, or ≥60% on its own', since: new Date(since).toISOString(), board, cost, waitsOpen: Object.fromEntries(Object.entries(entryAgent.waits).map(([k, v]) => [k, v.length])), recent: D.slice(-(parseInt(req.query.limit, 10) || 30)).reverse().map(d => ({ time: d.time, sym: d.sym, dir: d.dir, det: d.detector, kind: d.kind || 'entry', gate: d.gate || undefined, model: d.short, action: d.action, limit: d.limit, window: d.windowSec, conf: d.confidence, reason: d.reason, err: d.err || undefined, rule: d.rule, nowOutcome: d.nowOutcome || null, waitResult: d.waitResult || null, fillOutcome: d.fillOutcome || null, ruleOutcome: d.ruleOutcome || null, ms: d.ms })) });
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
@@ -22276,7 +22338,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '8.11-20261125-macd-turn-agent-shadow',
+    build: '8.13-20261125-agent-entry-question-both-models',
     clearedTrade: clearedTradeInfo(sym, s), // a manually cleared trade that can still be put back / closed in MT5 (2026-11-24) // bump on each deploy — lets /state verify what's live
     laneBenchStored: Object.fromEntries(Object.entries(laneBenchState).filter(([k]) => k.indexOf(sym + '|') === 0)), // stored lane benches for this symbol (2026-11-10): {since, why, hand, base, rearmed}
     btcCallBench: sym === 'BTC' ? { benched: btcCallsBenched(), n: global._btcCallBench.n, pct: global._btcCallBench.pct, bar: 're-arm at 60% over 25 on BTC-CALL-BENCH; BTC_CALLS_LIVE=1 lifts it' } : undefined, // BTC calls benched (2026-11-10)
