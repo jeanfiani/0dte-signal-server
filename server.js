@@ -2461,9 +2461,9 @@ function nasRthBlocked(sym) {
 }
 function cohortFor(reason) {
   if (/BTC-CALL-BENCH/.test(reason)) return 'BTC-CALL-BENCH'; // BTC calls benched 2026-11-10: would-fire rows on the lane's own bracket — first, the text names the lane
-  { const _px = reason.match(/\b(?:XAU|NAS100)-(?:RETRACE-PSX-SKIP|RETRACE-FAST-SKIP|RETRACE-EDGE-SKIP|PSX-FRONT|PSX-AT)\b/); if (_px) return _px[0]; } // prior-session magnet beyond a retrace stop: the skipped entry and the two fade-the-level twins (2026-11-17)
+  { const _px = reason.match(/\b(?:XAU|NAS100|BTC)-(?:RETRACE-PSX-SKIP|RETRACE-FAST-SKIP|RETRACE-EDGE-SKIP|PSX-FRONT|PSX-AT)\b/); if (_px) return _px[0]; } // prior-session magnet beyond a retrace stop: the skipped entry and the two fade-the-level twins (2026-11-17)
   { const _me = reason.match(/\bMACD-TURN-EP1(?:-(?:WITH4H|AGAINST4H))?\b/); if (_me) return _me[0]; } // one row per MACD-turn episode, and its with/against-the-4-hour-move split (2026-11-17)
-  { const _rr = reason.match(/\b(?:XAU|NAS100)-RETRACE-(?:REJ|TIGHT|LIMIT)\b/); if (_rr) return _rr[0]; } // lower-high / higher-low rejection lane and its blind-limit twin (2026-11-10) — first, the text names legs and gates
+  { const _rr = reason.match(/\b(?:XAU|NAS100|BTC)-RETRACE-(?:REJ|TIGHT|LIMIT)\b/); if (_rr) return _rr[0]; } // lower-high / higher-low rejection lane and its blind-limit twin (2026-11-10) — first, the text names legs and gates
   { const _mt = reason.match(/\bMACD-TURN-(?:FIRED|REF-[A-Z0-9-]+)/); if (_mt) return _mt[0]; } // shadow rows opened at the MACD turn (2026-11-09): FIRED = gates passed, REF-<GATE> = that gate refused after the turn — first, the text names other gates
   { const _sw = reason.match(/\bSESSREJ-WAIVED-(?:FRESHPUT|POCNEAR)\b/); if (_sw) return _sw[0]; } // SESS-REJ CRASH fires that exist only because a 11/05 guard is waived (2026-11-16)
   { const _hw = reason.match(/\bHYST-WAIVED(?:-MACD)?\b/); if (_hw) return _hw[0]; } // live fires the removed hysteresis gate would have refused (2026-11-09)
@@ -5158,7 +5158,7 @@ function processPrice(sym, price, hi, lo) {
       }
     } catch (eSR) { /* shadow lane must never crash the tick */ }
     // RETRACE-REJ — sell the lower high / buy the higher low (2026-11-10): see retraceRejTick()
-    try { if (isMT5 && (sym === 'XAU' || sym === 'NAS100') && cfdMarketOpenET(Date.now())) retraceRejTick(sym, s, price); } catch (eRT) {}
+    try { if (isMT5 && (((sym === 'XAU' || sym === 'NAS100') && cfdMarketOpenET(Date.now())) || (sym === 'BTC' && !btcWeekendClosed()))) retraceRejTick(sym, s, price); } catch (eRT) {} // BTC in shadow since 2026-11-24
 
     // ===== LORENTZIAN CLASSIFICATION — SHADOW ENTRY SCORE (2026-09-21, Jean: "implement 3") =====
     // Port of Dehorty's kNN classifier (github.com/artificial-intelligence-edge/lorentzian-
@@ -18128,7 +18128,7 @@ function retraceRejArmed(sym, kind) {
     if (c && now - c.ts < 600000) return c.armed;
     const t = (cohortTally[sym] && cohortTally[sym][sym + '-RETRACE-' + K]) || { win: 0, loss: 0 };
     const n = (t.win || 0) + (t.loss || 0), pct = n ? t.win / n : 0;
-    const armed = f === '1' ? true : (n >= 25 && pct >= 0.6);
+    const armed = f === '1' ? true : (sym === 'BTC' ? false : (n >= 25 && pct >= 0.6)); // BTC: shadow until Jean says go (2026-11-24)
     const prev = c ? c.armed : null;
     global._retrArm[key] = { ts: now, armed, n, pct: Math.round(pct * 100), bar: f === '1' ? 'forced live (enforced 6-fill bench only)' : '60% over 25' };
     if (prev !== null && prev !== armed) { const m = '↩️ ' + sym + '-RETRACE-' + K + ' ' + (armed ? 'ARMED LIVE' : 'DISARMED') + ' — shadow ' + (t.win || 0) + 'W/' + (t.loss || 0) + 'L (' + Math.round(pct * 100) + '% over ' + n + '; bar 60% over 25' + (f === '1' ? ', forced' : '') + ') (2026-11-10).'; log(sym, m); try { sendPush('↩️ ' + sym + ' RETRACE-' + K + ' ' + (armed ? 'armed' : 'disarmed'), (t.win || 0) + 'W/' + (t.loss || 0) + 'L in shadow', 'alert'); } catch (e) {} }
@@ -18263,7 +18263,8 @@ function retraceLiveFire(sym, s, dir, price, sl, tp1, tp2, tp3, note, kind) {
     if ((s.trade && s.trade.active) || (s._oteHold && !s._oteHold.swing) || s._invHold || s._macdHold) return false;
     if (!bootWarm(sym, s).ok) return false;
     if (s.newsBlackout && s.newsBlackout.active) return false;
-    if (typeof cfdMarketOpenET === 'function' && !cfdMarketOpenET(Date.now())) return false;
+    if (sym === 'BTC' ? btcWeekendClosed() : (typeof cfdMarketOpenET === 'function' && !cfdMarketOpenET(Date.now()))) return false;
+    if (sym === 'BTC' && dir === 'call' && btcCallBenchRefuse(s, 'RETRACE', price, sl, tp1)) return false; // BTC calls stay benched
     if (liveLaneBenched(sym, K === 'LIMIT' ? /RETRACE-LIM/ : /RETRACE-REJ/, sym + '-RETRACE-' + K)) return false;
     const isL = dir === 'call';
     if (isL ? (sl >= price || tp1 <= price) : (sl <= price || tp1 >= price)) return false;
@@ -18286,20 +18287,26 @@ function retraceLiveFire(sym, s, dir, price, sl, tp1, tp2, tp3, note, kind) {
 }
 function retraceRejTick(sym, s, price) {
   try {
-    if ((sym !== 'XAU' && sym !== 'NAS100') || process.env.RETRACE_REJ === '0') return;
+    // BTC SHADOW (2026-11-24, Jean: "BTC — no put fires and it's dropping pretty harshly, keep like that or make it evolve?"). BTC's
+    // only live lanes are RANGE5 (long only, calls benched) and SESS-REJ in a RANGE regime: nothing can sell a falling BTC.
+    // The retrace-limit lane — the best performer on gold and NAS — now runs on BTC in SHADOW: same leg / 70.5% / stop
+    // beyond the origin, first target 1×ATR. A bar-level replay of the last week read 30W/10L (puts 19W/6L), but the same
+    // replay flatters gold (85% vs 62% in live shadow), so it is an indication only. BTC does NOT arm itself on the counter:
+    // BTC_RETRACE_LIMIT_LIVE=1 (or a later build) after BTC-RETRACE-LIMIT shows >= 60% over >= 25 and Jean says go.
+    if ((sym !== 'XAU' && sym !== 'NAS100' && sym !== 'BTC') || process.env.RETRACE_REJ === '0') return;
     const M = Array.isArray(s._m5) ? s._m5 : [], atr = s._atr || 0;
     if (M.length < 18 || !(atr > 0) || !(price > 0)) return;
     const now = Date.now();
     const R = s._retr = s._retr || { m5Ts: 0, legs: { put: null, call: null }, done: {}, last: { put: 0, call: 0 } };
     const lc = M[M.length - 1];
-    const tpMin = sym === 'XAU' ? (parseFloat(process.env.XAU_TP1) || 5.24) : 50, tpMax = sym === 'XAU' ? 12 : 120;
+    const tpMin = sym === 'XAU' ? (parseFloat(process.env.XAU_TP1) || 5.24) : sym === 'BTC' ? Math.max(50, 1.0 * atr) : 50, tpMax = sym === 'XAU' ? 12 : sym === 'BTC' ? 3 * Math.max(50, 1.0 * atr) : 120;
     const _rLbMin = (parseInt(process.env.RETRACE_LOOKBACK_BARS, 10) || 36) * 5;
     const row = (det, dir, p, tp, sl, m) => ({ ts: now, time: ts(), symbol: sym, detector: det, type: dir, price: +p.toFixed(2), virtualTp1: +tp.toFixed(2), virtualSl: +sl.toFixed(2), maxMin: 240, firstLegOnly: true, blockReason: m, feat: blockFeat(sym, s, dir, p), snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
     if (lc.ts !== R.m5Ts) {
       R.m5Ts = lc.ts;
       // real, open-market bars inside the lookback's clock time only — a leg must not be a weekend gap (2026-11-23)
       const _rLb = parseInt(process.env.RETRACE_LOOKBACK_BARS, 10) || 36, _rT0 = now - (_rLb + 1) * 300000;
-      let W = M.slice(-_rLb).filter(b => b && b.ts >= _rT0 && b.h > b.l && cfdMarketOpenET(b.ts)); if (!W.length) W = [lc];
+      let W = M.slice(-_rLb).filter(b => b && b.ts >= _rT0 && b.h > b.l && (sym === 'BTC' || cfdMarketOpenET(b.ts))); if (!W.length) W = [lc];
       const n = W.length;
       const legMin = (parseFloat(process.env.RETRACE_LEG_ATR) || 4) * atr;
       // down-leg from the window high (PUT side) / up-leg from the window low (CALL side)
@@ -20951,10 +20958,59 @@ app.post('/trade/clear', (req, res) => {
     } catch (eMC) {}
     log(sym, '🧹 MANUAL CLEAR — ' + String(t.type || '').toUpperCase() + ' @ $' + (+t.ep || 0).toFixed(2) + ' cleared from the dashboard (source ' + src + ') @ $' + (+s.lastPrice || 0).toFixed(2) + ' · age ' + Math.round((Date.now() - (t.ts || Date.now())) / 60000) + 'min. NOTE: this stops server management only — the MT5 position is NOT closed; use 🛑 Close Trade @ Market for that.');
   }
+  // UNDO (2026-11-24, Jean: "I mistakenly cancelled the NAS trade on the bot — can you reinstate it?"): the cleared trade is
+  // kept for the undo window so POST /trade/unclear can put it back exactly as it was. See clearedTradeInfo().
+  if (live && isCfd) s._clearedTrade = { ts: Date.now(), trade: t, price: +(s.lastPrice || 0), src, row: (s.lastHistEntry && s.lastHistEntry.symbol === sym) ? s.lastHistEntry : null };
   s.trade = { active: false, type: '', ep: 0, t1: false, t2: false, sl: false, rev: false, lastETs: 0, pt1: 30, pt2: 60, sl2: 25, ts: Date.now() };
-  res.json({ ok: true });
+  res.json({ ok: true, undoSec: (live && isCfd) ? Math.round(UNCLEAR_WINDOW_MS / 1000) : 0 });
 });
 
+// ===== UNDO A MISTAKEN EXIT + CLOSE AN ORPHAN (2026-11-24) ===== The dashboard's Exit / ✕ only stops the SERVER managing a
+// trade; the MT5 position stays open with its broker stop and hard target (11/24 16:30 NAS put, cleared by mistake). Two
+// tools:
+//   • POST /trade/unclear {sym} — within UNCLEAR_WINDOW_MIN (10) of a manual clear, puts the SAME trade object back
+//     (levels, flags, trail) so the EA resumes managing the open position. The EA keys entries on the signal row, which is
+//     unchanged, so it does not enter again. Refused when the trade had already taken TP1 (the EA resets its half-close
+//     memory on a clear and would halve the remainder again), when the EA has reported the position closed, when price is
+//     at or beyond the stop (the broker has taken it), when another trade or a pending entry exists, or after the window.
+//   • POST /trade/close {sym, orphan:true} — after a clear, raises the normal EA close flag for that symbol even though
+//     the server has no active trade, so "Close in MT5" still works on a position the server has let go of.
+const UNCLEAR_WINDOW_MS = (parseInt(process.env.UNCLEAR_WINDOW_MIN, 10) || 10) * 60000;
+function clearedTradeInfo(sym, s) {
+  try {
+    const c = s && s._clearedTrade; if (!c || !c.trade) return null;
+    const t = c.trade, age = Date.now() - c.ts, px = +(s.lastPrice || 0), iC = t.type === 'call';
+    if (age > 12 * 3600000) { s._clearedTrade = null; return null; }
+    const stop = (t.trailSl > 0) ? +t.trailSl : +t.slPrice;
+    let blocked = null;
+    if (age > UNCLEAR_WINDOW_MS) blocked = 'the ' + Math.round(UNCLEAR_WINDOW_MS / 60000) + '-minute undo window has passed';
+    else if (s.trade && s.trade.active) blocked = 'another trade is active on ' + sym;
+    else if (s._oteHold || s._invHold || s._macdHold) blocked = 'a new entry is pending on ' + sym;
+    else if (t.t1) blocked = 'the trade had already taken TP1 — the EA would halve the remainder again; manage it in MT5';
+    else if (c.row && c.row.outcomes && (c.row.outcomes.eaClose || c.row.outcomes.slHit)) blocked = 'the EA has reported the position closed';
+    else if (px > 0 && stop > 0 && (iC ? px <= stop : px >= stop)) blocked = 'price is at or beyond the stop — the broker has taken the position';
+    return { type: t.type, ep: +t.ep || 0, sl: +t.slPrice || 0, tp1: +t.tp1Price || 0, tp2: +t.tp2Price || 0, tp3: +t.tp3Price || 0, clearedAgoSec: Math.round(age / 1000), undoLeftSec: Math.max(0, Math.round((UNCLEAR_WINDOW_MS - age) / 1000)), canUndo: !blocked, blocked };
+  } catch (e) { return null; }
+}
+app.post('/trade/unclear', (req, res) => {
+  try {
+    const sym = resolveSymbol(req.body && req.body.sym);
+    const token = (req.headers['x-close-token'] || (req.body && req.body.token) || '');
+    if (CLOSE_TOKEN && token !== CLOSE_TOKEN) return res.status(403).json({ error: 'bad token' });
+    const s = S[sym];
+    if (!s) return res.status(400).json({ error: 'Unknown symbol' });
+    const info = clearedTradeInfo(sym, s);
+    if (!info) return res.status(409).json({ ok: false, error: 'nothing to undo on ' + sym });
+    if (!info.canUndo) { log(sym, '↩️ UNDO REFUSED — ' + info.blocked + ' (' + String(info.type).toUpperCase() + ' @ $' + info.ep.toFixed(2) + ', cleared ' + info.clearedAgoSec + 's ago).'); return res.status(409).json({ ok: false, error: info.blocked, cleared: info }); }
+    const c = s._clearedTrade, t = c.trade;
+    t.active = true; t.lastETs = Date.now();
+    s.trade = t; s._clearedTrade = null;
+    try { const h = c.row; if (h && h.outcomes) { delete h.outcomes.manualClear; delete h.outcomes.manualClearTs; h.outcomes.clearUndone = { afterSec: info.clearedAgoSec, at: +(s.lastPrice || 0).toFixed(2) }; } } catch (eH) {}
+    log(sym, '↩️ UNDO — ' + String(t.type).toUpperCase() + ' @ $' + (+t.ep).toFixed(2) + ' restored ' + info.clearedAgoSec + 's after a manual clear · SL $' + (+t.slPrice).toFixed(2) + ' · TP1 $' + (+t.tp1Price).toFixed(2) + ' · the EA resumes managing the open position (2026-11-24).');
+    try { sendPush('↩️ ' + sym + ' trade restored', String(t.type).toUpperCase() + ' @ $' + (+t.ep).toFixed(2) + ' — the bot is managing it again', 'alert'); } catch (eP) {}
+    res.json({ ok: true, sym, type: t.type, ep: t.ep, sl: t.slPrice, tp1: t.tp1Price, tp2: t.tp2Price, tp3: t.tp3Price, restoredAfterSec: info.clearedAgoSec });
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+});
 // ===== MANUAL CLOSE COMMAND (2026-07-24) =====
 // The monitor "Close Trade" button POSTs here. Signal Trader POLLS /state/:sym, so we don't
 // push an order — we RAISE A FLAG (s.closeRequest) that the next /state poll surfaces. The
@@ -20972,7 +21028,17 @@ app.post('/trade/close', (req, res) => {
   if (CLOSE_TOKEN && token !== CLOSE_TOKEN) return res.status(403).json({ error: 'bad token' });
   const s = S[sym];
   if (!s) return res.status(400).json({ error: 'Unknown symbol' });
-  if (!s.trade || !s.trade.active) return res.status(409).json({ error: 'no active trade', sym });
+  if (!s.trade || !s.trade.active) {
+    // ORPHAN CLOSE (2026-11-24): the server has let go of the trade (manual clear) but the MT5 position is still open.
+    const c = s._clearedTrade;
+    if (!(req.body && req.body.orphan === true && c && c.trade && Date.now() - c.ts < 12 * 3600000)) return res.status(409).json({ error: 'no active trade', sym });
+    const oid = sym + '-orphan-' + Date.now();
+    s.closeRequest = { active: true, id: oid, ts: Date.now(), type: c.trade.type || '', ep: c.trade.ep || 0, source: 'manual-orphan' };
+    log(sym, '🛑 MANUAL CLOSE requested for the cleared ' + String(c.trade.type || '').toUpperCase() + ' @ $' + (+c.trade.ep || 0).toFixed(2) + ' — the server no longer manages it; EA asked to flatten ' + sym + ' at market · id ' + oid + '.');
+    try { sendPush('🛑 ' + sym + ' CLOSE requested', 'Close sent to Signal Trader for the cleared ' + String(c.trade.type || '').toUpperCase() + ' — awaiting fill', 'close-req'); } catch (eP) {}
+    s._clearedTrade = null;
+    return res.json({ ok: true, sym, id: oid, orphan: true, closeRequest: s.closeRequest });
+  }
   const id = sym + '-' + Date.now();
   s.closeRequest = { active: true, id, ts: Date.now(), type: s.trade.type || '', ep: s.trade.ep || 0, source: 'manual-monitor' };
   log(sym, '🛑 MANUAL CLOSE requested via monitor — ' + (s.trade.type || '').toUpperCase() + ' @ $' + (s.trade.ep || 0).toFixed(2) + ' · id ' + id + ' (flag surfaced to poller; awaiting EA ack).');
@@ -22129,7 +22195,8 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '8.07-20261124-retrace-edge-skip', // bump on each deploy — lets /state verify what's live
+    build: '8.09-20261124-undo-clear-close-mt5',
+    clearedTrade: clearedTradeInfo(sym, s), // a manually cleared trade that can still be put back / closed in MT5 (2026-11-24) // bump on each deploy — lets /state verify what's live
     laneBenchStored: Object.fromEntries(Object.entries(laneBenchState).filter(([k]) => k.indexOf(sym + '|') === 0)), // stored lane benches for this symbol (2026-11-10): {since, why, hand, base, rearmed}
     btcCallBench: sym === 'BTC' ? { benched: btcCallsBenched(), n: global._btcCallBench.n, pct: global._btcCallBench.pct, bar: 're-arm at 60% over 25 on BTC-CALL-BENCH; BTC_CALLS_LIVE=1 lifts it' } : undefined, // BTC calls benched (2026-11-10)
     retraceRej: (global._retrArm && { rej: global._retrArm[sym + '|REJ'] || null, limit: global._retrArm[sym + '|LIMIT'] || null }) || null, // RETRACE-REJ / RETRACE-LIMIT auto-arm state (2026-11-10)
