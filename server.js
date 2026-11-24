@@ -2461,7 +2461,7 @@ function nasRthBlocked(sym) {
 }
 function cohortFor(reason) {
   if (/BTC-CALL-BENCH/.test(reason)) return 'BTC-CALL-BENCH'; // BTC calls benched 2026-11-10: would-fire rows on the lane's own bracket — first, the text names the lane
-  { const _px = reason.match(/\b(?:XAU|NAS100)-(?:RETRACE-PSX-SKIP|RETRACE-FAST-SKIP|PSX-FRONT|PSX-AT)\b/); if (_px) return _px[0]; } // prior-session magnet beyond a retrace stop: the skipped entry and the two fade-the-level twins (2026-11-17)
+  { const _px = reason.match(/\b(?:XAU|NAS100)-(?:RETRACE-PSX-SKIP|RETRACE-FAST-SKIP|RETRACE-EDGE-SKIP|PSX-FRONT|PSX-AT)\b/); if (_px) return _px[0]; } // prior-session magnet beyond a retrace stop: the skipped entry and the two fade-the-level twins (2026-11-17)
   { const _me = reason.match(/\bMACD-TURN-EP1(?:-(?:WITH4H|AGAINST4H))?\b/); if (_me) return _me[0]; } // one row per MACD-turn episode, and its with/against-the-4-hour-move split (2026-11-17)
   { const _rr = reason.match(/\b(?:XAU|NAS100)-RETRACE-(?:REJ|TIGHT|LIMIT)\b/); if (_rr) return _rr[0]; } // lower-high / higher-low rejection lane and its blind-limit twin (2026-11-10) — first, the text names legs and gates
   { const _mt = reason.match(/\bMACD-TURN-(?:FIRED|REF-[A-Z0-9-]+)/); if (_mt) return _mt[0]; } // shadow rows opened at the MACD turn (2026-11-09): FIRED = gates passed, REF-<GATE> = that gate refused after the turn — first, the text names other gates
@@ -18228,6 +18228,22 @@ function retracePsxStamp(sym, s, R, dir, kind, price, sl, tp1, atr, tpMin, px) {
 //   • XAU: a limit touched within RETRACE_MIN_AGE_MIN (45) of the leg's extreme is NOT taken live; stamped
 //     XAU-RETRACE-FAST-SKIP on the same bracket (win = the skip was wrong); the skip withdraws itself when that cohort
 //     is net-positive over >= 3 resolved. RETRACE_FAST_GUARD=0 turns it off (rows keep stamping).
+// ===== LEG CUT OFF BY THE LOOKBACK (2026-11-24, Jean: "analyze the 2 missed NAS signals during the Asian session" → "add now")
+// ===== The lane takes the highest high (lowest low) of the last 3 hours as the leg's origin. When that extreme sits in
+// the first bars of the window it is usually not a swing at all — the real one has just scrolled out and the "origin" is
+// a point on the way down. 11/23 23:45 NAS put: window from 20:45, origin 26,818.6, real swing high 26,891.6 at 20:20; the
+// stop above the fake origin (26,825.5) was taken by a drift to 26,862 before NAS fell $500. One week of both markets:
+// origin at the window edge 15W/14L, origin a swing inside the window 24W/5L.
+//   • a leg whose origin is in the first 3 bars of the window is not traded; the entry is stamped <SYM>-RETRACE-EDGE-SKIP
+//     on the same bracket and is NOT counted in the lane's own RETRACE-LIMIT record (which now measures what is traded).
+//   • the skip is lifted when that cohort shows >= 60% over >= 25. RETRACE_EDGE_GUARD=0 turns it off.
+function retraceEdgeGuardOn(sym) {
+  try {
+    if (process.env.RETRACE_EDGE_GUARD === '0') return false;
+    const t = (cohortTally[sym] && cohortTally[sym][sym + '-RETRACE-EDGE-SKIP']) || {}; const w = t.win || 0, l = t.loss || 0;
+    return !((w + l) >= 25 && w / (w + l) >= 0.6);
+  } catch (e) { return true; }
+}
 function retraceFastStamp(sym, s, dir, price, sl, tp1, ageMin, g, atr) {
   try {
     let on = sym === 'XAU' && process.env.RETRACE_FAST_GUARD !== '0';
@@ -18277,6 +18293,7 @@ function retraceRejTick(sym, s, price) {
     const R = s._retr = s._retr || { m5Ts: 0, legs: { put: null, call: null }, done: {}, last: { put: 0, call: 0 } };
     const lc = M[M.length - 1];
     const tpMin = sym === 'XAU' ? (parseFloat(process.env.XAU_TP1) || 5.24) : 50, tpMax = sym === 'XAU' ? 12 : 120;
+    const _rLbMin = (parseInt(process.env.RETRACE_LOOKBACK_BARS, 10) || 36) * 5;
     const row = (det, dir, p, tp, sl, m) => ({ ts: now, time: ts(), symbol: sym, detector: det, type: dir, price: +p.toFixed(2), virtualTp1: +tp.toFixed(2), virtualSl: +sl.toFixed(2), maxMin: 240, firstLegOnly: true, blockReason: m, feat: blockFeat(sym, s, dir, p), snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
     if (lc.ts !== R.m5Ts) {
       R.m5Ts = lc.ts;
@@ -18288,10 +18305,10 @@ function retraceRejTick(sym, s, price) {
       // down-leg from the window high (PUT side) / up-leg from the window low (CALL side)
       let iH = 0; for (let i = 1; i < n; i++) if (W[i].h >= W[iH].h) iH = i;
       let iL = -1; for (let i = iH + 1; i < n; i++) if (iL < 0 || W[i].l <= W[iL].l) iL = i;
-      R.legs.put = (iL > iH && W[iH].h - W[iL].l >= legMin) ? { o: W[iH].h, x: W[iL].l, leg: W[iH].h - W[iL].l, xi: iL, xTs: W[iL].ts, key: 'put|' + W[iH].h.toFixed(2) + '|' + W[iL].l.toFixed(2) } : null;
+      R.legs.put = (iL > iH && W[iH].h - W[iL].l >= legMin) ? { o: W[iH].h, x: W[iL].l, leg: W[iH].h - W[iL].l, xi: iL, xTs: W[iL].ts, edge: iH <= 2, key: 'put|' + W[iH].h.toFixed(2) + '|' + W[iL].l.toFixed(2) } : null;
       let jL = 0; for (let i = 1; i < n; i++) if (W[i].l <= W[jL].l) jL = i;
       let jH = -1; for (let i = jL + 1; i < n; i++) if (jH < 0 || W[i].h >= W[jH].h) jH = i;
-      R.legs.call = (jH > jL && W[jH].h - W[jL].l >= legMin) ? { o: W[jL].l, x: W[jH].h, leg: W[jH].h - W[jL].l, xi: jH, xTs: W[jH].ts, key: 'call|' + W[jL].l.toFixed(2) + '|' + W[jH].h.toFixed(2) } : null;
+      R.legs.call = (jH > jL && W[jH].h - W[jL].l >= legMin) ? { o: W[jL].l, x: W[jH].h, leg: W[jH].h - W[jL].l, xi: jH, xTs: W[jH].ts, edge: jL <= 2, key: 'call|' + W[jL].l.toFixed(2) + '|' + W[jH].h.toFixed(2) } : null;
       for (const dir of ['put', 'call']) {
         const g = R.legs[dir]; if (!g) continue;
         const P = dir === 'put';
@@ -18319,7 +18336,7 @@ function retraceRejTick(sym, s, price) {
         const m = '↩️ ' + sym + '-RETRACE-REJ ' + dir.toUpperCase() + ' @ $' + price.toFixed(2) + ' — ' + note + ' · SL $' + sl.toFixed(2) + ' (beyond the leg\'s origin) · TP1 $' + tp1.toFixed(2) + ' · first leg only' + (retraceRejArmed(sym, 'REJ') ? '' : ' · shadow until 60% over 25') + ' (2026-11-10).';
         s.blockedOutcomes = s.blockedOutcomes || []; s.blockedOutcomes.push(row(sym + '-RETRACE-REJ', dir, price, tp1, sl, m)); log(sym, m);
         if (P ? (slT > price) : (slT < price)) s.blockedOutcomes.push(row(sym + '-RETRACE-TIGHT', dir, price, tp1, slT, '↩️ ' + sym + '-RETRACE-TIGHT ' + dir.toUpperCase() + ' @ $' + price.toFixed(2) + ' — same entry and target as RETRACE-REJ, stop 0.5×ATR beyond the retrace extreme $' + slT.toFixed(2) + ' instead of beyond the origin (measurement twin, 2026-11-10).'));
-        { const _px = retracePsx(sym, s, dir, sl, atr); if (!(_px && retracePsxStamp(sym, s, R, dir, 'REJ', price, sl, tp1, atr, tpMin, _px))) retraceLiveFire(sym, s, dir, price, sl, tp1, tp2, tp3, note, 'REJ'); } // prior-session magnet beyond the stop → not taken live (2026-11-17)
+        { const _px = retracePsx(sym, s, dir, sl, atr); const _edR = !!g.edge && retraceEdgeGuardOn(sym); /* origin at the window edge → not traded (2026-11-24) */ if (!_edR && !(_px && retracePsxStamp(sym, s, R, dir, 'REJ', price, sl, tp1, atr, tpMin, _px))) retraceLiveFire(sym, s, dir, price, sl, tp1, tp2, tp3, note, 'REJ'); } // prior-session magnet beyond the stop → not taken live (2026-11-17)
       }
       for (const k of Object.keys(R.done)) if (now - R.done[k] > 6 * 3600000) delete R.done[k];
     }
@@ -18334,6 +18351,7 @@ function retraceRejTick(sym, s, price) {
       if (through > 0.25 * atr) continue;                                              // first seen already well through the level — not a limit fill, not stamped
       const sl = P ? g.o + 0.25 * atr : g.o - 0.25 * atr, risk = Math.abs(sl - price);
       if (risk > 2.05 * tpMin) continue;
+      if (g.edge && retraceEdgeGuardOn(sym)) { const _em = '✂️ ' + sym + '-RETRACE-EDGE-SKIP ' + dir.toUpperCase() + ' @ $' + price.toFixed(2) + ' — retrace limit $' + lim.toFixed(2) + ' NOT traded: the leg $' + g.o.toFixed(2) + ' → $' + g.x.toFixed(2) + ' starts at the edge of the ' + Math.round(_rLbMin) + '-min lookback, not at a swing inside it (the real swing has scrolled out) · same bracket: SL $' + sl.toFixed(2) + ' · TP1 $' + tpMin.toFixed(2) + ' · graded, lifted at 60% over 25 (2026-11-24).'; s.blockedOutcomes = s.blockedOutcomes || []; s.blockedOutcomes.push(row(sym + '-RETRACE-EDGE-SKIP', dir, price, P ? price - tpMin : price + tpMin, sl, _em)); log(sym, _em); continue; }
       const m = '↩️ ' + sym + '-RETRACE-LIMIT ' + dir.toUpperCase() + ' @ $' + price.toFixed(2) + ' — blind limit at the 70.5% retrace $' + lim.toFixed(2) + ' of the ' + (g.leg / atr).toFixed(1) + '-ATR leg $' + g.o.toFixed(2) + ' → $' + g.x.toFixed(2) + ' · SL $' + sl.toFixed(2) + ' (beyond the origin) · TP1 $' + tpMin.toFixed(2) + ' · measurement twin of RETRACE-REJ (2026-11-10).';
       s.blockedOutcomes = s.blockedOutcomes || []; s.blockedOutcomes.push(row(sym + '-RETRACE-LIMIT', dir, price, P ? price - tpMin : price + tpMin, sl, m)); log(sym, m);
       // live on its own record (2026-11-10): TP1 the standard first target, TP2 the leg's end, TP3 the 38.2% extension
@@ -22111,7 +22129,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '8.06-20261123-real-bars-window', // bump on each deploy — lets /state verify what's live
+    build: '8.07-20261124-retrace-edge-skip', // bump on each deploy — lets /state verify what's live
     laneBenchStored: Object.fromEntries(Object.entries(laneBenchState).filter(([k]) => k.indexOf(sym + '|') === 0)), // stored lane benches for this symbol (2026-11-10): {since, why, hand, base, rearmed}
     btcCallBench: sym === 'BTC' ? { benched: btcCallsBenched(), n: global._btcCallBench.n, pct: global._btcCallBench.pct, bar: 're-arm at 60% over 25 on BTC-CALL-BENCH; BTC_CALLS_LIVE=1 lifts it' } : undefined, // BTC calls benched (2026-11-10)
     retraceRej: (global._retrArm && { rej: global._retrArm[sym + '|REJ'] || null, limit: global._retrArm[sym + '|LIMIT'] || null }) || null, // RETRACE-REJ / RETRACE-LIMIT auto-arm state (2026-11-10)
