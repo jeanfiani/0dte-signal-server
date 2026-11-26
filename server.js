@@ -2492,7 +2492,7 @@ function nasRthBlocked(sym) {
 }
 function cohortFor(reason) {
   if (/BTC-CALL-BENCH/.test(reason)) return 'BTC-CALL-BENCH'; // BTC calls benched 2026-11-10: would-fire rows on the lane's own bracket — first, the text names the lane
-  { const _px = reason.match(/\b(?:XAU|NAS100|BTC)-(?:RETRACE-PSX-SKIP|RETRACE-FAST-SKIP|RETRACE-EDGE-SKIP|PSX-FRONT|PSX-AT)\b/); if (_px) return _px[0]; } // prior-session magnet beyond a retrace stop: the skipped entry and the two fade-the-level twins (2026-11-17)
+  { const _px = reason.match(/\b(?:XAU|NAS100|BTC)-(?:RETRACE-PSX-SKIP|RETRACE-FAST-SKIP|RETRACE-EDGE-SKIP|RETRACE-ATR-SHRINK|PSX-FRONT|PSX-AT)\b/); if (_px) return _px[0]; } // prior-session magnet beyond a retrace stop: the skipped entry and the two fade-the-level twins (2026-11-17)
   { const _ma = reason.match(/\bMACD-TURN-AG-[A-Z0-9]+(?:-[A-Z]+)?\b/); if (_ma) return _ma[0]; } // MACD turn + the agent's entry call (2026-11-25)
   { const _me = reason.match(/\bMACD-TURN-EP1(?:-(?:WITH4H|AGAINST4H))?\b/); if (_me) return _me[0]; } // one row per MACD-turn episode, and its with/against-the-4-hour-move split (2026-11-17)
   { const _rr = reason.match(/\b(?:XAU|NAS100|BTC)-RETRACE-(?:REJ|TIGHT|LIMIT)\b/); if (_rr) return _rr[0]; } // lower-high / higher-low rejection lane and its blind-limit twin (2026-11-10) — first, the text names legs and gates
@@ -2548,6 +2548,7 @@ function cohortFor(reason) {
   // taking every CRASH call into the V-REC cohort — the <SYM>-SESS-REJ-CRASH record (13W/5L on 11/17) was the PUT side
   // only, while the calls were 4W/7L in the ring. Calls now have their own cohort; puts keep the existing one.
   { const _zq = reason.match(/\b(?:XAU|NAS100)-ZVCT-RANGE\b/); if (_zq) return _zq[0]; } // counter-trend signals the zone veto refuses on quiet / range days — the release rule under test (2026-11-25)
+  { const _mr = reason.match(/\bXAU-MOM-RANGE(?:-FIRED)?\b/); if (_mr) return _mr[0]; } // gold momentum in a RANGE market: -FIRED = the live record that decides the hold; plain = entries held while it is on (2026-11-26)
   { const _m5 = reason.match(/\bNAS100-MOM5D-(?:LONG|SHORT)\b/); if (_m5) return _m5[0]; } // momentum entries against the multi-day trend, refused and graded (2026-11-20)
   { const _tn = reason.match(/\b(?:XAU|NAS100)-TP3-NEAR\b/); if (_tn) return _tn[0]; } // runner taken just short of TP3: win = TP3 was reached anyway, loss = it fell back to TP2 first (2026-11-20)
   { const _cc = reason.match(/\b(?:XAU|BTC)-CRASH-CALL-(?:FIRST-LDNNY|FIRST-ASIA|REPEAT|HL)\b/); if (_cc) return _cc[0]; } // rebound-call splits and the higher-low twin (2026-11-18)
@@ -2718,6 +2719,7 @@ function fireCohortsOnResolve(sym, entry, outcome) {
     if (qb) names.push('ENTRYQ-' + String(qb).toUpperCase()); // fill quality inside the structural swing (2026-11-09)
     if (entry.macdRelease && entry.macdRelease.recov) names.push('MACD-RECOV-LIVE'); // fired through the recovery cell (2026-11-09)
     if (entry.hystWaived) names.push(/^MACD-DEFER/.test(String(entry.hystWaived.gate || '')) ? 'HYST-WAIVED-MACD' : 'HYST-WAIVED'); // fires that exist only because hysteresis is off (2026-11-09)
+    if (momRangeFiredRow(sym, entry)) { momRangeSeed(); names.push('XAU-MOM-RANGE-FIRED'); } // gold momentum fired while the day regime was RANGE — the record that decides the hold (2026-11-26)
     if (Array.isArray(entry.srWaived)) for (const w of entry.srWaived) names.push('SESSREJ-WAIVED-' + w); // waiver cohorts; net-negative over >=3 withdraws the waiver (2026-11-16)
     for (const n of names) bumpCohortTally(sym, n, outcome);
     entry.outcomes.fireCohorts = { names, outcome };
@@ -11387,6 +11389,8 @@ function processPrice(sym, price, hi, lo) {
       }
       // momentum against the multi-day trend on NAS (2026-11-20) — see mom5dRefuse()
       try { if (mom5dRefuse(sym, s, sig, tag)) { Object.assign(s, _emitSnapshot); return false; } } catch (eM5) {}
+      // gold momentum while the day regime is RANGE: fires and is counted; held only once the record says so (2026-11-26) — see momRangeHold()
+      try { if (momRangeHold(sym, s, sig, tag)) { Object.assign(s, _emitSnapshot); return false; } } catch (eMR) {}
       // ===== LANE COLD-START BENCH (2026-11-06) — see laneColdBench(). Placed last: a benched lane's fire is still a fire
       // the gates passed, stamped on the live ladder (XAU $5.24 / $10; other symbols the standard bracket) and graded.
       try {
@@ -18195,6 +18199,77 @@ function retraceRejArmed(sym, kind) {
 //   • multi-day regime BEAR → no momentum LONG;   • multi-day regime BULL → no momentum SHORT;   • neutral → no effect.
 // Each refusal is graded on the standard bracket, one row per direction per 30 min, as NAS100-MOM5D-LONG / -SHORT; a side
 // is released again when its own cohort shows >= 60% over >= 25. MOM5D_GATE=0 turns the rule off.
+// ===== GOLD MOMENTUM IN A RANGE MARKET — COUNTED FIRST, HELD ONLY ON A REPEAT (2026-11-26) ===== 11/26 04:37 a RIDE+MACRO
+// call bought $3,575.64 at market at the top of a three-hour box ($3,562.64–$3,575.88) whose ceiling had turned price back
+// six times; day regime RANGE (KER 0.12). The gates had refused the same call at 03:47 and 04:21; at 04:37 price poked 75
+// cents above the supply zone, the zone rule read "path clear", the call fired, the poke was the top. Stopped 05:07.
+// Build 8.14 answered with a hold on every gold momentum signal in RANGE. Jean, the same morning: "I am not sure it was
+// the good call to set a stop just because of one loss" — and he is right: it rested on ONE live trade (the other
+// numbers were background rates, not this signal), and only one such signal fired in seven days (the gates already
+// refuse the rest: 57 of 58 RANGE candidates), so "lifted at 60% over 25" meant a block for about six months. The 11/05
+// guards added after single losses later blocked the 11/16 winner. So, from 8.15, the record decides — the same idea as
+// the 0W/3L lane bench:
+//   • gold momentum signals (RIDE / TREND / FAST / SUST / 6-6; never +LIQ, retrace, session rejection, news, hand
+//     trades) keep FIRING when the day regime is RANGE;
+//   • each resolved fire is tallied as XAU-MOM-RANGE-FIRED (TP1 first = win, stop first = loss). The 11/26 loss is
+//     seeded from the history as the first entry;
+//   • the hold switches on by itself only when that record reaches >= 3 fires with more losses than wins. While it is
+//     on, the signal is not fired and is graded on the standard bracket as XAU-MOM-RANGE (one row per direction per
+//     30 min); it switches off again when those held entries show >= 60% over >= 5.
+// MOM_RANGE_GATE=0 never holds (the count keeps running); MOM_RANGE_GATE=1 holds now. /state/XAU shows momRange.
+function momRangeClass(score) {
+  const g = String(score || '').replace(/[⬆⬇]/g, '');
+  return /RIDE|TREND|FAST|SUST|6\/6/.test(g) && !/LHF|LLF|VREV|EXT-FLIP|OBREJ|OBMIT|INVERSAL|SWEEP|CHoCH|ATH|ATL|DIV|MFLIP|STRUCT|RETEST|LIQ|MANUAL|SESSREJ|RANGE5|PATH|BIGLEG|RETRACE|NEWS/.test(g);
+}
+function momRangeFiredRow(sym, h) {
+  try { return sym === 'XAU' && !!h && !h.manual && !h.liq && !!h.feat && h.feat.regime === 'RANGE' && /^(call|put)$/.test(String(h.type)) && momRangeClass(h.score); } catch (e) { return false; }
+}
+function momRangeSeed() {
+  try {
+    cohortTally.XAU = cohortTally.XAU || {};
+    if (cohortTally.XAU['XAU-MOM-RANGE-FIRED']) return;
+    let w = 0, l = 0;
+    for (const h of signalHistory) {
+      if (h.symbol !== 'XAU' || (h.conv && h.conv.enrichBlocked) || typeof h.oteHold === 'string' || !momRangeFiredRow('XAU', h) || !h.outcomes) continue;
+      const fc = h.outcomes.fireCohorts; // only fires already graded by fireCohortsOnResolve — anything still open is counted there when it resolves (exactly once either way)
+      if (!fc || !Array.isArray(fc.names) || fc.names.indexOf('XAU-MOM-RANGE-FIRED') >= 0) continue;
+      if (fc.outcome === 'win') w++; else if (fc.outcome === 'loss') l++; else continue;
+      fc.names.push('XAU-MOM-RANGE-FIRED');
+    }
+    cohortTally.XAU['XAU-MOM-RANGE-FIRED'] = { win: w, loss: l, scratch: 0, no_resolve: 0, lastTs: Date.now() }; _ctDirty = true;
+    log('XAU', '🧭 XAU-MOM-RANGE-FIRED seeded from the 7-day history: ' + w + 'W/' + l + 'L — gold momentum fires while the day regime was RANGE. The hold switches on only at >= 3 fires with more losses than wins (2026-11-26).');
+  } catch (e) {}
+}
+setTimeout(() => { try { momRangeSeed(); } catch (e) {} }, 20000);
+function momRangeState() {
+  try {
+    const T = cohortTally.XAU || {}; const F = T['XAU-MOM-RANGE-FIRED'] || {}, H = T['XAU-MOM-RANGE'] || {};
+    const fw = F.win || 0, fl = F.loss || 0, hw = H.win || 0, hl = H.loss || 0;
+    const losing = (fw + fl) >= 3 && fl > fw, earned = (hw + hl) >= 5 && hw / (hw + hl) >= 0.6;
+    const f = process.env.MOM_RANGE_GATE;
+    const hold = f === '0' ? false : f === '1' ? true : (losing && !earned);
+    return { hold, fired: fw + 'W/' + fl + 'L', held: hw + 'W/' + hl + 'L', rule: 'hold when fired >= 3 with more losses than wins; off again when held entries show >= 60% over >= 5', force: f === '0' || f === '1' ? f : null };
+  } catch (e) { return { hold: false, err: String(e).slice(0, 80) }; }
+}
+function momRangeHold(sym, s, sig, tag) {
+  try {
+    if (sym !== 'XAU' || !sig || sig.manual || sig._liq) return false;
+    const dr = s && s._dayRegime; if (!dr || dr.label !== 'RANGE') return false;
+    if (!/^(call|put)$/.test(String(sig.type))) return false;
+    const g = String(sig.score || tag || '').replace(/[⬆⬇]/g, '');
+    if (!momRangeClass(g)) return false;
+    momRangeSeed();
+    const st = momRangeState();
+    if (global._momRngHold !== undefined && global._momRngHold !== st.hold) { const _fm = '🧭 XAU-MOM-RANGE hold ' + (st.hold ? 'ON' : 'OFF') + ' — gold momentum fires in a RANGE market ' + st.fired + ', held entries ' + st.held + ' (2026-11-26).'; log(sym, _fm); try { sendPush('🧭 XAU momentum-in-range hold ' + (st.hold ? 'ON' : 'OFF'), 'fired ' + st.fired + ' · held ' + st.held, 'alert'); } catch (eP) {} }
+    global._momRngHold = st.hold;
+    if (!st.hold) return false;                                                           // fires as before; counted at resolution (XAU-MOM-RANGE-FIRED)
+    const coh = 'XAU-MOM-RANGE';
+    const now = Date.now(); s._momRngTs = s._momRngTs || {};
+    const m = '🧭 ' + g + ' ' + sig.type.toUpperCase() + ' REFUSED — ' + coh + ': momentum entry while the day regime is RANGE (KER ' + (isFinite(dr.ker) ? (+dr.ker).toFixed(2) : '?') + ' · CHOP ' + (isFinite(dr.chop) ? (+dr.chop).toFixed(0) : '?') + ') — these fires are ' + st.fired + ' live, so they are held; graded, released when the held entries show 60% over 5 (so far ' + st.held + ') (2026-11-26).';
+    if (now - (s._momRngTs[sig.type] || 0) >= 1800000) { s._momRngTs[sig.type] = now; log(sym, m); try { trackBlockedOutcome(sym, m, true); } catch (eT) {} }
+    return true;
+  } catch (e) { return false; }
+}
 function mom5dRefuse(sym, s, sig, tag) {
   try {
     if (sym !== 'NAS100' || process.env.MOM5D_GATE === '0' || !sig || sig.manual || sig._liq || !sig._regime) return false;
@@ -18292,6 +18367,28 @@ function retraceFastStamp(sym, s, dir, price, sl, tp1, ageMin, g, atr) {
     return on;
   } catch (e) { return false; }
 }
+// ===== RETRACE LEGS THAT QUALIFY ONLY BECAUSE ATR SHRANK — MEASUREMENT (2026-11-26, Jean: "ok go with all") ===== 11/26
+// 05:36 NAS bought the 70.5% retrace of the bounce $26,100.30 → $26,256.50 and was stopped in six minutes. The lane needs
+// a leg of >= 4 ATR. When price first fell through that level (04:15–04:35) ATR was ~45, the 156-point bounce was 3.4 ATR
+// and nothing was stamped; by 05:36 ATR had decayed to 29.3, the same bounce read 5.3 ATR, and the limit went live — on
+// the second visit, after a lower high. One case: "first touch only" does NOT hold up (second visits 6W/4L NAS, 5W/1L
+// gold over the last week), so nothing changes live. This only counts it: ATR is sampled once per M5 bar, and when a
+// retrace-limit entry is taken on a leg that was under the 4-ATR minimum at the HIGHEST ATR seen since the leg's
+// extreme, a twin row <SYM>-RETRACE-ATR-SHRINK is graded on the same bracket. No ATR history (just restarted) = no flag.
+function retraceAtrShrinkStamp(sym, s, R, dir, price, sl, tp1, g, atr) {
+  try {
+    if (process.env.RETRACE_ATR_SHRINK === '0' || !g || !g.xTs || !(atr > 0) || !Array.isArray(R.atrH)) return false;
+    let aMax = atr, n = 0; for (const a of R.atrH) { if (a.ts >= g.xTs + 240000) { n++; if (a.atr > aMax) aMax = a.atr; } }
+    const need = parseFloat(process.env.RETRACE_LEG_ATR) || 4;
+    if (!n || !(g.leg / aMax < need)) return false;
+    const now = Date.now();
+    const m = '📉 ' + sym + '-RETRACE-ATR-SHRINK ' + dir.toUpperCase() + ' @ $' + price.toFixed(2) + ' — RETRACE-LIMIT entry taken (measurement only): the leg $' + g.o.toFixed(2) + ' → $' + g.x.toFixed(2) + ' reads ' + (g.leg / atr).toFixed(1) + ' ATR now but was ' + (g.leg / aMax).toFixed(1) + ' ATR (under the ' + need + '-ATR minimum) at the highest ATR since its extreme ($' + aMax.toFixed(2) + ' then, $' + atr.toFixed(2) + ' now) — it qualifies because volatility shrank, not because the move was big. Same bracket, first leg (2026-11-26).';
+    s.blockedOutcomes = s.blockedOutcomes || [];
+    s.blockedOutcomes.push({ ts: now, time: ts(), symbol: sym, detector: sym + '-RETRACE-ATR-SHRINK', type: dir, price: +price.toFixed(2), virtualTp1: +tp1.toFixed(2), virtualSl: +sl.toFixed(2), maxMin: 240, firstLegOnly: true, blockReason: m, feat: blockFeat(sym, s, dir, price), snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
+    log(sym, m);
+    return true;
+  } catch (e) { return false; }
+}
 function retraceLiveFire(sym, s, dir, price, sl, tp1, tp2, tp3, note, kind) {
   try {
     const K = kind === 'LIMIT' ? 'LIMIT' : 'REJ', _sc = K === 'LIMIT' ? 'RETRACE-LIM' : 'RETRACE-REJ';
@@ -18340,6 +18437,7 @@ function retraceRejTick(sym, s, price) {
     const row = (det, dir, p, tp, sl, m) => ({ ts: now, time: ts(), symbol: sym, detector: det, type: dir, price: +p.toFixed(2), virtualTp1: +tp.toFixed(2), virtualSl: +sl.toFixed(2), maxMin: 240, firstLegOnly: true, blockReason: m, feat: blockFeat(sym, s, dir, p), snaps: { p5m: null, p15m: null, p30m: null, p60m: null }, tp1Hit: false, tp1HitTs: null, slHit: false, slHitTs: null, closed: false, closedTs: null, outcome: null });
     if (lc.ts !== R.m5Ts) {
       R.m5Ts = lc.ts;
+      { const _aH = R.atrH = R.atrH || []; _aH.push({ ts: now, atr: +atr }); while (_aH.length > 60) _aH.shift(); } // ATR once per M5 bar, ~5 h (2026-11-26, see retraceAtrShrinkStamp)
       // real, open-market bars inside the lookback's clock time only — a leg must not be a weekend gap (2026-11-23)
       const _rLb = parseInt(process.env.RETRACE_LOOKBACK_BARS, 10) || 36, _rT0 = now - (_rLb + 1) * 300000;
       let W = M.slice(-_rLb).filter(b => b && b.ts >= _rT0 && b.h > b.l && (sym === 'BTC' || cfdMarketOpenET(b.ts))); if (!W.length) W = [lc];
@@ -18403,6 +18501,7 @@ function retraceRejTick(sym, s, price) {
         const _ageMin = g.xTs ? (now - g.xTs) / 60000 : null;                              // minutes between the leg's extreme and this touch
         const _skF = (_ageMin != null && _ageMin <= (parseFloat(process.env.RETRACE_MIN_AGE_MIN) || 45)) ? retraceFastStamp(sym, s, dir, price, sl, _t1, _ageMin, g, atr) : false; // V-retrace (2026-11-18)
         const _skP = _px ? retracePsxStamp(sym, s, R, dir, 'LIMIT', price, sl, _t1, atr, tpMin, _px) : false;
+        retraceAtrShrinkStamp(sym, s, R, dir, price, sl, _t1, g, atr);                    // measurement twin only — never changes the fire (2026-11-26)
         if (!_skF && !_skP) retraceLiveFire(sym, s, dir, price, sl, _t1, _t2, _t3, 'limit at the 70.5% retrace $' + lim.toFixed(2) + ' of the ' + (g.leg / atr).toFixed(1) + '-ATR leg $' + g.o.toFixed(2) + ' → $' + g.x.toFixed(2), 'LIMIT'); }
     }
   } catch (e) { /* lane must never crash the tick */ }
@@ -22338,7 +22437,7 @@ app.get('/state/:sym', (req, res) => {
     rsiAtSessionLow: s.rsiAtSessionLow,
     rollingHigh: s.rollingHigh || 0,
     rollingLow: s.rollingLow === Infinity ? null : s.rollingLow,
-    build: '8.13-20261125-agent-entry-question-both-models',
+    build: '8.15-20261126-gold-mom-range-count-first',
     clearedTrade: clearedTradeInfo(sym, s), // a manually cleared trade that can still be put back / closed in MT5 (2026-11-24) // bump on each deploy — lets /state verify what's live
     laneBenchStored: Object.fromEntries(Object.entries(laneBenchState).filter(([k]) => k.indexOf(sym + '|') === 0)), // stored lane benches for this symbol (2026-11-10): {since, why, hand, base, rearmed}
     btcCallBench: sym === 'BTC' ? { benched: btcCallsBenched(), n: global._btcCallBench.n, pct: global._btcCallBench.pct, bar: 're-arm at 60% over 25 on BTC-CALL-BENCH; BTC_CALLS_LIVE=1 lifts it' } : undefined, // BTC calls benched (2026-11-10)
@@ -22349,6 +22448,7 @@ app.get('/state/:sym', (req, res) => {
     entryAgent: { keyPresent: !!process.env.ANTHROPIC_API_KEY, keyLen: (process.env.ANTHROPIC_API_KEY || '').length, keyPrefix: (process.env.ANTHROPIC_API_KEY || '').slice(0, 7) || null, models: entryAgentModels(), effort: process.env.ENTRY_AGENT_EFFORT || 'low', enabled: entryAgentEnabled(), mode: 'shadow', decisions: entryAgent.decisions.length, calls: entryAgent.stats.calls, errors: entryAgent.stats.errors, lastErr: entryAgent.stats.lastErr, last: entryAgent.decisions.length ? (function (d) { return { time: d.time, sym: d.sym, model: d.short, action: d.action || ('ERR ' + d.err), reason: d.reason }; })(entryAgent.decisions[entryAgent.decisions.length - 1]) : null }, // readiness readout for the entry agent (2026-10-09) — presence only, never the key
     btcMode: BTC_TRADING_ENABLED ? 'FULL' : ((process.env.BTC_RANGE5_LIVE !== '0' ? 'RANGE5-RT LIVE' : '') + (process.env.BTC_BIGLEG_LIVE === '1' /* RETIRED FROM LIVE 2026-10-28 (Jean: "always taking the call after the big leg happened"): live 1W/5L −$1,942 + the 10/28 05:16 call; shadow 0W/2S/4L (14d). The sampler keeps measuring; BTC_BIGLEG_LIVE=1 re-arms by hand */ ? ' + BIGLEG LIVE (weekday, non-RANGE)' : '') + (process.env.BTC_SESSREJ_LIVE !== '0' ? ' + SESS-REJ LIVE (RANGE, weekday)' : '') + (process.env.BTC_VREC_ENABLED === '1' ? ' + V-REC' : '') + ' (all other detectors dormant; V-REC retired 2026-09-24 → SESS-REJ-CRASH shadow)').replace(/^ \+ /, ''),
     cohortTally: cohortTally[sym] || {},
+    momRange: sym === 'XAU' ? momRangeState() : undefined, // gold momentum-in-range: live record and whether the hold is on (2026-11-26)
     pnlLedger: (function(){ try { const out = {}; let wk = 0; const _since = (fundedEpoch && fundedEpoch.since) || ''; const _base = (fundedEpoch && fundedEpoch.base) || {}; const days = Object.keys(pnlLedger).sort().slice(-7); for (const d of days) { if (pnlLedger[d][sym]) { out[d] = pnlLedger[d][sym]; if (d >= _since) wk += pnlLedger[d][sym].pnl - ((_base[d] && typeof _base[d][sym] === 'number') ? _base[d][sym] : 0); } } out.weekTotal = +wk.toFixed(2); out.account = (fundedEpoch && fundedEpoch.label) || null; return out; } catch (e) { return {}; } })(), // weekTotal counts the current funded-account epoch only (2026-10-01) // realized P&L, account terms (2026-08-17) // persistent per-cohort W/L/S — survives buffer churn + deploys (2026-07-31)
     fundedGuard: (function () { try { const g = Object.assign({}, global._fundedGuard || {}); g.accounts = acctIds().map(acctTotals); return g; } catch (e) { return global._fundedGuard || null; } })(), // Neura guard readout (2026-09-20) + per-account day/total/limits/stand-down (2026-10-01)
     regimeScore: s._dayRegime || null, // KER+CHOP+Hurst composite classifier (2026-09-20): {label TREND|RANGE|MIXED, ker, chop, hurst, n, ts}
